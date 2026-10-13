@@ -1,0 +1,138 @@
+{
+  "rationale": "New sourced question from the configuration/eligibility axis, found while re-reading the conf-change paths. Propose-time validation decides leave-joint purely from len(Changes) == 0, while applyConfChange decides it from ConfChangeV2.LeaveJoint(), which for an empty change set is true only when the transition is Auto; an empty ChangeV2 with an explicit transition therefore passes validation while joint and is then treated as entering joint, which fails with the error config is already joint and panics. A focused probe against the real FSM confirmed the whole chain: entering a joint config with an explicit transition produced voters [1 2 3 4] against outgoing [1 2 3]; an empty JointExplicit ChangeV2 tested LeaveJoint false and EnterJoint ok true; stepping it as a MsgProp returned nil and appended EntryConfChangeV2 (the entry was not replaced by validation); and applying it panicked with config is already joint. I record this as a new investigation with a fixed experiment so the controller can produce the receipt, and I deliberately add no interpretation yet since the receipt does not exist.",
+  "sources": [
+    {
+      "id": "val_joint",
+      "file": "raft.go",
+      "start_line": 1325,
+      "end_line": 1342,
+      "kind": "code_observation"
+    },
+    {
+      "id": "apply_cc",
+      "file": "raft.go",
+      "start_line": 1951,
+      "end_line": 1976,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cc_enter",
+      "file": "confchange/confchange.go",
+      "start_line": 39,
+      "end_line": 60,
+      "kind": "code_observation"
+    },
+    {
+      "id": "pb_leave",
+      "file": "raftpb/confchange.go",
+      "start_line": 70,
+      "end_line": 113,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@empty_explicit_joint",
+      "question": "Can an empty ConfChangeV2 whose Transition is explicit rather than auto pass the leader's propose-time configuration validation while the configuration is joint, and then panic the process when the application applies the committed entry? Propose-time validation tests len(Changes) == 0 for leave-joint, while applyConfChange tests ConfChangeV2.LeaveJoint(), which also requires the Auto transition.",
+      "source_ids": [
+        "val_joint",
+        "apply_cc",
+        "cc_enter",
+        "pb_leave"
+      ],
+      "hypothesis": "The two leave-joint tests disagree for an empty change set with a non-Auto transition in a joint configuration: stepLeader treats it as a leave-joint request (wantsLeaveJoint true, alreadyJoint true, so no failed check and no entry replacement), but applyConfChange sees LeaveJoint false, takes the EnterJoint branch because EnterJoint reports ok for an explicit transition, calls Changer.EnterJoint on an already-joint tracker, receives the error and panics on the spot. The panic happens in the application's ApplyConfChange call for an entry the library accepted and committed.",
+      "discriminator": "Confirm both halves separately: (a) the entry appended by the validated proposal still has type EntryConfChangeV2 rather than being replaced by EntryNormal, which shows validation accepted it; (b) applying that same ConfChangeV2 panics with config is already joint. If either half fails - for instance if some later guard replaces or drops the entry, or if EnterJoint returns ok false - the suspicion is refuted. Also check whether the Auto-transition empty change still leaves the joint config correctly, which would show the defect is specific to the explicit transition rather than to empty changes."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@K_empty_explicit_joint",
+      "kind": "behavior",
+      "statement": "For an empty ConfChangeV2 with Transition = JointExplicit in a joint configuration: LeaveJoint() reports false and EnterJoint() reports ok true; stepLeader's propose-time validation computes wantsLeaveJoint from len(Changes) == 0 and, with alreadyJoint also true, produces no failed check, so the EntryConfChangeV2 is appended unchanged; applyConfChange then takes the EnterJoint branch and Changer.EnterJoint rejects an already-joint configuration, so applyConfChange panics with the error string config is already joint. Observed end to end on a real instance: after entering joint explicitly (voters [1 2 3 4] against outgoing [1 2 3]), the proposal step returned a nil error and left an EntryConfChangeV2 at the new last index, and applying it panicked with that exact string while the configuration was still joint.",
+      "conditions": "The configuration is joint and the client supplies a ConfChangeV2 with an explicit (JointExplicit or JointImplicit) transition and no changes; propose-time validation is at its default (enabled), and the leader is a member so the proposal is not dropped for that reason. Validation only replaces the entry when it computes a failed check, which does not happen in this case because an empty change set is read as leave-joint regardless of transition. Distinct from the Auto-transition empty ChangeV2, which is the documented leave-joint idiom and takes the LeaveJoint path.",
+      "source_ids": [
+        "val_joint",
+        "apply_cc",
+        "pb_leave"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@empty_explicit_joint",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "val_joint",
+      "apply_cc",
+      "cc_enter",
+      "pb_leave"
+    ],
+    "scope": {
+      "description": "Drive a real raft through entering a joint configuration and then through proposing and applying an empty ConfChangeV2 with an explicit transition, recording whether propose-time validation keeps the entry and whether applying it panics.",
+      "assumptions": [
+        "Real raft over voters {1,2,3} built with newTestRaft and the library defaults; the joint configuration is entered by applying ConfChangeV2 with an explicit transition and a single add-node change, which is the normal EnterJoint path.",
+        "The malformed change is submitted through raft.Step as a MsgProp carrying an EntryConfChangeV2 built by marshalling ConfChangeV2{Transition: JointExplicit}, which is exactly the input shape an application or client would produce.",
+        "ApplyConfChange is invoked directly on the same instance because the entry would not be committed on a quorum-less test instance; no production logic is modified and the panic is captured with recover so it is recorded as data."
+      ],
+      "excluded": [
+        "Any claim about how a client library or etcd constructs its ConfChangeV2 messages; only the library's own acceptance and apply paths are measured.",
+        "The Auto-transition empty change, which is the supported leave-joint idiom and is not part of this comparison."
+      ],
+      "parameters": {
+        "voters": [1, 2, 3],
+        "added_node": 4,
+        "transition": "JointExplicit",
+        "changes": 0
+      }
+    },
+    "prefix": "TestAssuranceEmptyExplicitConfChangeJoint builds newTestRaft(1,3,1,newTestMemoryStorage(withPeers(1,2,3))), promotes it with becomeCandidate/becomeLeader, applies ConfChangeV2{Transition: JointExplicit, Changes: [add 4]} and emits a setup event with the resulting voters, outgoing voters, the tested transition, change count, LeaveJoint and EnterJoint results. It then marshals ConfChangeV2{Transition: JointExplicit} into an EntryConfChangeV2, steps it as a MsgProp, and emits an event with the step error, how many entries were appended and the type of the last entry. Finally it calls applyConfChange on that same change inside a recover and emits whether it panicked, the panic text and whether the configuration is still joint.",
+    "semantic_changes": [],
+    "prerequisites": [
+      {
+        "alias": "joint_empty_explicit_setup",
+        "event": "empty_cc_joint_setup",
+        "conditions": [
+          {
+            "field": "joint",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "empty_cc_joint_prop",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "joint_empty_explicit_setup",
+        "assertion": {
+          "field": "last_type",
+          "op": "eq",
+          "value": "EntryConfChangeV2"
+        },
+        "description": "Propose-time validation kept the entry as a configuration change rather than replacing it, so the library accepted the request."
+      },
+      {
+        "event": "empty_cc_joint_apply",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "joint_empty_explicit_setup",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Applying the accepted change panics because Changer.EnterJoint rejects an already-joint configuration."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "@K_empty_explicit_joint",
+        "revision": 1,
+        "assertion": "the explicit-transition empty change passes validation and panics on apply"
+      }
+    ]
+  }
+}

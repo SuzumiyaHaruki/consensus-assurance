@@ -37,3 +37,17 @@ def test_invalid_whole_update_never_partially_commits(tmp_path):
         commit_update(e,'bad',sub,lambda p:prepare_submission(p,product,Inputs(draft),'bad')())
     assert e.state.model_dump(mode='json')==before
     assert not (e.root/'semantic-commits/bad.json').exists()
+
+
+def test_interpretation_gap_answers_require_explicit_meaning():
+    from consensus_assurance.core.submissions import InterpretationUpdate
+    base=dict(investigation_id='q',source_ids=['source'],conclusion='unresolved',
+        defect_claim=None,rationale='The observed return remains available while the caller history is investigated')
+    for value in (None,'partial progress',{}, {'resolved':False}, {'explanation':'Partial progress'},
+                  {'explanation':'','resolved':True}, {'explanation':'Partial progress','resolved':'false'}):
+        with pytest.raises(ValueError):
+            InterpretationUpdate.model_validate({**base,'answers':{'gap':value}})
+    for resolved in (False,True):
+        opinion=InterpretationUpdate.model_validate({**base,'answers':{
+            'gap':dict(explanation='The local initializer establishes this input',resolved=resolved)}})
+        assert opinion.defect_claim is None and opinion.answers['gap'].resolved is resolved

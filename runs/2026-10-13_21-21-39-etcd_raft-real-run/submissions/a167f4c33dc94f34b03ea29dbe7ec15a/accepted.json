@@ -1,0 +1,135 @@
+{
+  "rationale": "Resolving the one open necessary gap from investigation 71f53a32a0c74532a55ad33bc1e71086-question-0 (whether some legal producer can deliver a MsgHeartbeatResp.Context the live leader never emitted). I traced every site that creates or consumes the readOnly instance and every producer of the Context field in the snapshot. r.readOnly is reassigned only at raft.go:809 inside raft.reset, and reset is called only from becomeFollower (:893), becomeCandidate (:908, with r.Term+1) and becomeLeader (:939, with the candidate's term). The only writer of a heartbeat Context is handleHeartbeat (:1837), which copies the Context of the heartbeat the leader sent; vote contexts (:1071) go to MsgVote, not heartbeats. Because leadership terms strictly increase (leader->candidate is forbidden by the becomeCandidate panic, and campaigning increments the term), a given readOnly instance lives only while its node is leader at one term, and responses carrying a different term are dropped before stepLeader by the term switch in raft.Step. The message total confirmedReads+len(unconfirmedReads) is non-decreasing for the instance's lifetime (addRequest grows it, maybeAdvance preserves it) and heartbeatCtx emits exactly that total. So no legal producer exists under the library's own producers, including a mixed-version cluster whose v3.6.0 node also echoes m.Context. This defeats the premise of the earlier suspicion, so I am correcting the account rather than restating it: the unvalidated Context is a robustness/validation property, not an in-model CFT safety or liveness defect, and I record it as a scoped fact with explicit out-of-contract conditions instead of preserving the original claim as a limitation.",
+  "sources": [
+    {
+      "id": "ro_ack",
+      "file": "read_only.go",
+      "start_line": 64,
+      "end_line": 89,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_hbresp",
+      "file": "raft.go",
+      "start_line": 1596,
+      "end_line": 1612,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_reset",
+      "file": "raft.go",
+      "start_line": 781,
+      "end_line": 812,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_terms",
+      "file": "raft.go",
+      "start_line": 891,
+      "end_line": 940,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_hb_echo",
+      "file": "raft.go",
+      "start_line": 1835,
+      "end_line": 1840,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_step_term",
+      "file": "raft.go",
+      "start_line": 1158,
+      "end_line": 1175,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "71f53a32a0c74532a55ad33bc1e71086-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": "Refined after resolving the gap: readOnly.recvAck does store a peer-supplied Context as a raw read-position ack with no check that the leader emitted it, and maybeAdvance slices unconfirmedReads by the resulting quorum position without clamping. But every legal producer in this snapshot echoes a value the live leader's heartbeatCtx produced (handleHeartbeat is the sole writer of MsgHeartbeatResp.Context), the readOnly instance is created only by raft.reset at a leadership transition, and the emitted position equals a message total that is non-decreasing, so the quorum position can never exceed confirmedReads+len(unconfirmedReads) in-model. The two consequences (slice-bounds panic; confirming a read no quorum observed) require a Context outside the set heartbeatCtx emitted, which no in-model producer supplies.",
+      "discriminator": "Resolved: enumerate the sites that create the readOnly instance (only raft.reset, called from becomeFollower/becomeCandidate/becomeLeader) and the writers of MsgHeartbeatResp.Context (only handleHeartbeat, echoing m.Context). None can deliver a value the leader did not emit while its instance was live, because a readOnly instance is only live while its node is leader in a single term and cross-term responses are dropped before stepLeader. If a later source read showed any other readOnly reassignment or Context producer (e.g. an application-visible heartbeat context), the in-model claim would revive.",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@K_read_ack_scope",
+      "kind": "fact",
+      "statement": "In this snapshot the ReadOnlySafe ack bookkeeping is in-model consistent: (1) r.readOnly is reassigned only in raft.reset (:809) and reset is called only by becomeFollower (:893), becomeCandidate (:908, term+1) and becomeLeader (:939, the candidate's term), so a readOnly instance is live only while its node is leader at one term; (2) raft.Step drops a lower-term MsgHeartbeatResp before dispatch (:1158-1175); (3) the only producer of MsgHeartbeatResp.Context is handleHeartbeat (:1837), echoing the leader's heartbeat Context, and vote contexts are sent on MsgVote (:1071); (4) heartbeatCtx emits exactly confirmedReads+len(unconfirmedReads), which addRequest only grows and maybeAdvance preserves. Therefore every value in readOnly.acks is at most the current message total, newConfirmedReads-confirmedReads can never exceed len(unconfirmedReads), and each returned read corresponds to a heartbeat emitted after that request was admitted and acknowledged by a quorum. The slice-bounds panic and premature confirmation observed when a probe supplied an out-of-contract Context are not reachable through the library's own producers.",
+      "conditions": "ReadOnlySafe; leadership terms strictly increase (becomeCandidate panics from StateLeader and increments the term); cluster members run this library's follower path (including a v3.6.0 node, which also echoes m.Context); no two leaders exist in the same term. Excludes a peer or intermediary that fabricates or corrupts MsgHeartbeatResp.Context, which is outside the crash-fault model.",
+      "source_ids": [
+        "src_reset",
+        "src_terms",
+        "src_hb_echo",
+        "src_step_term",
+        "ro_ack",
+        "raft_hbresp"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "71f53a32a0c74532a55ad33bc1e71086-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "ro_ack",
+        "raft_hbresp",
+        "src_reset",
+        "src_terms",
+        "src_hb_echo",
+        "src_step_term"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Revision of the earlier conditional account for investigation 71f53a32a0c74532a55ad33bc1e71086-question-0. What changed: I answered the recorded necessary gap (71f53a32a0c74532a55ad33bc1e71086-gap-0) by enumerating the two source facts the suspicion depended on - where the readOnly instance is created and who can write MsgHeartbeatResp.Context. r.readOnly is reassigned only at raft.go:809 within raft.reset, and reset is called only from becomeFollower (:893), becomeCandidate (:908) and becomeLeader (:939); handleHeartbeat (:1837) is the sole writer of the heartbeat Context, copying the leader's value, while vote contexts travel on MsgVote (:1071); and raft.Step drops lower-term messages before dispatch (:1158-1175). Combined with strictly increasing leadership terms (becomeCandidate increments the term and panics from StateLeader), a live readOnly instance coincides with exactly one leadership term, and heartbeatCtx emits a value equal to confirmedReads+len(unconfirmedReads), a total that addRequest only grows and maybeAdvance preserves. Hence in-model every stored ack is at most that total, the slice in maybeAdvance is always in range, and each confirmed read was observed by a quorum - the premise of the original suspicion does not hold. Still-applicable findings retained from the prior revision: the observation that recvAck performs no equality check against the emitted contexts and maybeAdvance does not clamp the slice is accurate as a description of the code (knowledge entries 71f53a32a0c74532a55ad33bc1e71086-knowledge-0 and -1 remain valid), and my focused local probe (native feedback, not a retained receipt) did reproduce both a slice-bounds panic and premature confirmation when values outside the emitted set were supplied. What that probe establishes is the code's behavior under an out-of-contract input, not an in-model trigger. Naming the boundary explicitly instead of keeping the claim: within the crash-fault model this is not a safety or liveness defect; the residual property is that a peer or intermediary fabricating or corrupting MsgHeartbeatResp.Context can panic the leader (slice bounds out of range) or advance a read index its peer never justified, which is robustness against a fault class the CFT model excludes. I therefore record it as a scoped fact (@K_read_ack_scope) rather than a defect, and I have no remaining doubt about the question as asked. Independent uncertainty I did not promote to a claim: addRequest no longer deduplicates by request context, so repeated documented ReadIndex retries with the same context accumulate one unconfirmed entry and one heartbeat broadcast per retry while the leader cannot reach a quorum ack; whether that is a reportable bounded-resource concern depends on client retry discipline and is not asserted here.",
+      "answers": {
+        "71f53a32a0c74532a55ad33bc1e71086-gap-0": {
+          "explanation": "No legal producer exists. The readOnly instance is created only by raft.reset, and reset is reached only through becomeFollower/becomeCandidate/becomeLeader; the only writer of MsgHeartbeatResp.Context is handleHeartbeat, which echoes the leader's own heartbeat Context; responses from a different term are dropped before stepLeader. Since leadership terms strictly increase, a live instance coincides with one leadership term, and heartbeatCtx values equal a non-decreasing message total, so a quorum ack position can never exceed the number of admitted requests. The out-of-contract consequences therefore need a Context the leader never emitted, which no in-model producer (including a mixed-version v3.6.0 follower, which echoes m.Context) supplies.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "71f53a32a0c74532a55ad33bc1e71086-knowledge-0",
+          "revision": 1,
+          "assertion": "recvAck stores the peer Context as a raw read position and maybeAdvance slices unconfirmedReads by the quorum position without validating the value"
+        },
+        {
+          "entry_id": "71f53a32a0c74532a55ad33bc1e71086-knowledge-1",
+          "revision": 1,
+          "assertion": "faithful producers keep ack values within the emitted range, so the slice is in range and confirmation corresponds to real heartbeat observation"
+        },
+        {
+          "entry_id": "@K_read_ack_scope",
+          "revision": 1,
+          "assertion": "the readOnly lifetime and Context-producer enumeration rule out an in-model value the leader never emitted"
+        }
+      ],
+      "counterevidence": [],
+      "limitations": [
+        "The refutation is a source-only argument (no retained execution receipt for the lifetime/producer enumeration); it relies on the listed reset call sites and the single Context producer being exhaustive in this snapshot.",
+        "The out-of-contract consequence (panic on a fabricated 8-byte Context; confirming a read from a peer that never observed the heartbeat) is real code behavior but excluded by the crash-fault model, so it is retained as a scoped robustness fact with its conditions, not as a CFT defect.",
+        "No experiment was submitted: an in-model probe cannot reproduce the symptom, and a direct readOnly probe only re-demonstrates the out-of-contract input."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

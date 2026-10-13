@@ -1,0 +1,95 @@
+{
+  "rationale": "One more source-decided lead is worth recording while the budget lasts, because it sits on the same handler as the last three findings and answers a question the earlier work walked past: every RPC that arrives on the consumer channel goes through processRPC, which runs checkRPCHeader first and drops a message whose command lacks a header or whose protocol version falls outside the accepted range, but the heartbeat fast path calls appendEntries directly from processHeartbeat and never runs that gate. The network transport's classification decides only that the request is an empty AppendEntries with a term and a leader address; it imposes no version requirement, so a peer speaking a protocol version this node rejects on every other path can still have its heartbeat processed, and processing it adopts its higher term, flips the node to follower and records it as the leader. I record this as a behaviour with both paths cited, answer it in one interpretation, and state the scope honestly: it grants no authority that a well-formed higher-term message would not already carry, and it does not touch entries or the commit index, but the compatibility gate the node enforces elsewhere is bypassed on this path, which is what the gate exists to prevent.",
+  "sources": [
+    {
+      "id": "processrpc",
+      "file": "raft.go",
+      "start_line": 1390,
+      "end_line": 1394,
+      "kind": "code_observation"
+    },
+    {
+      "id": "checkrpcheader",
+      "file": "raft.go",
+      "start_line": 45,
+      "end_line": 71,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@fast_path_protocol_gate",
+      "question": "Does a message the node would reject as unsupported on every other RPC path still take effect when it arrives as a heartbeat on the fast path?",
+      "source_ids": [
+        "processrpc",
+        "checkrpcheader",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "hypothesis": "The version and header gate lives in processRPC, which every consumer-channel request passes; the fast path bypasses processRPC and calls appendEntries from processHeartbeat, where nothing inspects the header, and the transport's classification is a shape test rather than a compatibility test. A heartbeat advertising an unsupported protocol version is therefore processed, and processing it adopts a higher term, sets the node to follower and records the sender as leader.",
+      "discriminator": "Compare the two delivery paths for the same request shape: if a request with an unsupported protocol version is dropped on the consumer path and processed on the fast path, the gate is bypassed on that path. Reading settles it since the gate is a single call at the top of processRPC and the fast path has no equivalent, so no execution is spent.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@fast_path_skips_rpc_header_gate",
+      "kind": "behavior",
+      "statement": "processRPC runs checkRPCHeader before dispatching any request from the consumer channel, and that check rejects a command that does not expose a header and a header whose protocol version is below the minimum, above the maximum, or more than one version behind the node's own. processHeartbeat does not call it: it checks only the shutdown channel and then passes an AppendEntriesRequest straight to appendEntries, and the network transport's heartbeat classification requires a term, a leader address, no previous entry, no entries and no leader commit index, but no protocol version. An empty heartbeat therefore reaches appendEntries without the gate every other RPC passes.",
+      "conditions": "This revision, any node whose transport implements the heartbeat fast path, for an incoming request that satisfies the transport's heartbeat classification regardless of the protocol version it advertises.",
+      "source_ids": [
+        "processrpc",
+        "checkrpcheader",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@fast_path_protocol_gate",
+      "experiment_id": null,
+      "source_ids": [
+        "processrpc",
+        "checkrpcheader",
+        "processheartbeat",
+        "netxpheartbeat",
+        "appendentriesmain"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "The two paths differ by one call. A request that arrives on the consumer channel enters processRPC, which runs checkRPCHeader first and answers with an error instead of dispatching when the command has no header or when the header's protocol version is outside the accepted range or more than one version behind this node; the heartbeat fast path enters processHeartbeat, which checks the shutdown channel and then hands an AppendEntriesRequest directly to appendEntries, with nothing inspecting the header in between, and the transport's classification is satisfied by a term, a leader address, a zero previous entry and term, no entries and a zero leader commit index. A heartbeat carrying an unsupported protocol version is therefore processed rather than dropped, and what processing does is not inert: appendEntries adopts a term above the node's current one, sets the node to follower and records the sender as leader, which is the same effect the gate's other callers are denied. The scope I claim is that gate bypass and nothing more: the fast path still cannot append entries or advance the commit index, and a well-formed message from a supported peer at the same term would have produced the same transition, so this is not a route to new authority - it is the node acting on a message it would reject as unsupported elsewhere, which is precisely what the compatibility check exists to prevent. The severity is therefore bounded but real, and the fix direction is obvious in the code rather than argued here.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The transition the bypass allows is one Raft tolerates from any peer with a higher term, so the bypass does not change what a supported peer could have caused; its effect is confined to messages the node would otherwise drop as unsupported.",
+        "This is a source-level finding with no execution: it rests on the gate being a single call at the top of processRPC and on the fast path having no equivalent, which is a claim about code structure rather than about observed behaviour.",
+        "The transport classification must still be satisfied, so the sender has to produce a well-formed empty AppendEntries request with a term and a leader address, which a peer running an old version can do.",
+        "The harnesses used in this run reach the handler through a wrapper transport rather than the network transport, so nothing here exercised the socket path where the classification actually lives."
+      ],
+      "limitations": [
+        "No execution behind this note; it is decidable by reading and was recorded as such rather than being turned into a test.",
+        "The consequence is bounded to term, state and leader identity, the same fields the fast path can already touch when the sender is a supported peer.",
+        "Whether an operator would ever have an unsupported peer that is reachable and well-formed is a deployment question this record does not answer."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

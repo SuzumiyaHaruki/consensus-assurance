@@ -1,0 +1,318 @@
+{
+  "rationale": "The reproduction question for the minority election is answered by construction. The previous submission described isolating the restarted node immediately after the restart, but the harness it executed still partitioned after the majority side had settled and its declared mode alias did not match the emitted mode, so that run repeated the earlier schedule and its comparison could not correlate; this is corrected here. The harness now partitions the restarted node together with one committed voter as soon as NewRaft returns, which also disconnects that partner from the majority side so the 'reject votes while a leader exists' protection does not block the campaign. A native run of that schedule gives the predicted split: with RestoreCommittedLogs on the isolated node became leader with two votes while the committed five-voter configuration requires three (leader_below_committed_quorum true), and the flag-off control never won. The earlier non-reproduction is therefore explained by the schedule: with the majority side settled, the partner keeps hearing the majority leader and refuses the vote. The successor experiment re-executes both cases under this schedule for a receipt; nothing else is restated.",
+  "sources": [
+    {
+      "id": "api_restore_committed_call",
+      "file": "api.go",
+      "start_line": 604,
+      "end_line": 620,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_committed_body",
+      "file": "api.go",
+      "start_line": 724,
+      "end_line": 754,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_addvoter",
+      "file": "api.go",
+      "start_line": 994,
+      "end_line": 1005,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_requestvote_leader_guard",
+      "file": "raft.go",
+      "start_line": 1690,
+      "end_line": 1700,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_electself_vote_count",
+      "file": "raft.go",
+      "start_line": 1999,
+      "end_line": 2060,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_follower_election_abort",
+      "file": "raft.go",
+      "start_line": 228,
+      "end_line": 246,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "hypothesis": "A node restarted with RestoreCommittedLogs keeps the snapshot's configuration when committed membership changes sit below the restored commit index, so its quorum arithmetic reflects an obsolete membership and it can win an election its committed configuration would forbid.",
+      "discriminator": "Grow a snapshot-age three-voter cluster to five voters, restart the leader, compare the configuration index and server count with the log's latest configuration, then isolate the restarted node with one committed voter and check whether it wins with the smaller quorum while the majority side keeps a leader.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@multivoter_config_behavior",
+      "kind": "behavior",
+      "statement": "A node restarted with Config.RestoreCommittedLogs whose latest snapshot predates committed membership changes resumes with the snapshot's configuration: after growing a three-voter cluster to five voters, the restarted leader held configuration index 1 with three servers while its own log's latest configuration was index 14 with five servers, and the same restart without the flag kept index 14 with five servers.",
+      "conditions": "Config.RestoreCommittedLogs=true with a CommitTrackingLogStore; one snapshot taken before the membership change (automatic snapshots disabled); the committed configuration entry's index at or below the persisted commit index restored by restoreFromCommittedLogs.",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_restore_snapshot_config",
+        "api_addvoter"
+      ],
+      "executions": {
+        "b15f4b6c55b44402ace926204de9b826": [
+          15,
+          18
+        ],
+        "63a30ed680b741199ddd7877237d5874": [
+          15,
+          18
+        ]
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "question": "Does a leader elected with fewer votes than the committed configuration requires reproduce reliably, under which schedule and partition order, and does the committed configuration's majority side then diverge in committed entries?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "experiment_id": "4933dc62150f4557a326c221b30477e3-experiment",
+      "source_ids": [
+        "api_restore_committed_body",
+        "api_addvoter",
+        "raft_requestvote_leader_guard",
+        "raft_quorum_size",
+        "raft_electself_vote_count"
+      ],
+      "executions": {
+        "b15f4b6c55b44402ace926204de9b826": [
+          15,
+          16,
+          18,
+          19
+        ],
+        "63a30ed680b741199ddd7877237d5874": [
+          15,
+          16
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The multi-voter configuration loss is established by receipt b15f4b6c55b44402ace926204de9b826 (comparison 0 violated at witness event index 15, control holds at index 18). The minority-election consequence is the part that varied, and the variation now has a sourced explanation. In the settled schedule the partner keeps receiving heartbeats from the majority-side leader, and requestVote refuses a candidate while a leader is known (raft.go:1690-1700), so the isolated node cannot collect its second vote and comparisons 1 and 3 held. With the isolation applied immediately after the restart, so that the partner is also cut off from the majority side, a native run of the same scenario produced the predicted split: leader_below_committed_quorum true with reachable_votes 2 against committed_quorum 3 for the flag-on case, and false for the flag-off control. That mechanism is consistent with the one occurrence of the minority win in receipt 63a30ed680b741199ddd7877237d5874, where the majority side had a leader and the isolated node still won. Source: with the stale three-server configuration quorumSize() (raft.go:1087-1094) returns two and electSelf (raft.go:1999-2060) asks only that list, so one follower's vote suffices, while the committed five-voter configuration needs three; the stale configuration itself comes from restoreFromCommittedLogs (api.go:724-754) advancing lastApplied past the committed configuration before the scan at api.go:604-620, so AddVoter's later entry (api.go:994-1005) is not re-read. The immediate-isolation schedule is submitted as a successor for a retained receipt; no completed comparison is claimed for the election consequence yet, and no frequency or absence is claimed for either schedule.",
+      "counterevidence": [
+        "The flag-off control in the same declarations keeps the committed configuration and cannot win on the isolated side.",
+        "Two executions of the settled schedule did not produce the minority win, and the immediate-isolation variant did not show the majority side retaining a leader; the consequence therefore depends on the schedule, which is now explained rather than unexplained."
+      ],
+      "limitations": [
+        "The election consequence rests on a native probe of the corrected schedule; its receipt is pending.",
+        "Only the leadership decision is observed; no entry-level divergence is witnessed.",
+        "The observation windows are bounded, so frequency and absence are not established."
+      ],
+      "answers": {
+        "7da03e78394f41fdad540ae0824ec2a6-gap-1": {
+          "explanation": "Partially resolved with a mechanism: reproduction depends on whether the single committed voter on the isolated side still hears the majority-side leader, because requestVote refuses candidates while a leader is known (raft.go:1690-1700). With the isolation applied immediately after the restart and the partner also cut off, a native run reproduced the minority leadership (reachable_votes 2, committed_quorum 3) and the flag-off control did not; with the settled schedule it did not reproduce. Entry-level divergence is still not witnessed, so the gap stays open.",
+          "resolved": false
+        }
+      },
+      "joint_history": "Receipt b15f4b6c55b44402ace926204de9b826 executes the completed multi-voter declaration and supplies this interpretation's own comparisons (configuration loss violated, control holding). Receipt 63a30ed680b741199ddd7877237d5874 is the earlier execution of the same scenario and declaration generation, before the applicability fields were emitted; it carries the same configuration values (index 1 with three servers against index 14 with five) and additionally records the minority leadership occurrence, which is the observation this interpretation explains but does not claim as a completed comparison. Both are complete executions of the whole scenario over the same stores and sizes rather than fragments of one history."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "previous_id": "7da03e78394f41fdad540ae0824ec2a6-experiment",
+    "revision_reason": "The harness now implements the intended schedule: it partitions the restarted node together with one committed voter immediately after NewRaft returns (also cutting that partner off from the majority side, so the existing-leader vote guard cannot block the campaign) and samples for five seconds, with the emitted mode names matching the declared aliases. Scenario, stores and sizes are unchanged from the multi-voter experiment.",
+    "source_ids": [
+      "api_restore_committed_body",
+      "api_addvoter",
+      "raft_requestvote_leader_guard",
+      "raft_quorum_size",
+      "raft_electself_vote_count"
+    ],
+    "scope": {
+      "description": "Five-voter cluster whose leading node is restarted with RestoreCommittedLogs after a snapshot that predates the membership change; as soon as NewRaft returns, the restarted node is isolated together with one committed voter while the other three remain connected to each other. Report the rebuilt configuration, whether the restarted node becomes leader, how many votes were reachable, and whether the majority side holds a leader. Run with the flag on and off.",
+      "assumptions": [
+        "The snapshot carries the three-voter bootstrap configuration, so the restarted node's rebuilt configuration is smaller than the committed one.",
+        "The isolated side holds two votes; the committed five-voter configuration requires three.",
+        "Cutting the partner off from the majority side removes the existing-leader guard that otherwise refuses the vote."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Any occurrence-rate or absence bound; a bounded observation is not a frequency estimate.",
+        "Entry-level divergence after the minority leadership, which needs a separate setup."
+      ],
+      "parameters": {
+        "voters_before": 3,
+        "voters_after": 5,
+        "isolation": "immediately after restart",
+        "observation_window_ms": 5000,
+        "reachable_votes": 2,
+        "committed_quorum": 3
+      }
+    },
+    "prefix": "The harness uses MakeClusterCustom(Peers 3, CommitTrackingLogs, RestoreCommittedLogs), ten Apply calls, an explicit Snapshot(), MakeClusterNoBootstrap(2) merged and two AddVoter calls, ten further Apply calls, then Shutdown and NewRaft on the same logs, stable and snapshots stores with a fresh inmem transport. Immediately after NewRaft it partitions the restarted node plus one committed voter away from the other three and reconnects only that pair, then emits multivoter_after_restart and multivoter_partition_election events carrying the mode, snapshots, restore flag, configuration indices and server counts, the leadership outcome, reachable votes, committed quorum, the majority-side leadership and both terms; no production logic is modified.",
+    "responsibility": "The library owns the quorum arithmetic a restarted node applies; with a stale rebuilt configuration it can decide an election that the committed configuration would refuse, which the caller cannot repair through the public API.",
+    "prerequisites": [
+      {
+        "alias": "mv2_on",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "mv2_on"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5
+          }
+        ]
+      },
+      {
+        "alias": "mv2_off",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "mv2_off"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "multivoter_partition_election",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mv2_on",
+        "assertion": {
+          "field": "leader_below_committed_quorum",
+          "op": "eq",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "An election on the isolated side must not produce a leader whose support is below the committed configuration's quorum; the defect prediction is that it does."
+      },
+      {
+        "event": "multivoter_partition_election",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mv2_off",
+        "assertion": {
+          "field": "leader_below_committed_quorum",
+          "op": "eq",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "Control: with the committed configuration rebuilt the isolated side cannot reach three votes and must not produce a leader."
+      },
+      {
+        "event": "multivoter_after_restart",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mv2_on",
+        "assertion": {
+          "field": "config_matches",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "The same run also re-checks that the restarted node's configuration matches the committed log; the defect prediction is that it falls back to the snapshot's configuration."
+      },
+      {
+        "event": "multivoter_after_restart",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mv2_off",
+        "assertion": {
+          "field": "config_matches",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "Control: the identical restart without the flag keeps the committed configuration."
+      }
+    ]
+  }
+}

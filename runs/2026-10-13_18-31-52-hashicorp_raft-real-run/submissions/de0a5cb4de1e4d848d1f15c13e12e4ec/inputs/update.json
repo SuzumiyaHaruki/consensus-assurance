@@ -1,0 +1,127 @@
+{
+  "rationale": "Orientation read of the captured snapshot (hashicorp/raft, commit c0dc6a0b) covered decision formation (election/pre-vote, commitment quorum) and authority transitions (configuration changes, leader lease, snapshot install). I ran the snapshot's own package tests in an isolated native workspace under a no-network sandbox: all failures except one were 'listen tcp ... operation not permitted' (environment network denial) from the TCP/NetworkTransport tests. One non-network failure appeared once: TestRaft_HasExistingState reported 'peer mismatch' (a pre-existing voter's reported configuration lacked the newly added voter) after AddVoter returned success, while a rerun of the whole suite passed and my isolated AddVoter reproduction shows the new configuration visible on every node within ~1ms. I therefore did not keep the mismatch as a defect; this update records the sourced behavior of the configuration/commitment machinery, the observed conflict, and a bounded discriminator. No defect is asserted.",
+  "sources": [
+    {
+      "id": "append_config",
+      "file": "raft.go",
+      "start_line": 1203,
+      "end_line": 1243,
+      "kind": "code_observation"
+    },
+    {
+      "id": "commitment_setcfg",
+      "file": "commitment.go",
+      "start_line": 50,
+      "end_line": 64,
+      "kind": "code_observation"
+    },
+    {
+      "id": "commitment_recalc",
+      "file": "commitment.go",
+      "start_line": 86,
+      "end_line": 104,
+      "kind": "code_observation"
+    },
+    {
+      "id": "leader_commit_handler",
+      "file": "raft.go",
+      "start_line": 785,
+      "end_line": 800,
+      "kind": "code_observation"
+    },
+    {
+      "id": "stable_gate",
+      "file": "raft.go",
+      "start_line": 653,
+      "end_line": 666,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cfg_struct",
+      "file": "configuration.go",
+      "start_line": 139,
+      "end_line": 192,
+      "kind": "code_observation"
+    },
+    {
+      "id": "next_configuration",
+      "file": "configuration.go",
+      "start_line": 225,
+      "end_line": 306,
+      "kind": "code_observation"
+    },
+    {
+      "id": "addnonvoter_rows",
+      "file": "configuration_test.go",
+      "start_line": 195,
+      "end_line": 202,
+      "kind": "test_expectation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_config_visibility",
+      "question": "After a stable leader returns success from AddVoter, can a pre-existing voter's locally reported configuration remain without the new voter, and if so for how long under normal in-process operation?",
+      "source_ids": [
+        "append_config",
+        "commitment_setcfg",
+        "commitment_recalc",
+        "leader_commit_handler",
+        "stable_gate"
+      ],
+      "hypothesis": "The leader sets its own latest configuration and the commitment voter set immediately at append time, so a successful AddVoter only certifies a quorum of the new configuration, not that every pre-existing voter has observed the entry.",
+      "discriminator": "Run the two-voter + one-new-server AddVoter scenario in-process and sample each node's reported configuration immediately after the future returns; disagreement should be transient and bounded by replication, versus persisting if the follower's configuration update path is broken."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_append_config_order",
+      "kind": "behavior",
+      "statement": "On the leader, appendConfigurationEntry stores the new configuration log entry via dispatchLogs, then sets r.configurations.latest to the new configuration and calls commitment.setConfiguration(new), which rebuilds the commit voter set and recalculates the commit index. Commit of later entries is therefore evaluated over the new configuration's voters, and the leader's own latest configuration is updated at append time rather than at commit time.",
+      "conditions": "Leader in Leader state; configurationChangeChIfStable gated (latestIndex == committedIndex and a commit of the current term already observed); protocolVersion 3 so the entry is a LogConfiguration; prevIndex match in nextConfiguration.",
+      "source_ids": [
+        "append_config",
+        "commitment_setcfg",
+        "commitment_recalc",
+        "stable_gate"
+      ]
+    },
+    {
+      "ref": "@k_addnonvoter_keeps_suffrage",
+      "kind": "behavior",
+      "statement": "nextConfiguration's AddNonvoter case does not demote an existing member: if the server ID already exists with Suffrage other than Nonvoter, only its Address is updated and its Voter/Staging suffrage is retained; a new server is appended as Nonvoter. Demotion of an existing voter is only reachable through DemoteVoter.",
+      "conditions": "protocol-version-3 ID-based configuration change request with a client-supplied server ID that already exists in the current configuration.",
+      "source_ids": [
+        "next_configuration",
+        "addnonvoter_rows"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_config_visibility",
+      "source_ids": [
+        "append_config",
+        "commitment_setcfg",
+        "commitment_recalc",
+        "leader_commit_handler"
+      ],
+      "rationale": "Source reading establishes the mechanism: the leader updates its own latest configuration and the commitment voter set at append time, and commitment is recomputed over the new voter set, so AddVoter success only means a quorum of the new configuration stored the entry. In an isolated native run of the submitted scenario the new configuration was already reported by all three nodes at the first sample (~1ms), i.e. no lasting disagreement. The earlier 'peer mismatch' occurred once during a full package run and did not reappear on a repeat run of the same suite. No source path was found that would keep a pre-existing voter's latest configuration permanently missing a committed configuration entry; the conflicting observation is currently attributed to harness timing under load, but that attribution is not yet grounded in a controller receipt.",
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q_config_visibility",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "append_config",
+      "commitment_setcfg",
+      "commitment_recalc"
+    ],
+    "scope": {
+      "description": "Two-voter in-process cluster over InmemTransport, plus one real unbootstrapped raft instance merged into the same network; call AddVoter for the new server on the current leader, record the future result and index, then sample each node's reported configuration every 100ms for 3s."
+    },
+    "prefix": "MakeCluster(2) starts a bootstrapped pair and waits for a leader; MakeClusterNoBootstrap(1) creates the new node with empty log and no configuration; Merge and FullyConnect wire the transports so the new node is reachable but has an empty log. The leader calls AddVoter(newID, newAddr, 0, 0) with prevIndex 0. Observations are the AddVoter future result/index and, per node, num_servers/num_voters/has_new_member sampled from the node's locally reported configuration, emitted as CA_EVENT JSON."
+  }
+}

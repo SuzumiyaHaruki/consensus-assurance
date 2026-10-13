@@ -182,7 +182,7 @@ for operation, value in [('case',3),('control',2)]:
     assert report.count('### ')==1
     assert 'confirmed=' not in report
     assert ('Interpretation differs from the mechanical result' in report)==(case=='mismatch')
-    if case=='gap':assert state.investigations[0].gaps[0].question in report and 'Unanswered necessary gaps' in report
+    if case=='gap':assert state.investigations[0].gaps[0].question in report and 'Unresolved necessary gaps' in report
     if case in {'missing','malformed','unmatched'}:assert 'Observation gaps' in report
     for path in (f'fixed-experiments/{fixed.id}/basis.json',f'logs/{check.id}/check.json',f'logs/{check.id}/observations.json'):
         assert path in report and (e.root/path).is_file()
@@ -390,6 +390,10 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
 
     def changed(state):
         assert state['current_submission']['no_change']
+        from consensus_assurance.workflow.research import operation_summary
+        summary=operation_summary(engine.state,engine.root)
+        assert summary['questions'][0]['id']==state['investigations'][0]['id']
+        assert summary['latest_actual_execution']['id'] not in {id for i in state['interpretations'] for id in i['executions']}
         sub, files = duplicate(state)
         sub['experiment']['prefix'] += ' A changed assumption.'
         return sub, files
@@ -397,7 +401,7 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
     def source_answer(state):
         assert state['current_submission']['phase'] == 'rejected'
         return {'rationale': 'Continue with available source investigation', 'interpretations': [dict(
-            investigation_id=state['investigations'][0]['id'], source_ids=['code'], conclusion='explained',
+            investigation_id=state['investigations'][0]['id'], source_ids=['code'], conclusion='explained',defect_claim=None,
             rationale='The captured boundary expression returns zero at capacity')]}, {}
 
     engine, repo = engine_for(tmp_path, [combined, duplicate, changed, source_answer, stop])
@@ -409,26 +413,50 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
 
 
 def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_path):
+    from consensus_assurance.workflow.research import operation_summary
+    counterevidence = [f'The documented caller condition {n} bounds the sampled input' for n in range(5)]
+    limitations = [f'No observation establishes asynchronous completion for caller {n}' for n in range(5)]
+    counterevidence[1] += '; the actual operand comes from the admitted caller' * 8
+    limitations[4] += '; downstream recovery remains outside this observation' * 8
+    saved = {}
     def start(state):
         sub, files = first(state)
         sub['investigations'] += [dict(question=f'Which return condition applies to caller {n}?',
             source_ids=['code']) for n in range(9)]
+        sub['interpretations'] = [dict(investigation_id='@q', source_ids=['code'], conclusion='unresolved',defect_claim=None,
+            rationale='The initial caller contract still needs inspection',
+            limitations=['The initial caller condition is unknown'])]
         return sub, files
 
     def revisit(state):
+        saved['initial'] = state['interpretations'][0]
         old, pending = state['investigations'][:2]
         return {'rationale':'Explain a local sample while retaining a separate caller premise',
             'interpretations':[dict(investigation_id=old['id'], source_ids=['code'], conclusion='explained',
                 defect_claim='refuted', rationale='The ordinary caller return is explained by the boundary branch',
-                counterevidence=['The sampled caller uses the documented bound'],
-                limitations=['No observation establishes the asynchronous caller completion'])],
+                counterevidence=counterevidence, limitations=limitations)],
             'gaps':[dict(investigation_id=pending['id'], question='Which actual producer establishes the caller bound?')]}, {}
 
     def another(state):
+        before = engine.state.model_dump(mode='json')
+        summary = operation_summary(engine.state, engine.root)
+        assert engine.state.model_dump(mode='json') == before
+        assert len(summary['questions']) == 1
+        local = summary['questions'][0]
+        assert local['id'] == state['investigations'][0]['id']
+        opinion = local['latest_interpretation']
+        assert opinion['id'] == state['interpretations'][-1]['id']
+        assert opinion['counterevidence'] == counterevidence and opinion['limitations'] == limitations
+        assert opinion['defect_claim'] == 'refuted' and opinion['conclusion'] == 'explained'
         return {'rationale':'Inspect another sourced condition', 'investigations':[dict(
             question='Which recovery caller uses this return?', source_ids=['code'])]}, {}
 
     def finish(state):
+        summary = operation_summary(engine.state, engine.root)
+        assert len(summary['questions']) == 1
+        assert summary['questions'][0]['id'] == state['investigations'][-1]['id']
+        assert summary['questions'][0]['latest_interpretation'] is None
+        assert len(state['interpretations']) == 2 and state['interpretations'][0] == saved['initial']
         view = json.loads((engine.root/'research.json').read_text())['reselection']
         questions = {q['id']:q for q in view['questions']}
         old, pending = state['investigations'][:2]
@@ -437,8 +465,9 @@ def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_pat
         assert state['investigations'][-1]['id'] in questions
         answer = questions[old['id']]
         assert answer['discriminator'] == old['discriminator'] and answer['hypothesis'] == old['hypothesis']
-        assert answer['latest_interpretation']['limitations'] == state['interpretations'][0]['limitations']
-        assert answer['latest_interpretation']['counterevidence'] == state['interpretations'][0]['counterevidence']
+        assert answer['latest_interpretation']['id'] == state['interpretations'][-1]['id']
+        assert answer['latest_interpretation']['limitations'] == [v[:300] for v in limitations[:3]]
+        assert answer['latest_interpretation']['counterevidence'] == [v[:300] for v in counterevidence[:3]]
         assert all(q['disposition'] == 'active' for q in state['investigations']) and not state['experiments']
         return stop(state)
 

@@ -1,0 +1,80 @@
+{
+  "rationale": "The submitted AddVoter configuration-visibility experiment was executed by the controller against the fixed snapshot (CheckRun a92f7689c4c642b6b8061a2bed2b624b, exit 0, tests_passed, 92 CA_EVENT records). The retained observations confirm the mechanism and resolve the earlier open question: immediately after AddVoter returned success (2ms, event index 1, err <nil>, index 3), the pre-existing voter server-d6f82acc still reported the old 2-server configuration (event index 3), while the leader and the newly added server already reported 3 servers (indices 2 and 4). At the next sample (102ms, event index 6) the same follower reported 3 servers and kept doing so for all remaining 29 probes out to 2927ms. So the disagreement is a bounded transient that self-corrects through normal replication, not a persistent failure of the follower's configuration-update path. This is a negative result and no defect is asserted. One new Behavior is promoted because the follower-side ordering (latest configuration updated at log-store time, before commit) is what makes this transient observable and is independently reusable.",
+  "sources": [
+    {
+      "id": "follower_cfg_update",
+      "file": "raft.go",
+      "start_line": 1546,
+      "end_line": 1559,
+      "kind": "code_observation"
+    },
+    {
+      "id": "process_cfg_entry",
+      "file": "raft.go",
+      "start_line": 1585,
+      "end_line": 1600,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cfg_latest_vs_committed",
+      "file": "configuration.go",
+      "start_line": 150,
+      "end_line": 161,
+      "kind": "code_observation"
+    },
+    {
+      "id": "append_config",
+      "file": "raft.go",
+      "start_line": 1203,
+      "end_line": 1243,
+      "kind": "code_observation"
+    },
+    {
+      "id": "commitment_setcfg",
+      "file": "commitment.go",
+      "start_line": 50,
+      "end_line": 64,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_follower_latest_config",
+      "kind": "behavior",
+      "statement": "On a follower, appendEntries stores accepted new entries and then calls processConfigurationLogEntry for each stored configuration entry, which sets configurations.latest/latestIndex to the newly decoded configuration at store time, before the entry's commit index is known. configurations.latest is therefore the locally stored (possibly uncommitted) configuration, and GetConfiguration on any node reports it without consulting the main thread.",
+      "conditions": "Follower receiving AppendEntries whose entries are new or whose conflicting suffix was deleted; protocol 3 LogConfiguration entries (or deprecated peer entries); configurations.latest is updated from the follower's own log store, independent of LeaderCommitIndex.",
+      "source_ids": [
+        "follower_cfg_update",
+        "process_cfg_entry",
+        "cfg_latest_vs_committed"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+      "experiment_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-experiment",
+      "source_ids": [
+        "append_config",
+        "commitment_setcfg",
+        "follower_cfg_update",
+        "process_cfg_entry"
+      ],
+      "rationale": "Source reading already showed that the leader updates its own latest configuration and the commitment voter set at append time, so AddVoter success certifies only that a quorum of the new configuration stored the entry; combined with the follower-side behavior that latest configuration is set at log-store time, a pre-existing voter's reported configuration may legitimately lag the leader's by one replication delivery. The retained execution witnesses exactly that: the AddVoter future returned success at 2ms (index 1, err <nil>, index 3), the pre-existing voter server-d6f82acc reported num_servers=2/has_new_member=false at the same 2ms sample (index 3), and at 102ms the same server reported num_servers=3/has_new_member=true (index 6). All probes 6 through 91 (out to 2927ms) show 3 servers on that server, so the disagreement did not persist or recur within the observed window. The earlier unexplained 'peer mismatch' under full-suite load is thus consistent with the same bounded replication transient rather than a broken configuration-update path on pre-existing voters.",
+      "conclusion": "holds",
+      "defect_claim": "refuted",
+      "limitations": [
+        "Single execution with two 100ms-spaced samples bracketing the transition: the exact instant the follower adopted the new configuration is only bounded to the interval (2ms, 102ms], so the observation shows boundedness, not a latency bound under load.",
+        "The sampled predicate is each node's locally reported latest configuration (getLatestConfiguration), not commit ordering; the samples say nothing about when the follower committed the entry.",
+        "The originally observed full-suite 'peer mismatch' lasted up to the harness 5s limit and was not reproduced in isolation, so its cause under CPU contention remains unmeasured; only its identity with this bounded transient is supported, not its duration."
+      ],
+      "executions": {
+        "a92f7689c4c642b6b8061a2bed2b624b": [
+          1,
+          3,
+          6
+        ]
+      }
+    }
+  ]
+}

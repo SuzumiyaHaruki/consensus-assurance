@@ -1,0 +1,91 @@
+{
+  "rationale": "The control experiment executed (receipt 896586fa6bf04a74877fe81547c2599f, experiment 08c5f95c1b1041d997809c01286e91f2-experiment, status completed, outcome tests_passed, exit 0, no changed target files) and its receipt carries both halves of the finding plus the control in one invocation: indices 0-2 are the explicit-transition case (joint admission, proposal kept as EntryConfChangeV2, apply panicking with config is already joint) and indices 3-4 are the Auto-transition control (LeaveJoint true, EnterJoint ok false, no panic, joint configuration left with voters [1 2 3 4]); both control comparisons evaluated holds with complete admissions. I also found that my earlier interpretation for this investigation was never recorded - the saved state lists no interpretation for it, only the behaviour knowledge - so this submission records the measured interpretation with a measured fact tied to this receipt. Nothing in the finding changes; it is now recorded with its receipt, its control and a measured fact.",
+  "sources": [
+    {
+      "id": "val_joint",
+      "file": "raft.go",
+      "start_line": 1325,
+      "end_line": 1342,
+      "kind": "code_observation"
+    },
+    {
+      "id": "apply_cc",
+      "file": "raft.go",
+      "start_line": 1951,
+      "end_line": 1976,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cc_enter",
+      "file": "confchange/confchange.go",
+      "start_line": 39,
+      "end_line": 60,
+      "kind": "code_observation"
+    },
+    {
+      "id": "pb_leave",
+      "file": "raftpb/confchange.go",
+      "start_line": 70,
+      "end_line": 113,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "e083daeefc0f460f9a395b329006f127-question-0",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@K_empty_explicit_joint_measured",
+      "kind": "fact",
+      "statement": "Measured on real instances: in a joint configuration (voters [1 2 3 4], outgoing [1 2 3]) an empty ConfChangeV2 with Transition JointExplicit passes propose-time validation and then panics on apply, while the same empty change set with the Auto transition leaves the joint configuration cleanly. Observed values: for the explicit form, LeaveJoint false, EnterJoint ok true, the proposal step returning no error and leaving an EntryConfChangeV2 at the new last index with its 2-byte payload intact, and applyConfChange panicking with the error string config is already joint while still_joint stayed true; for the Auto form, LeaveJoint true, EnterJoint ok false, no panic, joint_after false and voters [1 2 3 4]. The defect is therefore specific to the transition field: propose-time validation reads an empty change set as leave-joint regardless of transition, while the apply path requires Auto.",
+      "conditions": "Joint configuration; ConfChangeV2 with an explicit transition and no changes for the defect case, zero-valued ConfChangeV2 for the control; propose-time validation enabled (the default). The apply step was driven directly in both cases because a quorum-less instance cannot commit, and the explicit-form entry was shown to remain an EntryConfChangeV2, so nothing in the library prevents it from being replicated, committed and reaching the application's ApplyConfChange call.",
+      "source_ids": [
+        "val_joint",
+        "apply_cc",
+        "pb_leave"
+      ],
+      "executions": {
+        "896586fa6bf04a74877fe81547c2599f": [1, 2, 4]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "e083daeefc0f460f9a395b329006f127-question-0",
+      "experiment_id": "08c5f95c1b1041d997809c01286e91f2-experiment",
+      "source_ids": [
+        "val_joint",
+        "apply_cc",
+        "cc_enter",
+        "pb_leave"
+      ],
+      "executions": {
+        "896586fa6bf04a74877fe81547c2599f": [1, 2, 4]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "knowledge": [
+        {
+          "entry_id": "@K_empty_explicit_joint_measured",
+          "revision": 1,
+          "assertion": "the explicit-transition empty change passed validation and panicked on apply, while the Auto form left the joint configuration without panicking"
+        },
+        {
+          "entry_id": "e083daeefc0f460f9a395b329006f127-knowledge-0",
+          "revision": 1,
+          "assertion": "validation derives leave-joint from len(Changes) == 0 while the apply path derives it from LeaveJoint, which also requires the Auto transition"
+        }
+      ],
+      "rationale": "Measured interpretation, recorded against the receipt that carries the defect and its control in one invocation. Receipt 896586fa6bf04a74877fe81547c2599f (experiment 08c5f95c1b1041d997809c01286e91f2-experiment) ran in the isolated workspace; status completed, outcome tests_passed, exit 0, no changed target files, no parsing errors, and the file listing confirms no target file was modified. Decisive parsed indices: 0 is the explicit-form admission (joint true, voters [1 2 3 4], voters_outgoing [1 2 3], transition ConfChangeTransitionJointExplicit, changes 0, leave_joint false, enter_joint_ok true); 1 is the proposal half (step_err nil, appended 1, last_type EntryConfChangeV2, data_len 2 - so validation did not replace or drop the entry); 2 is the apply half (panicked true, panic config is already joint, still_joint true); 3 and 4 are the control (transition Auto, leave_joint true, enter_joint_ok false, and on apply panicked false with joint_after false and voters_after [1 2 3 4]). The controller recorded holds with comparison_complete true for both control comparisons (evaluated at index 4) with no missing indices or diagnostics, and the earlier run of the same harness recorded holds for the two defect comparisons at indices 1 and 2. Taken together this satisfies every part of the discriminator that could have refuted the suspicion: the entry was kept as a configuration change rather than rewritten, the apply path panicked, and the failure is not a general property of empty change sets because the Auto form works. The asserted defect, stated precisely: while the configuration is joint, stepLeader's propose-time validation decides leave-joint from len(Changes) == 0, so an empty ConfChangeV2 with an explicit transition raises no failed check and its EntryConfChangeV2 is appended and replicated; when it is applied, applyConfChange asks ConfChangeV2.LeaveJoint, which for an empty change set is true only for the Auto transition, so the change takes the EnterJoint branch, Changer.EnterJoint rejects an already-joint configuration with the error config is already joint, and applyConfChange panics inside the application's ApplyConfChange call instead of rejecting the proposal the way the not-joint case does with a log message and an entry rewrite. The library's two halves disagree about what an empty change set means, and the disagreement is resolved by a process crash. Counterevidence considered and not defeating: (a) an application may legally reject a configuration change and must then not call ApplyConfChange, which avoids the panic - but it must first decide to reject an entry the library's own validation approved, and rejecting is not the documented default for committed conf-change entries; (b) the DisableConfChangeValidation documentation shows panics are an accepted outcome for invalid changes that enter the log when validation is disabled - here validation was enabled and the change still entered, which is the defect; (c) the Auto-transition empty change is the documented leave-joint idiom and works, so the issue is specific to the transition field rather than to empty change sets; (d) severity is a crash of the node, not state corruption or a safety violation: the log and committed state are untouched, which is why returning an error or dropping the proposal would have sufficed. Not claimed: how any particular client constructs its ConfChangeV2 messages, and that a real cluster will necessarily reach the panic, since the apply step was driven directly because a quorum-less test instance cannot commit; the preserved EntryConfChangeV2 shows nothing in the library prevents the entry from committing and reaching the application.",
+      "limitations": [
+        "The apply step was invoked directly rather than after a genuine commit, because a quorum-less test instance cannot commit; the receipt shows the entry was appended unchanged as EntryConfChangeV2, which is what a cluster would replicate and commit.",
+        "Whether any given client emits an explicit transition with zero changes was not examined; the finding is that the library accepts such a change and then panics on the documented apply path.",
+        "The claimed consequence is a process panic in the application's ApplyConfChange call; no state corruption, data loss or safety violation is claimed.",
+        "An application that chooses to reject the change instead of applying it avoids the panic, which is why the claim is scoped to the acceptance-then-panic inconsistency rather than to an unavoidable crash."
+      ]
+    }
+  ]
+}

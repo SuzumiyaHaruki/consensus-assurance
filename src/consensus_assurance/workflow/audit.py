@@ -422,6 +422,19 @@ def accept_received(engine):
     result = current.get('result')
     archive = engine.root / 'submissions' / operation_id
     if current['status'] != ExecutionStatus.COMPLETED.value or not result:
+        check = next((c for c in engine.state.checks if c.id == operation_id), None)
+        if (check and check.action == 'agent_turn' and check.status == ExecutionStatus.TIMEOUT
+                and check.parameters.get('timeout_limit') == 'agent_turn_timeout'
+                and check.parameters.get('agent_diagnostic',{}).get('message') == ''
+                and not check.parameters.get('agent_turn_completed')
+                and not check.parameters.get('agent_session_unavailable')
+                and engine.state.agent_session_id
+                and check.parameters.get('agent_session_id') == engine.state.agent_session_id):
+            # Retain the interrupted receipt, never accept its draft. The normal loop
+            # checks remaining capacity and permissions before a charged same-session turn.
+            engine.state.current_submission = {}
+            engine.advance('agent_turn_timeout:' + check.id)
+            return False
         engine.state.stop_reason = 'Agent stopped: ' + current['reason']
         current['phase'] = 'failed'
         return False

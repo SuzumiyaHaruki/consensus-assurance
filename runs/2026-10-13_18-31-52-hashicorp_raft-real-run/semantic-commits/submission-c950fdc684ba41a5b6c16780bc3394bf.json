@@ -1,0 +1,735 @@
+{
+  "input": {
+    "rationale": "Continued the decision-formation axis after the configuration-visibility result: the safety core is which acknowledgements may advance the leader's commit index and therefore reach the FSM. Reading the actual producers (leader setup, configuration change, quorum and lease helpers, replication startup, commitment, processLogs) shows a single consistent eligibility rule: only servers with Suffrage Voter appear in the commitment match set, so a Nonvoter/Staging acknowledgement is recorded by the replication goroutine's commitment.match call but is dropped by the map lookup, and a Nonvoter's reported index can never decide commitIndex. The same voter-only set governs the election/lease quorum. This turn also ran a race-enabled subset of the snapshot's own tests over configuration-change and leadership-transfer paths (TestRaft_LeadershipTransfer, TestRaft_AddVoter/AddNonvoter/DemoteVoter/RemoveServer, TestRaft_LeaderLease, TestRaft_ConfigChange) with no data race and no failure, which removes the cheap concurrency-defect hypothesis for those paths. No defect is asserted; the new investigation is a sourced question with a discriminator for a next experiment.",
+    "sources": [
+      {
+        "id": "commit_new",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 48,
+        "kind": "code_observation"
+      },
+      {
+        "id": "commitment_recalc",
+        "file": "commitment.go",
+        "start_line": 86,
+        "end_line": 104,
+        "kind": "code_observation"
+      },
+      {
+        "id": "repl_all_servers",
+        "file": "raft.go",
+        "start_line": 582,
+        "end_line": 651,
+        "kind": "code_observation"
+      },
+      {
+        "id": "quorum_voters",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation"
+      },
+      {
+        "id": "lease_voters",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation"
+      },
+      {
+        "id": "process_logs",
+        "file": "raft.go",
+        "start_line": 1292,
+        "end_line": 1361,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_nonvoter_commit",
+        "question": "Can a Nonvoter's or Staging server's acknowledgement advance the leader's commitIndex (or reach the FSM), and is leader commit eligibility computed over the same participant set that the leader replicates to?",
+        "source_ids": [
+          "commit_new",
+          "commitment_recalc",
+          "repl_all_servers",
+          "quorum_voters",
+          "process_logs"
+        ],
+        "hypothesis": "Leader commit eligibility is defined only over Voter entries of the current latest configuration, while replication state is created for every configured server; therefore a Nonvoter acknowledgement is silently dropped and cannot commit an entry, so FSM application never depends on non-voter support.",
+        "discriminator": "In one process build a cluster whose latest configuration contains two Voters and one Nonvoter, make both Voters unable to store a new entry while the Nonvoter can (or conversely confirm that commits proceed when only a non-voter is lagging); commitIndex/apply progress must track Voter acknowledgements only. Withholding both Voter acknowledgements must stall commit and FSM application indefinitely, while withholding only the Nonvoter must not.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_voter_only_commit",
+        "kind": "fact",
+        "statement": "On the leader, the commit set is built exclusively from servers whose Suffrage is Voter: newCommitment and commitment.setConfiguration insert a matchIndexes entry only for Voter servers, commitment.match updates an index only if the reporting server is already a key in matchIndexes, and recalculate takes the majority-order element of those values. Replication goroutines, by contrast, are started for every server in configurations.latest regardless of suffrage, and quorumSize and checkLeaderLease also count only Voters. Consequently an acknowledgement from a Nonvoter/Staging server cannot advance commitIndex, and processLogs applies to the FSM only entries up to the leader's commitIndex.",
+        "conditions": "Leader state; protocol version 3 configuration with mixed suffrage; the leader's commitment was built from configurations.latest at leader setup and rebuilt on each committed/appended configuration change.",
+        "source_ids": [
+          "commit_new",
+          "commitment_recalc",
+          "repl_all_servers",
+          "quorum_voters",
+          "lease_voters",
+          "process_logs"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "@q_nonvoter_commit",
+        "experiment_id": null,
+        "source_ids": [
+          "commit_new",
+          "commitment_recalc",
+          "repl_all_servers",
+          "quorum_voters",
+          "process_logs"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Source-only account of the commit-eligibility rule. The three places that could let non-voter support count are all closed: the match set is built from Voter entries only at leader setup and at configuration change; match() rejects any server ID absent from that map, so a Nonvoter's AppendEntries response cannot create an entry; and recalculate derives commitIndex solely from the surviving map values. Replication is nonetheless started for every configured server, which explains why non-voters receive and store logs without ever contributing to commitment. No contradiction was found in the enclosing paths: the leader lease and election quorum helpers count the same Voter set, and processLogs is bounded by the leader's commitIndex. This is a source-explained negative, so no defect is asserted and the corresponding discriminator is left for execution rather than being inferred from the reading.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Source-only account: no retained execution yet exercises a mixed Voter/Nonvoter configuration, so the claim rests on reading the producers, not on an observed endpoint.",
+          "The reading covers the leader-side commit rule; it does not evaluate non-voter participation in any other mechanism (for example snapshot install or leadership transfer targeting a non-voter)."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "version": 1,
+        "question": "After a stable leader returns success from AddVoter, can a pre-existing voter's locally reported configuration remain without the new voter, and if so for how long under normal in-process operation?",
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "commitment_recalc",
+          "leader_commit_handler",
+          "stable_gate"
+        ],
+        "hypothesis": "The leader sets its own latest configuration and the commitment voter set immediately at append time, so a successful AddVoter only certifies a quorum of the new configuration, not that every pre-existing voter has observed the entry.",
+        "discriminator": "Run the two-voter + one-new-server AddVoter scenario in-process and sample each node's reported configuration immediately after the future returns; disagreement should be transient and bounded by replication, versus persisting if the follower's configuration update path is broken.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On the leader, appendConfigurationEntry stores the new configuration log entry via dispatchLogs, then sets r.configurations.latest to the new configuration and calls commitment.setConfiguration(new), which rebuilds the commit voter set and recalculates the commit index. Commit of later entries is therefore evaluated over the new configuration's voters, and the leader's own latest configuration is updated at append time rather than at commit time.",
+        "conditions": "Leader in Leader state; configurationChangeChIfStable gated (latestIndex == committedIndex and a commit of the current term already observed); protocolVersion 3 so the entry is a LogConfiguration; prevIndex match in nextConfiguration.",
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "commitment_recalc",
+          "stable_gate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "nextConfiguration's AddNonvoter case does not demote an existing member: if the server ID already exists with Suffrage other than Nonvoter, only its Address is updated and its Voter/Staging suffrage is retained; a new server is appended as Nonvoter. Demotion of an existing voter is only reachable through DemoteVoter.",
+        "conditions": "protocol-version-3 ID-based configuration change request with a client-supplied server ID that already exists in the current configuration.",
+        "source_ids": [
+          "next_configuration",
+          "addnonvoter_rows"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "3eb084cec7344a50b70253044fa3ffdb-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On a follower, appendEntries stores accepted new entries and then calls processConfigurationLogEntry for each stored configuration entry, which sets configurations.latest/latestIndex to the newly decoded configuration at store time, before the entry's commit index is known. configurations.latest is therefore the locally stored (possibly uncommitted) configuration, and GetConfiguration on any node reports it without consulting the main thread.",
+        "conditions": "Follower receiving AppendEntries whose entries are new or whose conflicting suffix was deleted; protocol 3 LogConfiguration entries (or deprecated peer entries); configurations.latest is updated from the follower's own log store, independent of LeaderCommitIndex.",
+        "source_ids": [
+          "follower_cfg_update",
+          "process_cfg_entry",
+          "cfg_latest_vs_committed"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3eb084cec7344a50b70253044fa3ffdb"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-interpretation-0",
+        "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "commitment_recalc",
+          "leader_commit_handler"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Source reading establishes the mechanism: the leader updates its own latest configuration and the commitment voter set at append time, and commitment is recomputed over the new voter set, so AddVoter success only means a quorum of the new configuration stored the entry. In an isolated native run of the submitted scenario the new configuration was already reported by all three nodes at the first sample (~1ms), i.e. no lasting disagreement. The earlier 'peer mismatch' occurred once during a full package run and did not reappear on a repeat run of the same suite. No source path was found that would keep a pre-existing voter's latest configuration permanently missing a committed configuration entry; the conflicting observation is currently attributed to harness timing under load, but that attribution is not yet grounded in a controller receipt.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "3eb084cec7344a50b70253044fa3ffdb-interpretation-0",
+        "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "experiment_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-experiment",
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "follower_cfg_update",
+          "process_cfg_entry"
+        ],
+        "executions": {
+          "a92f7689c4c642b6b8061a2bed2b624b": [
+            1,
+            3,
+            6
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "refuted",
+        "rationale": "Source reading already showed that the leader updates its own latest configuration and the commitment voter set at append time, so AddVoter success certifies only that a quorum of the new configuration stored the entry; combined with the follower-side behavior that latest configuration is set at log-store time, a pre-existing voter's reported configuration may legitimately lag the leader's by one replication delivery. The retained execution witnesses exactly that: the AddVoter future returned success at 2ms (index 1, err <nil>, index 3), the pre-existing voter server-d6f82acc reported num_servers=2/has_new_member=false at the same 2ms sample (index 3), and at 102ms the same server reported num_servers=3/has_new_member=true (index 6). All probes 6 through 91 (out to 2927ms) show 3 servers on that server, so the disagreement did not persist or recur within the observed window. The earlier unexplained 'peer mismatch' under full-suite load is thus consistent with the same bounded replication transient rather than a broken configuration-update path on pre-existing voters.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Single execution with two 100ms-spaced samples bracketing the transition: the exact instant the follower adopted the new configuration is only bounded to the interval (2ms, 102ms], so the observation shows boundedness, not a latency bound under load.",
+          "The sampled predicate is each node's locally reported latest configuration (getLatestConfiguration), not commit ordering; the samples say nothing about when the follower committed the entry.",
+          "The originally observed full-suite 'peer mismatch' lasted up to the harness 5s limit and was not reproduced in isolation, so its cause under CPU contention remains unmeasured; only its identity with this bounded transient is supported, not its duration."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3eb084cec7344a50b70253044fa3ffdb"
+      }
+    ],
+    "materials": [
+      {
+        "id": "append_config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1243,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}\n\n// dispatchLog is called on the leader to push a log to disk, mark it\n// as inflight and begin replication of it.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "commitment_setcfg",
+        "file": "commitment.go",
+        "start_line": 50,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "// Called when a new cluster membership configuration is created: it will be\n// used to determine commitment from now on. 'configuration' is the servers in\n// the cluster.\nfunc (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "commitment_recalc",
+        "file": "commitment.go",
+        "start_line": 86,
+        "end_line": 104,
+        "kind": "code_observation",
+        "text": "// Internal helper to calculate new commitIndex from matchIndexes.\n// Must be called with lock held.\nfunc (c *commitment) recalculate() {\n\tif len(c.matchIndexes) == 0 {\n\t\treturn\n\t}\n\n\tmatched := make([]uint64, 0, len(c.matchIndexes))\n\tfor _, idx := range c.matchIndexes {\n\t\tmatched = append(matched, idx)\n\t}\n\tsort.Sort(uint64Slice(matched))\n\tquorumMatchIndex := matched[(len(matched)-1)/2]\n\n\tif quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {\n\t\tc.commitIndex = quorumMatchIndex\n\t\tasyncNotifyCh(c.commitCh)\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "leader_commit_handler",
+        "file": "raft.go",
+        "start_line": 785,
+        "end_line": 800,
+        "kind": "code_observation",
+        "text": "\t\tcase <-r.leaderState.commitCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Process the newly committed entries\n\t\t\toldCommitIndex := r.getCommitIndex()\n\t\t\tcommitIndex := r.leaderState.commitment.getCommitIndex()\n\t\t\tr.setCommitIndex(commitIndex)\n\n\t\t\t// New configuration has been committed, set it as the committed\n\t\t\t// value.\n\t\t\tif r.configurations.latestIndex > oldCommitIndex &&\n\t\t\t\tr.configurations.latestIndex <= commitIndex {\n\t\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t\t\tif !hasVote(r.configurations.committed, r.localID) {\n\t\t\t\t\tstepDown = true\n\t\t\t\t}\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "stable_gate",
+        "file": "raft.go",
+        "start_line": 653,
+        "end_line": 666,
+        "kind": "code_observation",
+        "text": "func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {\n\t// Have to wait until:\n\t// 1. The latest configuration is committed, and\n\t// 2. This leader has committed some entry (the noop) in this term\n\t//    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J\n\tif r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\tr.getCommitIndex() >= r.leaderState.commitment.startIndex {\n\t\treturn r.configurationChangeCh\n\t}\n\treturn nil\n}\n\n// leaderLoop is the hot loop for a leader. It is invoked\n// after all the various leader setup is done.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_struct",
+        "file": "configuration.go",
+        "start_line": 139,
+        "end_line": 192,
+        "kind": "code_observation",
+        "text": "// configurations is state tracked on every server about its Configurations.\n// Note that, per Diego's dissertation, there can be at most one uncommitted\n// configuration at a time (the next configuration may not be created until the\n// prior one has been committed).\n//\n// One downside to storing just two configurations is that if you try to take a\n// snapshot when your state machine hasn't yet applied the committedIndex, we\n// have no record of the configuration that would logically fit into that\n// snapshot. We disallow snapshots in that case now. An alternative approach,\n// which LogCabin uses, is to track every configuration change in the\n// log.\ntype configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}\n\n// Clone makes a deep copy of a configurations object.\nfunc (c *configurations) Clone() (copy configurations) {\n\tcopy.committed = c.committed.Clone()\n\tcopy.committedIndex = c.committedIndex\n\tcopy.latest = c.latest.Clone()\n\tcopy.latestIndex = c.latestIndex\n\treturn\n}\n\n// hasVote returns true if the server identified by 'id' is a Voter in the\n// provided Configuration.\nfunc hasVote(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn server.Suffrage == Voter\n\t\t}\n\t}\n\treturn false\n}\n\n// inConfiguration returns true if the server identified by 'id' is in the\n// provided Configuration.\nfunc inConfiguration(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "next_configuration",
+        "file": "configuration.go",
+        "start_line": 225,
+        "end_line": 306,
+        "kind": "code_observation",
+        "text": "// nextConfiguration generates a new Configuration from the current one and a\n// configuration change request. It's split from appendConfigurationEntry so\n// that it can be unit tested easily.\nfunc nextConfiguration(current Configuration, currentIndex uint64, change configurationChangeRequest) (Configuration, error) {\n\tif change.prevIndex > 0 && change.prevIndex != currentIndex {\n\t\treturn Configuration{}, fmt.Errorf(\"configuration changed since %v (latest is %v)\", change.prevIndex, currentIndex)\n\t}\n\n\tconfiguration := current.Clone()\n\tswitch change.command {\n\tcase AddVoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Voter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage == Voter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase AddNonvoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Nonvoter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage != Nonvoter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase DemoteVoter:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Nonvoter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase RemoveServer:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers = append(configuration.Servers[:i], configuration.Servers[i+1:]...)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase Promote:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID && server.Suffrage == Staging {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Voter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n\n\t// Make sure we didn't do something bad like remove the last voter\n\tif err := checkConfiguration(configuration); err != nil {\n\t\treturn Configuration{}, err\n\t}\n\n\treturn configuration, nil\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "addnonvoter_rows",
+        "file": "configuration_test.go",
+        "start_line": 195,
+        "end_line": 202,
+        "kind": "test_expectation",
+        "text": "\t// AddNonvoter: was missing.\n\t{singleServer, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Nonvoter id2 addr2}]}\"},\n\t// AddNonvoter: was Voter.\n\t{singleServer, AddNonvoter, 1, \"{[{Voter id1 addr1}]}\"},\n\t// AddNonvoter: was Staging.\n\t{oneOfEach, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Staging id2 addr2} {Nonvoter id3 addr3x}]}\"},\n\t// AddNonvoter: was Nonvoter.\n\t{oneOfEach, AddNonvoter, 3, \"{[{Voter id1 addr1x} {Staging id2 addr2x} {Nonvoter id3 addr3}]}\"},",
+        "content_digest": "3e0e33568dc16ce536ebcda005e712b6e71dbc8052093ecf41f9ce2f7a00decf"
+      },
+      {
+        "id": "follower_cfg_update",
+        "file": "raft.go",
+        "start_line": 1546,
+        "end_line": 1559,
+        "kind": "code_observation",
+        "text": "\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_cfg_entry",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_latest_vs_committed",
+        "file": "configuration.go",
+        "start_line": 150,
+        "end_line": 161,
+        "kind": "code_observation",
+        "text": "type configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "c950fdc684ba41a5b6c16780bc3394bf",
+      "result": {
+        "submission": "update.json",
+        "summary": "Continued the decision-formation axis after the configuration-visibility result and recorded a source-only account of commit eligibility: the commitment match set is built only from Voter entries (newCommitment, setConfiguration), match() drops any server ID absent from that map, and recalculate derives commitIndex solely from those values, while replication goroutines exist for every configured server and quorumSize/checkLeaderLease count only Voters, so a Nonvoter/Staging acknowledgement cannot advance commitIndex or reach the FSM. Added the new investigation @q_nonvoter_commit with a mixed-suffrage discriminator, promoted the Fact @k_voter_only_commit, and interpreted it as explained with no defect asserted (source-only). Also ran a race-enabled subset of the snapshot's own tests over configuration-change and leadership-transfer paths (TestRaft_LeadershipTransfer, AddVoter/AddNonvoter/DemoteVoter/RemoveServer, LeaderLease, ConfigChange) with no data race and no failure."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-de0a5cb4de1e4d848d1f15c13e12e4ec": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-de0a5cb4de1e4d848d1f15c13e12e4ec.json"
+      },
+      "submission-3eb084cec7344a50b70253044fa3ffdb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-3eb084cec7344a50b70253044fa3ffdb.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "version": 1,
+        "question": "After a stable leader returns success from AddVoter, can a pre-existing voter's locally reported configuration remain without the new voter, and if so for how long under normal in-process operation?",
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "commitment_recalc",
+          "leader_commit_handler",
+          "stable_gate"
+        ],
+        "hypothesis": "The leader sets its own latest configuration and the commitment voter set immediately at append time, so a successful AddVoter only certifies a quorum of the new configuration, not that every pre-existing voter has observed the entry.",
+        "discriminator": "Run the two-voter + one-new-server AddVoter scenario in-process and sample each node's reported configuration immediately after the future returns; disagreement should be transient and bounded by replication, versus persisting if the follower's configuration update path is broken.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "c950fdc684ba41a5b6c16780bc3394bf-question-0",
+        "version": 1,
+        "question": "Can a Nonvoter's or Staging server's acknowledgement advance the leader's commitIndex (or reach the FSM), and is leader commit eligibility computed over the same participant set that the leader replicates to?",
+        "source_ids": [
+          "commit_new",
+          "commitment_recalc",
+          "repl_all_servers",
+          "quorum_voters",
+          "process_logs"
+        ],
+        "hypothesis": "Leader commit eligibility is defined only over Voter entries of the current latest configuration, while replication state is created for every configured server; therefore a Nonvoter acknowledgement is silently dropped and cannot commit an entry, so FSM application never depends on non-voter support.",
+        "discriminator": "In one process build a cluster whose latest configuration contains two Voters and one Nonvoter, make both Voters unable to store a new entry while the Nonvoter can (or conversely confirm that commits proceed when only a non-voter is lagging); commitIndex/apply progress must track Voter acknowledgements only. Withholding both Voter acknowledgements must stall commit and FSM application indefinitely, while withholding only the Nonvoter must not.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "c950fdc684ba41a5b6c16780bc3394bf"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On the leader, appendConfigurationEntry stores the new configuration log entry via dispatchLogs, then sets r.configurations.latest to the new configuration and calls commitment.setConfiguration(new), which rebuilds the commit voter set and recalculates the commit index. Commit of later entries is therefore evaluated over the new configuration's voters, and the leader's own latest configuration is updated at append time rather than at commit time.",
+        "conditions": "Leader in Leader state; configurationChangeChIfStable gated (latestIndex == committedIndex and a commit of the current term already observed); protocolVersion 3 so the entry is a LogConfiguration; prevIndex match in nextConfiguration.",
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "commitment_recalc",
+          "stable_gate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "nextConfiguration's AddNonvoter case does not demote an existing member: if the server ID already exists with Suffrage other than Nonvoter, only its Address is updated and its Voter/Staging suffrage is retained; a new server is appended as Nonvoter. Demotion of an existing voter is only reachable through DemoteVoter.",
+        "conditions": "protocol-version-3 ID-based configuration change request with a client-supplied server ID that already exists in the current configuration.",
+        "source_ids": [
+          "next_configuration",
+          "addnonvoter_rows"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "3eb084cec7344a50b70253044fa3ffdb-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On a follower, appendEntries stores accepted new entries and then calls processConfigurationLogEntry for each stored configuration entry, which sets configurations.latest/latestIndex to the newly decoded configuration at store time, before the entry's commit index is known. configurations.latest is therefore the locally stored (possibly uncommitted) configuration, and GetConfiguration on any node reports it without consulting the main thread.",
+        "conditions": "Follower receiving AppendEntries whose entries are new or whose conflicting suffix was deleted; protocol 3 LogConfiguration entries (or deprecated peer entries); configurations.latest is updated from the follower's own log store, independent of LeaderCommitIndex.",
+        "source_ids": [
+          "follower_cfg_update",
+          "process_cfg_entry",
+          "cfg_latest_vs_committed"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3eb084cec7344a50b70253044fa3ffdb"
+      },
+      {
+        "id": "c950fdc684ba41a5b6c16780bc3394bf-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the leader, the commit set is built exclusively from servers whose Suffrage is Voter: newCommitment and commitment.setConfiguration insert a matchIndexes entry only for Voter servers, commitment.match updates an index only if the reporting server is already a key in matchIndexes, and recalculate takes the majority-order element of those values. Replication goroutines, by contrast, are started for every server in configurations.latest regardless of suffrage, and quorumSize and checkLeaderLease also count only Voters. Consequently an acknowledgement from a Nonvoter/Staging server cannot advance commitIndex, and processLogs applies to the FSM only entries up to the leader's commitIndex.",
+        "conditions": "Leader state; protocol version 3 configuration with mixed suffrage; the leader's commitment was built from configurations.latest at leader setup and rebuilt on each committed/appended configuration change.",
+        "source_ids": [
+          "commit_new",
+          "commitment_recalc",
+          "repl_all_servers",
+          "quorum_voters",
+          "lease_voters",
+          "process_logs"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c950fdc684ba41a5b6c16780bc3394bf"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-interpretation-0",
+        "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "commitment_recalc",
+          "leader_commit_handler"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Source reading establishes the mechanism: the leader updates its own latest configuration and the commitment voter set at append time, and commitment is recomputed over the new voter set, so AddVoter success only means a quorum of the new configuration stored the entry. In an isolated native run of the submitted scenario the new configuration was already reported by all three nodes at the first sample (~1ms), i.e. no lasting disagreement. The earlier 'peer mismatch' occurred once during a full package run and did not reappear on a repeat run of the same suite. No source path was found that would keep a pre-existing voter's latest configuration permanently missing a committed configuration entry; the conflicting observation is currently attributed to harness timing under load, but that attribution is not yet grounded in a controller receipt.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec"
+      },
+      {
+        "id": "3eb084cec7344a50b70253044fa3ffdb-interpretation-0",
+        "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "experiment_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-experiment",
+        "source_ids": [
+          "append_config",
+          "commitment_setcfg",
+          "follower_cfg_update",
+          "process_cfg_entry"
+        ],
+        "executions": {
+          "a92f7689c4c642b6b8061a2bed2b624b": [
+            1,
+            3,
+            6
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "refuted",
+        "rationale": "Source reading already showed that the leader updates its own latest configuration and the commitment voter set at append time, so AddVoter success certifies only that a quorum of the new configuration stored the entry; combined with the follower-side behavior that latest configuration is set at log-store time, a pre-existing voter's reported configuration may legitimately lag the leader's by one replication delivery. The retained execution witnesses exactly that: the AddVoter future returned success at 2ms (index 1, err <nil>, index 3), the pre-existing voter server-d6f82acc reported num_servers=2/has_new_member=false at the same 2ms sample (index 3), and at 102ms the same server reported num_servers=3/has_new_member=true (index 6). All probes 6 through 91 (out to 2927ms) show 3 servers on that server, so the disagreement did not persist or recur within the observed window. The earlier unexplained 'peer mismatch' under full-suite load is thus consistent with the same bounded replication transient rather than a broken configuration-update path on pre-existing voters.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Single execution with two 100ms-spaced samples bracketing the transition: the exact instant the follower adopted the new configuration is only bounded to the interval (2ms, 102ms], so the observation shows boundedness, not a latency bound under load.",
+          "The sampled predicate is each node's locally reported latest configuration (getLatestConfiguration), not commit ordering; the samples say nothing about when the follower committed the entry.",
+          "The originally observed full-suite 'peer mismatch' lasted up to the harness 5s limit and was not reproduced in isolation, so its cause under CPU contention remains unmeasured; only its identity with this bounded transient is supported, not its duration."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3eb084cec7344a50b70253044fa3ffdb"
+      },
+      {
+        "id": "c950fdc684ba41a5b6c16780bc3394bf-interpretation-0",
+        "investigation_id": "c950fdc684ba41a5b6c16780bc3394bf-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "commit_new",
+          "commitment_recalc",
+          "repl_all_servers",
+          "quorum_voters",
+          "process_logs"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Source-only account of the commit-eligibility rule. The three places that could let non-voter support count are all closed: the match set is built from Voter entries only at leader setup and at configuration change; match() rejects any server ID absent from that map, so a Nonvoter's AppendEntries response cannot create an entry; and recalculate derives commitIndex solely from the surviving map values. Replication is nonetheless started for every configured server, which explains why non-voters receive and store logs without ever contributing to commitment. No contradiction was found in the enclosing paths: the leader lease and election quorum helpers count the same Voter set, and processLogs is bounded by the leader's commitIndex. This is a source-explained negative, so no defect is asserted and the corresponding discriminator is left for execution rather than being inferred from the reading.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Source-only account: no retained execution yet exercises a mixed Voter/Nonvoter configuration, so the claim rests on reading the producers, not on an observed endpoint.",
+          "The reading covers the leader-side commit rule; it does not evaluate non-voter participation in any other mechanism (for example snapshot install or leadership transfer targeting a non-voter)."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c950fdc684ba41a5b6c16780bc3394bf"
+      }
+    ],
+    "materials": [
+      {
+        "id": "append_config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1243,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}\n\n// dispatchLog is called on the leader to push a log to disk, mark it\n// as inflight and begin replication of it.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "commitment_setcfg",
+        "file": "commitment.go",
+        "start_line": 50,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "// Called when a new cluster membership configuration is created: it will be\n// used to determine commitment from now on. 'configuration' is the servers in\n// the cluster.\nfunc (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "commitment_recalc",
+        "file": "commitment.go",
+        "start_line": 86,
+        "end_line": 104,
+        "kind": "code_observation",
+        "text": "// Internal helper to calculate new commitIndex from matchIndexes.\n// Must be called with lock held.\nfunc (c *commitment) recalculate() {\n\tif len(c.matchIndexes) == 0 {\n\t\treturn\n\t}\n\n\tmatched := make([]uint64, 0, len(c.matchIndexes))\n\tfor _, idx := range c.matchIndexes {\n\t\tmatched = append(matched, idx)\n\t}\n\tsort.Sort(uint64Slice(matched))\n\tquorumMatchIndex := matched[(len(matched)-1)/2]\n\n\tif quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {\n\t\tc.commitIndex = quorumMatchIndex\n\t\tasyncNotifyCh(c.commitCh)\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "leader_commit_handler",
+        "file": "raft.go",
+        "start_line": 785,
+        "end_line": 800,
+        "kind": "code_observation",
+        "text": "\t\tcase <-r.leaderState.commitCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Process the newly committed entries\n\t\t\toldCommitIndex := r.getCommitIndex()\n\t\t\tcommitIndex := r.leaderState.commitment.getCommitIndex()\n\t\t\tr.setCommitIndex(commitIndex)\n\n\t\t\t// New configuration has been committed, set it as the committed\n\t\t\t// value.\n\t\t\tif r.configurations.latestIndex > oldCommitIndex &&\n\t\t\t\tr.configurations.latestIndex <= commitIndex {\n\t\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t\t\tif !hasVote(r.configurations.committed, r.localID) {\n\t\t\t\t\tstepDown = true\n\t\t\t\t}\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "stable_gate",
+        "file": "raft.go",
+        "start_line": 653,
+        "end_line": 666,
+        "kind": "code_observation",
+        "text": "func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {\n\t// Have to wait until:\n\t// 1. The latest configuration is committed, and\n\t// 2. This leader has committed some entry (the noop) in this term\n\t//    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J\n\tif r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\tr.getCommitIndex() >= r.leaderState.commitment.startIndex {\n\t\treturn r.configurationChangeCh\n\t}\n\treturn nil\n}\n\n// leaderLoop is the hot loop for a leader. It is invoked\n// after all the various leader setup is done.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_struct",
+        "file": "configuration.go",
+        "start_line": 139,
+        "end_line": 192,
+        "kind": "code_observation",
+        "text": "// configurations is state tracked on every server about its Configurations.\n// Note that, per Diego's dissertation, there can be at most one uncommitted\n// configuration at a time (the next configuration may not be created until the\n// prior one has been committed).\n//\n// One downside to storing just two configurations is that if you try to take a\n// snapshot when your state machine hasn't yet applied the committedIndex, we\n// have no record of the configuration that would logically fit into that\n// snapshot. We disallow snapshots in that case now. An alternative approach,\n// which LogCabin uses, is to track every configuration change in the\n// log.\ntype configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}\n\n// Clone makes a deep copy of a configurations object.\nfunc (c *configurations) Clone() (copy configurations) {\n\tcopy.committed = c.committed.Clone()\n\tcopy.committedIndex = c.committedIndex\n\tcopy.latest = c.latest.Clone()\n\tcopy.latestIndex = c.latestIndex\n\treturn\n}\n\n// hasVote returns true if the server identified by 'id' is a Voter in the\n// provided Configuration.\nfunc hasVote(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn server.Suffrage == Voter\n\t\t}\n\t}\n\treturn false\n}\n\n// inConfiguration returns true if the server identified by 'id' is in the\n// provided Configuration.\nfunc inConfiguration(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "next_configuration",
+        "file": "configuration.go",
+        "start_line": 225,
+        "end_line": 306,
+        "kind": "code_observation",
+        "text": "// nextConfiguration generates a new Configuration from the current one and a\n// configuration change request. It's split from appendConfigurationEntry so\n// that it can be unit tested easily.\nfunc nextConfiguration(current Configuration, currentIndex uint64, change configurationChangeRequest) (Configuration, error) {\n\tif change.prevIndex > 0 && change.prevIndex != currentIndex {\n\t\treturn Configuration{}, fmt.Errorf(\"configuration changed since %v (latest is %v)\", change.prevIndex, currentIndex)\n\t}\n\n\tconfiguration := current.Clone()\n\tswitch change.command {\n\tcase AddVoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Voter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage == Voter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase AddNonvoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Nonvoter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage != Nonvoter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase DemoteVoter:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Nonvoter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase RemoveServer:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers = append(configuration.Servers[:i], configuration.Servers[i+1:]...)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase Promote:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID && server.Suffrage == Staging {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Voter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n\n\t// Make sure we didn't do something bad like remove the last voter\n\tif err := checkConfiguration(configuration); err != nil {\n\t\treturn Configuration{}, err\n\t}\n\n\treturn configuration, nil\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "addnonvoter_rows",
+        "file": "configuration_test.go",
+        "start_line": 195,
+        "end_line": 202,
+        "kind": "test_expectation",
+        "text": "\t// AddNonvoter: was missing.\n\t{singleServer, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Nonvoter id2 addr2}]}\"},\n\t// AddNonvoter: was Voter.\n\t{singleServer, AddNonvoter, 1, \"{[{Voter id1 addr1}]}\"},\n\t// AddNonvoter: was Staging.\n\t{oneOfEach, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Staging id2 addr2} {Nonvoter id3 addr3x}]}\"},\n\t// AddNonvoter: was Nonvoter.\n\t{oneOfEach, AddNonvoter, 3, \"{[{Voter id1 addr1x} {Staging id2 addr2x} {Nonvoter id3 addr3}]}\"},",
+        "content_digest": "3e0e33568dc16ce536ebcda005e712b6e71dbc8052093ecf41f9ce2f7a00decf"
+      },
+      {
+        "id": "follower_cfg_update",
+        "file": "raft.go",
+        "start_line": 1546,
+        "end_line": 1559,
+        "kind": "code_observation",
+        "text": "\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_cfg_entry",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_latest_vs_committed",
+        "file": "configuration.go",
+        "start_line": 150,
+        "end_line": 161,
+        "kind": "code_observation",
+        "text": "type configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "commit_new",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 48,
+        "kind": "code_observation",
+        "text": "func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64) *commitment {\n\tmatchIndexes := make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tmatchIndexes[server.ID] = 0\n\t\t}\n\t}\n\treturn &commitment{\n\t\tcommitCh:     commitCh,\n\t\tmatchIndexes: matchIndexes,\n\t\tcommitIndex:  0,\n\t\tstartIndex:   startIndex,\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "repl_all_servers",
+        "file": "raft.go",
+        "start_line": 582,
+        "end_line": 651,
+        "kind": "code_observation",
+        "text": "func (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})\n\t\t} else if ok {\n\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\tif peer.Address != server.Address {\n\t\t\t\tr.logger.Info(\"updating peer\", \"peer\", server.ID)\n\t\t\t\ts.peerLock.Lock()\n\t\t\t\ts.peer = server\n\t\t\t\ts.peerLock.Unlock()\n\t\t\t}\n\t\t}\n\t}\n\n\t// Stop replication goroutines that need stopping\n\tfor serverID, repl := range r.leaderState.replState {\n\t\tif inConfig[serverID] {\n\t\t\tcontinue\n\t\t}\n\t\t// Replicate up to lastIdx and stop\n\t\tr.logger.Info(\"removed peer, stopping replication\", \"peer\", serverID, \"last-index\", lastIdx)\n\t\trepl.stopCh <- lastIdx\n\t\tclose(repl.stopCh)\n\t\tdelete(r.leaderState.replState, serverID)\n\t\tr.observe(PeerObservation{Peer: repl.peer, Removed: true})\n\t}\n\n\t// Update peers metric\n\tmetrics.SetGauge([]string{\"raft\", \"peers\"}, float32(len(r.configurations.latest.Servers)))\n}\n\n// configurationChangeChIfStable returns r.configurationChangeCh if it's safe\n// to process requests from it, or nil otherwise. This must only be called\n// from the main thread.\n//\n// Note that if the conditions here were to change outside of leaderLoop to take",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "quorum_voters",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "lease_voters",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_logs",
+        "file": "raft.go",
+        "start_line": 1292,
+        "end_line": 1361,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\n\t// Store maxAppendEntries for this call in case it ever becomes reloadable. We\n\t// need to use the same value for all lines here to get the expected result.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\n\tbatch := make([]*commitTuple, 0, maxAppendEntries)\n\n\t// Apply all the preceding logs\n\tfor idx := lastApplied + 1; idx <= index; idx++ {\n\t\tvar preparedLog *commitTuple\n\t\t// Get the log, either from the future or from our log store\n\t\tfuture, futureOk := futures[idx]\n\t\tif futureOk {\n\t\t\tpreparedLog = r.prepareLog(&future.log, future)\n\t\t} else {\n\t\t\tl := new(Log)\n\t\t\tif err := r.logs.GetLog(idx, l); err != nil {\n\t\t\t\tr.logger.Error(\"failed to get log\", \"index\", idx, \"error\", err)\n\t\t\t\tpanic(err)\n\t\t\t}\n\t\t\tpreparedLog = r.prepareLog(l, nil)\n\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n\n\t// Update the lastApplied index and term\n\tr.setLastApplied(index)\n}\n\n// processLog is invoked to process the application of a single committed log entry.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "c950fdc684ba41a5b6c16780bc3394bf",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_voter_only_commit": "c950fdc684ba41a5b6c16780bc3394bf-knowledge-0",
+        "@q_nonvoter_commit": "c950fdc684ba41a5b6c16780bc3394bf-question-0"
+      }
+    },
+    "applied_operations": {
+      "submission-de0a5cb4de1e4d848d1f15c13e12e4ec": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-de0a5cb4de1e4d848d1f15c13e12e4ec.json"
+      },
+      "submission-3eb084cec7344a50b70253044fa3ffdb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-3eb084cec7344a50b70253044fa3ffdb.json"
+      },
+      "submission-c950fdc684ba41a5b6c16780bc3394bf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-c950fdc684ba41a5b6c16780bc3394bf.json"
+      }
+    }
+  }
+}

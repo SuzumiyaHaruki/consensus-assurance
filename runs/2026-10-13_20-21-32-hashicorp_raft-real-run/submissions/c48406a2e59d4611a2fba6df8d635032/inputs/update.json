@@ -1,0 +1,267 @@
+{
+  "rationale": "Recovery/context-validity question on hashicorp/raft: after a restart with Config.RestoreCommittedLogs enabled, does the node's in-memory configuration still reflect the committed configuration retained in its own log? Receipt 3e2dd223dd5f43409c21066a1ca43175 (exit 0) now answers the two declared comparisons completely: with the flag on, the restarted node reports latest configuration index 0 and no voter (both assertions violated, witness event index 1) although it restored commit index 11 over 12 log entries; with the flag off the same restart reports index 1 with one voter (assertion holds, evaluated event index 3). Source reading gives the mechanism: NewRaft starts with an empty configurations struct; restoreSnapshot (api.go:655-681) is the only persistent-state producer of a configuration and the startup log scan (api.go:610-613) is the only other, but it starts at max(snapshotIndex, lastApplied)+1; restoreFromCommittedLogs (api.go:724-754) runs first and advances lastApplied to the persisted commit index, so committed LogConfiguration entries at or below it are skipped and processLogs never updates r.configurations (raft.go:1366-1391). The remaining open gap - a committed configuration entry newer than the on-disk snapshot - is addressed by the second experiment submitted here, which raises SnapshotThreshold so a snapshot exists, commits an AddNonvoter configuration change and then enough further entries that the change falls below the restored commit index.",
+  "sources": [
+    {
+      "id": "api_restore_committed_call",
+      "file": "api.go",
+      "start_line": 604,
+      "end_line": 620,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_committed_body",
+      "file": "api.go",
+      "start_line": 724,
+      "end_line": 754,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_snapshot_config",
+      "file": "api.go",
+      "start_line": 655,
+      "end_line": 681,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_addnonvoter",
+      "file": "api.go",
+      "start_line": 1012,
+      "end_line": 1023,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_restore_committed_doc",
+      "file": "config.go",
+      "start_line": 242,
+      "end_line": 254,
+      "kind": "document_statement"
+    },
+    {
+      "id": "log_commit_tracking_iface",
+      "file": "log.go",
+      "start_line": 194,
+      "end_line": 219,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "raft_follower_election_abort",
+      "file": "raft.go",
+      "start_line": 228,
+      "end_line": 246,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_processlogs_prepare",
+      "file": "raft.go",
+      "start_line": 1366,
+      "end_line": 1391,
+      "kind": "code_observation"
+    },
+    {
+      "id": "snapshot_compact_trailing",
+      "file": "snapshot.go",
+      "start_line": 212,
+      "end_line": 245,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@restart_config",
+      "question": "After a restart with Config.RestoreCommittedLogs enabled and a CommitTrackingLogStore, is the node's in-memory configuration still the committed configuration retained in its own log?",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_restore_snapshot_config",
+        "api_config_field",
+        "config_restore_committed_doc",
+        "log_commit_tracking_iface",
+        "raft_follower_election_abort",
+        "raft_quorum_size",
+        "raft_processlogs_prepare"
+      ],
+      "hypothesis": "restoreFromCommittedLogs advances lastApplied to the persisted commit index before the startup configuration scan, so the scan bound max(snapshotIndex, lastappliedIndex)+1 skips committed LogConfiguration entries and r.configurations keeps the snapshot (or empty) value.",
+      "discriminator": "Restart the same single-node state twice from identical stores, once with RestoreCommittedLogs on and once off, and compare configuration index, server count and hasVote(local) observed immediately after NewRaft returns; the cases differ only in whether lastApplied was advanced by restoreFromCommittedLogs."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@restart_config_fact",
+      "kind": "fact",
+      "statement": "At startup the in-memory configuration (r.configurations.latest/committed) is produced only by restoreSnapshot (the latest snapshot's configuration) and by the NewRaft log scan over indexes greater than max(snapshotIndex, lastApplied). With Config.RestoreCommittedLogs enabled, restoreFromCommittedLogs sets lastApplied to the persisted commit index before that scan, so a committed LogConfiguration entry at an index <= the restored commit index is never processed and the node keeps the snapshot configuration, or an empty configuration when no snapshot exists.",
+      "conditions": "Config.RestoreCommittedLogs=true with a LogStore implementing CommitTrackingLogStore; the persisted commit index from GetCommitIndex is at least the index of the latest committed LogConfiguration entry; no snapshot covers that entry (no snapshot at all, or snapshot.ConfigurationIndex below it).",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_restore_snapshot_config",
+        "log_commit_tracking_iface",
+        "raft_processlogs_prepare"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@restart_config",
+      "question": "Does the same loss of configuration occur when a snapshot exists whose configuration index is below the index of a committed LogConfiguration entry (entries in (snapshotIndex, restored commitIndex])?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "ef5ddbf78bd4456ea51537bd60a61a80-question-0",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_restore_snapshot_config",
+        "raft_follower_election_abort",
+        "raft_quorum_size",
+        "raft_processlogs_prepare"
+      ],
+      "executions": {
+        "3e2dd223dd5f43409c21066a1ca43175": [
+          1,
+          3
+        ],
+        "99b89f1a9b634301a58130e5494d394f": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Receipt 3e2dd223dd5f43409c21066a1ca43175 (exit 0, four events, no parse loss) establishes both declared comparisons completely. Comparison 0 (mode on, no snapshot): the asserted predicate after_latest_index == before_latest_index is contradicted by witness event index 1, which reports after_latest_index 0, after_servers 0, after_has_vote false, after_commit_index 11 and after_last_applied 11, having been admitted by event index 0 (before_latest_index 1, one server, snapshots 0); comparison 1 (mode on, after_has_vote true) is likewise violated by the same witness. Comparison 2 is the control: with RestoreCommittedLogs off the same restart satisfies after_latest_index == 1 and the event carries one voter, so the restart itself, the stores and the applied entries are not the cause. The earlier receipt 99b89f1a9b634301a58130e5494d394f carries the same two result events but its comparisons were declared with an identity that could not correlate admission and result, so those outcomes were unknown; the raw events are retained there and are not used as a completed comparison. Source mechanism: NewRaft begins with an empty configurations struct, restoreSnapshot (api.go:655-681) is the only persistent-state producer of a configuration, the startup log scan (api.go:610-613) is the only other producer but starts at max(snapshotIndex, lastApplied)+1, and restoreFromCommittedLogs (api.go:724-754) runs before it and sets lastApplied to the persisted commit index, so committed LogConfiguration entries at or below that index are never processed; processLogs only forwards LogConfiguration entries to the FSM and never updates r.configurations (raft.go:1366-1391). Consequence: the restarted node's own membership view is the snapshot's or empty, so runFollower's 'no known peers, aborting election' branch (raft.go:228-232) and the hasVote gate (raft.go:236-246) leave it unable to campaign, and quorumSize() (raft.go:1087-1094) is computed over a configuration that contradicts the node's committed log. The registered gap remains open here: the snapshot-present case is submitted as the second experiment and its receipt is required before that variant can be interpreted.",
+      "counterevidence": [
+        "The control case in the same receipt (RestoreCommittedLogs off) keeps the committed configuration, isolating the flagged recovery path.",
+        "A snapshot can supply a configuration (api.go:677-678) but only as of snapshot.ConfigurationIndex; this does not cover a configuration committed after the snapshot, which is what the second experiment checks."
+      ],
+      "limitations": [
+        "The witnessed case is a single-voter configuration with no snapshot; broader membership consequences (for example elections run under a stale configuration) are argued from the code but not witnessed.",
+        "The snapshot-present variant is not yet resolved by a receipt.",
+        "The unrelated suspicion that restoreFromCommittedLogs' processLogs call can block NewRaft before runFSM starts is untested and outside this claim."
+      ],
+      "answers": {
+        "ef5ddbf78bd4456ea51537bd60a61a80-gap-0": {
+          "explanation": "Partially advanced: a single-voter run without any snapshot is witnessed as violated by receipt 3e2dd223dd5f43409c21066a1ca43175, and the snapshot-present variant is submitted as a second experiment whose receipt is still required before this gap can be resolved.",
+          "resolved": false
+        }
+      },
+      "experiment_id": "d61f0a79ee2a45a19eba356117090f41-experiment",
+      "joint_history": "Receipt 99b89f1a9b634301a58130e5494d394f and receipt 3e2dd223dd5f43409c21066a1ca43175 both executed the same fixed inputs (same harness file, same single-node bootstrapped configuration with CommitTrackingLogs, same ten applied entries, same restart from the identical logs/stable/snapshots stores) and emitted four events with matching identities and matching operand values: mode on gave after_latest_index 0, after_servers 0, after_has_vote false and mode off gave 1, 1, true in both receipts. They are not fragments of one history: each receipt is a self-contained execution of the whole scenario, and the second one exists only because the comparison declaration changed (identity_fields reduced to mode); the first receipt's raw events are cited as observations, and only the second receipt's comparison outcomes are used as the completed comparison."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "ef5ddbf78bd4456ea51537bd60a61a80-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "api_restore_committed_call",
+      "api_restore_committed_body",
+      "api_restore_snapshot_config",
+      "api_addnonvoter",
+      "snapshot_compact_trailing"
+    ],
+    "scope": {
+      "description": "Single-node bootstrapped cluster with RestoreCommittedLogs on and a CommitTrackingLogStore. Commit enough entries that a snapshot is taken, then commit an AddNonvoter configuration change (which commits with a one-voter quorum) and ten further commands so the persisted commit index moves past the configuration entry. Restart from the same stores and compare the configuration held after NewRaft returns with the configuration the log says is latest.",
+      "assumptions": [
+        "The snapshot on disk carries only the bootstrap configuration, so it cannot represent the later AddNonvoter change.",
+        "Committing the nonvoter does not change the quorum, so the single voter keeps making progress.",
+        "The persisted commit index has advanced past the configuration entry's index by the time of the restart."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Any change of production logic; only the library's public configuration API and test facilities are used.",
+        "The unrelated suspicion that restoreFromCommittedLogs' processLogs call can block NewRaft before runFSM starts."
+      ],
+      "parameters": {
+        "peers": 1,
+        "snapshot_threshold": 5,
+        "config_change": "AddNonvoter",
+        "entries_after_change": 10
+      }
+    },
+    "prefix": "The harness boots one node with CommitTrackingLogs and a low SnapshotThreshold, repeats Apply until snapshots.List() returns a snapshot, then calls AddNonvoter, awaits its IndexFuture, and commits ten more commands so the staged commit index passes the configuration entry. It emits a startup_before_restart event carrying the snapshot index, the snapshot's configuration index, the configuration entry index and the expected server count, then shuts the node down and calls NewRaft again on the same logs, stable and snapshots stores with a fresh inmem transport. The restart_after_config_change event reports the configuration observed after NewRaft returns together with the operands of the comparison (expected and actual index and server count, restored commit index, lastApplied).",
+    "responsibility": "The library owns the precondition that a node's in-memory configuration reflects the committed configuration in its own log at startup, including changes newer than the snapshot; the caller selects Config.RestoreCommittedLogs and triggers the change through the public API.",
+    "prerequisites": [
+      {
+        "alias": "mode_snapshot",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "snapshot"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "snapshot_config_index",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 2
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "restart_after_config_change",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mode_snapshot",
+        "assertion": {
+          "field": "matches_committed_log",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "expected_latest_index",
+            "op": "ne",
+            "value": 1
+          }
+        ],
+        "description": "After restarting from a state whose log holds a committed configuration change newer than the snapshot, the node's latest configuration index and server count are expected to equal the ones the log established before shutdown; the defect prediction is that the node falls back to the snapshot's configuration."
+      },
+      {
+        "event": "restart_after_config_change",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mode_snapshot",
+        "assertion": {
+          "field": "after_servers",
+          "op": "eq",
+          "value": 2
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true
+          }
+        ],
+        "description": "The restarted node is expected to still list the added nonvoter, i.e. two servers against the snapshot's one; the defect prediction is one server."
+      }
+    ]
+  }
+}

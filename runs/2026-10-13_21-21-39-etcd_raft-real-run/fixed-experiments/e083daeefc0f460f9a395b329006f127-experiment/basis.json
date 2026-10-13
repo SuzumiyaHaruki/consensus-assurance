@@ -1,0 +1,123 @@
+{
+  "id": "e083daeefc0f460f9a395b329006f127-experiment",
+  "investigation_id": "e083daeefc0f460f9a395b329006f127-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n\t\"google.golang.org/protobuf/proto\"\n)\n\n// caEvent emits a single machine-parsable event line.\nfunc caEvent(t *testing.T, v map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(v)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceEmptyExplicitConfChangeJoint enters a joint configuration, then\n// proposes an empty ConfChangeV2 whose transition is explicit rather than auto,\n// and records what propose-time validation does with it and what applying it\n// does.\nfunc TestAssuranceEmptyExplicitConfChangeJoint(t *testing.T) {\n\tr := newTestRaft(1, 3, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\n\tenter := &pb.ConfChangeV2{\n\t\tTransition: pb.ConfChangeTransitionJointExplicit.Enum(),\n\t\tChanges:    []*pb.ConfChangeSingle{{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(4))}},\n\t}\n\tcs := r.applyConfChange(enter)\n\n\tbad := &pb.ConfChangeV2{Transition: pb.ConfChangeTransitionJointExplicit.Enum()}\n\t_, enterOK := bad.EnterJoint()\n\tcaEvent(t, map[string]any{\n\t\t\"event\":          \"empty_cc_joint_setup\",\n\t\t\"alias\":          \"joint_empty_explicit\",\n\t\t\"joint\":          len(cs.GetVotersOutgoing()) > 0,\n\t\t\"voters\":         cs.GetVoters(),\n\t\t\"voters_outgoing\": cs.GetVotersOutgoing(),\n\t\t\"transition\":     bad.GetTransition().String(),\n\t\t\"changes\":        len(bad.GetChanges()),\n\t\t\"leave_joint\":    bad.LeaveJoint(),\n\t\t\"enter_joint_ok\": enterOK,\n\t})\n\n\tdata, err := proto.Marshal(bad)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tlastBefore := r.raftLog.lastIndex()\n\tstepErr := r.Step(&pb.Message{\n\t\tFrom: new(uint64(1)),\n\t\tType: pb.MsgProp.Enum(),\n\t\tEntries: []*pb.Entry{{Type: pb.EntryConfChangeV2.Enum(), Data: data}},\n\t})\n\tents, err := r.raftLog.entries(r.raftLog.lastIndex(), noLimit)\n\tif err != nil {\n\t\tt.Fatalf(\"entries: %v\", err)\n\t}\n\tlastType := \"\"\n\tif len(ents) > 0 {\n\t\tlastType = ents[len(ents)-1].GetType().String()\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":       \"empty_cc_joint_prop\",\n\t\t\"alias\":       \"joint_empty_explicit\",\n\t\t\"step_err\":    fmt.Sprint(stepErr),\n\t\t\"appended\":    r.raftLog.lastIndex() - lastBefore,\n\t\t\"last_type\":   lastType,\n\t\t\"data_len\":    len(data),\n\t})\n\n\tpanicked := false\n\tpanicText := \"\"\n\tfunc() {\n\t\tdefer func() {\n\t\t\tif rec := recover(); rec != nil {\n\t\t\t\tpanicked = true\n\t\t\t\tpanicText = fmt.Sprint(rec)\n\t\t\t}\n\t\t}()\n\t\tr.applyConfChange(bad)\n\t}()\n\tcaEvent(t, map[string]any{\n\t\t\"event\":     \"empty_cc_joint_apply\",\n\t\t\"alias\":     \"joint_empty_explicit\",\n\t\t\"panicked\":  panicked,\n\t\t\"panic\":     panicText,\n\t\t\"still_joint\": len(r.trk.Config.Voters[1]) > 0,\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "joint_empty_explicit_setup",
+          "event": "empty_cc_joint_setup",
+          "conditions": [
+            {
+              "field": "joint",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "val_joint",
+      "apply_cc",
+      "cc_enter",
+      "pb_leave"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Drive a real raft through entering a joint configuration and then through proposing and applying an empty ConfChangeV2 with an explicit transition, recording whether propose-time validation keeps the entry and whether applying it panics.",
+      "assumptions": [
+        "Real raft over voters {1,2,3} built with newTestRaft and the library defaults; the joint configuration is entered by applying ConfChangeV2 with an explicit transition and a single add-node change, which is the normal EnterJoint path.",
+        "The malformed change is submitted through raft.Step as a MsgProp carrying an EntryConfChangeV2 built by marshalling ConfChangeV2{Transition: JointExplicit}, which is exactly the input shape an application or client would produce.",
+        "ApplyConfChange is invoked directly on the same instance because the entry would not be committed on a quorum-less test instance; no production logic is modified and the panic is captured with recover so it is recorded as data."
+      ],
+      "excluded": [
+        "Any claim about how a client library or etcd constructs its ConfChangeV2 messages; only the library's own acceptance and apply paths are measured.",
+        "The Auto-transition empty change, which is the supported leave-joint idiom and is not part of this comparison."
+      ],
+      "parameters": {
+        "voters": [
+          1,
+          2,
+          3
+        ],
+        "added_node": 4,
+        "transition": "JointExplicit",
+        "changes": 0
+      }
+    },
+    "prefix": "TestAssuranceEmptyExplicitConfChangeJoint builds newTestRaft(1,3,1,newTestMemoryStorage(withPeers(1,2,3))), promotes it with becomeCandidate/becomeLeader, applies ConfChangeV2{Transition: JointExplicit, Changes: [add 4]} and emits a setup event with the resulting voters, outgoing voters, the tested transition, change count, LeaveJoint and EnterJoint results. It then marshals ConfChangeV2{Transition: JointExplicit} into an EntryConfChangeV2, steps it as a MsgProp, and emits an event with the step error, how many entries were appended and the type of the last entry. Finally it calls applyConfChange on that same change inside a recover and emits whether it panicked, the panic text and whether the configuration is still joint.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "empty_cc_joint_prop",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "joint_empty_explicit_setup",
+        "assertion": {
+          "field": "last_type",
+          "op": "eq",
+          "value": "EntryConfChangeV2",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Propose-time validation kept the entry as a configuration change rather than replacing it, so the library accepted the request."
+      },
+      {
+        "event": "empty_cc_joint_apply",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "joint_empty_explicit_setup",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Applying the accepted change panics because Changer.EnterJoint rejects an already-joint configuration."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "e083daeefc0f460f9a395b329006f127-knowledge-0",
+        "revision": 1,
+        "assertion": "the explicit-transition empty change passes validation and panics on apply"
+      }
+    ]
+  },
+  "snapshot_id": "96808b54ce424b1b869534401691d5ef",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "e083daeefc0f460f9a395b329006f127",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

@@ -1,0 +1,269 @@
+{
+  "rationale": "A follow-up probe extends the multi-voter scenario past the election, to the duty a client hands to that leader. After the isolated restarted node wins with two votes, a client Apply is issued on it and on the majority-side leader (if one exists), the partition is healed, and the two FSMs' applied slices are compared. The probe's bounded observation is that the minority leader accepted and completed the client write (minority_apply_ok true) even though its support is two of the committed five; the majority side had no leader in that run, so no two-sided conflict or FSM divergence was witnessed and none is claimed. The previous execution of that probe produced the result events but no admission event, so its declared comparisons could not complete; the harness now emits the startup admission and the check is submitted again as a successor for a completed comparison. The claim under test is scoped: a write must not be acknowledged by a leader whose support is below the committed configuration's quorum. The established configuration-loss and minority-election findings are unchanged and not restated.",
+  "sources": [
+    {
+      "id": "api_restore_committed_body",
+      "file": "api.go",
+      "start_line": 724,
+      "end_line": 754,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_addvoter",
+      "file": "api.go",
+      "start_line": 994,
+      "end_line": 1005,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_apply_contract",
+      "file": "api.go",
+      "start_line": 245,
+      "end_line": 275,
+      "kind": "document_statement"
+    },
+    {
+      "id": "raft_requestvote_leader_guard",
+      "file": "raft.go",
+      "start_line": 1690,
+      "end_line": 1700,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_electself_vote_count",
+      "file": "raft.go",
+      "start_line": 1999,
+      "end_line": 2060,
+      "kind": "code_observation"
+    },
+    {
+      "id": "fsm_apply_dispatch",
+      "file": "raft.go",
+      "start_line": 1245,
+      "end_line": 1295,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "hypothesis": "A node restarted with RestoreCommittedLogs keeps the snapshot's configuration when committed membership changes sit below the restored commit index, so its quorum arithmetic reflects an obsolete membership and it can win an election its committed configuration would forbid.",
+      "discriminator": "Grow a snapshot-age three-voter cluster to five voters, restart the leader, compare the configuration index and server count with the log's latest configuration, then isolate the restarted node with one committed voter and check whether it wins with the smaller quorum while the majority side keeps a leader.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@minority_leader_behavior",
+      "kind": "behavior",
+      "statement": "A node restarted with Config.RestoreCommittedLogs whose rebuilt configuration is a stale, smaller membership can be elected leader with support that is a minority of the committed configuration: isolated together with one committed voter it became leader with two votes while the committed five-voter configuration requires three, and the same restart without the flag could not win on that side.",
+      "conditions": "Committed configuration grown from three to five voters after the node's snapshot; RestoreCommittedLogs=true with a CommitTrackingLogStore; the restarted node isolated together with one committed voter immediately after NewRaft returns, with that partner also cut off from the majority side so requestVote's existing-leader guard does not refuse it; observed with a bounded window against a flag-off control.",
+      "source_ids": [
+        "api_restore_committed_body",
+        "api_addvoter",
+        "raft_requestvote_leader_guard",
+        "raft_quorum_size",
+        "raft_electself_vote_count"
+      ],
+      "executions": {
+        "abfdbd1823b342409ef4a815bade0407": [
+          21,
+          22,
+          24,
+          25
+        ]
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "question": "Does a leader elected with fewer votes than the committed configuration requires reproduce reliably, under which schedule and partition order, and does the committed configuration's majority side then diverge in committed entries?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "experiment_id": "c34a830a404a4dad8ea4e2fe492f5e66-experiment",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_addvoter",
+        "api_apply_contract",
+        "raft_requestvote_leader_guard",
+        "raft_quorum_size",
+        "raft_electself_vote_count"
+      ],
+      "executions": {
+        "abfdbd1823b342409ef4a815bade0407": [
+          21,
+          22,
+          24,
+          25
+        ],
+        "b15f4b6c55b44402ace926204de9b826": [
+          15,
+          18
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Two completed comparisons answer this question, each with its flag-off control, and a third consequence is under test. Configuration: receipt b15f4b6c55b44402ace926204de9b826, comparison 0 violated at witness event index 15 - the node restarted from a log whose latest configuration is index 14 with five servers came back at configuration index 1 with three servers, the snapshot's bootstrap configuration - with the control holding at evaluated event index 18 (index 14, five servers). Election: receipt abfdbd1823b342409ef4a815bade0407, comparison 0 violated at witness event index 22 - the restarted node, isolated together with one committed voter immediately after NewRaft returned, became leader with reachable_votes 2 against committed_quorum 3, and the same run reports majority_side_leader true, so a leader elected on a minority of the committed configuration coexisted with the majority side's leader - with the control holding at evaluated event index 25 (became_leader false). Source: restoreFromCommittedLogs (api.go:724-754) advances lastApplied to the persisted commit index before the startup scan at api.go:604-620, so AddVoter's later entry (api.go:994-1005) is never re-read and the node keeps the snapshot's three-server list; quorumSize() (raft.go:1087-1094) then returns two and electSelf (raft.go:1999-2060) asks only that list, so the node's own vote plus one follower meets its stale quorum while the committed configuration needs three. The manouevre the run needed - also cutting the single committed voter off from the majority side so requestVote's existing-leader guard (raft.go:1690-1700) does not refuse the vote - is an ordinary partition shape; two executions produced the minority leadership and two settled-schedule executions did not, so the manifestation is schedule dependent while the decision itself is unrepaired. Third, the duty a client hands to such a leader is being checked: in a native run of the extended probe the isolated leader accepted and completed a client Apply (minority_apply_ok true) with two of five committed votes in support, which the successor experiment now tests against its control, the first execution having produced the result event without the admission event its declaration required; no divergence or lost-entry claim is made, because that run had no majority-side leader to write against.",
+      "counterevidence": [
+        "The flag-off controls in both receipts keep the committed configuration and cannot win on the isolated side.",
+        "Two settled-schedule executions did not produce the minority win, and the difference is explained by whether the isolated partner still heard the majority-side leader, so no frequency claim is made.",
+        "The redundant configuration re-checks in one receipt were incomplete because the two scenarios emit the same restart event name; they carry no new claim and are not used."
+      ],
+      "limitations": [
+        "Only the leadership decision, the coexistence with the majority-side leader and (in a native probe) the acknowledgement of a client write are observed; no FSM divergence or lost acknowledged entry is witnessed.",
+        "Observed windows are bounded, so no occurrence-rate or absence bound is established.",
+        "The scenario restarts the former leader of an enlarged cluster; other roles, change types and chain orders are not explored."
+      ],
+      "answers": {
+        "7da03e78394f41fdad540ae0824ec2a6-gap-1": {
+          "explanation": "The election part is resolved by a complete comparison: receipt abfdbd1823b342409ef4a815bade0407, comparison 0 violated at witness event index 22 (leader with two votes against a committed quorum of three, co-existing with the majority-side leader) and its control holding at index 25. Reproduction depends on whether the single committed voter on the isolated side still hears the majority-side leader, because requestVote refuses candidates while a leader is known (raft.go:1690-1700); with immediate isolation it reproduced twice, with the settled schedule it did not. Entry-level divergence between the two leaders remains unwitnessed - the extended probe found no majority-side leader - so the gap stays open on that point.",
+          "resolved": false
+        }
+      },
+      "joint_history": "Receipt b15f4b6c55b44402ace926204de9b826 supplies the configuration comparison and receipt abfdbd1823b342409ef4a815bade0407 supplies the election comparison; both are complete executions of the same five-voter scenario over identical stores, sizes and snapshot timing, and both report the same configuration values (index 1 with three servers against expected 14 with five, controls at 14 with five). They are separate complete histories rather than fragments: each built its own cluster, and only the comparison declarations and result event names differ between them."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "api_restore_committed_body",
+      "api_addvoter",
+      "api_apply_contract",
+      "raft_quorum_size",
+      "raft_electself_vote_count"
+    ],
+    "scope": {
+      "description": "Five-voter cluster whose leading node is restarted with RestoreCommittedLogs after a snapshot that predates the membership change, isolated together with one committed voter immediately after the restart. Once the isolated node is leader, a client Apply is issued on it and on the majority-side leader if one exists; the partition is then healed and the applied slices of both FSMs are compared. Run with the flag on and off.",
+      "assumptions": [
+        "The isolated node's rebuilt configuration is the three-voter snapshot configuration, so its quorum is two while the committed configuration's quorum is three.",
+        "An Apply that returns success is an acknowledged duty for the client.",
+        "With the flag off the same isolation cannot produce a leader, so the write has no leader to succeed on."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Any FSM divergence or lost-entry claim; the probe did not produce a majority-side leader and such a claim needs both sides to write.",
+        "The established configuration-loss and minority-election findings, which are recorded separately."
+      ],
+      "parameters": {
+        "voters_before": 3,
+        "voters_after": 5,
+        "isolation": "immediately after restart",
+        "apply_timeout_seconds": 2,
+        "heal_settle_seconds": 2
+      }
+    },
+    "prefix": "The harness reuses the same scenario construction as the immediate-isolation experiment (MakeClusterCustom with Peers 3, CommitTrackingLogs and RestoreCommittedLogs; a deliberate Snapshot; MakeClusterNoBootstrap(2) merged and two AddVoter calls; Shutdown and NewRaft on the same stores with a fresh inmem transport; Partition isolating the restarted node plus one committed voter with the pair reconnected). It then waits for the isolated node to become leader, issues Apply on it and on a majority-side leader when one exists, heals by reconnecting every transport, waits two seconds, and emits mvdiv_after_heal with the leadership outcome, both apply outcomes, the conflict index, the applied entries at that index where available, and the applied slice lengths; no production logic is modified.",
+    "responsibility": "The library owns the acknowledgement it gives a client: an Apply that reports success must rest on a majority of the committed configuration, which the caller cannot check from the public API.",
+    "prerequisites": [
+      {
+        "alias": "div_on",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "div_on"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5
+          }
+        ]
+      },
+      {
+        "alias": "div_off",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "div_off"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "mvdiv_after_heal",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "div_on",
+        "assertion": {
+          "field": "minority_apply_ok",
+          "op": "eq",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "A client write must not be acknowledged on the isolated side, whose support is below the committed configuration's quorum; the defect prediction is that it is acknowledged."
+      },
+      {
+        "event": "mvdiv_after_heal",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "div_off",
+        "assertion": {
+          "field": "minority_apply_ok",
+          "op": "eq",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "Control: with the committed configuration rebuilt the isolated side has no leader, so the write cannot be acknowledged there."
+      }
+    ],
+    "previous_id": "f985ee7fb68a4040aaa28a3e7fb6f60c-experiment",
+    "revision_reason": "The divergence harness now emits the startup_before_restart admission event (with mode, snapshots and expected server count) that the declared prerequisites require; the previous execution produced the result events but no admission, so both comparisons could not complete. Scenario, isolation, apply and heal steps and assertions are unchanged."
+  }
+}

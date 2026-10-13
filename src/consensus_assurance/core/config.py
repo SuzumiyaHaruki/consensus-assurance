@@ -3,7 +3,7 @@ import re
 from typing import Literal
 from urllib.parse import urlsplit
 from pydantic import Field, field_validator, model_validator
-from .types import ActivityClass, Record
+from .types import Record
 
 
 class Budget(Record):
@@ -77,7 +77,7 @@ class Config(Record):
     runs_dir: str = "runs"
     cargo_seed_cache_dir: str | None = None
     budget: Budget = Budget()
-    activity_focus: list[ActivityClass] = []
+    investigation_focus: list[str] = []
     directed_question: str | None = None
     fixture: str | None = None
     execution_isolation: Literal["bwrap", "workspace"] = "bwrap"

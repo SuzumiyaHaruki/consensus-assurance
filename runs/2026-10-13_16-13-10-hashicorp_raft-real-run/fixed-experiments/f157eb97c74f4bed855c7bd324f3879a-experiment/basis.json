@@ -1,0 +1,60 @@
+{
+  "id": "f157eb97c74f4bed855c7bd324f3879a-experiment",
+  "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// stallReader is the freeze handshake: its first Read signals and then blocks\n// until released, so a handler that reads from it cannot return.\ntype stallReader struct {\n\tstarted chan struct{}\n\trelease chan struct{}\n\tonce    sync.Once\n}\n\nfunc (s *stallReader) Read(p []byte) (int, error) {\n\ts.once.Do(func() { close(s.started) })\n\t<-s.release\n\treturn 0, io.ErrUnexpectedEOF\n}\n\n// fastPathTransport forwards everything to an in-memory transport but, like the\n// network transport, installs and honours a heartbeat handler: a strictly empty\n// AppendEntries request is dispatched to that handler on the caller's\n// goroutine, and the response is returned to the caller. The in-memory\n// transport's own SetHeartbeatHandler is a no-op, which is why this wrapper\n// exists.\ntype fastPathTransport struct {\n\t*InmemTransport\n\n\thbLock sync.Mutex\n\thbFn   func(RPC)\n}\n\nfunc (t *fastPathTransport) SetHeartbeatHandler(cb func(RPC)) {\n\tt.hbLock.Lock()\n\tt.hbFn = cb\n\tt.hbLock.Unlock()\n}\n\n// deliverHeartbeat mirrors the network transport's classification and dispatch.\nfunc (t *fastPathTransport) deliverHeartbeat(req *AppendEntriesRequest) (*AppendEntriesResponse, error) {\n\tt.hbLock.Lock()\n\tfn := t.hbFn\n\tt.hbLock.Unlock()\n\tif fn == nil {\n\t\treturn nil, fmt.Errorf(\"no heartbeat handler installed\")\n\t}\n\tif !(req.Term != 0 && req.RPCHeader.Addr != nil &&\n\t\treq.PrevLogEntry == 0 && req.PrevLogTerm == 0 &&\n\t\tlen(req.Entries) == 0 && req.LeaderCommitIndex == 0) {\n\t\treturn nil, fmt.Errorf(\"request would not be classified as a heartbeat\")\n\t}\n\trespCh := make(chan RPCResponse, 1)\n\tfn(RPC{Command: req, RespChan: respCh})\n\tr := <-respCh\n\tif r.Error != nil {\n\t\treturn nil, r.Error\n\t}\n\tresp, ok := r.Response.(*AppendEntriesResponse)\n\tif !ok {\n\t\treturn nil, fmt.Errorf(\"unexpected heartbeat response type\")\n\t}\n\treturn resp, nil\n}\n\n// TestAssurance_HeartbeatFastPathThread asks whether the heartbeat fast path\n// runs appendEntries outside the main thread, by occupying the main loop\n// deterministically and then delivering one empty heartbeat with a higher term\n// the way a fast-path transport would, on the caller's goroutine.\nfunc TestAssurance_HeartbeatFastPathThread(t *testing.T) {\n\taddr, itrans := NewInmemTransport(\"\")\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(addr)\n\ttrans := &fastPathTransport{InmemTransport: itrans}\n\tstore := NewInmemStore()\n\tsnaps := NewInmemSnapshotStore()\n\tfsm := &MockFSM{}\n\tconfiguration := Configuration{Servers: []Server{{\n\t\tSuffrage: Voter,\n\t\tID:       ServerID(addr),\n\t\tAddress:  addr,\n\t}}}\n\n\tif err := BootstrapCluster(conf, store, store, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tnode, err := NewRaft(conf, fsm, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\n\tlimit := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(limit) && node.getState() != Leader {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif node.getState() != Leader {\n\t\tt.Fatalf(\"single node did not reach Leader state\")\n\t}\n\n\t// Occupy the main loop through the public Restore path.\n\treader := &stallReader{started: make(chan struct{}), release: make(chan struct{})}\n\trestoreErr := make(chan error, 1)\n\tgo func() {\n\t\trestoreErr <- node.Restore(&SnapshotMeta{Version: 1, ID: \"assurance-fastpath\", Index: 1, Term: 1, Size: 1}, reader, 0)\n\t}()\n\thandshake := \"inside_restore_read\"\n\tselect {\n\tcase <-reader.started:\n\tcase <-time.After(5 * time.Second):\n\t\thandshake = \"timeout\"\n\t}\n\n\ttermBefore := node.getCurrentTerm()\n\tstateBefore := node.getState().String()\n\n\tpeerAddr := trans.EncodePeer(ServerID(\"peer-1\"), ServerAddress(\"peer-1\"))\n\treq := &AppendEntriesRequest{\n\t\tRPCHeader: RPCHeader{\n\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\tID:              []byte(\"peer-1\"),\n\t\t\tAddr:            peerAddr,\n\t\t},\n\t\tTerm:   termBefore + 1,\n\t\tLeader: peerAddr,\n\t}\n\n\thbErr := \"\"\n\thbSuccess := false\n\tif resp, err := trans.deliverHeartbeat(req); err != nil {\n\t\thbErr = err.Error()\n\t} else {\n\t\thbSuccess = resp.Success\n\t}\n\n\t// Sampled while the main loop is still inside the restore handler.\n\ttermDuring := node.getCurrentTerm()\n\tstateDuring := node.getState().String()\n\n\tclose(reader.release)\n\trestoreResult := \"\"\n\tselect {\n\tcase err := <-restoreErr:\n\t\tif err != nil {\n\t\t\trestoreResult = err.Error()\n\t\t}\n\tcase <-time.After(3 * time.Second):\n\t\trestoreResult = \"restore still blocked\"\n\t}\n\n\ttermAfterLoop := node.getCurrentTerm()\n\tstateAfterLoop := node.getState().String()\n\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"heartbeat_fast_path\\\",\\\"node_addr\\\":%q,\\\"freeze_handshake\\\":%q,\"+\n\t\t\"\\\"heartbeat_err\\\":%q,\\\"heartbeat_success\\\":%t,\\\"heartbeat_term\\\":%d,\"+\n\t\t\"\\\"term_before\\\":%d,\\\"state_before\\\":%q,\\\"term_while_loop_blocked\\\":%d,\"+\n\t\t\"\\\"state_while_loop_blocked\\\":%q,\\\"term_after_release\\\":%d,\\\"state_after_release\\\":%q,\"+\n\t\t\"\\\"restore_after_release\\\":%q}\\n\",\n\t\tstring(addr), handshake, hbErr, hbSuccess, req.Term,\n\t\ttermBefore, stateBefore, termDuring, stateDuring,\n\t\ttermAfterLoop, stateAfterLoop, restoreResult)\n\n\t_ = node.Shutdown().Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "processheartbeat",
+      "appendentriesmain",
+      "netxpheartbeat",
+      "inmemnosupport"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "On one real single-node Raft instance built over a transport that implements the heartbeat fast path, occupy the main loop inside a handler, deliver one empty heartbeat with a term above the node's current term, and emit one CA_EVENT JSON line recording the term and leader state sampled while the loop is still blocked, together with the heartbeat response and the states after the loop resumes.",
+      "assumptions": [
+        "The wrapper transport reproduces the network transport's classification and dispatch faithfully (term set, leader address present, zero previous entry and term, no entries, zero leader commit index) and installs the handler exactly as NewRaft expects, so the handler under test is the production processHeartbeat and the appendEntries it calls.",
+        "The freeze handshake used here is the one already validated elsewhere in this run: the caller-supplied reader's first Read proves the main loop is inside its handler, so any term or state read before releasing it cannot have been produced by the main loop.",
+        "One node bootstrapped as the only voter becomes leader on its own, so no peer traffic interferes with the sample.",
+        "A term and state change in that window is a behaviour of the fast path; whether it has a harmful consequence is a separate question, and this execution does not claim one."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test in the captured package plus two helper types it defines locally. It creates a real in-memory transport, wraps it in fastPathTransport, sets the config's LocalID to that address, bootstraps a single-voter configuration with BootstrapCluster and starts the node with NewRaft using an in-memory store, snapshot store and MockFSM, then waits (bounded) for the node to reach Leader state. It occupies the main loop by calling the public Restore with a caller-supplied reader whose first Read closes a channel and then blocks; receiving on that channel is the freeze handshake. While the loop is blocked it samples the node's term and state, builds an empty AppendEntriesRequest with a leader address and a term one above the current term, and delivers it through fastPathTransport.deliverHeartbeat, which applies the network transport's classification and invokes the installed handler on this goroutine, recording the returned success flag or error. It then samples the term and state again while the loop is still blocked, releases the reader so the occupied handler can return, records the Restore error and the states after release, prints one CA_EVENT JSON line with all operands, and shuts the node down.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "09193ea9b7ee4df99810e6eee7058028",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "f157eb97c74f4bed855c7bd324f3879a",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

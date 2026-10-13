@@ -1,0 +1,59 @@
+{
+  "id": "f8d39fe5edeb4560919d7100c0918db3-experiment",
+  "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"bytes\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// fastPathTransport forwards everything to an in-memory transport but, like the\n// network transport, installs and honours a heartbeat handler: a strictly empty\n// AppendEntries request is dispatched to that handler on the caller's goroutine\n// and the response comes back on the supplied channel.\ntype fastPathTransport struct {\n\t*InmemTransport\n\n\thbLock sync.Mutex\n\thbFn   func(RPC)\n}\n\nfunc (t *fastPathTransport) SetHeartbeatHandler(cb func(RPC)) {\n\tt.hbLock.Lock()\n\tt.hbFn = cb\n\tt.hbLock.Unlock()\n}\n\nfunc (t *fastPathTransport) deliverHeartbeat(req *AppendEntriesRequest, wait time.Duration) (*AppendEntriesResponse, error) {\n\tt.hbLock.Lock()\n\tfn := t.hbFn\n\tt.hbLock.Unlock()\n\tif fn == nil {\n\t\treturn nil, fmt.Errorf(\"no heartbeat handler installed\")\n\t}\n\tif !(req.Term != 0 && req.RPCHeader.Addr != nil &&\n\t\treq.PrevLogEntry == 0 && req.PrevLogTerm == 0 &&\n\t\tlen(req.Entries) == 0 && req.LeaderCommitIndex == 0) {\n\t\treturn nil, fmt.Errorf(\"request would not be classified as a heartbeat\")\n\t}\n\trespCh := make(chan RPCResponse, 1)\n\tfn(RPC{Command: req, RespChan: respCh})\n\tselect {\n\tcase r := <-respCh:\n\t\tif r.Error != nil {\n\t\t\treturn nil, r.Error\n\t\t}\n\t\tresp, ok := r.Response.(*AppendEntriesResponse)\n\t\tif !ok {\n\t\t\treturn nil, fmt.Errorf(\"unexpected heartbeat response type\")\n\t\t}\n\t\treturn resp, nil\n\tcase <-time.After(wait):\n\t\treturn nil, fmt.Errorf(\"no response within %s\", wait)\n\t}\n}\n\n// termGateStore behaves like the in-memory store but can be armed so that the\n// next write of the current term is held open: the writer signals on entered\n// and waits for release before the write is applied.\ntype termGateStore struct {\n\t*InmemStore\n\n\tmu      sync.Mutex\n\tarmed   bool\n\tentered chan struct{}\n\trelease chan struct{}\n}\n\nfunc (s *termGateStore) arm() {\n\ts.mu.Lock()\n\ts.armed = true\n\ts.mu.Unlock()\n}\n\nfunc (s *termGateStore) SetUint64(key []byte, val uint64) error {\n\tif bytes.Equal(key, keyCurrentTerm) {\n\t\ts.mu.Lock()\n\t\tarmed := s.armed\n\t\ts.armed = false\n\t\ts.mu.Unlock()\n\t\tif armed {\n\t\t\tclose(s.entered)\n\t\t\t<-s.release\n\t\t}\n\t}\n\treturn s.InmemStore.SetUint64(key, val)\n}\n\n// TestAssurance_TermRegressionControl is the control for the term-regression\n// witness: the same node, the same instrumented store and the same held-open\n// election write, with the one thing missing that the witness had - the empty\n// heartbeat delivered on the fast path during the hold. If the term still fell\n// after the release without that heartbeat, the regression would belong to the\n// instrumentation rather than to the off-main-thread write, and the witness\n// account would have to be withdrawn.\nfunc TestAssurance_TermRegressionControl(t *testing.T) {\n\taddr, itrans := NewInmemTransport(\"\")\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(addr)\n\ttrans := &fastPathTransport{InmemTransport: itrans}\n\tstore := &termGateStore{\n\t\tInmemStore: NewInmemStore(),\n\t\tentered:    make(chan struct{}),\n\t\trelease:    make(chan struct{}),\n\t}\n\tsnaps := NewInmemSnapshotStore()\n\tfsm := &MockFSM{}\n\tconfiguration := Configuration{Servers: []Server{{\n\t\tSuffrage: Voter,\n\t\tID:       ServerID(addr),\n\t\tAddress:  addr,\n\t}}}\n\n\tif err := BootstrapCluster(conf, store, store, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tnode, err := NewRaft(conf, fsm, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\n\tlimit := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(limit) && node.getState() != Leader {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tpeerAddr := trans.EncodePeer(ServerID(\"peer-1\"), ServerAddress(\"peer-1\"))\n\tnewHeartbeat := func(term uint64) *AppendEntriesRequest {\n\t\treturn &AppendEntriesRequest{\n\t\t\tRPCHeader: RPCHeader{\n\t\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\t\tID:              []byte(\"peer-1\"),\n\t\t\t\tAddr:            peerAddr,\n\t\t\t},\n\t\t\tTerm:   term,\n\t\t\tLeader: peerAddr,\n\t\t}\n\t}\n\n\t// Depose the node so that its own election timer starts an election.\n\ttermAsLeader := node.getCurrentTerm()\n\tdeposeErr := \"\"\n\tif _, err := trans.deliverHeartbeat(newHeartbeat(termAsLeader+1), 3*time.Second); err != nil {\n\t\tdeposeErr = err.Error()\n\t}\n\tstore.arm()\n\ttime.Sleep(120 * time.Millisecond)\n\ttermBeforeHold := node.getCurrentTerm()\n\tstateBeforeHold := node.getState().String()\n\n\tgateOpened := false\n\tselect {\n\tcase <-store.entered:\n\t\tgateOpened = true\n\tcase <-time.After(5 * time.Second):\n\t}\n\ttermWhileHeld := node.getCurrentTerm()\n\tpersistedWhileHeld, _ := store.GetUint64(keyCurrentTerm)\n\n\t// No heartbeat is delivered here: the held write is simply released.\n\tclose(store.release)\n\ttime.Sleep(200 * time.Millisecond)\n\n\ttermAfterRelease := node.getCurrentTerm()\n\tpersistedAfterRelease, _ := store.GetUint64(keyCurrentTerm)\n\tstateAfterRelease := node.getState().String()\n\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"term_control_no_heartbeat\\\",\\\"node_addr\\\":%q,\"+\n\t\t\"\\\"depose_err\\\":%q,\\\"term_as_leader\\\":%d,\\\"term_before_hold\\\":%d,\"+\n\t\t\"\\\"state_before_hold\\\":%q,\\\"gate_opened\\\":%t,\\\"term_while_held\\\":%d,\"+\n\t\t\"\\\"persisted_while_held\\\":%d,\\\"term_after_release\\\":%d,\"+\n\t\t\"\\\"persisted_after_release\\\":%d,\\\"state_after_release\\\":%q}\\n\",\n\t\tstring(addr), deposeErr, termAsLeader, termBeforeHold, stateBeforeHold,\n\t\tgateOpened, termWhileHeld, persistedWhileHeld,\n\t\ttermAfterRelease, persistedAfterRelease, stateAfterRelease)\n\n\t_ = node.Shutdown().Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "processheartbeat",
+      "appendentriesmain",
+      "netxpheartbeat",
+      "electself"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Control for the term-regression witness: on the same single-node setup with the same instrumented store, hold the election's term write open and release it without delivering any heartbeat, then emit one CA_EVENT JSON line recording the term and persisted term before the hold, while it is held, and after release, together with the node's state.",
+      "assumptions": [
+        "The setup is identical to the witness harness - in-memory transport wrapped for the heartbeat fast path, instrumented stable store, single-voter bootstrap, a real empty heartbeat to depose the node - so the only difference is the absence of the heartbeat delivered during the hold.",
+        "The instrumented store still holds only the first write of the current term after being armed, so the released write is the election's own.",
+        "If the held write alone produced a fall in the term, the discrimination would fail and the witness account would be withdrawn; the control is therefore a genuine test of the account rather than a supporting demonstration."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed control test plus the local transport wrapper and store wrapper used by the witness. It creates the in-memory transport, wraps it for the heartbeat fast path, wraps the in-memory store so its next write of the current term can be held open, bootstraps a single-voter configuration with BootstrapCluster and starts the node with NewRaft, then waits (bounded) for Leader state. It records the term as leader and delivers an empty heartbeat one term above it, which is a real depose, then arms the store and waits (bounded) for the gate to be entered, recording the term and state at that moment and the persisted term while the write is held. It then releases the gate without delivering anything else, waits briefly, and records the term, the persisted term and the state again, printing one CA_EVENT JSON line tagged term_control_no_heartbeat with all operands, and shuts the node down.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "09193ea9b7ee4df99810e6eee7058028",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "f8d39fe5edeb4560919d7100c0918db3",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

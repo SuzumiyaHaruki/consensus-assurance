@@ -1,7 +1,7 @@
 """One file-backed update; existing references are explicit, new batch names start with @."""
 from typing import Literal
 from pydantic import Field, StrictInt
-from .types import Record, KnowledgeUse
+from .types import Record, KnowledgeUse, GapAnswer
 from .types import EventComparison, EventRequirement, FailureAttribution
 from .types import Scope, SourceAnchor
 
@@ -24,8 +24,6 @@ class QuestionUpdate(Record):
     disposition: Literal["active", "paused", "explained", "closed"] | None = None
     parent_id: str | None = None
     knowledge: list[KnowledgeUse] | None = None
-    counterevidence: list[str] | None = None
-    limitations: list[str] | None = None
     resume_conditions: list[str] | None = None
 
 
@@ -54,11 +52,11 @@ class InterpretationUpdate(Record):
     source_ids: list[str] = Field(min_length=1)
     executions: dict[str, list[StrictInt]] = {}
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
-    defect_claim: Literal["asserted", "refuted", "unresolved"] | None = Field(default=None,
-        description="Current scoped model defect judgment, independent of execution and comparison results; omitted means no explicit current claim")
+    defect_claim: Literal["asserted", "refuted", "unresolved"] | None = Field(
+        description="Explicit current scoped model defect judgment, independent of execution and comparison results; null means no current claim, never inheritance")
     rationale: str = Field(min_length=1)
-    answers: dict[str, str | None] = Field(default_factory=dict,
-        description="Registered gap ID to its sourced or observed answer; null withdraws an earlier answer with the reason in rationale; omitted IDs keep prior answers")
+    answers: dict[str, GapAnswer] = Field(default_factory=dict,
+        description="Registered gap ID to an explanation and explicit model resolution judgment; resolved=false retains or reopens the gap; omitted IDs keep prior responses")
     knowledge: list[KnowledgeUse] = []
     counterevidence: list[str] = []
     limitations: list[str] = []

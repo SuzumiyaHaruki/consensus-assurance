@@ -91,7 +91,7 @@ def test_default_assembly_respects_plugin_dependency_boundary():
                 if isinstance(node,ast.Import):assert all('plugins' not in a.name.split('.') for a in node.names)
     with pytest.raises(ValueError,match='Unknown configured backend'):
         assemble(Config(execution_backend='hashicorp_raft',agent_backend='mock'))
-    assert Config().activity_focus==[]
+    assert Config().investigation_focus==[]
 
 
 def test_cargo_shared_seed_configuration_and_private_paths(tmp_path,monkeypatch):

@@ -1,0 +1,58 @@
+{
+  "rationale": "The remaining gap asks whether the off-main-thread execution of appendEntries can produce a harmful outcome, and I recorded last turn that the candidate I care about most - the main loop's unguarded read-modify-write of the term being overwritten by a higher term written off-thread - had no deterministic witness because the window is a couple of instructions. This turn removes that obstacle without touching production code: the harness supplies the stable store, so it can hold the store's write of the current term open at exactly the point that follows the main loop's read of the term and its computation of the next one. That is the real window, widened rather than invented, and the rest of the sequence is ordinary. The node is deposed with a higher term so its own election timer starts an election; the gate opens when that election reaches setCurrentTerm; while the main loop is held there, one empty heartbeat with a term ten above the current one is delivered on the fast path and is persisted and applied in memory; then the held write is released and the election's lower term lands on top. The operands that decide the question are the term and the persisted term immediately after the heartbeat and immediately after the release: if the term after release is lower than the one already adopted and persisted, a term the node had left is restored, durably, which is exactly the harmful outcome the gap asked about. If instead the term after release stays high, or the gate never opens, the suspicion is defeated or the run is inconclusive, and I will say which in the interpretation that follows the receipt.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": "raft.go marks processHeartbeat and appendEntries as main-thread-only, yet api.go installs processHeartbeat as the transport's heartbeat handler; the network transport dispatches strictly empty AppendEntries requests to it from its connection goroutine, and that request still runs appendEntries' term logic. The term path itself is not guarded against concurrent writers: the candidate path reads the current term, computes the next one and then writes it through setCurrentTerm, which persists and stores without any compare or lock around the pair, so a higher term written by the fast path in between is overwritten when the election's write lands. The node then sits at, and persists, a term it had already adopted and left, and can later accept or issue messages at terms it had already superseded.",
+      "discriminator": "Hold the main loop's term write open by supplying a stable store whose write of the current term can be armed to block once, deliver one empty heartbeat with a term well above the current one on the fast path while it is held, then release and read both the in-memory term and the persisted term: a term after release lower than the term adopted during the hold witnesses a durable term regression caused by the off-thread write; an unchanged term or a gate that never opens would defeat or leave the suspicion undecided. Queued for execution with exactly that harness.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": [],
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "processheartbeat",
+      "appendentriesmain",
+      "netxpheartbeat",
+      "inmemnosupport"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "On one real single-node Raft instance over a transport that implements the heartbeat fast path, hold the main loop's next term write open through an instrumented stable store, deliver one empty heartbeat with a much higher term on the fast path while it is held, then release and emit one CA_EVENT JSON line recording the term and the persisted term before the hold, inside the hold after the heartbeat, and after the release, together with the node's state.",
+      "assumptions": [
+        "The instrumented store implements the same interface as the in-memory store and blocks only the first write of the current term after being armed; the window it holds open is the existing gap between the election's read-modify-write of the term and its store, so no production logic is changed and the harness only widens a window that exists.",
+        "The node is deposed by a real empty heartbeat with a higher term, so the election that follows is the node's own timer-driven election rather than a direct state poke.",
+        "The heartbeat delivered during the hold carries a term far above the current one, so a release that lands a lower term is unambiguous rather than a near tie.",
+        "The wrapper transport reproduces the network transport's classification and dispatch, so the handler under test is the production processHeartbeat and the appendEntries it calls."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test plus two local helper types. It creates an in-memory transport, wraps it in a type that installs and fast-paths strictly empty AppendEntries requests on the caller's goroutine with a bounded response wait, wraps the in-memory store in a type that can be armed to block the next write of the current term while signalling that it has been entered, bootstraps a single-voter configuration with BootstrapCluster and starts the node with NewRaft over those objects, then waits (bounded) for Leader state. It records the term as leader and delivers an empty heartbeat one term above it, which depose the node; it arms the store gate immediately afterwards and waits (bounded, five seconds) for the gate to be entered, which is the main loop's election write being held open, recording the term and state at that moment. It then delivers a second empty heartbeat with a term ten above the current one on the fast path, records the response, the in-memory term and the persisted term, releases the gate, waits briefly, and records the in-memory term, the persisted term and the node's state again. All operands are printed in one CA_EVENT JSON line, and the node is shut down at the end.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

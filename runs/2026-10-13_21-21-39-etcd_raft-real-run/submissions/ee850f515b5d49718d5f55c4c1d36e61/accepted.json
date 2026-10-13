@@ -1,0 +1,123 @@
+{
+  "rationale": "The read-index ack thread is now fully evidenced (measured holds with a retained receipt and a refuted defect claim), so I reselected onto the one in-model consequence of the same v3.7.0 rewrite that I earlier left unclaimed: readOnly.addRequest no longer deduplicates by request context, and every admitted MsgReadIndex also triggers a heartbeat broadcast, so the documented retry contract interacts with a queue and an ack map that have no bound. I record it as a new sourced investigation with an explicit predicate, a behavior fact, and an open necessary question instead of asserting a defect, because whether it is reportable depends on how the caller is permitted to retry and on the leader's quorum situation, and I have not measured either.",
+  "sources": [
+    {
+      "id": "ra_admit",
+      "file": "raft.go",
+      "start_line": 1355,
+      "end_line": 1372,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_add",
+      "file": "read_only.go",
+      "start_line": 54,
+      "end_line": 62,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_send",
+      "file": "raft.go",
+      "start_line": 2146,
+      "end_line": 2162,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_bcast",
+      "file": "raft.go",
+      "start_line": 722,
+      "end_line": 728,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_contract",
+      "file": "node.go",
+      "start_line": 218,
+      "end_line": 224,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@read_retry_growth",
+      "question": "Can a caller that follows the documented ReadIndex retry contract grow the leader's per-request read state without bound? Specifically: does each retried MsgReadIndex (same RequestCtx) add one unconfirmedReads entry and one heartbeat broadcast that are never collapsed, and is there any in-model state (leader isolated from a quorum, checkQuorum disabled or not yet fired) under which the entries are never confirmed and never dropped?",
+      "source_ids": [
+        "ra_admit",
+        "ra_add",
+        "ra_send",
+        "ra_bcast",
+        "ra_contract"
+      ],
+      "hypothesis": "readOnly.addRequest appends unconditionally, without the context-keyed deduplication the v3.6.0 implementation performed, and sendMsgReadIndexResponse calls bcastHeartbeat for every admitted request. Entries leave unconfirmedReads only when a quorum acks the recorded position (readOnly.maybeAdvance), so a leader that cannot obtain quorum acks retains every retried request and rebroadcasts for each, which grows memory and generated traffic with the number of caller retries rather than with the number of distinct reads.",
+      "discriminator": "Establish whether the retry contract permits an unbounded number of retries with an identical RequestCtx while the leader stays in StateLeader without quorum confirmation (checkQuorum disabled, or the retry rate exceeding the election timeout). If that state is reachable under permitted use, the growth is an in-model bounded-resource concern; if the caller is required to bound retries or the leader always confirms or steps down first, the behavior is benign and the suspicion is refuted.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@K_read_retry_state",
+      "kind": "behavior",
+      "statement": "ReadOnlySafe admission and growth, in this snapshot: every MsgReadIndex that reaches a leader is admitted individually - if the cluster is not a singleton and committedEntryInCurrentTerm() holds, sendMsgReadIndexResponse adds one entry to readOnly.unconfirmedReads via readOnly.addRequest (which appends without any lookup of an existing request with the same context) and then broadcasts a heartbeat carrying heartbeatCtx(); if committedEntryInCurrentTerm() does not hold, the raw message is appended to pendingReadIndexMessages and released (one response per queued message) only later, each release again going through addRequest plus a heartbeat broadcast. Entries are removed from unconfirmedReads only by readOnly.maybeAdvance, which requires the quorum ack position to exceed confirmedReads. Nothing in the admission path inspects the RequestCtx, so N retries with an identical context produce N unconfirmedReads entries and N heartbeat broadcasts.",
+      "conditions": "ReadOnlySafe, leader in StateLeader. The behavior is a property of admission, independent of whether the reads are eventually confirmed; under a healthy quorum each retry is confirmed quickly, so the queue stays short. The node-level contract that makes retries the caller's duty is stated at node.go:222-223 ('request can be lost without notice, therefore it is user's job to ensure read index retries').",
+      "source_ids": [
+        "ra_admit",
+        "ra_add",
+        "ra_send",
+        "ra_bcast",
+        "ra_contract"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@read_retry_growth",
+      "question": "What bounds (if any) the number of outstanding read requests a client may have with the same RequestCtx while a leader is in StateLeader but unable to obtain quorum acknowledgements - is any bound stated by the ReadIndex contract, by etcd's usage, or enforced by the library (and does checkQuorum guarantee the leader steps down before the state persists)?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@read_retry_growth",
+      "experiment_id": null,
+      "source_ids": [
+        "ra_admit",
+        "ra_add",
+        "ra_send",
+        "ra_bcast",
+        "ra_contract"
+      ],
+      "executions": {},
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Source-only account; no execution is claimed and none was run for this predicate. What the sources establish: the admission path is per request and context-blind (read_only.go addRequest appends; raft.go sendMsgReadIndexResponse admits then broadcasts; bcastHeartbeat uses heartbeatCtx derived from confirmedReads plus len(unconfirmedReads)), removal requires a quorum ack position to advance maybeAdvance, and the node contract explicitly tells callers to retry ReadIndex requests that can be lost. The predicate I am testing - a caller following that contract can grow the leader's read state without bound - therefore holds mechanically for the admission half, and I demonstrated the arithmetic of the same structures directly with the retained experiment (ack positions and the slice bound depend on confirmedReads and len(unconfirmedReads)). What I cannot settle from sources alone is the applicability half: whether a permitted caller may keep retrying while the leader remains in StateLeader without quorum confirmation, or whether checkQuorum guarantees step-down before that state persists, or whether the library/downstream usage sets a retry bound. I deliberately did not convert this into an asserted defect: (a) the scenario requires the caller to retry without bound - a client that retries forever is the party repeatedly re-creating its own obligation, and the contract says retries are its job without specifying a bound; (b) a leader that cannot obtain quorum acks must not confirm reads, so the nonprogress itself is correct behavior, and only the unbounded accumulation and per-retry broadcast are at issue; (c) with a healthy quorum each retry is confirmed on the next heartbeat response, so the queue length is bounded by the round-trip, and I have not observed a case where it is not; (d) the v3.7.0 changelog presents the removal of context-keyed handling as the fix for stale read indexes on retries, so treating the new growth behavior as a defect would need a bounded-consequence argument I do not yet have. The gap above records exactly what would decide it. This is independent of the refuted ack-validation thread: that one concerned an out-of-contract Context, this one concerns in-contract repeated admission.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "@K_read_retry_state",
+          "revision": 1,
+          "assertion": "each admitted MsgReadIndex appends one unconfirmedReads entry and broadcasts a heartbeat, with no context-keyed deduplication"
+        }
+      ],
+      "counterevidence": [],
+      "limitations": [
+        "Source-only and unresolved: no execution measured unconfirmedReads growth under repeated same-context retries, and no downstream usage (etcd) was examined, so the practical bound is unknown.",
+        "The account assumes ReadOnlySafe; lease-based reads never enter the ack/queue structures.",
+        "Severity is unassessed: I have not shown a concrete memory figure, a triggered OOM, or a liveness failure, only the absence of an internal bound."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

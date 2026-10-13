@@ -79,6 +79,7 @@ def codex_diagnostic(events):
         return (not restricted(low) and not missing(low)
             and any(s in low for s in ('request timed out','stream disconnected','connection reset',
                 'connection closed','tls handshake','unexpected eof','error sending request')))
+    messages = [m if m.strip() else 'Unspecified Codex failure' for m in messages]
     normalized = [m.lower() for m in messages]
     return {'message':redact('\n'.join(messages)),
         'transport_failure':bool(messages) and all(map(transport,normalized)),

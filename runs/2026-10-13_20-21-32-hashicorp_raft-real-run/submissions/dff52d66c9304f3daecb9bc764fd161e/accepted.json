@@ -1,0 +1,277 @@
+{
+  "rationale": "Record consistency fix on the authority question, no new claim. Its limitation says its own experiment only exercises a single-voter configuration and that an election under a stale multi-voter membership is not witnessed there; that variant has since been witnessed under the child multi-voter question (receipt abfdbd1823b342409ef4a815bade0407, minority leadership violated at witness event index 22 with the control holding at 25), so this version names the child receipt in the execution set with joint history and rescopes the limitation to the single-voter sample while keeping the authority witness and its control unchanged.",
+  "sources": [
+    {
+      "id": "api_restore_committed_call",
+      "file": "api.go",
+      "start_line": 604,
+      "end_line": 620,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_restore_committed_doc",
+      "file": "config.go",
+      "start_line": 242,
+      "end_line": 254,
+      "kind": "document_statement"
+    },
+    {
+      "id": "raft_follower_election_abort",
+      "file": "raft.go",
+      "start_line": 228,
+      "end_line": 246,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_electself_vote_count",
+      "file": "raft.go",
+      "start_line": 1999,
+      "end_line": 2060,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": "A node restarted with RestoreCommittedLogs keeps the snapshot's configuration when committed membership changes sit below the restored commit index, so its quorum arithmetic reflects an obsolete membership and it can win an election its committed configuration would forbid.",
+      "discriminator": "Grow a snapshot-age three-voter cluster to five voters, restart the leader, compare the configuration index and server count with the log's latest configuration, then isolate the restarted node with one committed voter and check whether it wins with the smaller quorum while the majority side keeps a leader.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@no_divergence_observed",
+      "kind": "fact",
+      "statement": "In this scenario and window no acknowledged entry was lost after healing: two seconds after the partition healed, the isolated node and the majority-side leader each still held their own acknowledged entry in their own log store, neither had applied an entry absent from its own log, and the flag-off control's isolated side never acknowledged an entry.",
+      "conditions": "Five-voter committed configuration with a three-voter snapshot; RestoreCommittedLogs=true with a CommitTrackingLogStore; the restarted node isolated with one committed voter immediately after NewRaft returns and both sides acknowledging a distinct client write; two second apply timeout and two second heal settle; in-memory log stores.",
+      "source_ids": [
+        "api_restore_committed_body",
+        "api_addvoter",
+        "api_apply_contract"
+      ],
+      "executions": {
+        "4e9eaa72cf594018b8414a8d8efb7cb3": [
+          27,
+          29
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "question": "Does a leader elected with fewer votes than the committed configuration requires reproduce reliably, under which schedule and partition order, and does the committed configuration's majority side then diverge in committed entries?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "ec0aa4e70fc945f59fb6d1ae7a1f1396-question-0",
+      "experiment_id": "ec0aa4e70fc945f59fb6d1ae7a1f1396-experiment",
+      "source_ids": [
+        "api_restore_committed_call",
+        "config_restore_committed_doc",
+        "raft_follower_election_abort",
+        "raft_quorum_size",
+        "raft_electself_vote_count"
+      ],
+      "executions": {
+        "f5cb1459db5e418d9a9aa6987ef76dfc": [
+          11,
+          13
+        ],
+        "abfdbd1823b342409ef4a815bade0407": [
+          22,
+          25
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Receipt f5cb1459db5e418d9a9aa6987ef76dfc (exit 0, fourteen events, no parse loss) settles both comparisons of this question. Comparison 0 is violated by witness event index 11: after restarting the single-voter node with RestoreCommittedLogs on and no snapshot, became_leader is false and the final state is Follower across the whole 1500 ms sampling window, with after_latest_index 0 and the matching admission event recording before_latest_index 1 with one server. Comparison 1 holds at evaluated event index 13: the identical restart without the flag reported became_leader true, final state Leader and after_latest_index 1, so the difference tracks the recovery flag rather than restart timing. Source: with an empty latest configuration runFollower takes the 'no known peers, aborting election' branch and never sets Candidate (raft.go:228-232); even on the candidate path quorumSize() would be one while electSelf asks only the servers in that same empty list (raft.go:1087-1094, 1999-2060); and the configuration is empty because restoreFromCommittedLogs advanced lastApplied past the committed LogConfiguration before the startup scan (api.go:604-620, 724-754). Consequence under the witnessed conditions: a single-voter cluster that restarts with this flag never regains a leader, so duties needing a leader stay pending with no enabled path to completion, since the node's own committed log holds the configuration it would need. The multi-voter variant of the same question was later witnessed under the child question: with a five-voter committed configuration a restarted node kept the stale three-voter configuration and won leadership on two of the committed five votes (receipt abfdbd1823b342409ef4a815bade0407, violated at witness event index 22, control holding at 25), so the authority loss is not confined to an empty configuration.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The flag-off control reaches Leader inside the same 1500 ms window, so the non-campaigning is not a general restart delay.",
+        "The library deliberately grants votes when the server list is empty (a bootstrap affordance), which explains why such a node still answers vote requests; the witnessed defect is the state it resumes with, not the vote-granting rule."
+      ],
+      "limitations": [
+        "This question's own witness is a single-voter configuration with no snapshot; the stale multi-voter election is witnessed under the child question and cited there, not re-observed here.",
+        "The window is bounded at 1500 ms against a 50 ms election timeout, so a much later recovery is not excluded.",
+        "The snapshot-age configuration variant is witnessed through the configuration observation and the child's election, not through this authority sample."
+      ],
+      "joint_history": "Receipt f5cb1459db5e418d9a9aa6987ef76dfc is this question's own execution (single-voter node, no snapshot, wall-clock sampling of the restarted node). Receipt abfdbd1823b342409ef4a815bade0407 belongs to the child multi-voter question and is cited here only for the follow-on statement that the authority loss also occurs with a stale non-empty configuration. The two are complete executions of different scenarios rather than fragments of one history, and neither is used to establish the other's comparison.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "api_restore_committed_body",
+      "api_addvoter",
+      "api_apply_contract",
+      "raft_quorum_size",
+      "raft_electself_vote_count",
+      "raft_log_matching"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Five-voter cluster whose leading node is restarted with RestoreCommittedLogs after a snapshot predating the membership change, isolated with one committed voter immediately after the restart; both sides acknowledge a distinct client write, the partition heals, and after eight seconds the event reports whether the two nodes' logs hold different entries at the same index, whether either node applied an entry absent from its own log, and the leadership and acknowledgement outcomes. Run with the flag on and off.",
+      "assumptions": [
+        "A successful Apply is an acknowledgement to the client.",
+        "Two nodes holding different entries at the same log index after healing is a violation of log agreement.",
+        "Eight seconds is enough for AppendEntries exchange between the two sides."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Entry contents at the conflict index, which the probe reports as empty strings.",
+        "Any claim about durable stores; the in-memory stores are used."
+      ],
+      "parameters": {
+        "voters_before": 3,
+        "voters_after": 5,
+        "isolation": "immediately after restart",
+        "heal_settle_seconds": 8,
+        "apply_timeout_seconds": 2
+      }
+    },
+    "prefix": "The harness reuses the multi-voter scenario construction and the two-sided apply, then scans each side's log store for its own acknowledged entry, compares the two nodes' entries at the isolated side's last index, and emits logs_differ_at_conflict_index with the per-side log and FSM survival flags, the applied-without-log operands, and the leadership and acknowledgement outcomes. No production logic is modified.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "The library owns log agreement: after a partition heals, two replicas of the committed configuration must not hold different entries at the same index, especially when both writes were acknowledged to clients.",
+    "prerequisites": [
+      {
+        "alias": "div_on",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "div_on",
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "div_off",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "div_off",
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "mvdiv_after_heal",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "div_on",
+        "assertion": {
+          "field": "logs_differ_at_conflict_index",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "After healing, the two nodes must agree at the index where the isolated side wrote; the defect prediction is that they hold different entries there."
+      },
+      {
+        "event": "mvdiv_after_heal",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "div_off",
+        "assertion": {
+          "field": "logs_differ_at_conflict_index",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "Control: with the committed configuration rebuilt the isolated side never writes, so the two logs cannot differ at that index."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": "6881adc238a54f2191c2ff9a3871261e-experiment",
+    "revision_reason": "The heal settle is extended from two to eight seconds so a losing suffix has time to be truncated, and the event now carries logs_differ_at_conflict_index, which compares the two nodes' log entries at the index where the isolated side wrote. Scenario, isolation, waits and the two-sided apply are unchanged."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

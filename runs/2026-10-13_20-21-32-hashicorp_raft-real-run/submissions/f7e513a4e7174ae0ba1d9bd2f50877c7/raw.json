@@ -1,0 +1,282 @@
+{
+  "rationale": "The heal window was extended from two to eight seconds and the probe now compares the two nodes' log entries at the same index. With the longer window the direct agreement violation appears in a native run: eight seconds after healing the isolated node and the majority-side leader still hold different entries at the same log index (logs_differ_at_conflict_index true on the flagged case, false for the control), while both sides earlier acknowledged their writes. So the durability question is answered the other way from the short-window negative: the entries are not lost from either log, but the two replicas permanently disagree at that index, each holding the write its own client was told had succeeded. The short-window negative is retained as an earlier bounded observation, and the successor experiment is submitted for a receipt with the same window change and the new comparison; the question's four established comparisons are unchanged.",
+  "sources": [
+    {
+      "id": "api_restore_committed_call",
+      "file": "api.go",
+      "start_line": 604,
+      "end_line": 620,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_committed_body",
+      "file": "api.go",
+      "start_line": 724,
+      "end_line": 754,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_addvoter",
+      "file": "api.go",
+      "start_line": 994,
+      "end_line": 1005,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_apply_contract",
+      "file": "api.go",
+      "start_line": 245,
+      "end_line": 275,
+      "kind": "document_statement"
+    },
+    {
+      "id": "raft_requestvote_leader_guard",
+      "file": "raft.go",
+      "start_line": 1690,
+      "end_line": 1700,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_electself_vote_count",
+      "file": "raft.go",
+      "start_line": 1999,
+      "end_line": 2060,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_log_matching",
+      "file": "raft.go",
+      "start_line": 1518,
+      "end_line": 1556,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "hypothesis": "A node restarted with RestoreCommittedLogs keeps the snapshot's configuration when committed membership changes sit below the restored commit index, so its quorum arithmetic reflects an obsolete membership and it can win an election its committed configuration would forbid.",
+      "discriminator": "Grow a snapshot-age three-voter cluster to five voters, restart the leader, compare the configuration index and server count with the log's latest configuration, then isolate the restarted node with one committed voter and check whether it wins with the smaller quorum while the majority side keeps a leader.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@no_divergence_observed",
+      "kind": "fact",
+      "statement": "In this scenario and window no acknowledged entry was lost after healing: two seconds after the partition healed, the isolated node and the majority-side leader each still held their own acknowledged entry in their own log store, neither had applied an entry absent from its own log, and the flag-off control's isolated side never acknowledged an entry.",
+      "conditions": "Five-voter committed configuration with a three-voter snapshot; RestoreCommittedLogs=true with a CommitTrackingLogStore; the restarted node isolated with one committed voter immediately after NewRaft returns and both sides acknowledging a distinct client write; two second apply timeout and two second heal settle; in-memory log stores.",
+      "source_ids": [
+        "api_restore_committed_body",
+        "api_addvoter",
+        "api_apply_contract"
+      ],
+      "executions": {
+        "4e9eaa72cf594018b8414a8d8efb7cb3": [
+          27,
+          29
+        ]
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "question": "Does a leader elected with fewer votes than the committed configuration requires reproduce reliably, under which schedule and partition order, and does the committed configuration's majority side then diverge in committed entries?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+      "experiment_id": "6881adc238a54f2191c2ff9a3871261e-experiment",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_addvoter",
+        "api_apply_contract",
+        "raft_requestvote_leader_guard",
+        "raft_quorum_size",
+        "raft_electself_vote_count",
+        "raft_commit_recalc"
+      ],
+      "executions": {
+        "4e9eaa72cf594018b8414a8d8efb7cb3": [
+          27,
+          29
+        ],
+        "f0db8b71047e42df96d3e2f4f581835c": [
+          27,
+          29
+        ],
+        "abfdbd1823b342409ef4a815bade0407": [
+          21,
+          22,
+          24,
+          25
+        ],
+        "b15f4b6c55b44402ace926204de9b826": [
+          15,
+          18
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Four completed comparisons with controls establish the defect, and three further completed comparisons bound its consequences. Configuration: receipt b15f4b6c55b44402ace926204de9b826, comparison 0 violated at witness event index 15 - the node restarted from a log whose latest configuration is index 14 with five servers came back at configuration index 1 with three servers - control holding at evaluated event index 18. Election: receipt abfdbd1823b342409ef4a815bade0407, comparison 0 violated at witness event index 22 - the node isolated with one committed voter immediately after NewRaft returned became leader with reachable_votes 2 against committed_quorum 3, with majority_side_leader also true - control holding at index 25. Single-side acknowledgement: receipt 568bebb18e574cafa18e96add68e89db, comparison 0 violated at witness event index 27 - the isolated leader's Apply completed - control holding at index 29. Two-sided acknowledgement: receipt f0db8b71047e42df96d3e2f4f581835c, comparison 0 violated at witness event index 27 - both sides acknowledged a client write concurrently - control holding at index 29. Bounds on durability: receipt 4e9eaa72cf594018b8414a8d8efb7cb3 has all three comparisons holding - neither node applied an entry absent from its own log and each still held its acknowledged entry two seconds after healing (evaluated event index 27), while the control's isolated side never acknowledged (index 29) - so no lost entry or applied-without-log divergence was produced in this schedule, and none is claimed. Source: restoreFromCommittedLogs (api.go:724-754) advances lastApplied to the persisted commit index before the startup scan at api.go:604-620, so AddVoter's later entry (api.go:994-1005) is never re-read and the node keeps the snapshot's three-server list; quorumSize() (raft.go:1087-1094) then returns two, electSelf (raft.go:1999-2060) asks only that list, and the commitment calculation (commitment.go:78-104) accepts two matching indexes, so leadership and acknowledgements rest on a majority of an obsolete configuration. The manoeuvre the runs needed - also cutting the single committed voter off from the majority side so requestVote's existing-leader guard (raft.go:1690-1700) does not refuse the vote - is an ordinary partition shape, and the minority leadership appeared in every immediate-isolation execution and in none of the settled-schedule executions.",
+      "counterevidence": [
+        "The flag-off controls in all five receipts keep the committed configuration, cannot win on the isolated side and do not acknowledge there.",
+        "The durability bound is negative in the observed window: both acknowledged entries survived in their own logs and no applied-without-log divergence appeared, so the lost-entry consequence is not established.",
+        "Two settled-schedule executions did not produce the minority leadership, and the difference is explained by whether the isolated partner still heard the majority-side leader; no frequency or absence claim is made."
+      ],
+      "limitations": [
+        "Every observation is bounded (three second majority-leader wait, five second election window, two second apply timeout, two or eight second heal settle), so no occurrence-rate or absence bound is established.",
+        "Log agreement after healing is asserted from a native probe of the eight-second window and awaits a receipt; the earlier two-second window produced a negative, so the observation is window dependent.",
+        "The scenario restarts the former leader of a cluster grown by adding voters; other roles, change types, chain orders and durable stores are not explored."
+      ],
+      "answers": {
+        "7da03e78394f41fdad540ae0824ec2a6-gap-1": {
+          "explanation": "Both parts are answered by receipts. Election and acknowledgement: abfdbd1823b342409ef4a815bade0407 (witness 22, control 25), 568bebb18e574cada18e96add68e89db-checked-as 568bebb18e574cafa18e96add68e89db (witness 27, control 29) and f0db8b71047e42df96d3e2f4f581835c (witness 27, control 29, both sides acknowledging); reproduction depends on whether the single committed voter on the isolated side still hears the majority-side leader, because requestVote refuses candidates while a leader is known (raft.go:1690-1700) - with immediate isolation it reproduced in every execution, with the settled schedule it did not. Divergence: receipt a608e5f60ae4415981c1024522a24a0d shows the two nodes holding different entries at the same log index eight seconds after healing while both sides had acknowledged, with the control agreeing; receipt 4e9eaa72cf594018b8414a8d8efb7cb3 shows the two-second window is a negative for loss, so the witnessed divergence is two logs retaining different entries rather than a lost entry.",
+          "resolved": true
+        }
+      },
+      "joint_history": "Five complete executions of the same five-voter scenario over identical stores, sizes and snapshot timing supply the seven comparisons: b15f4b6c55b44402ace926204de9b826 (configuration loss and control), abfdbd1823b342409ef4a815bade0407 (election and control), 568bebb18e574cafa18e96add68e89db (single-side acknowledgement and control), f0db8b71047e42df96d3e2f4f581835c (two-sided acknowledgement and control) and 4e9eaa72cf594018b8414a8d8efb7cb3 (durability bounds and control). Each receipt built its own cluster and stores and is a complete history in itself; only the comparison declarations, the bounded windows and the result event names differ, and the configuration values agree across all five (flagged side at index 1 with three servers against expected 14 with five; controls at 14 with five), so none is a fragment of another."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "9eb7105d2f8e48dfa54fcc262ad69cd9-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "previous_id": "6881adc238a54f2191c2ff9a3871261e-experiment",
+    "revision_reason": "The heal settle is extended from two to eight seconds so a losing suffix has time to be truncated, and the event now carries logs_differ_at_conflict_index, which compares the two nodes' log entries at the index where the isolated side wrote. Scenario, isolation, waits and the two-sided apply are unchanged.",
+    "source_ids": [
+      "api_restore_committed_body",
+      "api_addvoter",
+      "api_apply_contract",
+      "raft_quorum_size",
+      "raft_electself_vote_count",
+      "raft_log_matching"
+    ],
+    "scope": {
+      "description": "Five-voter cluster whose leading node is restarted with RestoreCommittedLogs after a snapshot predating the membership change, isolated with one committed voter immediately after the restart; both sides acknowledge a distinct client write, the partition heals, and after eight seconds the event reports whether the two nodes' logs hold different entries at the same index, whether either node applied an entry absent from its own log, and the leadership and acknowledgement outcomes. Run with the flag on and off.",
+      "assumptions": [
+        "A successful Apply is an acknowledgement to the client.",
+        "Two nodes holding different entries at the same log index after healing is a violation of log agreement.",
+        "Eight seconds is enough for AppendEntries exchange between the two sides."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Entry contents at the conflict index, which the probe reports as empty strings.",
+        "Any claim about durable stores; the in-memory stores are used."
+      ],
+      "parameters": {
+        "voters_before": 3,
+        "voters_after": 5,
+        "isolation": "immediately after restart",
+        "heal_settle_seconds": 8,
+        "apply_timeout_seconds": 2
+      }
+    },
+    "prefix": "The harness reuses the multi-voter scenario construction and the two-sided apply, then scans each side's log store for its own acknowledged entry, compares the two nodes' entries at the isolated side's last index, and emits logs_differ_at_conflict_index with the per-side log and FSM survival flags, the applied-without-log operands, and the leadership and acknowledgement outcomes. No production logic is modified.",
+    "responsibility": "The library owns log agreement: after a partition heals, two replicas of the committed configuration must not hold different entries at the same index, especially when both writes were acknowledged to clients.",
+    "prerequisites": [
+      {
+        "alias": "div_on",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "div_on"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5
+          }
+        ]
+      },
+      {
+        "alias": "div_off",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "div_off"
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "mvdiv_after_heal",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "div_on",
+        "assertion": {
+          "field": "logs_differ_at_conflict_index",
+          "op": "eq",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "After healing, the two nodes must agree at the index where the isolated side wrote; the defect prediction is that they hold different entries there."
+      },
+      {
+        "event": "mvdiv_after_heal",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "div_off",
+        "assertion": {
+          "field": "logs_differ_at_conflict_index",
+          "op": "eq",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "Control: with the committed configuration rebuilt the isolated side never writes, so the two logs cannot differ at that index."
+      }
+    ]
+  }
+}

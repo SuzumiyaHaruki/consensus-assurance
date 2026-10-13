@@ -55,24 +55,27 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     def initial(state):
         return opinion(state,defect_claim='asserted',rationale='Compare the actual return. The initial model alleges a defect',
             counterevidence=['The documented input bound may exclude this caller'],limitations=['Only one call was observed'],
-            answers={state['investigations'][0]['gaps'][0]['id']:'Initial contract reading'})
+            answers={state['investigations'][0]['gaps'][0]['id']:dict(explanation='Initial contract reading',resolved=True)})
     def correction(state):
         return opinion(state,experiment_id=None,conclusion='conditional',rationale='Caller history remains unestablished',
             counterevidence=['The actual caller duty excludes the alleged general obligation'],
             limitations=['No broader consensus conclusion follows'],
-            answers={state['investigations'][0]['gaps'][0]['id']:None if claim=='refuted' else 'The cited local contract controls this call'},
-            **({'defect_claim':claim} if claim else {}))
+            answers={state['investigations'][0]['gaps'][0]['id']:dict(resolved=claim!='refuted',
+                explanation='The earlier answer did not establish the actual caller condition' if claim=='refuted' else 'The cited local contract controls this call')},
+            defect_claim=claim)
     e,repo=engine_for(tmp_path,[start,initial,correction,stop]);s=e.start(repo)
     before=s.model_dump(mode='json')
     text=render_report(s,e.root).read_text()
     current,execution=text.split('Fixed experiment `',1)
     execution,history=execution.split('Interpretation history:',1)
     for value in [s.interpretations[-1].rationale,*s.interpretations[-1].counterevidence,
-                  *s.interpretations[-1].limitations,*filter(None,s.interpretations[-1].answers.values())]:
+                  *s.interpretations[-1].limitations,*[v.explanation for v in s.interpretations[-1].answers.values()]]:
         assert value in current and text.count(value)==1
     if claim=='refuted':
-        assert 'previous answer withdrawn; necessary gap remains open' in current and 'Which caller contract applies?' in current
+        assert 'gap remains open:' in current and 'Which caller contract applies?' in current
     assert current.count('Was the producer history legal?')==1
+    assert not {'counterevidence','limitations'} & s.investigations[0].model_dump().keys()
+    assert 'Question counterevidence:' not in text and 'Question boundaries:' not in text
     for value in [s.interpretations[0].rationale,*s.interpretations[0].counterevidence,*s.interpretations[0].limitations]:
         assert value in history and text.count(value)==1
     assert 'historical interpretation; the question has a later account' in execution

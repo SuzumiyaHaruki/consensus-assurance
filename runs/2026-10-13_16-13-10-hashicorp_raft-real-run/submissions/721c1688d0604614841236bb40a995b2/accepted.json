@@ -1,0 +1,231 @@
+{
+  "rationale": "The shutdown experiment completed on a clean copy (CheckRun c5d127c955b549a8888fe6bab568dbce, exit 0) and its single parsed event settles the open question: the accepted duty never completed. On one real cluster the freeze handshake fired (freeze_handshake=inside_restore_read, so the main loop was provably inside the Restore handler and could no longer select on applyCh), the control Barrier on the undisturbed leader returned no error (so the same public call does complete when a producer exists), the leader accepted the Barrier future in state Leader, Shutdown() moved it to state Shutdown, and after the bounded observation the future had still not been responded while queued_in_apply_ch=1 with capacity 64. The release path then returned 'failed to write snapshot: unexpected EOF', confirming that the occupied handler was the node's own main loop and that it resumed and exited cleanly. The recorded discriminator said a completion would defeat the suspicion and must name the responding producer; none occurred, and source shows none can: the logFuture has no ShutdownCh (future.go:113-118 with only the internal restore and snapshot futures wired to shutdownCh), the main loop leaves on shutdownCh and runFSM exits with it, and runLeader's defer responds only futures already on leaderState.inflight. I therefore record the witnessed fact, answer the gap, and assert the scoped defect with its conditions, counterweight and limits stated.",
+  "sources": [
+    {
+      "id": "timeoutnow",
+      "file": "raft.go",
+      "start_line": 2209,
+      "end_line": 2214,
+      "kind": "code_observation"
+    },
+    {
+      "id": "xferprevoteskip",
+      "file": "raft.go",
+      "start_line": 294,
+      "end_line": 300,
+      "kind": "code_observation"
+    },
+    {
+      "id": "electself",
+      "file": "raft.go",
+      "start_line": 1976,
+      "end_line": 2043,
+      "kind": "code_observation"
+    },
+    {
+      "id": "pickserver",
+      "file": "raft.go",
+      "start_line": 2163,
+      "end_line": 2182,
+      "kind": "code_observation"
+    },
+    {
+      "id": "requestvoteorder",
+      "file": "raft.go",
+      "start_line": 1658,
+      "end_line": 1684,
+      "kind": "code_observation"
+    },
+    {
+      "id": "xferapi",
+      "file": "api.go",
+      "start_line": 1276,
+      "end_line": 1282,
+      "kind": "code_observation"
+    },
+    {
+      "id": "followervotegate",
+      "file": "raft.go",
+      "start_line": 240,
+      "end_line": 250,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": "Apply and Barrier hand the caller a logFuture as soon as the send into applyCh succeeds; with BatchApplyCh the channel is buffered, so acceptance and consumption are separate events. That logFuture has no ShutdownCh, Shutdown() closes shutdownCh and sets state Shutdown without draining applyCh, and both the main loop and runFSM leave on shutdownCh, so a future left in the buffer has no producer that can respond it: Error() blocks indefinitely and the caller's timeout, which only guarded the enqueue, cannot save it. runLeader's defer responds only futures on leaderState.inflight, so it does not cover a future that was never dispatched. Confirmed by observation: accepted in state Leader, still queued and unresponded after state Shutdown.",
+      "discriminator": "Occupy the main loop inside a handler (a public Restore with a caller-supplied reader that stalls on its first Read, which is the handshake), accept one Barrier future through the ordinary public path so it lands in the buffered applyCh, then call Shutdown() and observe whether the future is ever responded: a completion would defeat the suspicion and must name the responding producer, while non-completion together with the future still being queued in applyCh shows the duty was accepted and then lost. Executed: no completion; the duty stayed queued with the node in state Shutdown.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": [
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+          "revision": 1,
+          "assertion": "the caller's timeout guards only the enqueue, and the returned logFuture has no ShutdownCh, so completion is unbounded once the duty is accepted"
+        },
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+          "revision": 1,
+          "assertion": "Shutdown() drains nothing and runLeader's defer covers only leaderState.inflight, so a duty left in applyCh loses its producer"
+        }
+      ],
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    },
+    {
+      "id": null,
+      "ref": "@transfer_target_not_validated",
+      "question": "When a caller names a server that holds no vote as the target of an explicit leadership transfer, does the named server acquire leadership, and what happens to the sitting leader's authority?",
+      "source_ids": [
+        "xferapi",
+        "timeoutnow",
+        "xferprevoteskip",
+        "electself",
+        "requestvoteorder",
+        "pickserver",
+        "followervotegate"
+      ],
+      "hypothesis": "LeadershipTransferToServer forwards the caller's id and address to the transfer routine, which only requires a replication state for that server, so a vote-less member is accepted as a target. On that target the TimeoutNow handler sets Candidate and the leadership-transfer flag unconditionally and the candidate loop skips pre-vote because of that flag, so the target runs a real election at term+1; but electSelf casts a self-vote only when the local server is a Voter in the latest configuration, and voters receiving a RequestVote from a member that holds no vote reject it - after already adopting the higher term. The requested transfer is therefore unachievable: the named target can never win, while its higher-term vote request deposes the sitting leader, and the caller's future is answered without error because losing leadership during a transfer is reported as success. pickServer shows the implicit path deliberately skips non-voters, so the explicit path accepts an input the implicit path excludes.",
+      "discriminator": "Demote one real follower to a non-voter through the public API, then call LeadershipTransferToServer on that member and sample the real nodes for a bounded interval: whether the named target ever reaches Leader, which servers do lead, whether the original leader still leads at the end, the reported transfer error, and the term before and after. The named target reaching Leader, or leadership staying put with no term movement, would defeat the suspicion.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@observed_duty_lost_at_shutdown",
+      "kind": "fact",
+      "statement": "On one real bootstrapped three-node cluster with BatchApplyCh enabled, a Barrier future handed to the caller by the public API while the leader was occupied inside its own Restore handler was never responded after Shutdown(): the node moved from state Leader at acceptance to state Shutdown, the duty remained queued in applyCh (queued_in_apply_ch=1, capacity 64) and the future's Error() had not returned after the bounded 3000 ms observation. The control Barrier on the undisturbed leader returned no error, and the occupied handler resumed afterwards (restore returned 'failed to write snapshot: unexpected EOF').",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(3) with conf.BatchApplyCh=true; the main loop occupied by a public Restore whose caller-supplied reader stalls on its first Read at the moment the Barrier is accepted; Shutdown() called after acceptance and before any consumer drains applyCh.",
+      "source_ids": [
+        "applybarrier",
+        "batchapplyconfig",
+        "shutdown",
+        "runleaderdefer",
+        "defererror"
+      ],
+      "executions": {
+        "c5d127c955b549a8888fe6bab568dbce": [
+          0
+        ]
+      },
+      "knowledge": [
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+          "revision": 1,
+          "assertion": "Apply/ApplyLog/Barrier use the timeout only for the enqueue and the returned logFuture has no ShutdownCh, so acceptance is not followed by any timeout- or shutdown-bounded completion"
+        },
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+          "revision": 1,
+          "assertion": "Shutdown() closes shutdownCh and sets state Shutdown without draining applyCh, and runLeader's defer responds only futures already on leaderState.inflight, so a duty left in the buffer has no remaining producer"
+        }
+      ],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@transfer_target_not_validated",
+      "question": "Can a member that holds no vote ever acquire leadership after being named as an explicit leadership-transfer target, and what does the caller's transfer future report in that case?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+      "experiment_id": "f2c2b4e0415449d4941c8e53ffbc722e-experiment",
+      "source_ids": [
+        "applybarrier",
+        "batchapplyconfig",
+        "defererror",
+        "shutdown",
+        "runleaderdefer",
+        "aftershutdown"
+      ],
+      "executions": {
+        "c5d127c955b549a8888fe6bab568dbce": [
+          0
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "The declared discriminator resolved in the direction that supports the defect account, and the decisive operands come from one instance in one execution rather than from a join across scenarios: control_barrier_err is empty (the same Barrier call completed on the undisturbed leader, so acceptance and completion work when a producer exists), freeze_handshake is inside_restore_read (the main loop was inside its own restore handler and could not select on applyCh again), state_at_accept is Leader and duty_accepted is true (the public API handed the caller a future), state_after_shutdown is Shutdown, and the observation reports result=no_completion over a 3000 ms interval with queued_in_apply_ch=1 and apply_ch_capacity=64 - the accepted duty was still sitting in the buffer, with no consumer, after authority was lost. restore_after_release='failed to write snapshot: unexpected EOF' shows that the occupied handler was the node's main loop and that it did resume once the reader was released, which also rules out the harness having wedged the node in some other way. The interval is stated as what it is: 3000 ms of non-progress is not by itself the evidence for indefinite blocking; the indefinite part is source-fixed, and it is why the future can never be woken - deferError.Error() waits on the internal error channel alone once respond has not been called (future.go:113-118), and this logFuture is created without a ShutdownCh, unlike the internal restore and snapshot futures that do get one (raft.go:1169, raft.go:1914, snapshot.go:152); Shutdown() only closes shutdownCh and sets state Shutdown (api.go:1012-1025) while both the main loop and runFSM leave on that channel; and runLeader's defer responds only the futures already recorded on leaderState.inflight (raft.go:502-560), which a duty that never left applyCh is not. The duty was therefore accepted, its basis (a live leader to dispatch it) disappeared, and the accepted obligation was neither cancelled with a reason nor transferred: it was dropped silently, which is exactly the failure the repository's own test file flags for this family at raft_test.go:40-42. The condition that makes it reachable is the documented one: BatchApplyCh decouples acceptance from consumption (config.go:169-174), and the same comment concedes it breaks the timeout guarantee on Apply, so a caller that trusts a positive timeout to bound its wait is not protected.",
+      "answers": {
+        "f2c2b4e0415449d4941c8e53ffbc722e-gap-1": "No producer responded the accepted Barrier future after Shutdown(), and the duty was still queued at that point: with the leader occupied inside its own Restore handler, the Barrier future was accepted in state Leader and, after Shutdown() moved the node to state Shutdown, the future had not been responded within the 3000 ms observation while len(applyCh)=1 of capacity 64 (CheckRun c5d127c955b549a8888fe6bab568dbce, parsed event 0)."
+      },
+      "knowledge": [
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+          "revision": 1,
+          "assertion": "the timeout guards only the enqueue into applyCh and the returned logFuture has no ShutdownCh, so no timeout- or shutdown-bounded completion follows acceptance"
+        },
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+          "revision": 1,
+          "assertion": "Shutdown() leaves applyCh undrained and runLeader's defer responds only leaderState.inflight futures, so the queued duty has no remaining producer"
+        }
+      ],
+      "counterevidence": [
+        "The reachable window needs the main loop to be occupied at the moment of acceptance and shutdown; the harness makes that deterministic with a caller-supplied reader that stalls, so the execution shows the mechanism, not a frequency of occurrence under spontaneous timing.",
+        "The window also needs BatchApplyCh (config.go:169-174); with the default unbuffered applyCh the enqueue itself is the handoff, so the same duty would instead be rejected at enqueue via the caller's timeout or shutdownCh escape in Apply.",
+        "The node was in the middle of an orderly shutdown, so one can argue a shutting-down node owes nothing in flight; the defect account rests on the narrower observation that the API had already accepted the duty and returned a future whose Error() has no shutdown notice and no timeout, leaving the caller unable to distinguish dropped from pending."
+      ],
+      "limitations": [
+        "Single node and single execution; the claim that no completion path remains rests on the source argument above (no writer to the error channel after shutdown; every completer exits on shutdownCh), not on repeated sampling or on an unbounded wait.",
+        "Only the Barrier path was executed. VerifyLeader constructs its verifyFuture without a ShutdownCh too and sends it on a 64-buffered channel (api.go:883-893, api.go:568), so it shares the shape, but that is a source-level observation and was not exercised.",
+        "The scenario models a slow caller-supplied stream keeping the handler busy; it does not claim that shutdown always finds a duty in the buffer."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@transfer_target_not_validated",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "xferapi",
+      "timeoutnow",
+      "xferprevoteskip",
+      "electself",
+      "requestvoteorder",
+      "pickserver",
+      "followervotegate"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "On one real four-node cluster, demote one follower to a non-voter through the public API, name it as the target of an explicit leadership transfer, and emit one CA_EVENT JSON line recording the reported transfer error, whether the named target ever reached Leader, which servers led during a bounded interval, the state of the original leader and of the target at the end, and the cluster term before and after.",
+      "assumptions": [
+        "MakeCluster(4, t, nil) gives four real voters and a real leader; DemoteVoter is supported at protocol version 3, so the target stays a connected, log-receiving member of the committed configuration that simply holds no vote.",
+        "The target is chosen among nodes actually in Follower state, so it is a viable replication peer and the transfer routine's catch-up wait can be satisfied and the TimeoutNow actually delivered.",
+        "The bounded 3 s sampling window only observes leadership outcomes; the claim that a vote-less member cannot win rests on the election code (self-vote and voter gate), not on the window length."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test in the captured package. It bootstraps a real four-voter cluster with MakeCluster(4, t, nil), takes the single elected leader via c.Leader(), waits for a follower using c.WaitEvent and c.GetInState, and demotes that follower with leader.DemoteVoter(target.localID, 0, 5s), recording demote_err and confirming the target's suffrage from the leader's latest configuration. It samples the maximum current term across c.rafts, then calls leader.LeadershipTransferToServer(target.localID, target.localAddr) through the public API and records the error its future reports. It then polls every 20 ms for up to 3 s across all nodes in c.rafts, recording every address observed in Leader state, whether the named target was ever among them, and whether the original leader led again, and finally records the maximum term after the window and the end states of the original leader and the target. All operands are printed in one CA_EVENT JSON line, so the decisive facts (reported transfer outcome, who led, whether the named target ever led, term movement) come from the same nodes in one execution.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

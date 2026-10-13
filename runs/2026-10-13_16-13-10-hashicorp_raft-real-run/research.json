@@ -1,0 +1,2275 @@
+{
+  "run_id": "6f7d2c4c06d3406183d955b88ad140a6",
+  "method": "audit-products-v72",
+  "allocation": {
+    "seconds": 0,
+    "agent_calls": 34,
+    "experiments": 26
+  },
+  "source_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/agent-source",
+  "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/draft",
+  "state_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/state.json",
+  "submission_schema": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/submission.schema.json",
+  "method_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/audit-method.md",
+  "directed_question": null,
+  "activity_focus": [],
+  "investigations": [
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-question-0",
+      "version": 2,
+      "question": "For a running cluster, does the public configuration API expose the index of the latest configuration entry, and what value does a caller actually receive from ConfigurationFuture.Index()?",
+      "hypothesis": "GetConfiguration() constructs configurationsFuture{latest: r.getLatestConfiguration()} and responds immediately, so latestIndex/committedIndex stay zero and Index() returns 0 for every call, independent of cluster state; the real r.configurations.latestIndex is transferred to callers only through configurationsCh. Stats() publishes the same zero as latest_configuration_index, so the reported configuration index is a constant while the reported configuration itself is live. Confirmed by observation on a running bootstrapped leader: main-thread latest index 1 versus public index 0 in one execution.",
+      "discriminator": "On one running bootstrapped leader, sample f.Index() and Stats()[\"latest_configuration_index\"] together with the main-thread latestIndex obtained from the same instance over configurationsCh; if the public values track the real index the hypothesis is wrong, if the public values stay 0 while the main-thread index is >= 1 it holds. Executed: the public values stayed 0 while the main-thread index was 1.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "getconfig",
+        "futureindex",
+        "getlatest",
+        "configsch",
+        "stats"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [
+        {
+          "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-0",
+          "revision": 1,
+          "assertion": "GetConfiguration() carries only the Configuration (latestIndex left zero), so ConfigurationFuture.Index() is 0 on every call while the main thread holds the real latest configuration index and releases it only over configurationsCh"
+        },
+        {
+          "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-1",
+          "revision": 1,
+          "assertion": "Stats() publishes latest_configuration_index from the same GetConfiguration() future, i.e. the constant string \"0\", next to a live latest_configuration"
+        },
+        {
+          "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-2",
+          "revision": 1,
+          "assertion": "nextConfiguration enforces the caller's precondition only when prevIndex > 0, so the 0 that the public API returns disables the configuration compare-and-swap the API documents"
+        }
+      ],
+      "open_gaps": [],
+      "latest_execution": {
+        "id": "dd34591ecee5442ca8f7b8c478709f1b",
+        "experiment_id": "031156ce4e3d4bf5a8845619024ff0c4-experiment",
+        "status": "completed",
+        "exit_code": 0,
+        "record": "logs/dd34591ecee5442ca8f7b8c478709f1b/check.json",
+        "observations": "logs/dd34591ecee5442ca8f7b8c478709f1b/observations.json"
+      },
+      "latest_interpretation": {
+        "id": "6622393da5e94b6c9ea4b39a0f8f7a41-interpretation-0",
+        "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-0",
+        "experiment_id": "031156ce4e3d4bf5a8845619024ff0c4-experiment",
+        "source_ids": [
+          "getconfig",
+          "futureindex",
+          "getlatest",
+          "configsch",
+          "stats",
+          "nextconfig",
+          "addvoter"
+        ],
+        "executions": {
+          "dd34591ecee5442ca8f7b8c478709f1b": [
+            0
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "The declared discriminator was: if the public values track the real index the hypothesis is wrong, if the public values stay 0 while the main-thread index is >= 1 it holds. The completed execution reports exactly the second case on one node and one sample: main_latest_index=1 and main_committed_index=1 (3 voter servers) read from the main thread, public_index=0 with public_servers=3 read from GetConfiguration(), and stats_latest_configuration_index=\"0\" beside the same three-voter latest_configuration, with commit_index=3 and applied_index=3 showing the node was well past the configuration entry. Both values came from the same runtime object inside one execution, so this is a within-node comparison rather than a cross-scenario join. The account of why is source-fixed and independent of the sample: GetConfiguration() constructs configurationsFuture{latest: r.getLatestConfiguration()} and responds it immediately (api.go:900), getLatestConfiguration loads only the Configuration from the atomic copy (raft.go:2232-2240), and Index() is the never-assigned latestIndex of that struct (future.go:267-270); no code path assigns it for this future, so the constant is a property of the constructor rather than an artefact of one sample. The real index does exist in-process - the main loop answers configurationsCh with r.configurations.Clone(), which carries latestIndex and committedIndex (raft.go:889) and is what snapshot.go consumes - so the public producer drops a value the target itself publishes elsewhere. The consumer duty is what makes this consequential rather than cosmetic: ConfigurationFuture embeds IndexFuture ('Index holds the index of the newly applied log entry'), and the documented use of that index is the configuration precondition - AddVoter and its siblings describe prevIndex as the index of the only configuration upon which the change may be applied, failing if another configuration entry intervened (api.go:941-944). A caller that reads the index from the only public source and passes it back supplies 0, and nextConfiguration treats prevIndex == 0 as no precondition (configuration.go:229), so the request keeps the same return value while silently losing the protection it was composed around; the same 0 is republished as latest_configuration_index (api.go:1188), where a constant also misdescribes the node's configuration state to an operator. Scope is bounded and stated: the configuration contents are live and correct and no consensus decision is taken on this value, so this is a basis/contract defect for index-dependent callers, not a safety violation.",
+        "answers": {
+          "031156ce4e3d4bf5a8845619024ff0c4-gap-0": "Observed on the elected leader of a bootstrapped three-node cluster (CheckRun dd34591ecee5442ca8f7b8c478709f1b, parsed event 0): GetConfiguration().Index() carried 0 while the main thread's latest and committed configuration index for the same node was 1 with 3 voter servers, and Stats()[\"latest_configuration_index\"] carried the same \"0\" beside a non-empty latest_configuration; the public value does not track the real index."
+        },
+        "knowledge": [
+          {
+            "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-0",
+            "revision": 1,
+            "assertion": "GetConfiguration() carries only the Configuration (latestIndex left zero), so ConfigurationFuture.Index() is 0 on every call while the main thread holds the real latest configuration index"
+          },
+          {
+            "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-2",
+            "revision": 1,
+            "assertion": "nextConfiguration enforces prevIndex only when it is > 0, so the 0 returned by the public API disables the documented configuration compare-and-swap"
+          }
+        ],
+        "counterevidence": [
+          "The captured tree is byte-identical to the released upstream copy of the same revision, and no assertion or test in the snapshot requires ConfigurationFuture.Index() to be non-zero, so the judgment that the zero is a defect rather than an intended 'there is no index to report here' reading rests on the documented meaning of Index() and of prevIndex rather than on a violated in-tree expectation.",
+          "The witness is one node in one execution; the claim that the value is constant rests on the constructor and on the absence of any writer to that field for this future (api.go:895-903, future.go:255-270), not on repeated sampling."
+        ],
+        "limitations": [
+          "Only the index value is shown to be wrong; the returned Configuration is the true latest configuration, and callers that ignore Index() are unaffected.",
+          "The impact chain to the disabled precondition is source-based: the execution exercised the read path, not a configuration change issued with the returned 0 as prevIndex."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "6622393da5e94b6c9ea4b39a0f8f7a41"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "031156ce4e3d4bf5a8845619024ff0c4-question-0"
+      }
+    },
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+      "version": 3,
+      "question": "When authority over a node is lost by Shutdown() rather than by stepping down, does an already-accepted Apply/Barrier duty (a logFuture sitting in the buffered applyCh) still have a completion path?",
+      "hypothesis": "Apply and Barrier hand the caller a logFuture as soon as the send into applyCh succeeds; with BatchApplyCh the channel is buffered, so acceptance and consumption are separate events. That logFuture has no ShutdownCh, Shutdown() closes shutdownCh and sets state Shutdown without draining applyCh, and both the main loop and runFSM leave on shutdownCh, so a future left in the buffer has no producer that can respond it: Error() blocks indefinitely and the caller's timeout, which only guarded the enqueue, cannot save it. runLeader's defer responds only futures on leaderState.inflight, so it does not cover a future that was never dispatched. Confirmed by observation: accepted in state Leader, still queued and unresponded after state Shutdown.",
+      "discriminator": "Occupy the main loop inside a handler (a public Restore with a caller-supplied reader that stalls on its first Read, which is the handshake), accept one Barrier future through the ordinary public path so it lands in the buffered applyCh, then call Shutdown() and observe whether the future is ever responded: a completion would defeat the suspicion and must name the responding producer, while non-completion together with the future still being queued in applyCh shows the duty was accepted and then lost. Executed: no completion; the duty stayed queued with the node in state Shutdown.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "shutdown",
+        "applybarrier",
+        "aftershutdown"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+          "revision": 1,
+          "assertion": "the caller's timeout guards only the enqueue, and the returned logFuture has no ShutdownCh, so completion is unbounded once the duty is accepted"
+        },
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+          "revision": 1,
+          "assertion": "Shutdown() drains nothing and runLeader's defer covers only leaderState.inflight, so a duty left in applyCh loses its producer"
+        }
+      ],
+      "open_gaps": [],
+      "latest_execution": {
+        "id": "c5d127c955b549a8888fe6bab568dbce",
+        "experiment_id": "f2c2b4e0415449d4941c8e53ffbc722e-experiment",
+        "status": "completed",
+        "exit_code": 0,
+        "record": "logs/c5d127c955b549a8888fe6bab568dbce/check.json",
+        "observations": "logs/c5d127c955b549a8888fe6bab568dbce/observations.json"
+      },
+      "latest_interpretation": {
+        "id": "721c1688d0604614841236bb40a995b2-interpretation-0",
+        "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+        "experiment_id": "f2c2b4e0415449d4941c8e53ffbc722e-experiment",
+        "source_ids": [
+          "applybarrier",
+          "batchapplyconfig",
+          "defererror",
+          "shutdown",
+          "runleaderdefer",
+          "aftershutdown"
+        ],
+        "executions": {
+          "c5d127c955b549a8888fe6bab568dbce": [
+            0
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "The declared discriminator resolved in the direction that supports the defect account, and the decisive operands come from one instance in one execution rather than from a join across scenarios: control_barrier_err is empty (the same Barrier call completed on the undisturbed leader, so acceptance and completion work when a producer exists), freeze_handshake is inside_restore_read (the main loop was inside its own restore handler and could not select on applyCh again), state_at_accept is Leader and duty_accepted is true (the public API handed the caller a future), state_after_shutdown is Shutdown, and the observation reports result=no_completion over a 3000 ms interval with queued_in_apply_ch=1 and apply_ch_capacity=64 - the accepted duty was still sitting in the buffer, with no consumer, after authority was lost. restore_after_release='failed to write snapshot: unexpected EOF' shows that the occupied handler was the node's main loop and that it did resume once the reader was released, which also rules out the harness having wedged the node in some other way. The interval is stated as what it is: 3000 ms of non-progress is not by itself the evidence for indefinite blocking; the indefinite part is source-fixed, and it is why the future can never be woken - deferError.Error() waits on the internal error channel alone once respond has not been called (future.go:113-118), and this logFuture is created without a ShutdownCh, unlike the internal restore and snapshot futures that do get one (raft.go:1169, raft.go:1914, snapshot.go:152); Shutdown() only closes shutdownCh and sets state Shutdown (api.go:1012-1025) while both the main loop and runFSM leave on that channel; and runLeader's defer responds only the futures already recorded on leaderState.inflight (raft.go:502-560), which a duty that never left applyCh is not. The duty was therefore accepted, its basis (a live leader to dispatch it) disappeared, and the accepted obligation was neither cancelled with a reason nor transferred: it was dropped silently, which is exactly the failure the repository's own test file flags for this family at raft_test.go:40-42. The condition that makes it reachable is the documented one: BatchApplyCh decouples acceptance from consumption (config.go:169-174), and the same comment concedes it breaks the timeout guarantee on Apply, so a caller that trusts a positive timeout to bound its wait is not protected.",
+        "answers": {
+          "f2c2b4e0415449d4941c8e53ffbc722e-gap-1": "No producer responded the accepted Barrier future after Shutdown(), and the duty was still queued at that point: with the leader occupied inside its own Restore handler, the Barrier future was accepted in state Leader and, after Shutdown() moved the node to state Shutdown, the future had not been responded within the 3000 ms observation while len(applyCh)=1 of capacity 64 (CheckRun c5d127c955b549a8888fe6bab568dbce, parsed event 0)."
+        },
+        "knowledge": [
+          {
+            "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+            "revision": 1,
+            "assertion": "the timeout guards only the enqueue into applyCh and the returned logFuture has no ShutdownCh, so no timeout- or shutdown-bounded completion follows acceptance"
+          },
+          {
+            "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+            "revision": 1,
+            "assertion": "Shutdown() leaves applyCh undrained and runLeader's defer responds only leaderState.inflight futures, so the queued duty has no remaining producer"
+          }
+        ],
+        "counterevidence": [
+          "The reachable window needs the main loop to be occupied at the moment of acceptance and shutdown; the harness makes that deterministic with a caller-supplied reader that stalls, so the execution shows the mechanism, not a frequency of occurrence under spontaneous timing.",
+          "The window also needs BatchApplyCh (config.go:169-174); with the default unbuffered applyCh the enqueue itself is the handoff, so the same duty would instead be rejected at enqueue via the caller's timeout or shutdownCh escape in Apply.",
+          "The node was in the middle of an orderly shutdown, so one can argue a shutting-down node owes nothing in flight; the defect account rests on the narrower observation that the API had already accepted the duty and returned a future whose Error() has no shutdown notice and no timeout, leaving the caller unable to distinguish dropped from pending."
+        ],
+        "limitations": [
+          "Single node and single execution; the claim that no completion path remains rests on the source argument above (no writer to the error channel after shutdown; every completer exits on shutdownCh), not on repeated sampling or on an unbounded wait.",
+          "Only the Barrier path was executed. VerifyLeader constructs its verifyFuture without a ShutdownCh too and sends it on a 64-buffered channel (api.go:883-893, api.go:568), so it shares the shape, but that is a source-level observation and was not exercised.",
+          "The scenario models a slow caller-supplied stream keeping the handler busy; it does not claim that shutdown always finds a duty in the buffer."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "721c1688d0604614841236bb40a995b2"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "031156ce4e3d4bf5a8845619024ff0c4-question-1"
+      }
+    },
+    {
+      "id": "721c1688d0604614841236bb40a995b2-question-1",
+      "version": 3,
+      "question": "When a caller names a server that holds no vote as the target of an explicit leadership transfer, does the named server acquire leadership, and what happens to the sitting leader's authority?",
+      "hypothesis": "LeadershipTransferToServer forwards the caller's id and address to the transfer routine, which only requires a replication state for that server, so a vote-less member is accepted as a target. On that target the TimeoutNow handler sets Candidate and the leadership-transfer flag unconditionally and the candidate loop skips pre-vote because of that flag, so the target runs a real election at term+1; but electSelf casts a self-vote only when the local server is a Voter in the latest configuration, and voters receiving a RequestVote from a member that holds no vote reject it - after already adopting the higher term. The requested transfer is therefore unachievable: the named target can never win, while its higher-term vote request deposes the sitting leader, and the caller's future is answered without error because losing leadership during a transfer is reported as success. Observed twice, on separate clusters with the same harness: target_ever_leader=false, transfer_err empty, term 2 to 4, original leader back in Leader state, and in both runs the target's term-3 campaign skipped pre-vote while the recovery election at term 4 ran one.",
+      "discriminator": "Demote one real follower to a non-voter through the public API, then call LeadershipTransferToServer on that member and sample the real nodes for a bounded interval: whether the named target ever reaches Leader, which servers do lead, whether the original leader still leads at the end, the reported transfer error, and the term before and after. Executed twice with identical operands (CheckRuns 2b61659461634c04b53ec61c35541227 and cfde738278f04108b377b912cb3eb339); the control with a voter target (7224dba1ed234879b0cb1c65e5161bf7) moved leadership to the named server with a single term step.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "xferapi",
+        "timeoutnow",
+        "xferprevoteskip",
+        "electself",
+        "requestvoteorder",
+        "pickserver",
+        "followervotegate"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [],
+      "open_gaps": [],
+      "latest_execution": {
+        "id": "cfde738278f04108b377b912cb3eb339",
+        "experiment_id": "721c1688d0604614841236bb40a995b2-experiment",
+        "status": "completed",
+        "exit_code": 0,
+        "record": "logs/cfde738278f04108b377b912cb3eb339/check.json",
+        "observations": "logs/cfde738278f04108b377b912cb3eb339/observations.json"
+      },
+      "latest_interpretation": {
+        "id": "184de281ab83410ab0d2356656267a9c-interpretation-0",
+        "investigation_id": "721c1688d0604614841236bb40a995b2-question-1",
+        "experiment_id": "721c1688d0604614841236bb40a995b2-experiment",
+        "source_ids": [
+          "xferapi",
+          "timeoutnow",
+          "xferprevoteskip",
+          "electself",
+          "requestvoteorder",
+          "pickserver",
+          "followervotegate",
+          "xferrespond"
+        ],
+        "executions": {
+          "cfde738278f04108b377b912cb3eb339": [
+            0
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": null,
+        "rationale": "This run was queued to test the one gap I had left explicit, that the earlier vote-less result might have been a timing accident rather than the mechanism. The reproduction is exact on every operand: target_suffrage=Nonvoter, transfer_err empty, target_ever_leader=false with the target ending as Follower, the original leader the only server seen leading and in Leader state at the end, and the term advancing 2 to 4 - the same two-step cost as the first run, against a single step for the voter-target control. The second run's log repeats the internal sequence as well: the target enters candidate state at term 3 with no pre-vote lines of its own while both genuine elections in that run record pre-voting for self and a pre-vote success, each voter logs adopting the higher term immediately before rejecting a node that is not a voter, and the recovery election at term 4 is a real pre-voted election won by the original server with tally 2 of votesNeeded 2. That is the mechanism the sources predict - a candidate that holds no vote gets no self-vote, cannot be granted one by voters, and yet moves the term it runs at, so the caller spends an election and receives no transfer - and it now holds for two independent executions. What the repeat does not buy is a broader sample: both runs use the same fixed harness, the same cluster size and the same sequence of caller steps, so this is schedule variation on one scenario, and I keep that as the boundary of the claim rather than treating two runs as generality. The defect account for the question is unchanged and now reproducible: the explicit transfer path accepts a target that cannot hold leadership, moves no authority to it, and reports the same success value it reports when a real transfer succeeds (the control also reported an empty error), so the caller cannot distinguish a transfer that happened from one that never could.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "Both runs come from the same fixed harness with the same inputs, so the repetition tests scheduling variation of one scenario rather than a range of cluster sizes, timings or target choices; the source argument for the impossibility of a vote-less winner is what covers those unobserved variants.",
+          "As in the earlier control, an empty transfer error accompanies both the successful and the unsuccessful case, so the empty value is not evidence of failure by itself and the account rests on the outcome and term-cost operands.",
+          "The demotion that makes the target vote-less is performed by the caller in the same run, so the run does not separate the configuration change from the transfer in time."
+        ],
+        "limitations": [
+          "Two runs, one scenario: the reproduction is exact but narrow, and the claim that a vote-less member can never win still rests on the election code paths rather than on sampling many configurations.",
+          "The term cost is compared as an endpoint-to-endpoint difference between runs; the intermediate steps are corroborated by the library's own log messages, not by an independent probe of the term value at each instant."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "184de281ab83410ab0d2356656267a9c"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "721c1688d0604614841236bb40a995b2-question-1"
+      }
+    },
+    {
+      "id": "184de281ab83410ab0d2356656267a9c-question-1",
+      "version": 2,
+      "question": "Does the documented staging phase of AddVoter exist in the implementation: can a server added through the public AddVoter API be a Nonvoter or Staging member that the leader later promotes once it has caught up?",
+      "hypothesis": "The public documentation for AddVoter states that the server is added as a staging server and that the leader promotes it to a voter once it is ready, and the membership design notes list catching new servers up before granting them a vote as a main goal. The implementation does not have that phase: nextConfiguration builds the AddVoter entry with Suffrage Voter outright, the separate Staging suffrage is only reachable by an explicit Promote command, and the library's own command documentation says AddStaging was actually AddVoter and is deprecated in its favour. The in-tree unit expectations agree with the implementation, expecting a Voter for a member added through AddVoter from missing, Staging or Nonvoter states, so the state the documentation describes is never entered through the public API and the promotion duty it describes is owed by nobody.",
+      "discriminator": "Trace every producer of a configuration entry for AddVoter and every consumer of the Staging suffrage: if the only public path that can add a member writes Suffrage Voter and nothing in the non-test code ever issues Promote, the documented staging phase and its promotion duty do not exist, and the mismatch is decidable by reading rather than by execution. Executed by reading: the AddVoter case writes Voter, Promote is only reached by an explicit Promote command that no non-test caller issues, and the unit expectations for AddVoter match the AddStaging cases. An end-to-end witness is queued to confirm the consequence that the added member votes immediately.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "addvoter",
+        "cfgaddvoter",
+        "cfgcommands",
+        "cfgpromote",
+        "stagingdoc"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [
+        {
+          "entry_id": "184de281ab83410ab0d2356656267a9c-knowledge-1",
+          "revision": 1,
+          "assertion": "nextConfiguration's AddVoter case writes Suffrage Voter into the very entry that adds the member, so no Staging state is entered on that path and the promotion duty the doc describes is owed by nobody"
+        }
+      ],
+      "open_gaps": [],
+      "latest_execution": {
+        "id": "9245773442404356acaafba5198cba2a",
+        "experiment_id": "fb6f285736fa49b5af424be6a078aa1e-experiment",
+        "status": "completed",
+        "exit_code": 0,
+        "record": "logs/9245773442404356acaafba5198cba2a/check.json",
+        "observations": "logs/9245773442404356acaafba5198cba2a/observations.json"
+      },
+      "latest_interpretation": {
+        "id": "6aac0bc06d4247569a2bff46e6398a94-interpretation-0",
+        "investigation_id": "184de281ab83410ab0d2356656267a9c-question-1",
+        "experiment_id": "fb6f285736fa49b5af424be6a078aa1e-experiment",
+        "source_ids": [
+          "addvoter",
+          "cfgaddvoter",
+          "cfgcommands",
+          "cfgtestaddvoter"
+        ],
+        "executions": {
+          "9245773442404356acaafba5198cba2a": [
+            0
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "The point of this control was to test the one soft spot in the AddVoter account: the witness inferred that the commit after the disconnect required the newly added member's acknowledgement, and an inference about quorum arithmetic is only as good as the discriminator behind it. The control holds the harness fixed and changes only the join call, and the outcome separates the two cases exactly as the arithmetic predicts: with AddNonvoter the member is a Nonvoter, the configuration keeps two voters, and after one original voter is disconnected the command cannot commit - the future returned leadership lost and the leader stepped down - while the added node still advanced its log, which is what a non-voting member is for. With AddVoter in the same shape the member is a Voter, there are three voters, and the same disconnect still leaves a committing majority. So the commit in the witness could not have come from any path other than the added member's acknowledgement, and the earlier counterweight is answered rather than merely acknowledged. That leaves the account of the question where it was, now with both halves witnessed: the public documentation promises a staging member promoted once it is ready, no such state is entered - the member is a voter in the very entry that adds it, in the leader's view and in its own - and the practical difference is exactly the availability arithmetic the documentation's promise would have avoided, since the fresh member counts toward commitment immediately while the control shows what the non-voting case looks like instead. What this does not do is turn the finding into a safety claim: voters still compare logs, so a member that has not caught up cannot win an election, and the implementation still matches its own unit expectations - the defect remains the documented contract that the code never had, not a broken consensus rule.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "Both halves are single executions on separate clusters with the test facility's Disconnect rather than a real partition or crash, so the contrast shows the arithmetic as this harness models reachability.",
+          "The control's failure mode was leadership loss rather than a silent stall, which is a different shape from the witness's success; the comparison therefore rests on commit versus no commit, not on identical failure timing.",
+          "Because the control leaves two voters, it also confirms that a two-voter configuration cannot commit with one member gone, which is standard majority behaviour and not by itself evidence about AddVoter."
+        ],
+        "limitations": [
+          "One case and one control, each executed once; the pair establishes that the discriminator works, not a distribution over timings or cluster sizes.",
+          "The control used AddNonvoter, which produces a non-voting member by design; it does not exercise the Staging suffrage, which no public path reaches."
+        ],
+        "joint_history": "The control and the AddVoter witness are two executions of the same harness shape on separate fresh clusters: MakeCluster(2) merged with MakeClusterNoBootstrap(1), fully connected, one elected leader, one original voter disconnected before the apply, and the same bounded apply wait. They differ only in the public join call, AddVoter in the witness and AddNonvoter in the control, so the pair is a same-cause case and control rather than one split history; the control's own receipt is the only one cited here, and the witness receipt is named in the rationale for the contrast.",
+        "failure_attribution": null,
+        "operation_id": "6aac0bc06d4247569a2bff46e6398a94"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "184de281ab83410ab0d2356656267a9c-question-1"
+      }
+    },
+    {
+      "id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "version": 7,
+      "question": "Does the transport heartbeat fast path run appendEntries outside the main thread, and can that be observed as a term or leader-state change while the main loop is provably occupied?",
+      "hypothesis": "raft.go marks processHeartbeat and appendEntries as main-thread-only, yet api.go installs processHeartbeat as the transport's heartbeat handler; the network transport dispatches strictly empty AppendEntries requests to it from its connection goroutine, and that request still runs appendEntries' term logic. The term path itself is not guarded against concurrent writers: the candidate path reads the current term, computes the next one and then writes it through setCurrentTerm, which persists and stores without any compare or lock around the pair, so a higher term written by the fast path in between is overwritten when the election's write lands. The node then sits at, and persists, a term it had already adopted and left, and can later accept or issue messages at terms it had already superseded.",
+      "discriminator": "Hold the main loop's term write open by supplying a stable store whose write of the current term can be armed to block once, deliver one empty heartbeat with a term well above the current one on the fast path while it is held, then release and read both the in-memory term and the persisted term: a term after release lower than the term adopted during the hold witnesses a durable term regression caused by the off-thread write. Executed twice with the same operands (d5d2d6e4b4304f65ba05d1865 and f5bfa53fce5c4314a29fe898c38b8808), the control with the same hold and no heartbeat (68ee55636577494e915fce091da4d876) shows the held write alone is monotone, and a natural-timing probe with no instrumentation saw zero falls in 792 deliveries (c839d00a425a4b75b09fbfb353fc4fc8). The open question is now whether the rate rises when the window is as wide as a slow durable write rather than a couple of instructions, which the queued probe tests with a store that sleeps before applying the current-term write and no hold-open hook.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat",
+        "inmemnosupport"
+      ],
+      "counterevidence": [],
+      "limitations": [
+        "The broader harmful-consequence gap has no deterministic in-process witness with the tools available here: it needs the off-thread store to land inside the main loop's read-modify-write of the term, which is a two-instruction window in the candidate path, and this backend runs tests without the race detector, so that consequence can be argued from the code but not witnessed in this run.",
+        "The narrower post-shutdown facet was witnessable precisely because it needs no interleaving: the handler's shutdown branch is taken before any term logic runs, so the outcome is decided by the node's state rather than by timing.",
+        "The fast path is reachable only through a transport that installs the handler; the in-memory transport used by the test facility does not, so every execution here supplies a wrapper that mirrors the network transport's classification and dispatch rather than exercising its socket path."
+      ],
+      "resume_conditions": [],
+      "knowledge": [
+        {
+          "entry_id": "e587e860b8e84d64b7e2ea4522366190-knowledge-0",
+          "revision": 1,
+          "assertion": "the candidate path reads the current term, computes the next one and writes it with no guard around the pair, so a higher term written off the main thread in between is overwritten in memory and in the stable store"
+        },
+        {
+          "entry_id": "2aa9e9b7af1840e9b90e8ceced03c800-knowledge-0",
+          "revision": 1,
+          "assertion": "with no instrumented store, no fall was observed in 792 fast-path deliveries followed by immediate term samples on a single-voter node"
+        }
+      ],
+      "open_gaps": [],
+      "latest_execution": {
+        "id": "394ae390a0164b5dbda779132c28478d",
+        "experiment_id": "f45fd8d956f54afcbcb5b9a5f6ae8a4b-experiment",
+        "status": "completed",
+        "exit_code": 0,
+        "record": "logs/394ae390a0164b5dbda779132c28478d/check.json",
+        "observations": "logs/394ae390a0164b5dbda779132c28478d/observations.json"
+      },
+      "latest_interpretation": {
+        "id": "2d1fee32964a42108db71599ef4fe90f-interpretation-0",
+        "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+        "experiment_id": "f45fd8d956f54afcbcb5b9a5f6ae8a4b-experiment",
+        "source_ids": [
+          "electself",
+          "appendentriesmain",
+          "processheartbeat",
+          "netxpheartbeat"
+        ],
+        "executions": {
+          "394ae390a0164b5dbda779132c28478d": [
+            0
+          ]
+        },
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The gap asked whether asymmetric latencies bring the regression out under natural timing, and reading the two writers answers the mechanism half of it even though it cannot answer the rate. The two writers share one store and one key, so what the node holds is whatever the store applied last; in a store that serialises writes, the applied-last writer is settled by the order the writes take effect. That explains both uninstrumented zeros without touching the witnessed cases: with a uniform latency the heartbeat's write arrives and is applied last, so the higher term survives, and with continuous delivery the campaign it would have to collide with never starts. It also says what shape would produce the fall naturally - the main loop's write deferred behind the fast path's, which is what a lock or a write pipeline reached first by the heartbeat's write would do, and what the gate achieved by holding the main loop's write until the heartbeat's had completed. So the answer to the gap is conditional: not latencies as such, but application order under contention, and the discriminating test is a store whose write path defers the main thread's application behind the fast path's rather than a denser schedule or a uniformly slower store. I keep the defect claim on the mechanism the three earlier receipts establish, and I record this as the current account of the remaining uncertainty rather than as a measurement.",
+        "answers": {
+          "83111bbe058e4ca8b3e10d1d24593da6-gap-7": "Conditional, and not by latency alone. Both writers use the same stable store and key, so the term the node holds is whichever write that store applied last, and in a serialising store that is decided by the order the writes take effect. The fall needs the main loop's write applied after the heartbeat's - i.e. the main loop's write deferred behind the fast path's, as by contending on a lock or a write pipeline the heartbeat's write reaches first. A uniformly slower store does not supply that ordering, which is why it stayed clean, and a denser schedule suppresses the campaign instead; the discriminating shape is a store whose write path defers the main thread's application behind the fast path's."
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "This is a reading-derived answer: it explains why the two probes stayed clean and names the shape that should not, but no execution has yet produced the fall under natural timing.",
+          "The ordering argument assumes the two writers go through the same store; a deployment where the heartbeat's write takes a different path would need its own analysis.",
+          "The witnessed cases still establish the fall only by construction, so the practical rate under a contended store remains unmeasured."
+        ],
+        "limitations": [
+          "One open question answered conditionally by source, with the discriminating experiment named but not run inside this budget.",
+          "The account says nothing about how often a real store defers the main thread's write behind the fast path's, which is a property of the deployment's storage and scheduling."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "2d1fee32964a42108db71599ef4fe90f"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "6aac0bc06d4247569a2bff46e6398a94-question-0"
+      }
+    },
+    {
+      "id": "01d042310b9c416c8dc8c2b94ab283fe-question-0",
+      "version": 1,
+      "question": "Can the log cache serve an entry value that the underlying log store no longer agrees with, for producers inside this package?",
+      "hypothesis": "The cache keeps the caller's Log pointers in its ring and returns a cached entry when the slot's index matches, so its view agrees with the store only as long as nothing mutates a stored Log afterwards, or as long as the store keeps the same object rather than a copy. The in-memory store keeps the same pointers, so for that store the two views are the same objects; for a copying store, a caller that mutates a stored Log would make the cache serve the mutated value while the durable copy kept the original.",
+      "discriminator": "Check every non-test producer that hands a Log to the store: if each finishes filling an entry before storing it and never mutates it afterwards, then no in-tree producer can make the cache and the store disagree, and the residual hazard is confined to external callers using a copying store. Reading settles it, so no execution is spent.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "cacheread",
+        "cachestore",
+        "cachedelete",
+        "inmemstorelogs",
+        "dispatchstore",
+        "followerstore"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [],
+      "open_gaps": [],
+      "latest_execution": null,
+      "latest_interpretation": {
+        "id": "01d042310b9c416c8dc8c2b94ab283fe-interpretation-0",
+        "investigation_id": "01d042310b9c416c8dc8c2b94ab283fe-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "cacheread",
+          "cachestore",
+          "cachedelete",
+          "inmemstorelogs",
+          "dispatchstore",
+          "followerstore"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The suspicion was that the cache could serve an entry value the store no longer agrees with, which would matter because replication and commit decisions read through the log store. Reading refutes it for in-tree producers on two independent grounds. First, the cache's read path is conservative: it returns a cached entry only when the ring slot's index matches the requested index, and otherwise asks the store, so a mis-keyed slot is a miss rather than a wrong answer, and a delete clears the whole ring before the store deletes, so a truncated suffix cannot be served from the cache. Second, the two views hold the same objects: StoreLogs caches the pointers it was handed and the in-memory store keeps those same pointers, so a mutation would move both views together rather than separating them. On the producer side, each non-test call site fills the entry before storing it and never mutates it afterwards - the leader assigns index, term and timestamp in the loop before StoreLogs, the follower stores the entries decoded from the request and then only reads them, and bootstrap writes a single entry and returns. The residual hazard is therefore real but external and narrower than the suspicion: a caller that hands a Log to a copying store - a disk store that serializes - and then mutates that same Log would have the cache serving the mutated object while the durable copy keeps the original, because the cache keeps the caller's pointer while the store kept bytes. That is a boundary worth stating for callers, not a defect of the in-tree producers, and I record it as such rather than dressing it up.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The refutation is scoped to in-tree producers and to stores that keep the pointers they are given; with a serializing store plus an external caller that mutates a stored Log, the two views can differ, which is the case the boundary names.",
+          "This is a source-level negative with no execution behind it, which is appropriate for a claim about which code paths mutate what, but it does not measure what any particular external store implementation keeps.",
+          "The cache's conservative read path means a divergence would show up as a stale-but-index-matching entry rather than a wrong index, so the observable effect of the external hazard would be subtler than a mismatch in keys."
+        ],
+        "limitations": [
+          "No execution: the negative rests on reading the cache, the in-memory store and the three producers, not on a test that mutates a stored entry.",
+          "Only the in-package producers were checked; an application that wraps its own store and reuses Log values remains the case the boundary describes."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "01d042310b9c416c8dc8c2b94ab283fe"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "01d042310b9c416c8dc8c2b94ab283fe-question-0"
+      }
+    },
+    {
+      "id": "925ed222d83145a083d0c0bf263bd1c1-question-0",
+      "version": 1,
+      "question": "Does a message the node would reject as unsupported on every other RPC path still take effect when it arrives as a heartbeat on the fast path?",
+      "hypothesis": "The version and header gate lives in processRPC, which every consumer-channel request passes; the fast path bypasses processRPC and calls appendEntries from processHeartbeat, where nothing inspects the header, and the transport's classification is a shape test rather than a compatibility test. A heartbeat advertising an unsupported protocol version is therefore processed, and processing it adopts a higher term, sets the node to follower and records the sender as leader.",
+      "discriminator": "Compare the two delivery paths for the same request shape: if a request with an unsupported protocol version is dropped on the consumer path and processed on the fast path, the gate is bypassed on that path. Reading settles it since the gate is a single call at the top of processRPC and the fast path has no equivalent, so no execution is spent.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "processrpc",
+        "checkrpcheader",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [],
+      "open_gaps": [],
+      "latest_execution": null,
+      "latest_interpretation": {
+        "id": "925ed222d83145a083d0c0bf263bd1c1-interpretation-0",
+        "investigation_id": "925ed222d83145a083d0c0bf263bd1c1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "processrpc",
+          "checkrpcheader",
+          "processheartbeat",
+          "netxpheartbeat",
+          "appendentriesmain"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The two paths differ by one call. A request that arrives on the consumer channel enters processRPC, which runs checkRPCHeader first and answers with an error instead of dispatching when the command has no header or when the header's protocol version is outside the accepted range or more than one version behind this node; the heartbeat fast path enters processHeartbeat, which checks the shutdown channel and then hands an AppendEntriesRequest directly to appendEntries, with nothing inspecting the header in between, and the transport's classification is satisfied by a term, a leader address, a zero previous entry and term, no entries and a zero leader commit index. A heartbeat carrying an unsupported protocol version is therefore processed rather than dropped, and what processing does is not inert: appendEntries adopts a term above the node's current one, sets the node to follower and records the sender as leader, which is the same effect the gate's other callers are denied. The scope I claim is that gate bypass and nothing more: the fast path still cannot append entries or advance the commit index, and a well-formed message from a supported peer at the same term would have produced the same transition, so this is not a route to new authority - it is the node acting on a message it would reject as unsupported elsewhere, which is precisely what the compatibility check exists to prevent. The severity is therefore bounded but real, and the fix direction is obvious in the code rather than argued here.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The transition the bypass allows is one Raft tolerates from any peer with a higher term, so the bypass does not change what a supported peer could have caused; its effect is confined to messages the node would otherwise drop as unsupported.",
+          "This is a source-level finding with no execution: it rests on the gate being a single call at the top of processRPC and on the fast path having no equivalent, which is a claim about code structure rather than about observed behaviour.",
+          "The transport classification must still be satisfied, so the sender has to produce a well-formed empty AppendEntries request with a term and a leader address, which a peer running an old version can do.",
+          "The harnesses used in this run reach the handler through a wrapper transport rather than the network transport, so nothing here exercised the socket path where the classification actually lives."
+        ],
+        "limitations": [
+          "No execution behind this note; it is decidable by reading and was recorded as such rather than being turned into a test.",
+          "The consequence is bounded to term, state and leader identity, the same fields the fast path can already touch when the sender is a supported peer.",
+          "Whether an operator would ever have an unsupported peer that is reachable and well-formed is a deployment question this record does not answer."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "925ed222d83145a083d0c0bf263bd1c1"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "925ed222d83145a083d0c0bf263bd1c1-question-0"
+      }
+    },
+    {
+      "id": "2cfc284531344e89a4293b449089c945-question-0",
+      "version": 2,
+      "question": "Does a leader verification establish that a majority of the voters can be reached, or can acknowledgements from members that hold no vote satisfy it?",
+      "hypothesis": "The verification target is the voter quorum, but the set the count draws on is larger than that in two ways: the leader credits itself with a vote before consulting the configuration, so a leader that the latest configuration no longer counts as a voter still starts at one, and the acknowledgements it accepts come from every entry of its replication state, which includes non-voting members, with no suffrage check in the counter. A leader that can reach only non-voters, or that no longer holds a vote itself, can therefore satisfy a verification whose target describes a majority of voters.",
+      "discriminator": "Compare the set the count draws on with the set the target is computed over, checking both the initial credit and the acknowledgement loop: if either can contribute a vote that the voter set does not contain, the verification can succeed without a voter majority. The election path is the contrast, since electSelf asks voters only, and the lease check is the countermeasure, since it counts voters only. Reading settles it, so no execution is spent.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "verifyleader",
+        "replnotifyall",
+        "quorumsize",
+        "replstart",
+        "verifyvote",
+        "checklease"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [],
+      "open_gaps": [],
+      "latest_execution": null,
+      "latest_interpretation": {
+        "id": "2cfc284531344e89a4293b449089c945-interpretation-0",
+        "investigation_id": "2cfc284531344e89a4293b449089c945-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verifyleader",
+          "replnotifyall",
+          "quorumsize",
+          "replstart",
+          "verifyvote",
+          "checklease",
+          "electself"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The verification counts votes from a strictly larger set than the set its target is computed over, and nothing in between filters them. verifyLeader starts the count at one for the leader and sets the target to quorumSize, which counts voters only; it then registers the verification on every entry of the leader's replication state, and that state has one entry per member of the latest configuration except the local node, because startStopReplication creates entries for every server in the latest configuration and skips only the node itself - a non-voting member is replicated to and heartbeated exactly like a voter. When a heartbeat is acknowledged, notifyAll hands the ack to every registered verification and vote increments the count without asking what suffrage that member holds, so with a three-voter configuration plus any number of non-voters, the leader's own vote plus one acknowledgement from a non-voter reaches a target of two while both other voters may be unreachable. That matters because the verification is the guard the documentation offers against serving stale data after losing leadership: a caller that verifies before reading can be told the node is still leader when a majority of the voters cannot be reached, which is exactly the condition the guard is meant to detect. The scope is the verification result and what it establishes, not the agreement rule: elections are unaffected because electSelf asks voters only for votes, commitment is unaffected because the commitment counts voter match indexes, and the leader-lease check counts voters only and will step this leader down within the lease interval, so the exposure is a bounded window rather than an indefinite false positive. I also note where the countermeasure already exists in the code: the lease check computes reachability over voters, which is precisely the filter the verification lacks.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The window is bounded: checkLeaderLease counts only voters and steps the leader down once fewer than a quorum of voters has been heard from within the lease interval, so the false positive cannot persist indefinitely.",
+          "A non-voter acknowledgement is a genuine response from a member the leader is configured to replicate to, so the defect is not that the acknowledgement is invalid but that it is used as evidence about a different set than the target describes.",
+          "The exposure requires a configuration with non-voting members and a leader that can reach them while it cannot reach a voter majority, which is a specific topology rather than the default.",
+          "This is a source finding with no execution behind it; it rests on the sizes of the two sets and the absence of a suffrage check, which is a claim about code structure rather than about an observed verification."
+        ],
+        "limitations": [
+          "No execution: the account is decidable by reading and was recorded as such rather than turned into a multi-node partition test.",
+          "The claim is about what a successful verification establishes, not about the correctness of agreement, which the election and commitment paths compute over voters.",
+          "The size of the practical window is set by the lease interval and by how quickly the leader notices it has lost the voter majority, neither of which this record measures."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "2cfc284531344e89a4293b449089c945"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "2cfc284531344e89a4293b449089c945-question-0"
+      }
+    },
+    {
+      "id": "4cb2ed33b6314a96ab0ab30f27bf0e67-question-0",
+      "version": 1,
+      "question": "Does the leader's commitment calculation pick an index that a quorum of voters has actually reached, or is its median expression off by one for some voter count?",
+      "hypothesis": "The candidate index is the element at position (n-1)/2 of the sorted voter match indexes, which for every tested count corresponds to the (n - quorum + 1)-th smallest, so it is an index at least quorum voters have reached.",
+      "discriminator": "Evaluate the position expression against the quorum for each voter count and check which voters must have reached it: if the position yields an index fewer than quorum voters could have reached, the formula is wrong. Arithmetic, so no execution is spent.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "recalculate",
+        "quorumsize"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [],
+      "open_gaps": [],
+      "latest_execution": null,
+      "latest_interpretation": {
+        "id": "4cb2ed33b6314a96ab0ab30f27bf0e67-interpretation-0",
+        "investigation_id": "4cb2ed33b6314a96ab0ab30f27bf0e67-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "recalculate",
+          "quorumsize"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The suspicion was that the median expression could commit an index that a quorum had not reached, which would be the most serious kind of error in the run. Evaluating it per voter count answers no. With the match indexes sorted ascending, the element at position (n-1)/2 is the first smallest for one and two voters, the second for three and four, and the third for five, and the quorum sizes for those counts are one, two, two, three and three, so in each case the chosen element is the highest index that at least quorum voters are known to have reached, and the two guards around it only require that it beat the previous commit index and that it not fall below the leader's first index of the term. The negative is scoped to the arithmetic and to the counts I worked through; it says nothing about whether the match indexes fed in are trustworthy, which is the separate question the election and replication findings address, and it is a reading result rather than a measurement.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The check is arithmetic on one expression; it does not exercise the commitment path in a cluster, so it excludes an off-by-one in the position and nothing else about commitment.",
+          "The correctness of the result still depends on the match indexes being genuine acknowledgements, which is where the vote-less-member and non-voter findings live.",
+          "Only voter counts one through five were worked through, which covers this package's practical range but is not a proof for all sizes; the pattern of the expression and the quorum formula makes a different outcome implausible, and that reasoning is stated rather than measured."
+        ],
+        "limitations": [
+          "No execution: the claim is about an expression and a quorum formula, both read directly.",
+          "It bounds only the position arithmetic, not the provenance of the indexes or the persistence of the commit index."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "4cb2ed33b6314a96ab0ab30f27bf0e67"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "4cb2ed33b6314a96ab0ab30f27bf0e67-question-0"
+      }
+    },
+    {
+      "id": "79d796b2d75b45f9ad8e1d329ff5f89c-question-0",
+      "version": 1,
+      "question": "Can live bootstrap write a current term lower than one the node has already adopted and persisted, taking it backwards the way the heartbeat interleaving can?",
+      "hypothesis": "The live bootstrap path writes the term as one unconditionally, so if it could be reached on a node that had already adopted a higher term the node would go backwards; the guard in BootstrapCluster refuses when any state exists, and a nonzero persisted term counts as state, so the path cannot be reached after any term has been observed.",
+      "discriminator": "Check whether the unconditional write has a guard and whether every writer of the term persists it: if term adoption always persists and the guard treats a nonzero persisted term as existing state, the write cannot lower it. Reading settles it, so no execution is spent.",
+      "disposition": "active",
+      "parent_id": null,
+      "source_ids": [
+        "livebootstrap",
+        "bootstrapguard"
+      ],
+      "counterevidence": [],
+      "limitations": [],
+      "resume_conditions": [],
+      "knowledge": [],
+      "open_gaps": [],
+      "latest_execution": null,
+      "latest_interpretation": {
+        "id": "79d796b2d75b45f9ad8e1d329ff5f89c-interpretation-0",
+        "investigation_id": "79d796b2d75b45f9ad8e1d329ff5f89c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "livebootstrap",
+          "bootstrapguard"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The suspicion was that live bootstrap could take a node's term backwards, which would be a second route to the monotonicity violation this run already witnessed through the heartbeat path. It cannot, and the reason is worth stating precisely because it is a protection rather than an absence of one: the path writes the term as one, but it does so through BootstrapCluster, which first asks whether any state exists and refuses when the persisted current term is above zero, and since every term adoption in this package persists the term before storing it in memory, there is no way to have observed a term without that guard firing. So the unconditional write is safe only in the company of the caller-side guard, and the negative is scoped to that: the claim is that the guard covers the path as the code stands, not that the write would be safe on its own. I also note the shape this shares with the finding I did record - the same invariant, the same absence of any check at the point of the write, and a different protection upstream - because that is the kind of protection a later change could remove without noticing, and naming it here is what makes the difference visible.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The check is source-level: it establishes that the guard exists and that term writes persist first, not that no other entry point writes the term unconditionally.",
+          "The protection lives in the caller, so the write itself remains unguarded and would be a defect if a future caller reached it another way.",
+          "Nothing here changes the witnessed regression, which arises from concurrent writers rather than from a single unguarded write on a non-concurrent path."
+        ],
+        "limitations": [
+          "No execution: the claim rests on the guard and on the persist-before-store order in setCurrentTerm.",
+          "It covers the two entry points that write the term as part of bootstrap, not every writer of the term in the package."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "79d796b2d75b45f9ad8e1d329ff5f89c"
+      },
+      "record": {
+        "path": "state.json",
+        "collection": "investigations",
+        "id": "79d796b2d75b45f9ad8e1d329ff5f89c-question-0"
+      }
+    }
+  ],
+  "knowledge": [
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "Raft.GetConfiguration() returns a configurationsFuture whose configurations field carries only latest (the atomic latestConfiguration copy), and ConfigurationFuture.Index() returns configurations.latestIndex, so the value a caller receives from Index() is 0 on every call regardless of the cluster's committed or latest configuration index. The authoritative index r.configurations.latestIndex lives only on the main thread and reaches callers solely through the configurationsCh request path (raft.go:882-890, snapshot.go:155).",
+      "conditions": "Any Raft instance, running or started with skipStartup (including the package-level GetConfiguration helper, api.go:445-458 which the doc claims has identical behavior); GetConfiguration is documented as returning the latest configuration, which may be uncommitted.",
+      "source_ids": [
+        "getconfig",
+        "futureindex",
+        "getlatest",
+        "configsch"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "031156ce4e3d4bf5a8845619024ff0c4",
+      "uses": [
+        "031156ce4e3d4bf5a8845619024ff0c4-question-0",
+        "6622393da5e94b6c9ea4b39a0f8f7a41-interpretation-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-1",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "Raft.Stats() sets latest_configuration_index from the future returned by GetConfiguration(), so the published value is the constant string \"0\" even on a bootstrapped cluster whose configuration entry sits at index >= 1, while the same future supplies a non-empty latest_configuration. A Stats() consumer therefore cannot distinguish clusters by configuration index, and the key is constant rather than observed.",
+      "conditions": "Any node that serves Stats() while its GetConfiguration branch runs; applies to leader and follower alike.",
+      "source_ids": [
+        "stats",
+        "getconfig",
+        "futureindex"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "031156ce4e3d4bf5a8845619024ff0c4",
+      "uses": [
+        "031156ce4e3d4bf5a8845619024ff0c4-question-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-2",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "nextConfiguration applies the caller's precondition only when change.prevIndex > 0; AddVoter/AddNonvoter/RemoveServer/DemoteVoter pass the caller-supplied prevIndex through unchanged, so passing 0 (the value the public API returns for the configuration index) silently converts a conditional configuration change into an unconditional one.",
+      "conditions": "The leader-loop configuration change path of this revision; requires the caller to have obtained prevIndex from the public API.",
+      "source_ids": [
+        "nextconfig",
+        "addvoter"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "031156ce4e3d4bf5a8845619024ff0c4",
+      "uses": [
+        "031156ce4e3d4bf5a8845619024ff0c4-question-0",
+        "6622393da5e94b6c9ea4b39a0f8f7a41-interpretation-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "6622393da5e94b6c9ea4b39a0f8f7a41-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one running bootstrapped three-node cluster (term 2, commit_index 3, applied_index 3), the elected leader's main thread held configuration index 1 (latest and committed, 3 voter servers), while the same instance's public GetConfiguration().Index() was 0 with Configuration() returning the same 3 voter servers, and Stats()[\"latest_configuration_index\"] was \"0\" next to a non-empty latest_configuration. The value handed to API callers is therefore not the node's configuration index.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028, sampled while exactly one node was in Leader state, MakeCluster(3) bootstrap in one process with one committed client command.",
+      "source_ids": [
+        "getconfig",
+        "futureindex",
+        "stats"
+      ],
+      "executions": {
+        "dd34591ecee5442ca8f7b8c478709f1b": [
+          0
+        ]
+      },
+      "knowledge": [
+        {
+          "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-0",
+          "revision": 1,
+          "assertion": "GetConfiguration() carries only the Configuration, so Index() is 0 on every call while the main thread holds the real latest index"
+        },
+        {
+          "entry_id": "031156ce4e3d4bf5a8845619024ff0c4-knowledge-1",
+          "revision": 1,
+          "assertion": "Stats() publishes latest_configuration_index from the same future, i.e. the constant \"0\""
+        }
+      ],
+      "operation_id": "6622393da5e94b6c9ea4b39a0f8f7a41",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "Apply/ApplyLog and Barrier use the caller's timeout only in the select that enqueues the logFuture into applyCh; the returned logFuture has no ShutdownCh (only internal restore and snapshot futures set one, raft.go:1169, raft.go:1914, snapshot.go:152), so once the send succeeds the caller's Error() waits on the internal error channel alone and neither the timeout nor Shutdown() bounds completion.",
+      "conditions": "Any caller that keeps the future returned by Apply/ApplyLog/Barrier; the window requires acceptance to succeed, which BatchApplyCh (config.go:169-174) permits without a consumer, and its documentation already states that it breaks the timeout guarantee on Apply.",
+      "source_ids": [
+        "applybarrier",
+        "batchapplyconfig",
+        "defererror",
+        "restorefuturech"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "f2c2b4e0415449d4941c8e53ffbc722e",
+      "uses": [
+        "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+        "721c1688d0604614841236bb40a995b2-interpretation-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "Shutdown() closes shutdownCh and sets state Shutdown but does not drain or respond to futures already queued in applyCh; the main loop leaves its select on shutdownCh and run() returns, and runLeader's defer responds only futures already recorded on leaderState.inflight, so a duty that reached the buffer but was never dispatched has no remaining producer to complete it.",
+      "conditions": "Applies whenever a logFuture was accepted into applyCh while the main loop was occupied elsewhere and the node is then shut down; the repository's own test file already notes stuck Barrier/VerifyLeader/GetConfiguration futures after shutdown at raft_test.go:40-42.",
+      "source_ids": [
+        "shutdown",
+        "applybarrier",
+        "runleaderdefer",
+        "aftershutdown"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "f2c2b4e0415449d4941c8e53ffbc722e",
+      "uses": [
+        "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+        "721c1688d0604614841236bb40a995b2-interpretation-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "721c1688d0604614841236bb40a995b2-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real bootstrapped three-node cluster with BatchApplyCh enabled, a Barrier future handed to the caller by the public API while the leader was occupied inside its own Restore handler was never responded after Shutdown(): the node moved from state Leader at acceptance to state Shutdown, the duty remained queued in applyCh (queued_in_apply_ch=1, capacity 64) and the future's Error() had not returned after the bounded 3000 ms observation. The control Barrier on the undisturbed leader returned no error, and the occupied handler resumed afterwards (restore returned 'failed to write snapshot: unexpected EOF').",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(3) with conf.BatchApplyCh=true; the main loop occupied by a public Restore whose caller-supplied reader stalls on its first Read at the moment the Barrier is accepted; Shutdown() called after acceptance and before any consumer drains applyCh.",
+      "source_ids": [
+        "applybarrier",
+        "batchapplyconfig",
+        "shutdown",
+        "runleaderdefer",
+        "defererror"
+      ],
+      "executions": {
+        "c5d127c955b549a8888fe6bab568dbce": [
+          0
+        ]
+      },
+      "knowledge": [
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-0",
+          "revision": 1,
+          "assertion": "Apply/ApplyLog/Barrier use the timeout only for the enqueue and the returned logFuture has no ShutdownCh, so acceptance is not followed by any timeout- or shutdown-bounded completion"
+        },
+        {
+          "entry_id": "f2c2b4e0415449d4941c8e53ffbc722e-knowledge-1",
+          "revision": 1,
+          "assertion": "Shutdown() closes shutdownCh and sets state Shutdown without draining applyCh, and runLeader's defer responds only futures already on leaderState.inflight, so a duty left in the buffer has no remaining producer"
+        }
+      ],
+      "operation_id": "721c1688d0604614841236bb40a995b2",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "e847bfa0cb1b455db00f2364d7eb1610-knowledge-0",
+      "revision": 2,
+      "kind": "fact",
+      "statement": "In two independent executions on real four-node clusters whose named transfer target held no vote (target_suffrage=Nonvoter in both), LeadershipTransferToServer returned a future reporting no error while the named target never reached Leader in the observation window and ended in state Follower, the maximum cluster term advanced from 2 to 4 in both runs, and the only server observed leading was the original leader, which was in Leader state at the end of both runs. The requested transfer of authority to the named server did not take effect and was not reported as a failure, and the outcome reproduced across separate clusters and schedules.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(4) with the target demoted by a committed DemoteVoter in the same run, in each of two runs of the same fixed harness; target chosen from nodes in Follower state and still replicated to by the leader; observation window 3 s sampled every 20 ms.",
+      "source_ids": [
+        "xferapi",
+        "timeoutnow",
+        "xferprevoteskip",
+        "electself"
+      ],
+      "executions": {
+        "2b61659461634c04b53ec61c35541227": [
+          0
+        ],
+        "cfde738278f04108b377b912cb3eb339": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "184de281ab83410ab0d2356656267a9c",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": {
+        "revision": 1,
+        "correction": "The premise changes from a single observation on one cluster to a reproduced behaviour across two independent executions: the same target suffrage, the same outcome (target never leads), the same empty transfer error and the same two-step term cost recurred, so the statement no longer rests on one run. The conditions now name both receipts and the fact that the two runs share the fixed harness and inputs, which is schedule variation rather than a broader sample. The saved uses that relied on the single-run premise are the transfer investigation 721c1688d0604614841236bb40a995b2-question-1 and the two interpretations that reasoned from that case, e847bfa0cb1b455db00f2364d7eb1610-interpretation-0 and b1ef67e81473491cb1f7a33a992bc8dd-interpretation-0; both remain valid under the stronger, reproduced premise.",
+        "recorded_uses": [],
+        "affected_uses": []
+      }
+    },
+    {
+      "id": "b1ef67e81473491cb1f7a33a992bc8dd-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real four-node cluster where the named transfer target held its vote (target_suffrage=Voter), LeadershipTransferToServer moved leadership to that named server: the target was the only server observed in Leader state, it was in Leader state at the end, the original leader ended in Follower state without leading again, and the maximum term advanced by one, from 2 to 3. The caller's future reported no error, the same empty value reported for the vote-less target in the paired case.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(4) with no configuration change before the transfer; target chosen from nodes in Follower state; observation window 3 s, sampled every 20 ms; separate execution from the vote-less case, same harness shape and cluster shape.",
+      "source_ids": [
+        "xferapi",
+        "timeoutnow",
+        "electself"
+      ],
+      "executions": {
+        "7224dba1ed234879b0cb1c65e5161bf7": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "b1ef67e81473491cb1f7a33a992bc8dd",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "184de281ab83410ab0d2356656267a9c-knowledge-1",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "nextConfiguration's AddVoter case constructs the new server entry with Suffrage Voter and either replaces an existing member entry or appends it, so a member added through the public AddVoter API becomes a voter in the very configuration entry that adds it; no Staging state is written on that path, and Staging is only left by the Promote case, while configuration.go's own command table states that AddStaging was actually AddVoter and is deprecated in favour of it. The api.go doc comment for AddVoter still describes the opposite sequence (added as a staging server, promoted by the leader once ready), and membership.md lists catching new servers up before granting them a vote as a main goal.",
+      "conditions": "This revision, any leader that processes an AddVoter configuration change request; state reached through the public API only, since Promote is not issued anywhere in the non-test code.",
+      "source_ids": [
+        "addvoter",
+        "cfgaddvoter",
+        "cfgcommands",
+        "cfgpromote",
+        "stagingdoc"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "184de281ab83410ab0d2356656267a9c",
+      "uses": [
+        "184de281ab83410ab0d2356656267a9c-question-1"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "fb6f285736fa49b5af424be6a078aa1e-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real cluster a fresh, empty node joined through the public AddVoter call became a voting member in the entry that added it: the leader's latest configuration and the new node's own latest configuration both reported suffrage Voter with three voters in the configuration, and after one original voter was disconnected a command applied subsequently still committed, which requires the newly added member's acknowledgement because only two voters remained reachable out of the three needed for a majority of three.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(2) merged with a MakeClusterNoBootstrap(1) node and fully connected, join through the public AddVoter API with protocol version 3; one original voter disconnected through the test facility before the apply; apply waited on under a bounded interval.",
+      "source_ids": [
+        "addvoter",
+        "cfgaddvoter",
+        "cfgtestaddvoter"
+      ],
+      "executions": {
+        "75d8b1b6b9f544acac8a3a21d02ff4e9": [
+          0
+        ]
+      },
+      "knowledge": [
+        {
+          "entry_id": "184de281ab83410ab0d2356656267a9c-knowledge-1",
+          "revision": 1,
+          "assertion": "the AddVoter path writes Suffrage Voter into the very entry that adds the member, so no Staging state is entered and the promotion duty the doc describes is owed by nobody"
+        }
+      ],
+      "operation_id": "fb6f285736fa49b5af424be6a078aa1e",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "6aac0bc06d4247569a2bff46e6398a94-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real cluster built the same way as the AddVoter witness but joined with the public AddNonvoter call, the new member was a Nonvoter in the leader's latest configuration with only two voters present, and after one original voter was disconnected the next applied command did not commit: the future returned leadership lost after about 50 ms and the leader ended in Follower state, while the new node still advanced its log to index 4. The same harness with AddVoter instead had commitments succeed after the identical disconnect.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(2) merged with a MakeClusterNoBootstrap(1) node, fully connected; join via public AddNonvoter at protocol version 3; one original voter disconnected through the test facility before the apply; apply waited on under a bounded interval.",
+      "source_ids": [
+        "addvoter",
+        "cfgaddvoter"
+      ],
+      "executions": {
+        "9245773442404356acaafba5198cba2a": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "6aac0bc06d4247569a2bff46e6398a94",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "6aac0bc06d4247569a2bff46e6398a94-knowledge-1",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "Whether a command can commit after one member of a three-member configuration becomes unreachable depends on the suffrage the join call wrote: a member added with AddVoter is counted in the leader's quorum arithmetic from the entry that adds it, so a majority of two remains reachable and the command commits, while a member added with AddNonvoter is not counted, no majority remains, and the leader steps down without committing.",
+      "conditions": "Three-member configuration reached by joining a fresh node to a two-voter cluster through the public API, then disconnecting one of the two original voters; observed in this revision with the in-memory transport and the test facility's Disconnect.",
+      "source_ids": [
+        "addvoter",
+        "cfgaddvoter"
+      ],
+      "executions": {
+        "75d8b1b6b9f544acac8a3a21d02ff4e9": [
+          0
+        ],
+        "9245773442404356acaafba5198cba2a": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "6aac0bc06d4247569a2bff46e6398a94",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "6d7c2649900545d2b4979698753f4e4c-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "The network transport classifies an AppendEntries request as a heartbeat only when the term is set, a leader address is present, the previous log entry and term are zero, there are no entries and the leader commit index is zero, and it then dispatches that request synchronously to the installed handler on the connection goroutine before waiting for the response. The installed handler is Raft.processHeartbeat, which calls appendEntries; both are documented as main-thread-only, and appendEntries runs its term logic before anything about entries matters, so an empty heartbeat with a term above the node's current term calls setState(Follower) and setCurrentTerm from that goroutine. The in-memory transport's SetHeartbeatHandler is a no-op, so this path exists only for transports that implement it.",
+      "conditions": "This revision, any node whose transport implements the heartbeat fast path (for example NetworkTransport) and that has been configured through NewRaft, which installs processHeartbeat as the handler; empty heartbeats from a peer with a higher term are enough to take it.",
+      "source_ids": [
+        "netxpheartbeat",
+        "processheartbeat",
+        "appendentriesmain",
+        "inmemnosupport"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "6d7c2649900545d2b4979698753f4e4c",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "6d7c2649900545d2b4979698753f4e4c-knowledge-1",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance in Leader state at term 2, with its main loop provably blocked inside a handler, one empty heartbeat carrying term 3 was dispatched through a transport that installs the handler the way the network transport does and returned success, and the node's term already read 3 and its state already read Follower at the moment of sampling inside that window; both values were unchanged after the handler was released. The term adoption and the leader-to-follower transition therefore happened on the calling goroutine, not on the node's main loop.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node bootstrapped with BootstrapCluster and started with NewRaft over an in-memory transport wrapped by a local transport that fast-paths strictly empty AppendEntries requests; main loop occupied by a public Restore whose caller-supplied reader blocks on its first Read; term and state read through the package's atomic getters.",
+      "source_ids": [
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat",
+        "inmemnosupport"
+      ],
+      "executions": {
+        "d8502f6858ca421a80fe527efafffdd8": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "6d7c2649900545d2b4979698753f4e4c",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "db6aa620cc2142739c6c9c8c5111d110-knowledge-0",
+      "revision": 2,
+      "kind": "behavior",
+      "statement": "processHeartbeat begins by checking the node's shutdown channel and returning immediately when it is closed, before it inspects the command and before appendEntries runs, and that branch never calls Respond. On the fast path the transport has already handed the request to the handler and is waiting on the response channel it supplied, and whether that waiter is ever released depends on the transport: the network transport's wait also selects on the transport's own shutdown channel, which its Close signals, while the in-memory transport's Close only disconnects its peers and never closes the shutdown channel it created, so with that transport nothing releases the waiter.",
+      "conditions": "This revision, any transport that installs the heartbeat handler and any node whose shutdown channel is closed while the transport is still open. The release path is transport-supplied: NetworkTransport's Close signals the channel its response wait selects on, InmemTransport's Close does not signal its shutdown channel at all, and Raft.Shutdown's future closes the transport only when the caller waits on it.",
+      "source_ids": [
+        "processheartbeat",
+        "netxpheartbeat",
+        "netrespescape",
+        "inmemclose"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "9c6ad2b4ce934f088e779104a72e950e",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": {
+        "revision": 1,
+        "correction": "The premise changes in one respect: the earlier statement treated the transport's shutdown channel as the waiter's escape and the closure of the transport as what releases it, without distinguishing transports. The network transport does provide that escape, but the in-memory transport's Close only disconnects and never closes its shutdown channel, so for that transport the accepted heartbeat has no release at all - the caller is not merely delayed until a close, it is never woken. The observed receipt is unaffected and still supports the finding; only the account of the escape is narrowed to the transport that implements one. The saved use that relied on the earlier phrasing is the interpretation at operation a3e037c016ac4e2f976d62b3165916ce, which stays valid because its operands are unchanged and only the release condition is corrected.",
+        "recorded_uses": [],
+        "affected_uses": []
+      }
+    },
+    {
+      "id": "db6aa620cc2142739c6c9c8c5111d110-knowledge-1",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance over a transport that implements the heartbeat fast path, an empty heartbeat delivered while the node was live was answered successfully and moved its term from 2 to 3, while the identical delivery after Shutdown - node in state Shutdown at term 3 with its transport left open - received no response within the 2000 ms bound and left the term at 3, showing the handler returned before running the term logic.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node bootstrapped with BootstrapCluster and started with NewRaft over an in-memory transport wrapped by a local transport that fast-paths strictly empty AppendEntries requests on the caller's goroutine and waits on the supplied response channel; Shutdown called without waiting on the returned future so the transport stays open.",
+      "source_ids": [
+        "processheartbeat",
+        "netxpheartbeat",
+        "appendentriesmain"
+      ],
+      "executions": {
+        "d5ac2dbfe86e438f8cd995156206efe2": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "db6aa620cc2142739c6c9c8c5111d110",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "e587e860b8e84d64b7e2ea4522366190-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "The candidate path computes the next term as the current term plus one and then writes it through setCurrentTerm, which persists the value and stores it in memory, with no compare, lock or ordering guard around the read-modify-write pair; the term adoption path in appendEntries likewise reads the current term and writes a higher one. Because the heartbeat fast path runs appendEntries on the transport's goroutine, a higher term can be written from outside the main loop between the election's read and its write, and the election's lower value then overwrites it in memory and in the stable store.",
+      "conditions": "This revision, any node whose transport implements the heartbeat fast path and which is simultaneously in an election on the main thread; the window is the interval between the term read and the term store in the candidate path, and a stable-store write of the current term is the durable record that makes the regression survive a restart.",
+      "source_ids": [
+        "electself",
+        "appendentriesmain",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "e587e860b8e84d64b7e2ea4522366190",
+      "uses": [
+        "6aac0bc06d4247569a2bff46e6398a94-question-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "e587e860b8e84d64b7e2ea4522366190-knowledge-1",
+      "revision": 2,
+      "kind": "fact",
+      "statement": "In two independent executions of the same harness on real single-node Raft instances, after the node was deposed from leadership at term 2 to term 3 and its own election was held inside its term write, one empty heartbeat carrying term 13 delivered on the fast path was fully adopted - in-memory term 13 and persisted term 13 - and when the held write was released the node's term and persisted term fell to a value lower than the term it had already adopted and durably recorded (4 landed from the held write and 5 was written by the ordinary follower election that followed), after which the node again reached Leader state at that lower term. Both executions produced the same operands throughout.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node bootstrapped with BootstrapCluster and started with NewRaft over an in-memory transport wrapped by a local transport that fast-paths strictly empty AppendEntries requests, with an instrumented stable store that holds the next write of the current term open once it is armed; the depose is a real empty heartbeat with a higher term so the following election is timer-driven; two runs of the same fixed harness.",
+      "source_ids": [
+        "electself",
+        "appendentriesmain",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {
+        "d5d2d6e4b4304f65ba05d1869b42fa3c": [
+          0
+        ],
+        "f5bfa53fce5c4314a29fe898c38b8808": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "2af212ef27604f349c87db85c5f2195f",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": {
+        "revision": 1,
+        "correction": "The premise changes from a single observation to a reproduced behaviour: the same harness on a fresh cluster and schedule produced the same operands at every step, so the statement no longer rests on one run. It also gains a mechanism detail the first run could not settle - the held write lands while the heartbeat has already made the node a follower, so the candidate loop never runs and the later value 5 comes from the ordinary follower election that reads the regressed term - which explains both the endpoint and why the two runs agree. The saved use that relied on the single-run premise is the interpretation at operation 192609798d744832b3cfd702dfd1c5bd, which stays valid under the stronger, reproduced premise.",
+        "recorded_uses": [],
+        "affected_uses": []
+      }
+    },
+    {
+      "id": "33e9903cc4eb4bc0bd6fb3cbba195f2a-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance with the same instrumented store used by the term-regression witness, the election's term write was held open with the term and the persisted term both reading 3, and when it was released without any heartbeat being delivered the term and the persisted term became 4 and the node reached Leader state - a monotone step, with no fall below the held term.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; identical setup to the witness harness (in-memory transport wrapped for the heartbeat fast path, instrumented stable store, single-voter bootstrap, a real empty heartbeat to depose the node) with the only difference that nothing is delivered during the hold.",
+      "source_ids": [
+        "electself",
+        "processheartbeat",
+        "appendentriesmain"
+      ],
+      "executions": {
+        "68ee55636577494e915fce091da4d876": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "33e9903cc4eb4bc0bd6fb3cbba195f2a",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "01d042310b9c416c8dc8c2b94ab283fe-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "LogCache.GetLog validates a ring slot by comparing the cached entry's index with the requested one and otherwise falls through to the store, DeleteRange clears the whole ring before the store deletes, and StoreLogs caches exactly the pointers it was given; the in-memory store keeps the same pointers, so for that store the cache and the store hold the same objects. Every non-test producer fills the entry (index, term, timestamp) before storing it and only reads it afterwards - the leader in dispatchLogs, the follower in appendEntries, and BootstrapCluster which writes one entry and returns.",
+      "conditions": "This revision, producers inside the package, with the in-memory store or any store that keeps the pointers it is given. The agreement claim does not extend to an external caller that mutates a Log after storing it while the store copies on write.",
+      "source_ids": [
+        "cacheread",
+        "cachestore",
+        "cachedelete",
+        "inmemstorelogs",
+        "dispatchstore",
+        "followerstore"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "01d042310b9c416c8dc8c2b94ab283fe",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "2aa9e9b7af1840e9b90e8ceced03c800-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance with no instrumented store, 792 empty heartbeats were delivered on the fast path across about six seconds of alternating deposition and election starts, with a term sample taken immediately after each delivery: all 792 deliveries succeeded, no sampled term fell below the highest term already adopted, and the term ended at 2390 in memory and in the stable store with the node in Follower state. No natural fall was observed in 792 delivery opportunities under this schedule.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node over the in-memory transport wrapped for the heartbeat fast path, plain in-memory store, deliveries in bursts of twelve every sixty milliseconds, each three terms above the node's current term, spaced about two milliseconds apart, sampled after each delivery; the schedule is bursty rather than uniformly distributed in time.",
+      "source_ids": [
+        "electself",
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat"
+      ],
+      "executions": {
+        "c839d00a425a4b75b09fbfb353fc4fc8": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "2aa9e9b7af1840e9b90e8ceced03c800",
+      "uses": [
+        "6aac0bc06d4247569a2bff46e6398a94-question-0"
+      ],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "85a4d561bce74d35bb162097279446e8-knowledge-0",
+      "revision": 1,
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance over a store whose write of the current-term key sleeps 3 ms before applying, 768 fast-path deliveries all succeeded and 4605 term samples were taken among them with no sample below the highest term already adopted; the term ended at 2306 in memory and in the stable store with the node in Follower state. A uniform slow term write did not produce the regression in this schedule.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node, in-memory transport wrapped for the heartbeat fast path, store that sleeps on the current-term write only, heartbeats delivered continuously three terms above the node's current term with six samples after each; no hold-open hook of any kind.",
+      "source_ids": [
+        "electself",
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat"
+      ],
+      "executions": {
+        "394ae390a0164b5dbda779132c28478d": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "operation_id": "85a4d561bce74d35bb162097279446e8",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "925ed222d83145a083d0c0bf263bd1c1-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "processRPC runs checkRPCHeader before dispatching any request from the consumer channel, and that check rejects a command that does not expose a header and a header whose protocol version is below the minimum, above the maximum, or more than one version behind the node's own. processHeartbeat does not call it: it checks only the shutdown channel and then passes an AppendEntriesRequest straight to appendEntries, and the network transport's heartbeat classification requires a term, a leader address, no previous entry, no entries and no leader commit index, but no protocol version. An empty heartbeat therefore reaches appendEntries without the gate every other RPC passes.",
+      "conditions": "This revision, any node whose transport implements the heartbeat fast path, for an incoming request that satisfies the transport's heartbeat classification regardless of the protocol version it advertises.",
+      "source_ids": [
+        "processrpc",
+        "checkrpcheader",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "925ed222d83145a083d0c0bf263bd1c1",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "2cfc284531344e89a4293b449089c945-knowledge-0",
+      "revision": 3,
+      "kind": "behavior",
+      "statement": "verifyLeader credits the leader with one vote before consulting any configuration and sets the target to quorumSize, which counts voters only, then registers the verification future on every entry of the leader's replication state; that state holds one entry per member of the latest configuration other than the local node, non-voting members included, because startStopReplication creates entries for all of them. Each heartbeat acknowledgement runs notifyAll, which calls vote on every registered future, and vote increments the count towards the target without checking the acknowledging member's suffrage. The count therefore draws on sources that may hold no vote twice over - the leader's own unconditional credit and the acknowledgements of non-voting members - and the exposure is confined to this one API, because a verify future is constructed only in the public VerifyLeader and no other in-tree path creates one.",
+      "conditions": "This revision, any leader whose latest configuration contains non-voting members, or whose latest configuration no longer includes the local node as a voter - the window after a leader has appended its own removal or demotion and before that entry commits - whenever the public VerifyLeader is called or an application uses that verification to guard a read. The producer set is closed: VerifyLeader is the only constructor of a verify future in the package, so commitment, elections and the lease check are outside this exposure, each of them computing over voters.",
+      "source_ids": [
+        "verifyleader",
+        "replnotifyall",
+        "quorumsize",
+        "replstart",
+        "verifyproducer"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "57c0a8d3b9574f9790371bd9dc934638",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": {
+        "revision": 2,
+        "correction": "The premise is narrowed in its reach rather than changed in direction: the earlier statement named the two sources of votes that fall outside the voter set the target is computed over and the topologies in which they can be reached, and reading the consumers shows the producer set is a single public entry point, VerifyLeader, with every other reference either registering the future on the leader or answering it in the follower and candidate loops. The mechanism is unchanged; what is added is that the exposure cannot arise through any other in-tree path, which is the boundary a reader needs in order to judge the finding's scope.",
+        "recorded_uses": [],
+        "affected_uses": []
+      }
+    },
+    {
+      "id": "2d1fee32964a42108db71599ef4fe90f-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "Both the candidate path's term write and the heartbeat fast path's term write go through the same stable store for the same current-term key, so the term a node visibly holds is whichever of the two writes that store applied most recently. In a store that serialises writes, the outcome is decided by the order in which the two writes take effect, not by their arrival times or durations; the term falls only when the main loop's lower write is applied after the off-thread higher one, which requires the main loop's write to be deferred behind the fast path's - for example by contending on a lock or a write pipeline that the fast path's write reaches first.",
+      "conditions": "This revision, any node in which a candidate's term write and a heartbeat's term adoption are in flight together against the same stable store; a store that keeps the two writers' application order tied to their latency rather than to contention does not produce the fall.",
+      "source_ids": [
+        "electself",
+        "appendentriesmain",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "2d1fee32964a42108db71599ef4fe90f",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "4cb2ed33b6314a96ab0ab30f27bf0e67-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "commitment.recalculate collects the match indexes of the voters, sorts them ascending, and takes the element at position (n-1)/2 as the candidate commit index, committing it only when it exceeds the current commit index and is not below the first index of the leader's term. That position is the (n - quorum + 1)-th smallest for every voter count from one to five, which is by construction an index that at least quorum voters have reached: n=1 gives the first of one, n=2 the first of two, n=3 the second of three, n=4 the second of four, n=5 the third of five, matching quorum sizes one, two, two, three and three.",
+      "conditions": "This revision, the leader's commitment calculation over its voter match indexes; the derivation holds for the voter counts shown, and the position expression is the standard lower-median quorum index rather than an off-by-one.",
+      "source_ids": [
+        "recalculate",
+        "quorumsize"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "4cb2ed33b6314a96ab0ab30f27bf0e67",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "79d796b2d75b45f9ad8e1d329ff5f89c-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "liveBootstrap seeds a running node by calling BootstrapCluster and then writing the current term as one, which would take a node that had already adopted a higher term backwards. The write is protected by the caller-side guard rather than by itself: BootstrapCluster first calls HasExistingState, which reports existing state as soon as the persisted current term is above zero, and every term adoption in this package persists the term before storing it in memory, so a node that has observed any term at all - through a vote request, an append from a leader, or its own election - cannot reach that line. The unconditional write is therefore safe only because the guard refuses the call first.",
+      "conditions": "This revision, a running node calling the public BootstrapCluster or live bootstrap; the protection depends on the guard in BootstrapCluster and on setCurrentTerm persisting before it stores, so removing the guard or reversing that order would let the write lower a term.",
+      "source_ids": [
+        "livebootstrap",
+        "bootstrapguard"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "79d796b2d75b45f9ad8e1d329ff5f89c",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "4d2efef6faed4deabf9c7d063d367373-knowledge-0",
+      "revision": 2,
+      "kind": "behavior",
+      "statement": "Auditing every quorum-like count in this package against the set its target is computed over leaves one mismatch and four matches. The mismatch is the leader verification, which credits the leader with a vote before consulting any configuration and counts acknowledgements from every entry of the replication state, non-voting members included, while its target counts voters only. The matches are: the election, which asks only voters for votes and tallies only those replies, with the quorum target computed over voters; the pre-vote, which likewise asks voters only; the commitment calculation, whose match map is built from voter entries alone and whose match function updates a server's index only when that server is already a key in the map, so acknowledgements from other members are dropped rather than counted; and the leader lease, which records a contact only for servers whose suffrage is voter. Commit, election, pre-vote and lease therefore all compare a voter-derived count against a voter-derived target.",
+      "conditions": "This revision, the counts as written in the cited sites; the audit covers the quorum-like counts used for election, pre-vote, commitment and lease decisions, and does not cover message tallies that are not compared against a target.",
+      "source_ids": [
+        "electself",
+        "commitmentworkset",
+        "commitmentmatch",
+        "quorumsize",
+        "checklease",
+        "verifyleader",
+        "replnotifyall",
+        "replstart"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "ca9c85d7495f4eb4bb841c01c9af0e03",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": {
+        "revision": 1,
+        "correction": "This revision changes nothing about what is claimed; it completes the evidence behind one clause. The commitment's exclusion of non-voter acknowledgements was stated from the map construction alone, and the call-level site that enforces it - the match function updating an index only for a server already in the map - is now cited with it, so the clause is supported at both the build and the call. The scope, the conditions and the other four counts are unchanged.",
+        "recorded_uses": [],
+        "affected_uses": []
+      }
+    },
+    {
+      "id": "fe1fbd8a5fd342d6b1923f08a46067d6-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "The documentation for VerifyLeader states that it is used to ensure the peer is still the leader and may be used to prevent returning stale data from the FSM after the peer has lost leadership. That is the promise the verification count is measured against: the call is offered as a leadership guard for reads, so a successful verification is read by callers as evidence that this node may still answer as leader, which is why it matters that the count it aggregates can be satisfied by sources the voter quorum does not contain.",
+      "conditions": "This revision, the public VerifyLeader call as documented at the cited range; the statement records the documented purpose, and whether a given application relies on it that way is a property of the application.",
+      "source_ids": [
+        "verifydoc",
+        "verifyleader",
+        "replnotifyall",
+        "quorumsize",
+        "replstart"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "fe1fbd8a5fd342d6b1923f08a46067d6",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    },
+    {
+      "id": "fad0abf6d3f145f6b66b69a9f680c1ba-knowledge-0",
+      "revision": 1,
+      "kind": "behavior",
+      "statement": "The documentation for LeadershipTransferToServer states that it does the same as LeadershipTransfer but takes a specific server in the cluster as an argument, that the leader stops accepting requests, makes sure the target is up to date and starts the transfer with a TimeoutNow message, and that the use is safe in a cluster where not every node runs the latest version because a follower that cannot be promoted fails gracefully. That is the promise the transfer finding is measured against: the call is offered as a way to hand leadership to a named member of the cluster, so a target that holds no vote being accepted and the caller being told the transfer did not fail is a mismatch with the documented purpose rather than an operator mistake.",
+      "conditions": "This revision, the public LeadershipTransferToServer call as documented at the cited range; the statement records the documented purpose, and the warning about mixed versions is the documentation's own, not an inference from the run.",
+      "source_ids": [
+        "xferdoc",
+        "xferapi",
+        "timeoutnow",
+        "xferprevoteskip",
+        "electself"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "operation_id": "fad0abf6d3f145f6b66b69a9f680c1ba",
+      "uses": [],
+      "use_paths": {},
+      "last_correction": null
+    }
+  ],
+  "experiments": [
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-experiment",
+      "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/031156ce4e3d4bf5a8845619024ff0c4-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "031156ce4e3d4bf5a8845619024ff0c4-experiment",
+          "check_id": "dd34591ecee5442ca8f7b8c478709f1b",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [],
+          "interpretation_id": "6622393da5e94b6c9ea4b39a0f8f7a41-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "f2c2b4e0415449d4941c8e53ffbc722e-experiment",
+      "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+      "previous_id": null,
+      "basis": "fixed-experiments/f2c2b4e0415449d4941c8e53ffbc722e-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "f2c2b4e0415449d4941c8e53ffbc722e-experiment",
+          "check_id": "c5d127c955b549a8888fe6bab568dbce",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [],
+          "interpretation_id": "721c1688d0604614841236bb40a995b2-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "721c1688d0604614841236bb40a995b2-experiment",
+      "investigation_id": "721c1688d0604614841236bb40a995b2-question-1",
+      "previous_id": null,
+      "basis": "fixed-experiments/721c1688d0604614841236bb40a995b2-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "721c1688d0604614841236bb40a995b2-experiment",
+          "check_id": "2b61659461634c04b53ec61c35541227",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [],
+          "interpretation_id": "e847bfa0cb1b455db00f2364d7eb1610-interpretation-0"
+        },
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "721c1688d0604614841236bb40a995b2-experiment",
+          "check_id": "cfde738278f04108b377b912cb3eb339",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [],
+          "interpretation_id": "184de281ab83410ab0d2356656267a9c-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "e847bfa0cb1b455db00f2364d7eb1610-experiment",
+      "investigation_id": "721c1688d0604614841236bb40a995b2-question-1",
+      "previous_id": null,
+      "basis": "fixed-experiments/e847bfa0cb1b455db00f2364d7eb1610-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "e847bfa0cb1b455db00f2364d7eb1610-experiment",
+          "check_id": "7224dba1ed234879b0cb1c65e5161bf7",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "Can a member that holds no vote ever acquire leadership after being named as an explicit leadership-transfer target, and what does the caller's transfer future report in that case?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "721c1688d0604614841236bb40a995b2-gap-2"
+          ],
+          "interpretation_id": "b1ef67e81473491cb1f7a33a992bc8dd-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "4ec0b60ba6bf4a158b1b72b0c7ca21ad-experiment",
+      "investigation_id": "184de281ab83410ab0d2356656267a9c-question-1",
+      "previous_id": null,
+      "basis": "fixed-experiments/4ec0b60ba6bf4a158b1b72b0c7ca21ad-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "4ec0b60ba6bf4a158b1b72b0c7ca21ad-experiment",
+          "check_id": "75d8b1b6b9f544acac8a3a21d02ff4e9",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [],
+          "interpretation_id": "fb6f285736fa49b5af424be6a078aa1e-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "fb6f285736fa49b5af424be6a078aa1e-experiment",
+      "investigation_id": "184de281ab83410ab0d2356656267a9c-question-1",
+      "previous_id": null,
+      "basis": "fixed-experiments/fb6f285736fa49b5af424be6a078aa1e-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "fb6f285736fa49b5af424be6a078aa1e-experiment",
+          "check_id": "9245773442404356acaafba5198cba2a",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [],
+          "interpretation_id": "6aac0bc06d4247569a2bff46e6398a94-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "f157eb97c74f4bed855c7bd324f3879a-experiment",
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/f157eb97c74f4bed855c7bd324f3879a-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "f157eb97c74f4bed855c7bd324f3879a-experiment",
+          "check_id": "d8502f6858ca421a80fe527efafffdd8",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "Does the off-main-thread execution of appendEntries produce an observable harmful outcome - for example a persisted term lower than one already adopted, a term or state transition lost against a concurrent main-thread transition, or a leader acting on cleared state after the fast path flips it?",
+            "When a heartbeat is delivered on the transport fast path while the Raft node is shut down but its transport is still open, does the caller ever receive a response, and does the handler's shutdown check prevent the term logic from running?",
+            "Does the natural rate of the term-regression interleaving rise with a delivery schedule that lands heartbeats more densely on election starts, or in configurations where an election's read-modify-write lasts longer, such as a multi-voter cluster or a slower stable store?",
+            "Does the term-regression interleaving arise under natural timing when the two writers have asymmetric latencies - a fast write on the heartbeat's path against a delayed or contended write on the election's path - which is the ordering the gate produced deliberately and which the equal-latency probes could not produce?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "6d7c2649900545d2b4979698753f4e4c-gap-3",
+            "a3e037c016ac4e2f976d62b3165916ce-gap-4",
+            "2aa9e9b7af1840e9b90e8ceced03c800-gap-6",
+            "83111bbe058e4ca8b3e10d1d24593da6-gap-7"
+          ],
+          "interpretation_id": "6d7c2649900545d2b4979698753f4e4c-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "a3e037c016ac4e2f976d62b3165916ce-experiment",
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/a3e037c016ac4e2f976d62b3165916ce-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "a3e037c016ac4e2f976d62b3165916ce-experiment",
+          "check_id": "d5ac2dbfe86e438f8cd995156206efe2",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "Current interpretation remains conditional, disputed or unresolved",
+            "Does the off-main-thread execution of appendEntries produce an observable harmful outcome - for example a persisted term lower than one already adopted, a term or state transition lost against a concurrent main-thread transition, or a leader acting on cleared state after the fast path flips it?",
+            "Does the natural rate of the term-regression interleaving rise with a delivery schedule that lands heartbeats more densely on election starts, or in configurations where an election's read-modify-write lasts longer, such as a multi-voter cluster or a slower stable store?",
+            "Does the term-regression interleaving arise under natural timing when the two writers have asymmetric latencies - a fast write on the heartbeat's path against a delayed or contended write on the election's path - which is the ordering the gate produced deliberately and which the equal-latency probes could not produce?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "6d7c2649900545d2b4979698753f4e4c-gap-3",
+            "2aa9e9b7af1840e9b90e8ceced03c800-gap-6",
+            "83111bbe058e4ca8b3e10d1d24593da6-gap-7"
+          ],
+          "interpretation_id": "9c6ad2b4ce934f088e779104a72e950e-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "192609798d744832b3cfd702dfd1c5bd-experiment",
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/192609798d744832b3cfd702dfd1c5bd-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "192609798d744832b3cfd702dfd1c5bd-experiment",
+          "check_id": "d5d2d6e4b4304f65ba05d1869b42fa3c",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "When a heartbeat is delivered on the transport fast path while the Raft node is shut down but its transport is still open, does the caller ever receive a response, and does the handler's shutdown check prevent the term logic from running?",
+            "Does the natural rate of the term-regression interleaving rise with a delivery schedule that lands heartbeats more densely on election starts, or in configurations where an election's read-modify-write lasts longer, such as a multi-voter cluster or a slower stable store?",
+            "Does the term-regression interleaving arise under natural timing when the two writers have asymmetric latencies - a fast write on the heartbeat's path against a delayed or contended write on the election's path - which is the ordering the gate produced deliberately and which the equal-latency probes could not produce?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "a3e037c016ac4e2f976d62b3165916ce-gap-4",
+            "2aa9e9b7af1840e9b90e8ceced03c800-gap-6",
+            "83111bbe058e4ca8b3e10d1d24593da6-gap-7"
+          ],
+          "interpretation_id": "2af212ef27604f349c87db85c5f2195f-interpretation-0"
+        },
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "192609798d744832b3cfd702dfd1c5bd-experiment",
+          "check_id": "f5bfa53fce5c4314a29fe898c38b8808",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "When a heartbeat is delivered on the transport fast path while the Raft node is shut down but its transport is still open, does the caller ever receive a response, and does the handler's shutdown check prevent the term logic from running?",
+            "Does the natural rate of the term-regression interleaving rise with a delivery schedule that lands heartbeats more densely on election starts, or in configurations where an election's read-modify-write lasts longer, such as a multi-voter cluster or a slower stable store?",
+            "Does the term-regression interleaving arise under natural timing when the two writers have asymmetric latencies - a fast write on the heartbeat's path against a delayed or contended write on the election's path - which is the ordering the gate produced deliberately and which the equal-latency probes could not produce?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "a3e037c016ac4e2f976d62b3165916ce-gap-4",
+            "2aa9e9b7af1840e9b90e8ceced03c800-gap-6",
+            "83111bbe058e4ca8b3e10d1d24593da6-gap-7"
+          ],
+          "interpretation_id": "2af212ef27604f349c87db85c5f2195f-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "f8d39fe5edeb4560919d7100c0918db3-experiment",
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/f8d39fe5edeb4560919d7100c0918db3-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "f8d39fe5edeb4560919d7100c0918db3-experiment",
+          "check_id": "68ee55636577494e915fce091da4d876",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "Does the off-main-thread execution of appendEntries produce an observable harmful outcome - for example a persisted term lower than one already adopted, a term or state transition lost against a concurrent main-thread transition, or a leader acting on cleared state after the fast path flips it?",
+            "When a heartbeat is delivered on the transport fast path while the Raft node is shut down but its transport is still open, does the caller ever receive a response, and does the handler's shutdown check prevent the term logic from running?",
+            "Does the natural rate of the term-regression interleaving rise with a delivery schedule that lands heartbeats more densely on election starts, or in configurations where an election's read-modify-write lasts longer, such as a multi-voter cluster or a slower stable store?",
+            "Does the term-regression interleaving arise under natural timing when the two writers have asymmetric latencies - a fast write on the heartbeat's path against a delayed or contended write on the election's path - which is the ordering the gate produced deliberately and which the equal-latency probes could not produce?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "6d7c2649900545d2b4979698753f4e4c-gap-3",
+            "a3e037c016ac4e2f976d62b3165916ce-gap-4",
+            "2aa9e9b7af1840e9b90e8ceced03c800-gap-6",
+            "83111bbe058e4ca8b3e10d1d24593da6-gap-7"
+          ],
+          "interpretation_id": "33e9903cc4eb4bc0bd6fb3cbba195f2a-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "07b73952c24749f9a57c8fa1603e4d72-experiment",
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/07b73952c24749f9a57c8fa1603e4d72-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "07b73952c24749f9a57c8fa1603e4d72-experiment",
+          "check_id": "c839d00a425a4b75b09fbfb353fc4fc8",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "Current interpretation remains conditional, disputed or unresolved",
+            "Does the off-main-thread execution of appendEntries produce an observable harmful outcome - for example a persisted term lower than one already adopted, a term or state transition lost against a concurrent main-thread transition, or a leader acting on cleared state after the fast path flips it?",
+            "When a heartbeat is delivered on the transport fast path while the Raft node is shut down but its transport is still open, does the caller ever receive a response, and does the handler's shutdown check prevent the term logic from running?",
+            "Does the natural rate of the term-regression interleaving rise with a delivery schedule that lands heartbeats more densely on election starts, or in configurations where an election's read-modify-write lasts longer, such as a multi-voter cluster or a slower stable store?",
+            "Does the term-regression interleaving arise under natural timing when the two writers have asymmetric latencies - a fast write on the heartbeat's path against a delayed or contended write on the election's path - which is the ordering the gate produced deliberately and which the equal-latency probes could not produce?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "6d7c2649900545d2b4979698753f4e4c-gap-3",
+            "a3e037c016ac4e2f976d62b3165916ce-gap-4",
+            "2aa9e9b7af1840e9b90e8ceced03c800-gap-6",
+            "83111bbe058e4ca8b3e10d1d24593da6-gap-7"
+          ],
+          "interpretation_id": "2aa9e9b7af1840e9b90e8ceced03c800-interpretation-0"
+        }
+      ]
+    },
+    {
+      "id": "f45fd8d956f54afcbcb5b9a5f6ae8a4b-experiment",
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "previous_id": null,
+      "basis": "fixed-experiments/f45fd8d956f54afcbcb5b9a5f6ae8a4b-experiment/basis.json",
+      "results": [
+        {
+          "prerequisites": {
+            "status": "unknown",
+            "reason": "No correlated prerequisite specification",
+            "matched_indices": [],
+            "alias_indices": {}
+          },
+          "parsing_errors": [],
+          "experiment_id": "f45fd8d956f54afcbcb5b9a5f6ae8a4b-experiment",
+          "check_id": "394ae390a0164b5dbda779132c28478d",
+          "outcome": "unknown",
+          "blockers": [
+            "Exploratory basis has no fixed requirement. Retained observations still support sourced interpretation; no successor or rerun is required merely to add a requirement.",
+            "No fixed comparisons",
+            "Current interpretation remains conditional, disputed or unresolved",
+            "Does the off-main-thread execution of appendEntries produce an observable harmful outcome - for example a persisted term lower than one already adopted, a term or state transition lost against a concurrent main-thread transition, or a leader acting on cleared state after the fast path flips it?",
+            "When a heartbeat is delivered on the transport fast path while the Raft node is shut down but its transport is still open, does the caller ever receive a response, and does the handler's shutdown check prevent the term logic from running?",
+            "No correlated prerequisite specification"
+          ],
+          "gap_ids": [
+            "6d7c2649900545d2b4979698753f4e4c-gap-3",
+            "a3e037c016ac4e2f976d62b3165916ce-gap-4"
+          ],
+          "interpretation_id": "2d1fee32964a42108db71599ef4fe90f-interpretation-0"
+        }
+      ]
+    }
+  ],
+  "reselection": {
+    "task": [
+      "A1: CFT decision formation and progress.",
+      "A2: Context and authority acquisition, transition and loss."
+    ],
+    "target": {
+      "repo": "/home/nitro/Desktop/hashicorp-raft",
+      "snapshot_id": "09193ea9b7ee4df99810e6eee7058028"
+    },
+    "directed_question": null,
+    "questions": [
+      {
+        "id": "79d796b2d75b45f9ad8e1d329ff5f89c-question-0",
+        "question": "Can live bootstrap write a current term lower than one the node has already adopted and persisted, taking it backwards the way the heartbeat interleaving can?",
+        "disposition": "active",
+        "hypothesis": "The live bootstrap path writes the term as one unconditionally, so if it could be reached on a node that had already adopted a higher term the node would go backwards; the guard in BootstrapCluster refuses when any state exists, and a nonzero persisted term counts as state, so the path cannot be reached after any term has been observed.",
+        "discriminator": "Check whether the unconditional write has a guard and whether every writer of the term persists it: if term adoption always persists and the guard treats a nonzero persisted term as existing state, the write cannot lower it. Reading settles it, so no execution is spent.",
+        "source_ids": [
+          "livebootstrap",
+          "bootstrapguard"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "79d796b2d75b45f9ad8e1d329ff5f89c-interpretation-0",
+          "conclusion": "explained",
+          "defect_claim": "refuted",
+          "rationale": "The suspicion was that live bootstrap could take a node's term backwards, which would be a second route to the monotonicity violation this run already witnessed through the heartbeat path. It cannot, and the reason is worth stating precisely because it is a protection rather than an absence of one: the path writes the term as one, but it does so through BootstrapCluster, which first asks whether a",
+          "counterevidence": [
+            "The check is source-level: it establishes that the guard exists and that term writes persist first, not that no other entry point writes the term unconditionally.",
+            "The protection lives in the caller, so the write itself remains unguarded and would be a defect if a future caller reached it another way.",
+            "Nothing here changes the witnessed regression, which arises from concurrent writers rather than from a single unguarded write on a non-concurrent path."
+          ],
+          "limitations": [
+            "No execution: the claim rests on the guard and on the persist-before-store order in setCurrentTerm.",
+            "It covers the two entry points that write the term as part of bootstrap, not every writer of the term in the package."
+          ]
+        }
+      },
+      {
+        "id": "4cb2ed33b6314a96ab0ab30f27bf0e67-question-0",
+        "question": "Does the leader's commitment calculation pick an index that a quorum of voters has actually reached, or is its median expression off by one for some voter count?",
+        "disposition": "active",
+        "hypothesis": "The candidate index is the element at position (n-1)/2 of the sorted voter match indexes, which for every tested count corresponds to the (n - quorum + 1)-th smallest, so it is an index at least quorum voters have reached.",
+        "discriminator": "Evaluate the position expression against the quorum for each voter count and check which voters must have reached it: if the position yields an index fewer than quorum voters could have reached, the formula is wrong. Arithmetic, so no execution is spent.",
+        "source_ids": [
+          "recalculate",
+          "quorumsize"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "4cb2ed33b6314a96ab0ab30f27bf0e67-interpretation-0",
+          "conclusion": "explained",
+          "defect_claim": "refuted",
+          "rationale": "The suspicion was that the median expression could commit an index that a quorum had not reached, which would be the most serious kind of error in the run. Evaluating it per voter count answers no. With the match indexes sorted ascending, the element at position (n-1)/2 is the first smallest for one and two voters, the second for three and four, and the third for five, and the quorum sizes for tho",
+          "counterevidence": [
+            "The check is arithmetic on one expression; it does not exercise the commitment path in a cluster, so it excludes an off-by-one in the position and nothing else about commitment.",
+            "The correctness of the result still depends on the match indexes being genuine acknowledgements, which is where the vote-less-member and non-voter findings live.",
+            "Only voter counts one through five were worked through, which covers this package's practical range but is not a proof for all sizes; the pattern of the expression and the quorum formula makes a different outcome implausible, and that reasoning is stated rather than measured."
+          ],
+          "limitations": [
+            "No execution: the claim is about an expression and a quorum formula, both read directly.",
+            "It bounds only the position arithmetic, not the provenance of the indexes or the persistence of the commit index."
+          ]
+        }
+      },
+      {
+        "id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+        "question": "Does the transport heartbeat fast path run appendEntries outside the main thread, and can that be observed as a term or leader-state change while the main loop is provably occupied?",
+        "disposition": "active",
+        "hypothesis": "raft.go marks processHeartbeat and appendEntries as main-thread-only, yet api.go installs processHeartbeat as the transport's heartbeat handler; the network transport dispatches strictly empty AppendEntries requests to it from its connection goroutine, and that request still runs appendEntries' term logic. The term path itself is not guarded against concurrent writers: the candidate path reads the",
+        "discriminator": "Hold the main loop's term write open by supplying a stable store whose write of the current term can be armed to block once, deliver one empty heartbeat with a term well above the current one on the fast path while it is held, then release and read both the in-memory term and the persisted term: a term after release lower than the term adopted during the hold witnesses a durable term regression ca",
+        "source_ids": [
+          "processheartbeat",
+          "appendentriesmain",
+          "netxpheartbeat",
+          "inmemnosupport"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "2d1fee32964a42108db71599ef4fe90f-interpretation-0",
+          "conclusion": "conditional",
+          "defect_claim": "asserted",
+          "rationale": "The gap asked whether asymmetric latencies bring the regression out under natural timing, and reading the two writers answers the mechanism half of it even though it cannot answer the rate. The two writers share one store and one key, so what the node holds is whatever the store applied last; in a store that serialises writes, the applied-last writer is settled by the order the writes take effect.",
+          "counterevidence": [
+            "This is a reading-derived answer: it explains why the two probes stayed clean and names the shape that should not, but no execution has yet produced the fall under natural timing.",
+            "The ordering argument assumes the two writers go through the same store; a deployment where the heartbeat's write takes a different path would need its own analysis.",
+            "The witnessed cases still establish the fall only by construction, so the practical rate under a contended store remains unmeasured."
+          ],
+          "limitations": [
+            "One open question answered conditionally by source, with the discriminating experiment named but not run inside this budget.",
+            "The account says nothing about how often a real store defers the main thread's write behind the fast path's, which is a property of the deployment's storage and scheduling."
+          ]
+        }
+      },
+      {
+        "id": "2cfc284531344e89a4293b449089c945-question-0",
+        "question": "Does a leader verification establish that a majority of the voters can be reached, or can acknowledgements from members that hold no vote satisfy it?",
+        "disposition": "active",
+        "hypothesis": "The verification target is the voter quorum, but the set the count draws on is larger than that in two ways: the leader credits itself with a vote before consulting the configuration, so a leader that the latest configuration no longer counts as a voter still starts at one, and the acknowledgements it accepts come from every entry of its replication state, which includes non-voting members, with n",
+        "discriminator": "Compare the set the count draws on with the set the target is computed over, checking both the initial credit and the acknowledgement loop: if either can contribute a vote that the voter set does not contain, the verification can succeed without a voter majority. The election path is the contrast, since electSelf asks voters only, and the lease check is the countermeasure, since it counts voters o",
+        "source_ids": [
+          "verifyleader",
+          "replnotifyall",
+          "quorumsize",
+          "replstart"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "2cfc284531344e89a4293b449089c945-interpretation-0",
+          "conclusion": "explained",
+          "defect_claim": "asserted",
+          "rationale": "The verification counts votes from a strictly larger set than the set its target is computed over, and nothing in between filters them. verifyLeader starts the count at one for the leader and sets the target to quorumSize, which counts voters only; it then registers the verification on every entry of the leader's replication state, and that state has one entry per member of the latest configuratio",
+          "counterevidence": [
+            "The window is bounded: checkLeaderLease counts only voters and steps the leader down once fewer than a quorum of voters has been heard from within the lease interval, so the false positive cannot persist indefinitely.",
+            "A non-voter acknowledgement is a genuine response from a member the leader is configured to replicate to, so the defect is not that the acknowledgement is invalid but that it is used as evidence about a different set than the target describes.",
+            "The exposure requires a configuration with non-voting members and a leader that can reach them while it cannot reach a voter majority, which is a specific topology rather than the default."
+          ],
+          "limitations": [
+            "No execution: the account is decidable by reading and was recorded as such rather than turned into a multi-node partition test.",
+            "The claim is about what a successful verification establishes, not about the correctness of agreement, which the election and commitment paths compute over voters.",
+            "The size of the practical window is set by the lease interval and by how quickly the leader notices it has lost the voter majority, neither of which this record measures."
+          ]
+        }
+      },
+      {
+        "id": "925ed222d83145a083d0c0bf263bd1c1-question-0",
+        "question": "Does a message the node would reject as unsupported on every other RPC path still take effect when it arrives as a heartbeat on the fast path?",
+        "disposition": "active",
+        "hypothesis": "The version and header gate lives in processRPC, which every consumer-channel request passes; the fast path bypasses processRPC and calls appendEntries from processHeartbeat, where nothing inspects the header, and the transport's classification is a shape test rather than a compatibility test. A heartbeat advertising an unsupported protocol version is therefore processed, and processing it adopts ",
+        "discriminator": "Compare the two delivery paths for the same request shape: if a request with an unsupported protocol version is dropped on the consumer path and processed on the fast path, the gate is bypassed on that path. Reading settles it since the gate is a single call at the top of processRPC and the fast path has no equivalent, so no execution is spent.",
+        "source_ids": [
+          "processrpc",
+          "checkrpcheader",
+          "processheartbeat",
+          "netxpheartbeat"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "925ed222d83145a083d0c0bf263bd1c1-interpretation-0",
+          "conclusion": "explained",
+          "defect_claim": "asserted",
+          "rationale": "The two paths differ by one call. A request that arrives on the consumer channel enters processRPC, which runs checkRPCHeader first and answers with an error instead of dispatching when the command has no header or when the header's protocol version is outside the accepted range or more than one version behind this node; the heartbeat fast path enters processHeartbeat, which checks the shutdown ch",
+          "counterevidence": [
+            "The transition the bypass allows is one Raft tolerates from any peer with a higher term, so the bypass does not change what a supported peer could have caused; its effect is confined to messages the node would otherwise drop as unsupported.",
+            "This is a source-level finding with no execution: it rests on the gate being a single call at the top of processRPC and on the fast path having no equivalent, which is a claim about code structure rather than about observed behaviour.",
+            "The transport classification must still be satisfied, so the sender has to produce a well-formed empty AppendEntries request with a term and a leader address, which a peer running an old version can do."
+          ],
+          "limitations": [
+            "No execution behind this note; it is decidable by reading and was recorded as such rather than being turned into a test.",
+            "The consequence is bounded to term, state and leader identity, the same fields the fast path can already touch when the sender is a supported peer.",
+            "Whether an operator would ever have an unsupported peer that is reachable and well-formed is a deployment question this record does not answer."
+          ]
+        }
+      },
+      {
+        "id": "01d042310b9c416c8dc8c2b94ab283fe-question-0",
+        "question": "Can the log cache serve an entry value that the underlying log store no longer agrees with, for producers inside this package?",
+        "disposition": "active",
+        "hypothesis": "The cache keeps the caller's Log pointers in its ring and returns a cached entry when the slot's index matches, so its view agrees with the store only as long as nothing mutates a stored Log afterwards, or as long as the store keeps the same object rather than a copy. The in-memory store keeps the same pointers, so for that store the two views are the same objects; for a copying store, a caller th",
+        "discriminator": "Check every non-test producer that hands a Log to the store: if each finishes filling an entry before storing it and never mutates it afterwards, then no in-tree producer can make the cache and the store disagree, and the residual hazard is confined to external callers using a copying store. Reading settles it, so no execution is spent.",
+        "source_ids": [
+          "cacheread",
+          "cachestore",
+          "cachedelete",
+          "inmemstorelogs"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "01d042310b9c416c8dc8c2b94ab283fe-interpretation-0",
+          "conclusion": "explained",
+          "defect_claim": "refuted",
+          "rationale": "The suspicion was that the cache could serve an entry value the store no longer agrees with, which would matter because replication and commit decisions read through the log store. Reading refutes it for in-tree producers on two independent grounds. First, the cache's read path is conservative: it returns a cached entry only when the ring slot's index matches the requested index, and otherwise ask",
+          "counterevidence": [
+            "The refutation is scoped to in-tree producers and to stores that keep the pointers they are given; with a serializing store plus an external caller that mutates a stored Log, the two views can differ, which is the case the boundary names.",
+            "This is a source-level negative with no execution behind it, which is appropriate for a claim about which code paths mutate what, but it does not measure what any particular external store implementation keeps.",
+            "The cache's conservative read path means a divergence would show up as a stale-but-index-matching entry rather than a wrong index, so the observable effect of the external hazard would be subtler than a mismatch in keys."
+          ],
+          "limitations": [
+            "No execution: the negative rests on reading the cache, the in-memory store and the three producers, not on a test that mutates a stored entry.",
+            "Only the in-package producers were checked; an application that wraps its own store and reuses Log values remains the case the boundary describes."
+          ]
+        }
+      },
+      {
+        "id": "184de281ab83410ab0d2356656267a9c-question-1",
+        "question": "Does the documented staging phase of AddVoter exist in the implementation: can a server added through the public AddVoter API be a Nonvoter or Staging member that the leader later promotes once it has caught up?",
+        "disposition": "active",
+        "hypothesis": "The public documentation for AddVoter states that the server is added as a staging server and that the leader promotes it to a voter once it is ready, and the membership design notes list catching new servers up before granting them a vote as a main goal. The implementation does not have that phase: nextConfiguration builds the AddVoter entry with Suffrage Voter outright, the separate Staging suff",
+        "discriminator": "Trace every producer of a configuration entry for AddVoter and every consumer of the Staging suffrage: if the only public path that can add a member writes Suffrage Voter and nothing in the non-test code ever issues Promote, the documented staging phase and its promotion duty do not exist, and the mismatch is decidable by reading rather than by execution. Executed by reading: the AddVoter case wri",
+        "source_ids": [
+          "addvoter",
+          "cfgaddvoter",
+          "cfgcommands",
+          "cfgpromote"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "6aac0bc06d4247569a2bff46e6398a94-interpretation-0",
+          "conclusion": "holds",
+          "defect_claim": "asserted",
+          "rationale": "The point of this control was to test the one soft spot in the AddVoter account: the witness inferred that the commit after the disconnect required the newly added member's acknowledgement, and an inference about quorum arithmetic is only as good as the discriminator behind it. The control holds the harness fixed and changes only the join call, and the outcome separates the two cases exactly as th",
+          "counterevidence": [
+            "Both halves are single executions on separate clusters with the test facility's Disconnect rather than a real partition or crash, so the contrast shows the arithmetic as this harness models reachability.",
+            "The control's failure mode was leadership loss rather than a silent stall, which is a different shape from the witness's success; the comparison therefore rests on commit versus no commit, not on identical failure timing.",
+            "Because the control leaves two voters, it also confirms that a two-voter configuration cannot commit with one member gone, which is standard majority behaviour and not by itself evidence about AddVoter."
+          ],
+          "limitations": [
+            "One case and one control, each executed once; the pair establishes that the discriminator works, not a distribution over timings or cluster sizes.",
+            "The control used AddNonvoter, which produces a non-voting member by design; it does not exercise the Staging suffrage, which no public path reaches."
+          ]
+        }
+      },
+      {
+        "id": "721c1688d0604614841236bb40a995b2-question-1",
+        "question": "When a caller names a server that holds no vote as the target of an explicit leadership transfer, does the named server acquire leadership, and what happens to the sitting leader's authority?",
+        "disposition": "active",
+        "hypothesis": "LeadershipTransferToServer forwards the caller's id and address to the transfer routine, which only requires a replication state for that server, so a vote-less member is accepted as a target. On that target the TimeoutNow handler sets Candidate and the leadership-transfer flag unconditionally and the candidate loop skips pre-vote because of that flag, so the target runs a real election at term+1;",
+        "discriminator": "Demote one real follower to a non-voter through the public API, then call LeadershipTransferToServer on that member and sample the real nodes for a bounded interval: whether the named target ever reaches Leader, which servers do lead, whether the original leader still leads at the end, the reported transfer error, and the term before and after. Executed twice with identical operands (CheckRuns 2b6",
+        "source_ids": [
+          "xferapi",
+          "timeoutnow",
+          "xferprevoteskip",
+          "electself"
+        ],
+        "open_gap_count": 0,
+        "latest_interpretation": {
+          "id": "184de281ab83410ab0d2356656267a9c-interpretation-0",
+          "conclusion": "holds",
+          "defect_claim": null,
+          "rationale": "This run was queued to test the one gap I had left explicit, that the earlier vote-less result might have been a timing accident rather than the mechanism. The reproduction is exact on every operand: target_suffrage=Nonvoter, transfer_err empty, target_ever_leader=false with the target ending as Follower, the original leader the only server seen leading and in Leader state at the end, and the term",
+          "counterevidence": [
+            "Both runs come from the same fixed harness with the same inputs, so the repetition tests scheduling variation of one scenario rather than a range of cluster sizes, timings or target choices; the source argument for the impossibility of a vote-less winner is what covers those unobserved variants.",
+            "As in the earlier control, an empty transfer error accompanies both the successful and the unsuccessful case, so the empty value is not evidence of failure by itself and the account rests on the outcome and term-cost operands.",
+            "The demotion that makes the target vote-less is performed by the caller in the same run, so the run does not separate the configuration change from the transfer in time."
+          ],
+          "limitations": [
+            "Two runs, one scenario: the reproduction is exact but narrow, and the claim that a vote-less member can never win still rests on the election code paths rather than on sampling many configurations.",
+            "The term cost is compared as an endpoint-to-endpoint difference between runs; the intermediate steps are corroborated by the library's own log messages, not by an independent probe of the term value at each instant."
+          ]
+        }
+      }
+    ],
+    "recent_knowledge": [
+      {
+        "id": "4d2efef6faed4deabf9c7d063d367373-knowledge-0",
+        "revision": 2,
+        "kind": "behavior",
+        "statement": "Auditing every quorum-like count in this package against the set its target is computed over leaves one mismatch and four matches. The mismatch is the leader verification, which credits the leader with a vote before consulting any configuration and counts acknowledgements from every entry of the replication state, non-voting members included, while its target counts voters only. The matches are: the election, which asks only voters for votes and tallies only those replies, with the quorum target computed over voters; the pre-vote, which likewise asks voters only; the commitment calculation, wh",
+        "conditions": "This revision, the counts as written in the cited sites; the audit covers the quorum-like counts used for election, pre-vote, commitment and lease decisions, and does not cover message tallies that are not compared against a target.",
+        "source_ids": [
+          "electself",
+          "commitmentworkset",
+          "commitmentmatch",
+          "quorumsize"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "operation_id": "ca9c85d7495f4eb4bb841c01c9af0e03",
+        "uses": [],
+        "use_paths": {},
+        "last_correction": {
+          "revision": 1,
+          "correction": "This revision changes nothing about what is claimed; it completes the evidence behind one clause. The commitment's exclusion of non-voter acknowledgements was stated from the map construction alone, and the call-level site that enforces it - the match function updating an index only for a server already in the map - is now cited with it, so the clause is supported at both the build and the call. The scope, the conditions and the other four counts are unchanged.",
+          "recorded_uses": [],
+          "affected_uses": []
+        },
+        "source_locations": {
+          "electself": "agent-source/raft.go:1976-2043",
+          "quorumsize": "agent-source/raft.go:1086-1094",
+          "commitmentworkset": "agent-source/commitment.go:35-64",
+          "commitmentmatch": "agent-source/commitment.go:77-84"
+        }
+      },
+      {
+        "id": "fe1fbd8a5fd342d6b1923f08a46067d6-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The documentation for VerifyLeader states that it is used to ensure the peer is still the leader and may be used to prevent returning stale data from the FSM after the peer has lost leadership. That is the promise the verification count is measured against: the call is offered as a leadership guard for reads, so a successful verification is read by callers as evidence that this node may still answer as leader, which is why it matters that the count it aggregates can be satisfied by sources the voter quorum does not contain.",
+        "conditions": "This revision, the public VerifyLeader call as documented at the cited range; the statement records the documented purpose, and whether a given application relies on it that way is a property of the application.",
+        "source_ids": [
+          "verifydoc",
+          "verifyleader",
+          "replnotifyall",
+          "quorumsize"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "operation_id": "fe1fbd8a5fd342d6b1923f08a46067d6",
+        "uses": [],
+        "use_paths": {},
+        "last_correction": null,
+        "source_locations": {
+          "verifyleader": "agent-source/raft.go:965-987",
+          "replnotifyall": "agent-source/replication.go:100-111",
+          "quorumsize": "agent-source/raft.go:1086-1094",
+          "verifydoc": "agent-source/api.go:880-883"
+        }
+      },
+      {
+        "id": "fad0abf6d3f145f6b66b69a9f680c1ba-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The documentation for LeadershipTransferToServer states that it does the same as LeadershipTransfer but takes a specific server in the cluster as an argument, that the leader stops accepting requests, makes sure the target is up to date and starts the transfer with a TimeoutNow message, and that the use is safe in a cluster where not every node runs the latest version because a follower that cannot be promoted fails gracefully. That is the promise the transfer finding is measured against: the call is offered as a way to hand leadership to a named member of the cluster, so a target that holds n",
+        "conditions": "This revision, the public LeadershipTransferToServer call as documented at the cited range; the statement records the documented purpose, and the warning about mixed versions is the documentation's own, not an inference from the run.",
+        "source_ids": [
+          "xferdoc",
+          "xferapi",
+          "timeoutnow",
+          "xferprevoteskip"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "operation_id": "fad0abf6d3f145f6b66b69a9f680c1ba",
+        "uses": [],
+        "use_paths": {},
+        "last_correction": null,
+        "source_locations": {
+          "timeoutnow": "agent-source/raft.go:2209-2214",
+          "xferprevoteskip": "agent-source/raft.go:294-300",
+          "xferapi": "agent-source/api.go:1276-1282",
+          "xferdoc": "agent-source/api.go:1269-1275"
+        }
+      }
+    ],
+    "index": "research.json; full statements, sources, uses and history: state.json; captured tree: agent-source/",
+    "scope": "Open-gap questions first, then recently updated questions; bounded navigation, not research priority or coverage. A scoped negative does not settle unobserved consequences; full records and remaining questions are in research.json.",
+    "execution_capacity": {
+      "available": false,
+      "timeout_ceiling_seconds": 0,
+      "note": "Capacity is not a runtime estimate. Include construction/review time; source work remains useful if a test will not fit."
+    }
+  },
+  "current": {
+    "phase": "failed",
+    "operation_id": "651134ab670b41e6976d2caf901b0215",
+    "result": null,
+    "status": "timeout",
+    "reason": "Total runtime budget exhausted; process group killed",
+    "session_unavailable": false
+  },
+  "validation": {
+    "command": [
+      "/home/nitro/Desktop/consensus-assurance/.venv/bin/python",
+      "-I",
+      "-B",
+      "-c",
+      "import sys; sys.path.insert(0, '/home/nitro/Desktop/consensus-assurance/src'); from consensus_assurance.cli import main; raise SystemExit(main())",
+      "validate",
+      "--run",
+      "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run",
+      "--submission"
+    ],
+    "read_only_paths": [
+      "/home/nitro/Desktop/consensus-assurance/src",
+      "/home/nitro/Desktop/consensus-assurance/.venv/lib/python3.10/site-packages",
+      "/home/nitro/Desktop/consensus-assurance/.venv/bin",
+      "/home/nitro/Desktop/consensus-assurance/.venv/pyvenv.cfg"
+    ]
+  },
+  "tools": {
+    "agent": "codex-cli 0.162.0-alpha.17.2",
+    "implementation": "go version go1.23.5 linux/amd64"
+  },
+  "build_inputs": [],
+  "implementation": {
+    "name": "go_module",
+    "harness_kind": "go_test",
+    "harness_filename": "assurance_generated_test.go",
+    "default_execution_package": ".",
+    "instructions": "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs.",
+    "network": "Agent shell networking is disabled. Isolated target execution may communicate only inside its private network namespace.",
+    "support_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/target-support"
+  },
+  "example": {
+    "rationale": "Investigate a sourced local uncertainty",
+    "sources": [
+      {
+        "id": "source",
+        "file": "REPLACE_WITH_CAPTURED_FILE",
+        "start_line": 1,
+        "end_line": 1,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "ref": "@question",
+        "question": "Which applicable caller condition establishes this result?",
+        "source_ids": [
+          "source"
+        ],
+        "discriminator": "Trace the actual producer and the enclosing protection"
+      }
+    ]
+  },
+  "optional_experiment": {
+    "investigation_id": "@question",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "source"
+    ],
+    "scope": {
+      "description": "Observe the sourced local behavior"
+    },
+    "prefix": "Describe actual initialization and producer calls in the draft harness, including supplied state"
+  },
+  "costs": {
+    "agent_calls": 46,
+    "target_executions": 14,
+    "process_seconds": 192.67281000000003,
+    "action_seconds": 198.8557256899985,
+    "unrecorded_action_ids": [],
+    "elapsed_seconds": 3600.339331846997
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "rationale": "The retained-bytes experiment executed (receipt 6eccd9a311b84ba4b6c02771f746dd50, experiment 2bb54275ad0a4414918a4d338739fcf6-experiment, status completed, outcome tests_passed, exit 0, no changed target files) and I read its receipt before writing. All three comparisons hold with complete admissions: setup index 10 records a StateLeader with CheckQuorum false over three voters, ctx_bytes 4096 and 64 rounds, and probe index 11 records pending 64, retained_ctx_bytes 262144 and distinct_ctx_buffers 64 - so the retained payload is the accepted-request count multiplied by the caller-chosen context size, and the 64 payloads really sit in 64 distinct buffers rather than one shared slice counted repeatedly. That receipt also carries every earlier case (indices 1-9), so one receipt now covers the whole predicate including the severity measurement. I promote the retention to a durable fact, revise the interpretation to cite this receipt, set the answered question's disposition to explained, and narrow the severity limitation to what is still unmeasured (total process footprint, allocator overhead, OOM).",
+  "sources": [
+    {
+      "id": "ra_admit",
+      "file": "raft.go",
+      "start_line": 1355,
+      "end_line": 1372,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_reset",
+      "file": "raft.go",
+      "start_line": 781,
+      "end_line": 812,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_contract",
+      "file": "node.go",
+      "start_line": 218,
+      "end_line": 224,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@K_read_retained_bytes",
+      "kind": "fact",
+      "statement": "The read state a quorum-less leader retains is caller-controlled in size. With CheckQuorum false over voters {1,2,3}, 64 ReadIndex requests each carrying its own freshly allocated 4096-byte RequestCtx were all retained in pendingReadIndexMessages: pending 64, summed retained Data length 262144 bytes, and 64 distinct backing buffers, so the total is genuine per-request retention rather than one shared slice counted 64 times. The retained payload per leader therefore equals the number of accepted requests times the caller-chosen context size, with no library-side limit on either factor.",
+      "conditions": "No MsgAppResp or MsgHeartbeatResp is delivered, so every request takes the queued path; each request carries a distinct buffer, modelling a caller issuing distinct reads (the ReadIndex API takes an opaque rctx []byte and documents no size limit). The count covers only the entry Data payloads held in pendingReadIndexMessages, not message structs, slice headers or allocator overhead, and no deployment memory limit is claimed.",
+      "source_ids": [
+        "ra_admit",
+        "ra_reset"
+      ],
+      "executions": {
+        "6eccd9a311b84ba4b6c02771f746dd50": [11]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+      "experiment_id": "2bb54275ad0a4414918a4d338739fcf6-experiment",
+      "source_ids": [
+        "ra_admit",
+        "ra_reset",
+        "ra_contract"
+      ],
+      "executions": {
+        "6eccd9a311b84ba4b6c02771f746dd50": [1, 2, 4, 6, 8, 9, 11]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "knowledge": [
+        {
+          "entry_id": "@K_read_retained_bytes",
+          "revision": 1,
+          "assertion": "retained payload equals accepted requests times caller-chosen context size, held in distinct buffers"
+        },
+        {
+          "entry_id": "ec634053934546af8e5da7dcb41717bd-knowledge-0",
+          "revision": 1,
+          "assertion": "without CheckQuorum the queued path accumulates one entry per request and is not reclaimed"
+        },
+        {
+          "entry_id": "03642230074a4ecfa828a594c9580e21-knowledge-0",
+          "revision": 1,
+          "assertion": "with CheckQuorum the window closes at step-down but the accumulated state is retained"
+        },
+        {
+          "entry_id": "e2b3f903fe394533a660cc23bded2379-knowledge-0",
+          "revision": 1,
+          "assertion": "the accumulated queue is released as a burst of one admission and one heartbeat per entry"
+        }
+      ],
+      "rationale": "Final revision; one receipt carries every part of the predicate including the severity measurement. Receipt 6eccd9a311b84ba4b6c02771f746dd50 (experiment 2bb54275ad0a4414918a4d338739fcf6-experiment) ran in the isolated workspace; status completed, outcome tests_passed, exit 0, no changed target files, no parsing errors. Decisive parsed indices: 1 and 2, the quorum-less leader with CheckQuorum false (64 requests to pending 64, still 64 after deposition); 3 and 4, the two-voter leader committed in its term whose 64 requests produced unconfirmed 64 and broadcasts 64; 5 and 6, the drain case (pending 64 to pending 0, unconfirmed 64, broadcasts 64 in a single commit step); 7, 8 and 9, the CheckQuorum control (24 requests over three ticks ending at StateFollower with window_closed true, and eight further reads leaving the queue at 24); 10 and 11, the retention measurement (StateLeader, ctx_bytes 4096, pending 64, retained_ctx_bytes 262144, distinct_ctx_buffers 64). Every declared comparison across the five executions of this investigation evaluated holds with comparison_complete true and no missing indices, and all four paths are now measured rather than argued. The asserted claim, with its sharpened conditions: under permitted use - a legitimate leader, ReadOnlySafe, CheckQuorum false (the library default, which ReadOnlySafe does not require) or a bounded CheckQuorum window, and a caller that retries or issues reads per the documented contract at node.go:218-224 - the library retains one read request per accepted request with no collapsing and no library-side bound, never reclaims the state (raft.reset leaves the queue; only a quorum ack advances maybeAdvance for admitted requests), pins caller-controlled payload equal to accepted requests times context size, and emits one heartbeat per retry as well as a burst of one admission plus one heartbeat per queued entry on release. The refusal to answer reads without quorum remains correct and is not the complaint. Competing explanations considered and settled: the state is not transient (the CheckQuorum control shows the window closing while the state persists, and the default configuration has no window at all); a healthy quorum confirms each retry on the next heartbeat response, so this is not a steady-state cost; the removal of context-keyed handling is the v3.7.0 stale-index fix (CHANGELOG/CHANGELOG-3.7.md, PR 397) and is not contested, only the absence of a size limit around it; and the caller recreating its obligation on each retry does not explain the missing bound or the absence of any signal that its request is still queued. Severity is now measured for retention itself: 64 requests with 4 KiB contexts retained 262144 bytes in 64 distinct buffers, so the footprint scales with the product of accepted requests and caller-chosen context size; what remains unmeasured is total process footprint (message structs, slice headers, allocator overhead), a concrete OOM threshold, transport saturation and any liveness failure, none of which is claimed.",
+      "limitations": [
+        "Severity is measured for the retained caller payload only; total process footprint, allocator overhead, an OOM threshold, transport saturation and liveness failure are not claimed.",
+        "All experiments drive direct raft instances with no responses delivered, so the triggers (partition from quorum with CheckQuorum false; quorum loss with CheckQuorum true) are modelled rather than exercised over a network.",
+        "etcd's own retry policy and RequestCtx sizes were not examined, so the practical magnitude in the primary downstream user is unknown.",
+        "The growth, drain and control cases each use one configuration at one depth (64 or 24 requests); linearity in the accepted-request count follows from the mechanism (one append per accepted request, looped release) and from the byte measurement at one depth, not from a sweep of depths.",
+        "The control fixes the retry rate at eight per tick, so it shows the window closing within the election timeout but does not measure how much state a faster retry rate could accumulate in that interval."
+      ]
+    }
+  ]
+}

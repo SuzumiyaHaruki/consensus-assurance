@@ -18,6 +18,7 @@ def test_cli_fixed_execution_and_fresh_run_are_independent(tmp_path, capsys):
     fixture = tmp_path / 'responses.json'
     fixture.write_text(json.dumps([dict(submission=submission, files=files)]))
     config = Config(agent_backend='mock', execution_backend='python', fixture=str(fixture),
+                    investigation_focus=['Trace persistence across recovery'],
                     execution_isolation='workspace', runs_dir=str(tmp_path / 'runs'),
                     budget=Budget(agent_calls=1, experiments=1, total_seconds=30))
     path = tmp_path / 'config.json'
@@ -34,9 +35,15 @@ def test_cli_fixed_execution_and_fresh_run_are_independent(tmp_path, capsys):
         assert len(state['experiments']) == 1 and state['interpretations'] == []
         assert main(['report', '--run', str(root), '--export-views']) == 0
         assert (root / 'knowledge.json').is_file()
+        view = json.loads((root / 'research.json').read_text())
+        assert view['investigation_focus'] == config.investigation_focus
+        assert len(view['reselection']['investigation_axes']) == 2
         schema = json.loads((root / 'submission.schema.json').read_text())
         assert not {'Unit', 'Claim', 'Binding', 'GraphPatch', 'Evidence', 'Finding'} & schema['$defs'].keys()
         assert not {'report_title', 'report_answer'} & schema['$defs']['InterpretationUpdate']['properties'].keys()
+        assert 'defect_claim' in schema['$defs']['InterpretationUpdate']['required']
+        assert set(schema['$defs']['GapAnswer']['required'])=={'explanation','resolved'}
+        assert not {'counterevidence','limitations'} & schema['$defs']['QuestionUpdate']['properties'].keys()
     assert {p.name: p.read_bytes() for p in repo.iterdir()} == original
     capsys.readouterr()
 

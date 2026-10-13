@@ -1,0 +1,60 @@
+{
+  "id": "a3e037c016ac4e2f976d62b3165916ce-experiment",
+  "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// fastPathTransport forwards everything to an in-memory transport but, like the\n// network transport, installs and honours a heartbeat handler: a strictly empty\n// AppendEntries request is dispatched to that handler on the caller's\n// goroutine, and the caller then waits for a response on the channel it\n// supplied, which is what the network transport's connection goroutine does.\ntype fastPathTransport struct {\n\t*InmemTransport\n\n\thbLock sync.Mutex\n\thbFn   func(RPC)\n}\n\nfunc (t *fastPathTransport) SetHeartbeatHandler(cb func(RPC)) {\n\tt.hbLock.Lock()\n\tt.hbFn = cb\n\tt.hbLock.Unlock()\n}\n\n// deliverHeartbeat mirrors the network transport's classification, dispatch and\n// response wait. It returns the response or an error, including when no\n// response arrives inside the given bound.\nfunc (t *fastPathTransport) deliverHeartbeat(req *AppendEntriesRequest, wait time.Duration) (*AppendEntriesResponse, error) {\n\tt.hbLock.Lock()\n\tfn := t.hbFn\n\tt.hbLock.Unlock()\n\tif fn == nil {\n\t\treturn nil, fmt.Errorf(\"no heartbeat handler installed\")\n\t}\n\tif !(req.Term != 0 && req.RPCHeader.Addr != nil &&\n\t\treq.PrevLogEntry == 0 && req.PrevLogTerm == 0 &&\n\t\tlen(req.Entries) == 0 && req.LeaderCommitIndex == 0) {\n\t\treturn nil, fmt.Errorf(\"request would not be classified as a heartbeat\")\n\t}\n\trespCh := make(chan RPCResponse, 1)\n\tfn(RPC{Command: req, RespChan: respCh})\n\tselect {\n\tcase r := <-respCh:\n\t\tif r.Error != nil {\n\t\t\treturn nil, r.Error\n\t\t}\n\t\tresp, ok := r.Response.(*AppendEntriesResponse)\n\t\tif !ok {\n\t\t\treturn nil, fmt.Errorf(\"unexpected heartbeat response type\")\n\t\t}\n\t\treturn resp, nil\n\tcase <-time.After(wait):\n\t\treturn nil, fmt.Errorf(\"no response within %s\", wait)\n\t}\n}\n\n// TestAssurance_HeartbeatAfterShutdown asks what the fast path does with an\n// accepted heartbeat once the node has been shut down while its transport is\n// still open, which is the state a caller leaves the node in when it does not\n// wait on the shutdown future.\nfunc TestAssurance_HeartbeatAfterShutdown(t *testing.T) {\n\taddr, itrans := NewInmemTransport(\"\")\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(addr)\n\ttrans := &fastPathTransport{InmemTransport: itrans}\n\tstore := NewInmemStore()\n\tsnaps := NewInmemSnapshotStore()\n\tfsm := &MockFSM{}\n\tconfiguration := Configuration{Servers: []Server{{\n\t\tSuffrage: Voter,\n\t\tID:       ServerID(addr),\n\t\tAddress:  addr,\n\t}}}\n\n\tif err := BootstrapCluster(conf, store, store, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tnode, err := NewRaft(conf, fsm, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\n\tlimit := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(limit) && node.getState() != Leader {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tpeerAddr := trans.EncodePeer(ServerID(\"peer-1\"), ServerAddress(\"peer-1\"))\n\tnewHeartbeat := func(term uint64) *AppendEntriesRequest {\n\t\treturn &AppendEntriesRequest{\n\t\t\tRPCHeader: RPCHeader{\n\t\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\t\tID:              []byte(\"peer-1\"),\n\t\t\t\tAddr:            peerAddr,\n\t\t\t},\n\t\t\tTerm:   term,\n\t\t\tLeader: peerAddr,\n\t\t}\n\t}\n\n\t// Control: the same delivery path while the node is live.\n\ttermBefore := node.getCurrentTerm()\n\tcontrolErr := \"\"\n\tcontrolSuccess := false\n\tif resp, err := trans.deliverHeartbeat(newHeartbeat(termBefore+1), 3*time.Second); err != nil {\n\t\tcontrolErr = err.Error()\n\t} else {\n\t\tcontrolSuccess = resp.Success\n\t}\n\ttermAfterControl := node.getCurrentTerm()\n\tstateAfterControl := node.getState().String()\n\n\t// Shut the node down but leave its transport open, then deliver one more\n\t// heartbeat on the same fast path.\n\tshutdownFuture := node.Shutdown()\n\ttime.Sleep(200 * time.Millisecond)\n\n\ttermAfterShutdown := node.getCurrentTerm()\n\tstateAfterShutdown := node.getState().String()\n\n\tpostErr := \"\"\n\tpostSuccess := false\n\tpostWaitStart := time.Now()\n\tif resp, err := trans.deliverHeartbeat(newHeartbeat(termAfterShutdown+1), 2*time.Second); err != nil {\n\t\tpostErr = err.Error()\n\t} else {\n\t\tpostSuccess = resp.Success\n\t}\n\tpostWaitMs := time.Since(postWaitStart).Milliseconds()\n\ttermAfterPost := node.getCurrentTerm()\n\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"heartbeat_after_shutdown\\\",\\\"node_addr\\\":%q,\"+\n\t\t\"\\\"control_err\\\":%q,\\\"control_success\\\":%t,\\\"term_before\\\":%d,\\\"term_after_control\\\":%d,\"+\n\t\t\"\\\"state_after_control\\\":%q,\\\"term_after_shutdown\\\":%d,\\\"state_after_shutdown\\\":%q,\"+\n\t\t\"\\\"post_shutdown_err\\\":%q,\\\"post_shutdown_success\\\":%t,\\\"post_shutdown_wait_ms\\\":%d,\"+\n\t\t\"\\\"term_after_post\\\":%d}\\n\",\n\t\tstring(addr), controlErr, controlSuccess, termBefore, termAfterControl,\n\t\tstateAfterControl, termAfterShutdown, stateAfterShutdown,\n\t\tpostErr, postSuccess, postWaitMs, termAfterPost)\n\n\t_ = shutdownFuture.Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "processheartbeat",
+      "appendentriesmain",
+      "netxpheartbeat",
+      "inmemnosupport"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "On one real single-node Raft instance built over a transport that implements the heartbeat fast path, deliver one empty heartbeat while the node is live as a control, then shut the node down while leaving its transport open and deliver a second empty heartbeat, emitting one CA_EVENT JSON line that records whether each delivery got a response, how long the second waited, and the node's term and state around each.",
+      "assumptions": [
+        "The wrapper transport reproduces the network transport's classification, synchronous dispatch to the installed handler and response wait faithfully, so the handler under test is the production processHeartbeat and the appendEntries it calls.",
+        "Calling Shutdown() without waiting on the returned future leaves the in-memory transport open, which is the state a caller creates when it does not wait, and the transport is only closed when the shutdown future is waited on at the end of the test.",
+        "The second heartbeat carries a term one above the node's current term, so if the handler ran its term logic the term would move and be observable; a term that stays put together with no response is evidence the handler returned at its shutdown check.",
+        "A bounded response wait is the only practical way to observe a missing response in-process; the zero-response reading is interpreted together with the source fact that the handler has no other response path once the shutdown channel is closed."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test in the captured package plus a local transport wrapper. It creates a real in-memory transport, wraps it in a type that stores the handler set by NewRaft and dispatches strictly empty AppendEntries requests to it on the caller's goroutine before waiting on the supplied response channel, bootstraps a single-voter configuration with BootstrapCluster and starts the node with NewRaft over in-memory stores, snapshots and MockFSM, then waits (bounded) for Leader state. It records the term, delivers an empty heartbeat one term above it through the wrapper's fast path with a bounded wait and records the control outcome, term and state. It then calls Shutdown() and deliberately does not wait on the returned future, sleeps briefly so the node's routines observe the shutdown, records the term and state, and delivers a second empty heartbeat one term above the current one with a bounded wait, recording whether a response arrived, how long the wait was and whether the term moved. It prints one CA_EVENT JSON line with all of these operands and only then waits on the shutdown future, which is what closes the transport.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "09193ea9b7ee4df99810e6eee7058028",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "a3e037c016ac4e2f976d62b3165916ce",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

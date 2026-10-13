@@ -1,0 +1,153 @@
+{
+  "id": "c48406a2e59d4611a2fba6df8d635032-experiment",
+  "investigation_id": "ef5ddbf78bd4456ea51537bd60a61a80-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// restartAfterRecovery boots a single-node cluster, commits entries that\n// include the bootstrap configuration entry, then restarts the node from the\n// same on-disk state and reports the configuration the node holds in memory\n// after NewRaft returns.\n//\n// No snapshot is ever taken, so restoreSnapshot cannot supply a configuration;\n// the log is the only source of the configuration (LogStore is also the\n// CommitTrackingLogStore whose persisted commit index drives\n// restoreFromCommittedLogs).\nfunc restartAfterRecovery(t *testing.T, restoreCommittedLogs bool) {\n\tconf := inmemConfig(t)\n\tconf.RestoreCommittedLogs = restoreCommittedLogs\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 1 << 40\n\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tleader := c.Leader()\n\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply err: %v\", err)\n\t\t}\n\t}\n\n\tbeforeLatestIndex := leader.configurations.latestIndex\n\tbeforeCommittedIndex := leader.configurations.committedIndex\n\tbeforeServers := len(leader.configurations.latest.Servers)\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\n\tmode := map[bool]string{true: \"on\", false: \"off\"}[restoreCommittedLogs]\n\tsetup := map[string]interface{}{\n\t\t\"event\":                  \"startup_before_restart\",\n\t\t\"mode\":                   mode,\n\t\t\"phase\":                  \"before_restart\",\n\t\t\"restore_committed_logs\": restoreCommittedLogs,\n\t\t\"snapshots\":              len(snaps),\n\t\t\"before_latest_index\":    beforeLatestIndex,\n\t\t\"before_committed_index\": beforeCommittedIndex,\n\t\t\"before_servers\":         beforeServers,\n\t\t\"peers\":                  opts.Peers,\n\t\t\"applied_entries\":        10,\n\t}\n\tsetupBytes, err := json.Marshal(setup)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal setup: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(setupBytes))\n\n\t// Restart from the same logs/stable/snapshots stores.\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown err: %v\", err)\n\t}\n\t_, trans2 := NewInmemTransport(leader.trans.LocalAddr())\n\tcfg := leader.config()\n\trestarted, err := NewRaft(&cfg, leader.fsm, leader.logs, leader.stable, leader.snapshots, trans2)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft err: %v\", err)\n\t}\n\tc.rafts[0] = restarted\n\tdefer c.Close()\n\n\tafter := restarted.getLatestConfiguration()\n\n\tevent := map[string]interface{}{\n\t\t\"event\":                  \"restart_after_recovery\",\n\t\t\"phase\":                  \"after_restart\",\n\t\t\"mode\":                   mode,\n\t\t\"restore_committed_logs\": restoreCommittedLogs,\n\t\t\"snapshots\":              len(snaps),\n\t\t\"before_latest_index\":    beforeLatestIndex,\n\t\t\"before_committed_index\": beforeCommittedIndex,\n\t\t\"before_servers\":         beforeServers,\n\t\t\"after_latest_index\":     restarted.configurations.latestIndex,\n\t\t\"after_committed_index\":  restarted.configurations.committedIndex,\n\t\t\"after_servers\":          len(after.Servers),\n\t\t\"after_has_vote\":         hasVote(after, restarted.localID),\n\t\t\"after_quorum_size\":      restarted.quorumSize(),\n\t\t\"after_commit_index\":     restarted.getCommitIndex(),\n\t\t\"after_last_applied\":     restarted.getLastApplied(),\n\t\t\"after_last_log_index\":   restarted.getLastIndex(),\n\t}\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc TestAssuranceRestartConfigurationRecovery(t *testing.T) {\n\trestartAfterRecovery(t, true)\n\trestartAfterRecovery(t, false)\n}\n\n// restartAfterConfigChangeCommittedAfterSnapshot covers the registered gap: a\n// committed LogConfiguration entry that is newer than the on-disk snapshot.\n// A nonvoter is added so the change commits with a one-voter quorum, then the\n// node is restarted from the same stores and the configuration it holds after\n// NewRaft returns is compared with the configuration the log says is latest.\nfunc restartAfterConfigChangeCommittedAfterSnapshot(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.RestoreCommittedLogs = true\n\tconf.SnapshotThreshold = 5\n\tconf.SnapshotInterval = 50 * time.Millisecond\n\tconf.TrailingLogs = 1 << 40\n\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tleader := c.Leader()\n\n\t// Drive enough traffic for a snapshot to exist before the config change.\n\tdeadline := time.Now().Add(20 * time.Second)\n\tvar snaps []*SnapshotMeta\n\tfor i := 0; time.Now().Before(deadline); i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply err: %v\", err)\n\t\t}\n\t\tvar err error\n\t\tsnaps, err = leader.snapshots.List()\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t\t}\n\t\tif len(snaps) > 0 {\n\t\t\tbreak\n\t\t}\n\t}\n\tif len(snaps) == 0 {\n\t\tt.Fatal(\"no snapshot was taken before the configuration change\")\n\t}\n\n\t// Commit a configuration change that is newer than the snapshot.\n\tcfgFuture := leader.AddNonvoter(ServerID(\"nonvoter-b\"), ServerAddress(\"nonvoter-b\"), 0, 5*time.Second)\n\tif err := cfgFuture.Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter err: %v\", err)\n\t}\n\n\t// Commit further entries so the persisted (staged) commit index advances\n\t// past the configuration entry's index; otherwise the entry would still sit\n\t// above the restored commit index and be re-scanned.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"post%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply err: %v\", err)\n\t\t}\n\t}\n\t// Give the replication/commit path a moment to stage the newer index.\n\ttime.Sleep(50 * time.Millisecond)\n\n\texpectedIndex := cfgFuture.Index()\n\texpectedServers := len(leader.configurations.latest.Servers)\n\tbeforeLatestIndex := leader.configurations.latestIndex\n\tsnapshotIndex := snaps[0].Index\n\tsnapshotConfigIndex := snaps[0].ConfigurationIndex\n\n\tmode := \"snapshot\"\n\tsetup := map[string]interface{}{\n\t\t\"event\":                  \"startup_before_restart\",\n\t\t\"mode\":                   mode,\n\t\t\"phase\":                  \"before_restart\",\n\t\t\"restore_committed_logs\": true,\n\t\t\"snapshots\":              len(snaps),\n\t\t\"snapshot_index\":         snapshotIndex,\n\t\t\"snapshot_config_index\":  snapshotConfigIndex,\n\t\t\"expected_latest_index\":  expectedIndex,\n\t\t\"expected_servers\":       expectedServers,\n\t\t\"before_latest_index\":    beforeLatestIndex,\n\t}\n\tsetupBytes, err := json.Marshal(setup)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal setup: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(setupBytes))\n\n\t// Restart from the same stores.\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown err: %v\", err)\n\t}\n\t_, trans2 := NewInmemTransport(leader.trans.LocalAddr())\n\tcfg := leader.config()\n\trestarted, err := NewRaft(&cfg, leader.fsm, leader.logs, leader.stable, leader.snapshots, trans2)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft err: %v\", err)\n\t}\n\tc.rafts[0] = restarted\n\tdefer c.Close()\n\n\tafter := restarted.getLatestConfiguration()\n\tmatches := restarted.configurations.latestIndex == expectedIndex &&\n\t\tlen(after.Servers) == expectedServers\n\n\tevent := map[string]interface{}{\n\t\t\"event\":                  \"restart_after_config_change\",\n\t\t\"mode\":                   mode,\n\t\t\"phase\":                  \"after_restart\",\n\t\t\"restore_committed_logs\": true,\n\t\t\"snapshots\":              len(snaps),\n\t\t\"snapshot_index\":         snapshotIndex,\n\t\t\"snapshot_config_index\":  snapshotConfigIndex,\n\t\t\"expected_latest_index\":  expectedIndex,\n\t\t\"expected_servers\":       expectedServers,\n\t\t\"before_latest_index\":    beforeLatestIndex,\n\t\t\"after_latest_index\":     restarted.configurations.latestIndex,\n\t\t\"after_servers\":          len(after.Servers),\n\t\t\"after_has_vote\":         hasVote(after, restarted.localID),\n\t\t\"after_commit_index\":     restarted.getCommitIndex(),\n\t\t\"after_last_applied\":     restarted.getLastApplied(),\n\t\t\"matches_committed_log\":  matches,\n\t}\n\teventBytes, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(eventBytes))\n}\n\nfunc TestAssuranceRestartConfigurationAfterSnapshot(t *testing.T) {\n\trestartAfterConfigChangeCommittedAfterSnapshot(t)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "mode_snapshot",
+          "event": "startup_before_restart",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "snapshot",
+              "reference": null
+            },
+            {
+              "field": "snapshots",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "snapshot_config_index",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "expected_servers",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "api_restore_committed_call",
+      "api_restore_committed_body",
+      "api_restore_snapshot_config",
+      "api_addnonvoter",
+      "snapshot_compact_trailing"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Single-node bootstrapped cluster with RestoreCommittedLogs on and a CommitTrackingLogStore. Commit enough entries that a snapshot is taken, then commit an AddNonvoter configuration change (which commits with a one-voter quorum) and ten further commands so the persisted commit index moves past the configuration entry. Restart from the same stores and compare the configuration held after NewRaft returns with the configuration the log says is latest.",
+      "assumptions": [
+        "The snapshot on disk carries only the bootstrap configuration, so it cannot represent the later AddNonvoter change.",
+        "Committing the nonvoter does not change the quorum, so the single voter keeps making progress.",
+        "The persisted commit index has advanced past the configuration entry's index by the time of the restart."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Any change of production logic; only the library's public configuration API and test facilities are used.",
+        "The unrelated suspicion that restoreFromCommittedLogs' processLogs call can block NewRaft before runFSM starts."
+      ],
+      "parameters": {
+        "peers": 1,
+        "snapshot_threshold": 5,
+        "config_change": "AddNonvoter",
+        "entries_after_change": 10
+      }
+    },
+    "prefix": "The harness boots one node with CommitTrackingLogs and a low SnapshotThreshold, repeats Apply until snapshots.List() returns a snapshot, then calls AddNonvoter, awaits its IndexFuture, and commits ten more commands so the staged commit index passes the configuration entry. It emits a startup_before_restart event carrying the snapshot index, the snapshot's configuration index, the configuration entry index and the expected server count, then shuts the node down and calls NewRaft again on the same logs, stable and snapshots stores with a fresh inmem transport. The restart_after_config_change event reports the configuration observed after NewRaft returns together with the operands of the comparison (expected and actual index and server count, restored commit index, lastApplied).",
+    "requirement": null,
+    "responsibility": "The library owns the precondition that a node's in-memory configuration reflects the committed configuration in its own log at startup, including changes newer than the snapshot; the caller selects Config.RestoreCommittedLogs and triggers the change through the public API.",
+    "comparisons": [
+      {
+        "event": "restart_after_config_change",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mode_snapshot",
+        "assertion": {
+          "field": "matches_committed_log",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "expected_latest_index",
+            "op": "ne",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "After restarting from a state whose log holds a committed configuration change newer than the snapshot, the node's latest configuration index and server count are expected to equal the ones the log established before shutdown; the defect prediction is that the node falls back to the snapshot's configuration."
+      },
+      {
+        "event": "restart_after_config_change",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mode_snapshot",
+        "assertion": {
+          "field": "after_servers",
+          "op": "eq",
+          "value": 2,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "The restarted node is expected to still list the added nonvoter, i.e. two servers against the snapshot's one; the defect prediction is one server."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "5c746d29242b4f9d86ccfda9aefed009",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "c48406a2e59d4611a2fba6df8d635032",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

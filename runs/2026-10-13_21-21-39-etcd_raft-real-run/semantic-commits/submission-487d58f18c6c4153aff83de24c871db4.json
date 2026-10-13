@@ -1,0 +1,1695 @@
+{
+  "input": {
+    "rationale": "A durable correction rather than a new finding: the behaviour entry that describes ReadOnlySafe admission said each admitted request broadcasts a heartbeat, and the isolated-network receipt shows the cost is one heartbeat per peer, that is n-1 messages per request (64 for 32 requests in a three-voter cluster). Because that entry is used by the asserted read-index defect and by several interpretations that reasoned about retry cost, I am correcting its premise under the same id and naming the recorded uses that relied on the old reading, rather than adding a parallel entry.",
+    "sources": [
+      {
+        "id": "ra_admit",
+        "file": "raft.go",
+        "start_line": 1355,
+        "end_line": 1372,
+        "kind": "code_observation"
+      },
+      {
+        "id": "ra_send",
+        "file": "raft.go",
+        "start_line": 2146,
+        "end_line": 2162,
+        "kind": "code_observation"
+      },
+      {
+        "id": "ra_bcast",
+        "file": "raft.go",
+        "start_line": 722,
+        "end_line": 728,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [],
+    "knowledge": [
+      {
+        "id": "ee850f515b5d49718d5f55c4c1d36e61-knowledge-0",
+        "ref": null,
+        "kind": "behavior",
+        "statement": "ReadOnlySafe admission and growth, in this snapshot: every MsgReadIndex that reaches a leader is admitted individually. If the cluster is not a singleton and committedEntryInCurrentTerm holds, sendMsgReadIndexResponse adds one entry to readOnly.unconfirmedReads through readOnly.addRequest, which appends without any lookup of an existing request with the same context, and then calls bcastHeartbeat, which sends one heartbeat to every other tracked peer carrying r.readOnly.heartbeatCtx() - so one admitted request costs one heartbeat per peer, not a single message. If committedEntryInCurrentTerm does not hold, the raw message is appended to pendingReadIndexMessages and released only later, one response per queued message, each release again costing an admission plus a heartbeat per peer. Measured on a real three-node network with the leader isolated from both followers: 32 same-context requests produced unconfirmedReads length 32 with confirmedReads 0 and 64 heartbeat messages, one per peer per request.",
+        "conditions": "ReadOnlySafe, leader in StateLeader. Admission is per request and context-blind, so N retries with an identical context produce N entries; the outbound cost scales with N times the number of other tracked peers. Under a healthy quorum each retry is confirmed on the next heartbeat response, so the queue stays short. The node-level contract that makes retries the caller's duty is at node.go:218-224.",
+        "source_ids": [
+          "ra_admit",
+          "ra_send",
+          "ra_bcast"
+        ],
+        "executions": {
+          "e3bd14fe94534fbca3955cae4e521df7": [
+            1
+          ]
+        },
+        "knowledge": [],
+        "changed_premise": "The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+        "affected_uses": [
+          "8e42a5752e9d454bb97823c6d38e4728-interpretation-0",
+          "be2af26c5f2f43679ffe2592668f8388-experiment",
+          "d3c59bbf96b7456c891afc06f2cd1a5f-experiment",
+          "e2b3f903fe394533a660cc23bded2379-interpretation-0",
+          "ec634053934546af8e5da7dcb41717bd-interpretation-0",
+          "ee850f515b5d49718d5f55c4c1d36e61-interpretation-0"
+        ]
+      }
+    ],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "71f53a32a0c74532a55ad33bc1e71086-question-0",
+        "version": 2,
+        "question": "In the ReadOnlySafe read-index flow, is a heartbeat response's Context validated against the outstanding read requests before it is used to confirm a read index, and what bounds the value used to slice unconfirmedReads?",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp",
+          "raft_readidx"
+        ],
+        "hypothesis": "Refined after resolving the gap: readOnly.recvAck does store a peer-supplied Context as a raw read-position ack with no check that the leader emitted it, and maybeAdvance slices unconfirmedReads by the resulting quorum position without clamping. But every legal producer in this snapshot echoes a value the live leader's heartbeatCtx produced (handleHeartbeat is the sole writer of MsgHeartbeatResp.Context), the readOnly instance is created only by raft.reset at a leadership transition, and the emitted position equals a message total that is non-decreasing, so the quorum position can never exceed confirmedReads+len(unconfirmedReads) in-model. The two consequences (slice-bounds panic; confirming a read no quorum observed) require a Context outside the set heartbeatCtx emitted, which no in-model producer supplies.",
+        "discriminator": "Resolved: enumerate the sites that create the readOnly instance (only raft.reset, called from becomeFollower/becomeCandidate/becomeLeader) and the writers of MsgHeartbeatResp.Context (only handleHeartbeat, echoing m.Context). None can deliver a value the leader did not emit while its instance was live, because a readOnly instance is only live while its node is leader in a single term and cross-term responses are dropped before stepLeader. If a later source read showed any other readOnly reassignment or Context producer (e.g. an application-visible heartbeat context), the in-model claim would revive.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "71f53a32a0c74532a55ad33bc1e71086-gap-0",
+            "question": "Is there any legal producer in this snapshot (or a mixed-version cluster running the v3.6.0 node) that delivers MsgHeartbeatResp.Context values the current leader's heartbeatCtx never emitted for its live readOnly instance - for example an in-flight heartbeat response that survives a same-term readOnly recreation, or a peer that echoes a context from a different node/term?",
+            "experiment_id": null,
+            "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+          }
+        ],
+        "history": [
+          {
+            "id": "71f53a32a0c74532a55ad33bc1e71086-question-0",
+            "version": 1,
+            "question": "In the ReadOnlySafe read-index flow, is a heartbeat response's Context validated against the outstanding read requests before it is used to confirm a read index, and what bounds the value used to slice unconfirmedReads?",
+            "source_ids": [
+              "ro_ack",
+              "raft_hbresp",
+              "raft_readidx"
+            ],
+            "hypothesis": "readOnly.recvAck decodes the peer-supplied Context as a raw uint64 read position with no check that it was produced by heartbeatCtx for an outstanding request, and readOnly.maybeAdvance slices unconfirmedReads by the quorum position without clamping. A Context larger than the number of outstanding reads would then confirm reads no quorum actually acknowledged, or panic with a slice-bounds error.",
+            "discriminator": "Identify any legal (non-Byzantine) producer of MsgHeartbeatResp whose Context is not a value the leader's own heartbeatCtx emitted for the current readOnly lifetime. If none exists, the premise fails and the behavior is unreachable in the crash-fault model; if one exists (or if the leader itself can supply a stale/oversized value), the safety and liveness consequences apply in-model.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+          }
+        ],
+        "operation_id": "a167f4c33dc94f34b03ea29dbe7ec15a"
+      },
+      {
+        "id": "109448522bc649dea46fc5461752da53-question-0",
+        "version": 2,
+        "question": "When a MsgReadIndex is postponed because the leader has not committed an entry in its term, is that queued duty eventually completed with a read index at least as large as the one the same request would have received at admission, including when the queue survives loss and later reacquisition of leadership (and when the node is deposed, removed, or restarted in between)?",
+        "source_ids": [
+          "q_admit",
+          "q_release_call",
+          "q_release_fn",
+          "q_reset",
+          "q_commit_mono",
+          "q_restore_guard",
+          "q_loadstate"
+        ],
+        "hypothesis": "The queue is not cleared by raft.reset (term or state change), so a request admitted at term T is released later, while the node is leader again at term T' > T. Release recomputes the index from the live r.raftLog.committed, and every write to raftLog.committed is non-decreasing (commitTo refuses to lower it; loadState and log restore are guarded to only raise it above the current value). The completed read index is therefore >= the committed index at admission, so the surviving duty cannot produce a stale read index.",
+        "discriminator": "Look for any site that lowers raftLog.committed after a request is queued, or any release path that reuses an index captured before admission instead of reading the live commit index. None would mean the stale-index suspicion is defeated; a lowering site or a cached-index release would revive it. Secondary: whether the queue can be released while the node is not the current leader (releasePendingReadIndexMessages is only called from the leader's MsgAppResp path and re-checks committedEntryInCurrentTerm).",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "109448522bc649dea46fc5461752da53-question-0",
+            "version": 1,
+            "question": "When a MsgReadIndex is postponed because the leader has not committed an entry in its term, is that queued duty eventually completed with a read index at least as large as the one the same request would have received at admission, including when the queue survives loss and later reacquisition of leadership (and when the node is deposed, removed, or restarted in between)?",
+            "source_ids": [
+              "q_admit",
+              "q_release_call",
+              "q_release_fn",
+              "q_reset",
+              "q_commit_mono",
+              "q_restore_guard",
+              "q_loadstate"
+            ],
+            "hypothesis": "The queue is not cleared by raft.reset (term or state change), so a request admitted at term T is released later, while the node is leader again at term T' > T. Release recomputes the index from the live r.raftLog.committed, and every write to raftLog.committed is non-decreasing (commitTo refuses to lower it; loadState and log restore are guarded to only raise it above the current value). The completed read index is therefore >= the committed index at admission, so the surviving duty cannot produce a stale read index.",
+            "discriminator": "Look for any site that lowers raftLog.committed after a request is queued, or any release path that reuses an index captured before admission instead of reading the live commit index. None would mean the stale-index suspicion is defeated; a lowering site or a cached-index release would revive it. Secondary: whether the queue can be released while the node is not the current leader (releasePendingReadIndexMessages is only called from the leader's MsgAppResp path and re-checks committedEntryInCurrentTerm).",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "109448522bc649dea46fc5461752da53"
+          }
+        ],
+        "operation_id": "a38031973bee49ac9248ded78a2843e4"
+      },
+      {
+        "id": "a38031973bee49ac9248ded78a2843e4-question-1",
+        "version": 2,
+        "question": "Once a leader puts a follower's Progress into StateSnapshot, which actors can restore replication to that follower, and is there an enabled repair when the follower applied the snapshot but the corresponding MsgAppResp is lost?",
+        "source_ids": [
+          "sn_entry",
+          "sn_recover",
+          "sn_status",
+          "sn_paused",
+          "sn_hbresp"
+        ],
+        "hypothesis": "The state pauses appends (IsPaused is unconditionally true in StateSnapshot), so the only exits are: the leader's MsgAppResp handler advancing pr.Match and hitting the StateSnapshot recovery arm, or an application ReportSnapshot call arriving as MsgSnapStatus. Both require an external event, so a follower that applied the snapshot whose MsgAppResp was lost, with no ReportSnapshot from the application, would remain paused.",
+        "discriminator": "Check whether the library reaches StateSnapshot without a matching application report obligation, and whether any timer or heartbeat path can exit StateSnapshot on its own. The README/Ready contract and the ReportSnapshot doc place that obligation on the application; a self-repair path that does not exist in the leader code would mean the duty is only repairable externally.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "a38031973bee49ac9248ded78a2843e4-question-1",
+            "version": 1,
+            "question": "Once a leader puts a follower's Progress into StateSnapshot, which actors can restore replication to that follower, and is there an enabled repair when the follower applied the snapshot but the corresponding MsgAppResp is lost?",
+            "source_ids": [
+              "sn_entry",
+              "sn_recover",
+              "sn_status",
+              "sn_paused",
+              "sn_hbresp"
+            ],
+            "hypothesis": "The state pauses appends (IsPaused is unconditionally true in StateSnapshot), so the only exits are: the leader's MsgAppResp handler advancing pr.Match and hitting the StateSnapshot recovery arm, or an application ReportSnapshot call arriving as MsgSnapStatus. Both require an external event, so a follower that applied the snapshot whose MsgAppResp was lost, with no ReportSnapshot from the application, would remain paused.",
+            "discriminator": "Check whether the library reaches StateSnapshot without a matching application report obligation, and whether any timer or heartbeat path can exit StateSnapshot on its own. The README/Ready contract and the ReportSnapshot doc place that obligation on the application; a self-repair path that does not exist in the leader code would mean the duty is only repairable externally.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "a38031973bee49ac9248ded78a2843e4"
+          }
+        ],
+        "operation_id": "8086d0fc533a4eabb061df6601d55b5b"
+      },
+      {
+        "id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+        "version": 2,
+        "question": "Can a caller that follows the documented ReadIndex retry contract grow the leader's per-request read state without bound? Specifically: does each retried MsgReadIndex (same RequestCtx) add one unconfirmedReads entry and one heartbeat broadcast that are never collapsed, and is there any in-model state (leader isolated from a quorum, checkQuorum disabled or not yet fired) under which the entries are never confirmed and never dropped?",
+        "source_ids": [
+          "ra_admit",
+          "ra_add",
+          "ra_send",
+          "ra_bcast",
+          "ra_contract"
+        ],
+        "hypothesis": "readOnly.addRequest appends unconditionally, without the context-keyed deduplication the v3.6.0 implementation performed, and sendMsgReadIndexResponse calls bcastHeartbeat for every admitted request. Entries leave unconfirmedReads only when a quorum acks the recorded position (readOnly.maybeAdvance), so a leader that cannot obtain quorum acks retains every retried request and rebroadcasts for each, which grows memory and generated traffic with the number of caller retries rather than with the number of distinct reads.",
+        "discriminator": "Establish whether the retry contract permits an unbounded number of retries with an identical RequestCtx while the leader stays in StateLeader without quorum confirmation (checkQuorum disabled, or the retry rate exceeding the election timeout). If that state is reachable under permitted use, the growth is an in-model bounded-resource concern; if the caller is required to bound retries or the leader always confirms or steps down first, the behavior is benign and the suspicion is refuted.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "ee850f515b5d49718d5f55c4c1d36e61-gap-1",
+            "question": "What bounds (if any) the number of outstanding read requests a client may have with the same RequestCtx while a leader is in StateLeader but unable to obtain quorum acknowledgements - is any bound stated by the ReadIndex contract, by etcd's usage, or enforced by the library (and does checkQuorum guarantee the leader steps down before the state persists)?",
+            "experiment_id": null,
+            "operation_id": "ee850f515b5d49718d5f55c4c1d36e61"
+          }
+        ],
+        "history": [
+          {
+            "id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+            "version": 1,
+            "question": "Can a caller that follows the documented ReadIndex retry contract grow the leader's per-request read state without bound? Specifically: does each retried MsgReadIndex (same RequestCtx) add one unconfirmedReads entry and one heartbeat broadcast that are never collapsed, and is there any in-model state (leader isolated from a quorum, checkQuorum disabled or not yet fired) under which the entries are never confirmed and never dropped?",
+            "source_ids": [
+              "ra_admit",
+              "ra_add",
+              "ra_send",
+              "ra_bcast",
+              "ra_contract"
+            ],
+            "hypothesis": "readOnly.addRequest appends unconditionally, without the context-keyed deduplication the v3.6.0 implementation performed, and sendMsgReadIndexResponse calls bcastHeartbeat for every admitted request. Entries leave unconfirmedReads only when a quorum acks the recorded position (readOnly.maybeAdvance), so a leader that cannot obtain quorum acks retains every retried request and rebroadcasts for each, which grows memory and generated traffic with the number of caller retries rather than with the number of distinct reads.",
+            "discriminator": "Establish whether the retry contract permits an unbounded number of retries with an identical RequestCtx while the leader stays in StateLeader without quorum confirmation (checkQuorum disabled, or the retry rate exceeding the election timeout). If that state is reachable under permitted use, the growth is an in-model bounded-resource concern; if the caller is required to bound retries or the leader always confirms or steps down first, the behavior is benign and the suspicion is refuted.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "ee850f515b5d49718d5f55c4c1d36e61"
+          }
+        ],
+        "operation_id": "387cf209ec6647bd9b65cedaac0cf8cf"
+      },
+      {
+        "id": "d82592dffc9d4a5893fbc6028fc438e7-question-0",
+        "version": 2,
+        "question": "Can a node that the configuration no longer contains have its proposals accepted and committed after it learns of a new leader? node.run() blocks the proposal channel only until the next observed leader change, and describes that behaviour as unsound; do the raft handlers then accept a proposal whose sender is not a member, and is sender eligibility a library duty or a caller duty?",
+        "source_ids": [
+          "node_gate",
+          "node_removal",
+          "lead_prop",
+          "follow_fwd"
+        ],
+        "hypothesis": "The Node facade re-enables the proposal channel whenever lead != r.lead and the new lead is not None, regardless of the node's own membership, so a removed node's client can keep proposing after any leadership change; the proposal is then forwarded by stepFollower to the current leader, and stepLeader's MsgProp handler writes it without consulting Progress[m.From], so the entry is appended and can be committed even though the sender is not in the configuration.",
+        "discriminator": "Decide who owns sender eligibility: if the library's documented contract places authorization on the caller (the application), then accepting a proposal from a non-member is out of scope and the suspicion is refuted; if node.go's own stated intent to block proposals from a removed node is the contract, then re-enabling the channel on a leader change is a defect. Concretely: check whether any handler or contract rejects MsgProp from an id absent from the configuration, and whether the application can observe that its request came from a removed member.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "d82592dffc9d4a5893fbc6028fc438e7-gap-2",
+            "question": "Does any part of the library contract, node documentation or Ready/Propose API make sender eligibility the caller's responsibility (so that a leader accepting a non-member's proposal is intended), or is node.go's 'block incoming proposals' the intended guarantee, which the leader-change path then breaks?",
+            "experiment_id": null,
+            "operation_id": "d82592dffc9d4a5893fbc6028fc438e7"
+          }
+        ],
+        "history": [
+          {
+            "id": "d82592dffc9d4a5893fbc6028fc438e7-question-0",
+            "version": 1,
+            "question": "Can a node that the configuration no longer contains have its proposals accepted and committed after it learns of a new leader? node.run() blocks the proposal channel only until the next observed leader change, and describes that behaviour as unsound; do the raft handlers then accept a proposal whose sender is not a member, and is sender eligibility a library duty or a caller duty?",
+            "source_ids": [
+              "node_gate",
+              "node_removal",
+              "lead_prop",
+              "follow_fwd"
+            ],
+            "hypothesis": "The Node facade re-enables the proposal channel whenever lead != r.lead and the new lead is not None, regardless of the node's own membership, so a removed node's client can keep proposing after any leadership change; the proposal is then forwarded by stepFollower to the current leader, and stepLeader's MsgProp handler writes it without consulting Progress[m.From], so the entry is appended and can be committed even though the sender is not in the configuration.",
+            "discriminator": "Decide who owns sender eligibility: if the library's documented contract places authorization on the caller (the application), then accepting a proposal from a non-member is out of scope and the suspicion is refuted; if node.go's own stated intent to block proposals from a removed node is the contract, then re-enabling the channel on a leader change is a defect. Concretely: check whether any handler or contract rejects MsgProp from an id absent from the configuration, and whether the application can observe that its request came from a removed member.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "d82592dffc9d4a5893fbc6028fc438e7"
+          }
+        ],
+        "operation_id": "014141e1cc2e474ebf95be149b343099"
+      },
+      {
+        "id": "e083daeefc0f460f9a395b329006f127-question-0",
+        "version": 2,
+        "question": "Can an empty ConfChangeV2 whose Transition is explicit rather than auto pass the leader's propose-time configuration validation while the configuration is joint, and then panic the process when the application applies the committed entry? Propose-time validation tests len(Changes) == 0 for leave-joint, while applyConfChange tests ConfChangeV2.LeaveJoint(), which also requires the Auto transition.",
+        "source_ids": [
+          "val_joint",
+          "apply_cc",
+          "cc_enter",
+          "pb_leave"
+        ],
+        "hypothesis": "The two leave-joint tests disagree for an empty change set with a non-Auto transition in a joint configuration: stepLeader treats it as a leave-joint request (wantsLeaveJoint true, alreadyJoint true, so no failed check and no entry replacement), but applyConfChange sees LeaveJoint false, takes the EnterJoint branch because EnterJoint reports ok for an explicit transition, calls Changer.EnterJoint on an already-joint tracker, receives the error and panics on the spot. The panic happens in the application's ApplyConfChange call for an entry the library accepted and committed.",
+        "discriminator": "Confirm both halves separately: (a) the entry appended by the validated proposal still has type EntryConfChangeV2 rather than being replaced by EntryNormal, which shows validation accepted it; (b) applying that same ConfChangeV2 panics with config is already joint. If either half fails - for instance if some later guard replaces or drops the entry, or if EnterJoint returns ok false - the suspicion is refuted. Also check whether the Auto-transition empty change still leaves the joint config correctly, which would show the defect is specific to the explicit transition rather than to empty changes.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "e083daeefc0f460f9a395b329006f127-question-0",
+            "version": 1,
+            "question": "Can an empty ConfChangeV2 whose Transition is explicit rather than auto pass the leader's propose-time configuration validation while the configuration is joint, and then panic the process when the application applies the committed entry? Propose-time validation tests len(Changes) == 0 for leave-joint, while applyConfChange tests ConfChangeV2.LeaveJoint(), which also requires the Auto transition.",
+            "source_ids": [
+              "val_joint",
+              "apply_cc",
+              "cc_enter",
+              "pb_leave"
+            ],
+            "hypothesis": "The two leave-joint tests disagree for an empty change set with a non-Auto transition in a joint configuration: stepLeader treats it as a leave-joint request (wantsLeaveJoint true, alreadyJoint true, so no failed check and no entry replacement), but applyConfChange sees LeaveJoint false, takes the EnterJoint branch because EnterJoint reports ok for an explicit transition, calls Changer.EnterJoint on an already-joint tracker, receives the error and panics on the spot. The panic happens in the application's ApplyConfChange call for an entry the library accepted and committed.",
+            "discriminator": "Confirm both halves separately: (a) the entry appended by the validated proposal still has type EntryConfChangeV2 rather than being replaced by EntryNormal, which shows validation accepted it; (b) applying that same ConfChangeV2 panics with config is already joint. If either half fails - for instance if some later guard replaces or drops the entry, or if EnterJoint returns ok false - the suspicion is refuted. Also check whether the Auto-transition empty change still leaves the joint config correctly, which would show the defect is specific to the explicit transition rather than to empty changes.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "e083daeefc0f460f9a395b329006f127"
+          }
+        ],
+        "operation_id": "445153ef4a5b4839a90c275d46a90023"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "71f53a32a0c74532a55ad33bc1e71086-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For ReadOnlySafe, the leader confirms reads as follows: sendMsgReadIndexResponse calls readOnly.addRequest(committed, m), self-acks by recvAck(r.id, heartbeatCtx()) and broadcasts a heartbeat carrying heartbeatCtx(); heartbeatCtx encodes confirmedReads+len(unconfirmedReads) in 8 little-endian bytes; on each MsgHeartbeatResp with non-empty Context the leader calls readOnly.recvAck(m.From, m.Context), which stores max(existing, binary.LittleEndian.Uint64(Context)) in acks[m.From]; maybeAdvance computes newConfirmedReads = quorum.JointConfig.CommittedIndex(ro) over acks (unacked voters count as 0), and if newConfirmedReads > confirmedReads it returns unconfirmedReads[:newConfirmedReads-confirmedReads] and advances confirmedReads. No comparison is made between the received Context and any value the leader emitted.",
+        "conditions": "Leader in StateLeader with ReadOnlySafe; the ack map and unconfirmedReads are per readOnly instance, recreated by raft.reset on each state/term change. Values in acks are positions (counts of admitted read requests), not log indexes.",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp",
+          "raft_readidx"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+      },
+      {
+        "id": "71f53a32a0c74532a55ad33bc1e71086-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Under the framework's own producers, every value written into readOnly.acks equals a value heartbeatCtx produced for this readOnly lifetime, and heartbeatCtx values are non-decreasing and at most the number of admitted read requests. Therefore for a faithful cluster the quorum position newConfirmedReads never exceeds confirmedReads+len(unconfirmedReads); the slicing in maybeAdvance is in range and each confirmed read corresponds to a heartbeat sent after that read was admitted.",
+        "conditions": "All peers echo MsgHeartbeatResp.Context exactly as produced by the leader's heartbeatCtx (the only context the checked-in follower path writes, via handleHeartbeat), and the leader's readOnly is not recreated between request admission and response handling except across state/term changes, after which lower-term responses are ignored by raft.Step.",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp",
+          "raft_readidx"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+      },
+      {
+        "id": "a167f4c33dc94f34b03ea29dbe7ec15a-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In this snapshot the ReadOnlySafe ack bookkeeping is in-model consistent: (1) r.readOnly is reassigned only in raft.reset (:809) and reset is called only by becomeFollower (:893), becomeCandidate (:908, term+1) and becomeLeader (:939, the candidate's term), so a readOnly instance is live only while its node is leader at one term; (2) raft.Step drops a lower-term MsgHeartbeatResp before dispatch (:1158-1175); (3) the only producer of MsgHeartbeatResp.Context is handleHeartbeat (:1837), echoing the leader's heartbeat Context, and vote contexts are sent on MsgVote (:1071); (4) heartbeatCtx emits exactly confirmedReads+len(unconfirmedReads), which addRequest only grows and maybeAdvance preserves. Therefore every value in readOnly.acks is at most the current message total, newConfirmedReads-confirmedReads can never exceed len(unconfirmedReads), and each returned read corresponds to a heartbeat emitted after that request was admitted and acknowledged by a quorum. The slice-bounds panic and premature confirmation observed when a probe supplied an out-of-contract Context are not reachable through the library's own producers.",
+        "conditions": "ReadOnlySafe; leadership terms strictly increase (becomeCandidate panics from StateLeader and increments the term); cluster members run this library's follower path (including a v3.6.0 node, which also echoes m.Context); no two leaders exist in the same term. Excludes a peer or intermediary that fabricates or corrupts MsgHeartbeatResp.Context, which is outside the crash-fault model.",
+        "source_ids": [
+          "src_reset",
+          "src_terms",
+          "src_hb_echo",
+          "src_step_term",
+          "ro_ack",
+          "raft_hbresp"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "a167f4c33dc94f34b03ea29dbe7ec15a"
+      },
+      {
+        "id": "109448522bc649dea46fc5461752da53-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "pendingReadIndexMessages lifecycle for MsgReadIndex on a leader: in stepLeader (:1355-1372) a request is answered immediately when the cluster is a singleton or when committedEntryInCurrentTerm() holds, and is otherwise appended to r.pendingReadIndexMessages without a term stamp; raft.reset (:781-812) does not clear the slice, so it survives step-downs, re-elections and being removed from the config; releasePendingReadIndexMessages (:2127-2144) is invoked only from the leader's MsgAppResp fast path after maybeCommit() returns true (:1546-1556), returns early with an error log if committedEntryInCurrentTerm() no longer holds, and otherwise swaps the slice out and passes each stored message to sendMsgReadIndexResponse, which captures the index as r.raftLog.committed at that moment (ReadOnlySafe also re-enters the addRequest/heartbeat confirmation flow for it).",
+        "conditions": "Node acts as leader; r.raftLog.committed is the only source of the read index. Commit index monotonicity holds because commitTo (:322-330) assigns only when l.committed < tocommit, log restore is reached only when the snapshot index exceeds the current committed (log.go :463-470 guard), and loadState (:2037-2047) rejects any state.commit below the current committed.",
+        "source_ids": [
+          "q_admit",
+          "q_release_call",
+          "q_release_fn",
+          "q_reset",
+          "q_commit_mono",
+          "q_restore_guard",
+          "q_loadstate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "109448522bc649dea46fc5461752da53"
+      },
+      {
+        "id": "a38031973bee49ac9248ded78a2843e4-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Leader-side StateSnapshot handling: maybeSendSnapshot (:666-694) refuses to send while pr.RecentActive is false, and otherwise calls pr.BecomeSnapshot(snapshotIndex) which sets State=StateSnapshot, PendingSnapshot=Next-1 and pauses the follower. While in that state Progress.IsPaused() returns true unconditionally (tracker/progress.go :262-282), so maybeSendAppend returns immediately, bcastAppend is a no-op for that peer, and the MsgHeartbeatResp branch's sendAppend (:1588-1596) also sends nothing. Exactly two producers can leave the state: (1) stepLeader's MsgAppResp handler (:1518-1546) when pr.MaybeUpdate(m.GetIndex()) is true (m.Index strictly greater than pr.Match) and then pr.Match+1 >= raftLog.firstIndex(), which runs BecomeProbe followed by BecomeReplicate; and (2) stepLeader's MsgSnapStatus handler (:1612-1634) from the application's ReportSnapshot, which returns early unless pr.State == StateSnapshot, then clears PendingSnapshot when the snapshot failed and calls BecomeProbe either way.",
+        "conditions": "Node is leader; the peer is a tracked follower or learner. The follower emits the MsgAppResp either by applying the snapshot (handleSnapshot sends MsgAppResp with its last index) or by ignoring an obsolete snapshot (handleSnapshot sends MsgAppResp with its committed index). ReportSnapshot reaches the leader as MsgSnapStatus only when the application calls it.",
+        "source_ids": [
+          "sn_entry",
+          "sn_recover",
+          "sn_status",
+          "sn_paused",
+          "sn_hbresp"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "a38031973bee49ac9248ded78a2843e4"
+      },
+      {
+        "id": "ae6755767a574dd5b375bc66265f147b-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "When readOnly.recvAck is given an 8-byte Context value larger than the number of outstanding read requests, the ReadOnlySafe confirmation path behaves as follows in this snapshot. With a quorum of such values (leader self-ack position 1 plus two peers at position 2^40, voters {1,2,3}), readOnly.maybeAdvance panics inside its slice expression: 'runtime error: slice bounds out of range [:1099511627776] with capacity 1'. With a single such value (two admitted reads, leader self-ack position 2, an honest peer at position 1, one peer at position 2 that received no heartbeat carrying position 2), maybeAdvance does not panic and instead returns both admitted reads (advanced=2, confirmed_reads=2), i.e. it confirms a read index that the forged voter never observed. Both outcomes were observed with the ack map, unconfirmedReads and confirmedReads driven directly; no raft instance, network or storage was involved.",
+        "conditions": "ReadOnlySafe; ack values are injected directly into the unexported readOnly via recvAck instead of being produced by the library's follower path (handleHeartbeat), which is the out-of-contract premise. Quorum position is the median of stored acks because CommittedIndex is evaluated over quorum.JointConfig{1,2,3},nil. Does not apply to ReadOnlyLeaseBased, which does not use the ack map.",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp"
+        ],
+        "executions": {
+          "8dd8fb7e47a14057ba98a6755fdc5b49": [
+            1,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ae6755767a574dd5b375bc66265f147b"
+      },
+      {
+        "id": "ee850f515b5d49718d5f55c4c1d36e61-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "ReadOnlySafe admission and growth, in this snapshot: every MsgReadIndex that reaches a leader is admitted individually - if the cluster is not a singleton and committedEntryInCurrentTerm() holds, sendMsgReadIndexResponse adds one entry to readOnly.unconfirmedReads via readOnly.addRequest (which appends without any lookup of an existing request with the same context) and then broadcasts a heartbeat carrying heartbeatCtx(); if committedEntryInCurrentTerm() does not hold, the raw message is appended to pendingReadIndexMessages and released (one response per queued message) only later, each release again going through addRequest plus a heartbeat broadcast. Entries are removed from unconfirmedReads only by readOnly.maybeAdvance, which requires the quorum ack position to exceed confirmedReads. Nothing in the admission path inspects the RequestCtx, so N retries with an identical context produce N unconfirmedReads entries and N heartbeat broadcasts.",
+        "conditions": "ReadOnlySafe, leader in StateLeader. The behavior is a property of admission, independent of whether the reads are eventually confirmed; under a healthy quorum each retry is confirmed quickly, so the queue stays short. The node-level contract that makes retries the caller's duty is stated at node.go:222-223 ('request can be lost without notice, therefore it is user's job to ensure read index retries').",
+        "source_ids": [
+          "ra_admit",
+          "ra_add",
+          "ra_send",
+          "ra_bcast",
+          "ra_contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ee850f515b5d49718d5f55c4c1d36e61"
+      },
+      {
+        "id": "ec634053934546af8e5da7dcb41717bd-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "For a real raft leader of a three-voter configuration that cannot obtain quorum acknowledgements, repeated local MsgReadIndex submissions with an identical RequestCtx accumulate without bound in pendingReadIndexMessages and are not reclaimed by an authority transition. Measured: with the node at term 1, committed 0, lastIndex 1, CheckQuorum false and the default ReadOnlySafe option, 64 retries produced pendingReadIndexMessages length 64 (one entry per retry, no collapsing) and readOnly.unconfirmedReads length 0 while the node was still StateLeader; after a higher-term MsgHeartbeat deposed it to StateFollower the queue was still length 64 and unconfirmedReads still 0. The growth count equals the retry count, so neither the library nor raft.reset (which recreates readOnly but leaves the queue) bounds or clears it.",
+        "conditions": "Library defaults as built by newTestRaft without CheckQuorum (false) and with ReadOnlySafe; the environment delivers no MsgAppResp or MsgHeartbeatResp, modelling a leader partitioned from its quorum. Callers retry with the same RequestCtx, which node.go:218-224 tells them to do and does not bound. Scope: the queued path (leader has not committed in its term); the admitted path is subject to the same per-request, context-blind admission and additionally broadcasts a heartbeat per request.",
+        "source_ids": [
+          "ra_admit",
+          "ra_reset",
+          "ra_contract"
+        ],
+        "executions": {
+          "b91fd4d8638c4446a332be9849f23f70": [
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ec634053934546af8e5da7dcb41717bd"
+      },
+      {
+        "id": "e2b3f903fe394533a660cc23bded2379-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "When a two-voter leader that has accumulated 64 queued read requests (pendingReadIndexMessages length 64, committed 0, committedEntryInCurrentTerm() false, unconfirmedReads 0) finally commits in its term through the normal MsgAppResp fast path, that single step empties the queue and re-admits everything: pendingReadIndexMessages becomes 0, readOnly.unconfirmedReads becomes 64 and 64 MsgHeartbeat messages are produced in the same step, with committed 1 and in_term true afterwards. So the retained queue is not merely passive memory: on release it becomes one read request plus one outbound heartbeat per queued entry, all at once.",
+        "conditions": "Library defaults (CheckQuorum false, ReadOnlySafe); the commit is produced by stepping the leader's own MsgAppResp and then node 2's MsgAppResp at lastIndex, which is the call site that invokes releasePendingReadIndexMessages - the harness never calls the release function directly. No heartbeat response is delivered afterwards, so the re-admitted requests stay unconfirmed.",
+        "source_ids": [
+          "ra_release",
+          "ra_release_fn",
+          "ra_send"
+        ],
+        "executions": {
+          "7e046ae9ebb44e58bb2a4800bdf14ef3": [
+            6
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "e2b3f903fe394533a660cc23bded2379"
+      },
+      {
+        "id": "03642230074a4ecfa828a594c9580e21-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "CheckQuorum bounds the growth window of accumulated read requests but does not reclaim them. With CheckQuorum enabled on a three-voter leader at election timeout 3 and no peer messages, 24 same-context retries submitted over three ticks ended with the node already StateFollower (the quorum view was lost and it stepped down within the election timeout), and eight further read requests submitted after the step-down left pendingReadIndexMessages at exactly its prior length of 24 with readOnly.unconfirmedReads 0, because a leaderless follower drops ReadIndex messages instead of queueing them. So under CheckQuorum the accumulation stops when the leader steps down, whereas with CheckQuorum disabled (the library default) nothing stops it; in both configurations the state already accumulated is retained.",
+        "conditions": "Real raft over voters {1,2,3} built from newTestConfig with CheckQuorum true, election timeout 3 ticks, ReadOnlySafe, no peer messages delivered. Retries use an identical RequestCtx (the documented retry pattern). The control says nothing about a network partition or about ReadOnlyLeaseBased, which requires CheckQuorum.",
+        "source_ids": [
+          "ckq_tick",
+          "ckq_check",
+          "ra_reset"
+        ],
+        "executions": {
+          "26c0509e6788479a87a674b2d686b134": [
+            8,
+            9
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "03642230074a4ecfa828a594c9580e21"
+      },
+      {
+        "id": "387cf209ec6647bd9b65cedaac0cf8cf-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The read state a quorum-less leader retains is caller-controlled in size. With CheckQuorum false over voters {1,2,3}, 64 ReadIndex requests each carrying its own freshly allocated 4096-byte RequestCtx were all retained in pendingReadIndexMessages: pending 64, summed retained Data length 262144 bytes, and 64 distinct backing buffers, so the total is genuine per-request retention rather than one shared slice counted 64 times. The retained payload per leader therefore equals the number of accepted requests times the caller-chosen context size, with no library-side limit on either factor.",
+        "conditions": "No MsgAppResp or MsgHeartbeatResp is delivered, so every request takes the queued path; each request carries a distinct buffer, modelling a caller issuing distinct reads (the ReadIndex API takes an opaque rctx []byte and documents no size limit). The count covers only the entry Data payloads held in pendingReadIndexMessages, not message structs, slice headers or allocator overhead, and no deployment memory limit is claimed.",
+        "source_ids": [
+          "ra_admit",
+          "ra_reset"
+        ],
+        "executions": {
+          "6eccd9a311b84ba4b6c02771f746dd50": [
+            11
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "387cf209ec6647bd9b65cedaac0cf8cf"
+      },
+      {
+        "id": "d82592dffc9d4a5893fbc6028fc438e7-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Proposal eligibility handling in this snapshot. In node.run, the proposal send channel is set to nil when the node learns that it was removed from the configuration by a config change it applied (only when it was in the config before), which blocks incoming proposals, but it is re-assigned to the real channel whenever the observed leader changes to a non-None value, independently of the node's membership; the accompanying in-tree comment states that this is not sound and likely has bugs. On the raft side, stepFollower's MsgProp case forwards the message to r.lead without any membership test, and stepLeader's MsgProp case only checks whether the leader itself is still a member (Progress[r.id] == nil) before appending, so a proposal whose From is not in the configuration is written to the log if it reaches the leader.",
+        "conditions": "Applies to the Node facade (the goroutine-driven run loop) plus the raft handlers; RawNode users bypass the facade and step messages directly, and DisableProposalForwarding only affects followers that are members. The behaviour concerns eligibility of the proposer, not voting or commit quorums, which continue to use the configuration.",
+        "source_ids": [
+          "node_gate",
+          "node_removal",
+          "lead_prop",
+          "follow_fwd"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "d82592dffc9d4a5893fbc6028fc438e7"
+      },
+      {
+        "id": "5a3be50f1bc74a1fbf2433e4ed473442-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The documented MsgProp contract assigns no proposer-eligibility check to the library. doc.go states that when MsgProp is passed to the leader's Step method the leader first calls appendEntry to append entries to its log and then broadcasts them, that MsgProp is dropped by a candidate, and that on a follower it is stored with the sender's ID and later forwarded to the leader; the contract is about redirection of proposals, not about authorizing the proposer. Consistently, the checked-in handlers do not consult membership for proposals: stepFollower forwards MsgProp to r.lead, and stepLeader's MsgProp case checks only whether the leader itself is still a member. The Node facade does block its own proposal channel when it applies a config change that removes it, but that is a local best-effort whose accompanying comment calls it unsound and notes that the channel is reset on a leader change.",
+        "conditions": "Applies to the Node and RawNode APIs in this snapshot, including a mixed cluster: the leader cannot in general verify the sender's identity beyond the self-declared From field, and the documented contract does not ask it to. Eligibility of voters and commit quorums still use the configuration; only proposer eligibility is unguarded.",
+        "source_ids": [
+          "doc_prop",
+          "node_gate",
+          "node_removal",
+          "lead_prop",
+          "follow_fwd"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "5a3be50f1bc74a1fbf2433e4ed473442"
+      },
+      {
+        "id": "014141e1cc2e474ebf95be149b343099-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The read state that a leader accumulates is volatile and cannot outlive the process. newRaft builds it fresh (readOnly via newReadOnly at raft.go:462; pendingReadIndexMessages is a slice field of the raft struct, raft.go:430-435, left nil), the only writers are the stepLeader MsgReadIndex append and the release path that swaps the slice out, and the Storage interface exposes only InitialState, Entries, Term, FirstIndex, LastIndex and Snapshot (storage.go:48-95) with no read-state member; there is no ReadState or readStates reference in storage.go or raftpb. A restarted node therefore begins with an empty pending queue and an empty ack map, so any accumulation is bounded by the process lifetime and cleared incidentally by a restart, even though the library never clears it while running.",
+        "conditions": "Applies to both StartNode and RestartNode paths, since both build the raft through newRaft; the statement is about library-side state only and says nothing about how a restart interacts with the caller's retries. It bounds the retry-growth finding rather than contradicting it: within one process lifetime there is still no bound and no reclamation.",
+        "source_ids": [
+          "ra_newraft",
+          "ra_field",
+          "ra_storage_iface"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "014141e1cc2e474ebf95be149b343099"
+      },
+      {
+        "id": "e083daeefc0f460f9a395b329006f127-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For an empty ConfChangeV2 with Transition = JointExplicit in a joint configuration: LeaveJoint() reports false and EnterJoint() reports ok true; stepLeader's propose-time validation computes wantsLeaveJoint from len(Changes) == 0 and, with alreadyJoint also true, produces no failed check, so the EntryConfChangeV2 is appended unchanged; applyConfChange then takes the EnterJoint branch and Changer.EnterJoint rejects an already-joint configuration, so applyConfChange panics with the error string config is already joint. Observed end to end on a real instance: after entering joint explicitly (voters [1 2 3 4] against outgoing [1 2 3]), the proposal step returned a nil error and left an EntryConfChangeV2 at the new last index, and applying it panicked with that exact string while the configuration was still joint.",
+        "conditions": "The configuration is joint and the client supplies a ConfChangeV2 with an explicit (JointExplicit or JointImplicit) transition and no changes; propose-time validation is at its default (enabled), and the leader is a member so the proposal is not dropped for that reason. Validation only replaces the entry when it computes a failed check, which does not happen in this case because an empty change set is read as leave-joint regardless of transition. Distinct from the Auto-transition empty ChangeV2, which is the documented leave-joint idiom and takes the LeaveJoint path.",
+        "source_ids": [
+          "val_joint",
+          "apply_cc",
+          "pb_leave"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "e083daeefc0f460f9a395b329006f127"
+      },
+      {
+        "id": "445153ef4a5b4839a90c275d46a90023-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on real instances: in a joint configuration (voters [1 2 3 4], outgoing [1 2 3]) an empty ConfChangeV2 with Transition JointExplicit passes propose-time validation and then panics on apply, while the same empty change set with the Auto transition leaves the joint configuration cleanly. Observed values: for the explicit form, LeaveJoint false, EnterJoint ok true, the proposal step returning no error and leaving an EntryConfChangeV2 at the new last index with its 2-byte payload intact, and applyConfChange panicking with the error string config is already joint while still_joint stayed true; for the Auto form, LeaveJoint true, EnterJoint ok false, no panic, joint_after false and voters [1 2 3 4]. The defect is therefore specific to the transition field: propose-time validation reads an empty change set as leave-joint regardless of transition, while the apply path requires Auto.",
+        "conditions": "Joint configuration; ConfChangeV2 with an explicit transition and no changes for the defect case, zero-valued ConfChangeV2 for the control; propose-time validation enabled (the default). The apply step was driven directly in both cases because a quorum-less instance cannot commit, and the explicit-form entry was shown to remain an EntryConfChangeV2, so nothing in the library prevents it from being replicated, committed and reaching the application's ApplyConfChange call.",
+        "source_ids": [
+          "val_joint",
+          "apply_cc",
+          "pb_leave"
+        ],
+        "executions": {
+          "896586fa6bf04a74877fe81547c2599f": [
+            1,
+            2,
+            4
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "445153ef4a5b4839a90c275d46a90023"
+      },
+      {
+        "id": "a30a3cfa85994b70bb34c3d0f3c815b7-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on a real instance: an empty ConfChangeV2 with Transition JointImplicit in a joint configuration behaves exactly like the explicit form. The tested change reported LeaveJoint false and EnterJoint ok true; submitting it as a MsgProp returned no error and left an EntryConfChangeV2 at the new last index, so propose-time validation accepted it; applying it panicked with the error string config is already joint and the configuration remained joint. The Auto-transition control in the same invocation reported LeaveJoint true and EnterJoint ok false and left the joint configuration without panicking (joint_after false, voters [1 2 3 4]). The trigger is therefore every non-Auto transition with an empty change set in a joint configuration, not one particular explicit value.",
+        "conditions": "Joint configuration entered with an explicit-transition add-node change; ConfChangeV2 with zero changes and Transition JointImplicit (defect) or the zero value (control); propose-time validation enabled; the apply step driven directly because a quorum-less instance cannot commit, with the entry shown to remain an EntryConfChangeV2 for the defect case.",
+        "source_ids": [
+          "val_joint",
+          "pb_leave",
+          "cc_enter"
+        ],
+        "executions": {
+          "a07650e44835449790f588dc30fb5df0": [
+            6,
+            7
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "a30a3cfa85994b70bb34c3d0f3c815b7"
+      },
+      {
+        "id": "81bcf16eb8ab4b758bcc18dd09afd758-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The propose-time conf-change validation has a guard that can decide the outcome before the transition mismatch is reached: in stepLeader's MsgProp handling, alreadyPending is computed as pendingConfIndex > r.raftLog.applied, and when that is true the failed check possible unapplied conf change applies, so the entry is rewritten to EntryNormal and the change is dropped regardless of its transition. Observed in a real three-node network where the joint configuration had been applied through applyConfChange but the application's applied index was never advanced: the empty JointExplicit change was proposed, the entry at the new last index came out as EntryNormal, and the malformed change was therefore dropped rather than replicated. In the direct-instance receipts pendingConfIndex had been left at the value becomeLeader set before appending the empty entry (0) while applied was also 0, so alreadyPending was false and the same change was accepted as EntryConfChangeV2. The applied index is advanced by the application through appliedTo when it acknowledges applied entries, so in normal operation applied catches up with the pending configuration change and the guard does not fire.",
+        "conditions": "Leader in StateLeader proposing a ConfChangeV2; validation enabled; alreadyPending is true exactly when a configuration change is in the log but not yet acknowledged as applied by the application. This guard is about unapplied conf changes, not about the transition field, so it is a precondition on the defect rather than a fix for it.",
+        "source_ids": [
+          "val_guard",
+          "note_apply"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "81bcf16eb8ab4b758bcc18dd09afd758"
+      },
+      {
+        "id": "e577e1a3e13643ada4cf00afb816084f-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "End-to-end observation in a real three-node network: with the joint configuration active and the application caught up so that pendingConfIndex equals applied (2 and 2, already_pending false), an empty ConfChangeV2 whose transition is explicit was proposed and took the configuration-change path rather than being rewritten - the entry at index 3 read back as EntryConfChangeV2 and the commit index reached it (committed 3). Applying that committed entry the way an application must panicked with the error string config is already joint, and the configuration was still joint afterwards. The earlier variant of the same test, which proposed the same change without acknowledging applied entries, left the entry at index 3 as EntryNormal and therefore never reached the apply path, which is consistent with the pending-conf guard being the deciding factor in that run.",
+        "conditions": "Real three-node network built with the package test helpers, leader 1 elected, joint configuration entered with an explicit-transition add-node change applied by every application; application progress simulated with raftLog.appliedTo(committed), the effect of Advance. The committed-entry read-back is the direct evidence; the receipt's declared comparisons were not evaluated because the harness contained two tests emitting identically named events.",
+        "source_ids": [
+          "val_guard",
+          "note_apply",
+          "val_joint"
+        ],
+        "executions": {
+          "58945529ae764a599616bc1cf8629dd4": [
+            11,
+            12,
+            13
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "e577e1a3e13643ada4cf00afb816084f"
+      },
+      {
+        "id": "74d3be2ded2c4f38a1ff2c1973cd046c-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on real leaders: a follower's Progress enters StateSnapshot through the production snapshot path (log compacted past the peer's next index, storage snapshot present, peer recently active) with match 1, PendingSnapshot 2 and IsPaused true, and both documented exits were then observed. A peer MsgAppResp at the snapshot index left the Progress in StateReplicate with match 2 and cleared the pause; an application report delivered as a rejecting MsgSnapStatus, applied to a Progress put into StateSnapshot with PendingSnapshot 1, left it in StateProbe with PendingSnapshot cleared to 0 and appends still paused. So the leader resumes replication to a paused follower through either producer, and no timer or heartbeat path does so on its own.",
+        "conditions": "Three-voter raft instances built with newTestRaft; the snapshot state reached by maybeSendAppend rather than by direct assignment for the peer-driven case; the application-driven case assigns BecomeSnapshot(1) directly and then steps the rejection, which is how ReportSnapshot delivers a failure. The case where the peer's MsgAppResp is lost and no report arrives is not covered and remains a source-based account.",
+        "source_ids": [
+          "sn_entry",
+          "sn_recover",
+          "sn_status"
+        ],
+        "executions": {
+          "2df1aae4d1d24ede9b0a2990938e27b3": [
+            1,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "74d3be2ded2c4f38a1ff2c1973cd046c"
+      },
+      {
+        "id": "8c1b3b1accac4862bebd937d58db3f94-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on a real three-node network: after leader 1 was elected (committed 1, committedEntryInCurrentTerm true, CheckQuorum false, ReadOnlySafe) and then isolated from both followers, 32 same-context ReadIndex requests were all admitted as unconfirmed reads with confirmed 0 while the leader remained StateLeader, and the leader emitted 64 heartbeat messages, one to each of the two peers per request. So the outbound cost of a retry is one heartbeat per peer rather than a single message, scaling with the number of voters, and the retained read state grows by one entry per request in the same step.",
+        "conditions": "Real three-node raft network built with the package test helpers; the partition is expressed with the network helper's isolate for peers 2 and 3; CheckQuorum left at the library default of false so the leader is not required to step down; ReadOnlySafe is the default option. Outbound messages were counted and cleared each round, so the figure is the heartbeats produced, not a growing buffer. No claim is made about a real transport.",
+        "source_ids": [
+          "ra_admit",
+          "ra_send",
+          "ra_bcast"
+        ],
+        "executions": {
+          "e3bd14fe94534fbca3955cae4e521df7": [
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8c1b3b1accac4862bebd937d58db3f94"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "487d58f18c6c4153aff83de24c871db4",
+      "result": {
+        "submission": "update.json",
+        "summary": "Recorded a durable correction rather than a new finding. The behaviour entry describing ReadOnlySafe admission said each admitted request broadcasts a heartbeat, which reads as one message per request; the isolated-network receipt shows the cost is one heartbeat per other tracked peer, that is n-1 messages per request - 64 for 32 requests in a three-voter cluster. Since that entry is used by the asserted read-index defect account and by several interpretations that reasoned about retry cost, I corrected its premise under the same id rather than adding a parallel entry: the revised statement spells out that sendMsgReadIndexResponse admits the request and then calls bcastHeartbeat, so a request costs one heartbeat per peer, and it cites the measured 32 admitted requests with confirmed zero and 64 heartbeats as the execution evidence. The changed_premise field explains the semantic difference from the earlier revision, and affected_uses lists the recorded experiment and interpretation records that relied on the old reading, verified against the controller's own list of valid use ids. The two asserted defects and their receipts, the measured StateSnapshot repair exits, and the explained or refuted threads are otherwise unchanged; the correction tightens the read-index amplification claim from one message per retry to one per peer per retry."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-71f53a32a0c74532a55ad33bc1e71086": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-71f53a32a0c74532a55ad33bc1e71086.json"
+      },
+      "submission-a167f4c33dc94f34b03ea29dbe7ec15a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a167f4c33dc94f34b03ea29dbe7ec15a.json"
+      },
+      "submission-109448522bc649dea46fc5461752da53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-109448522bc649dea46fc5461752da53.json"
+      },
+      "submission-a38031973bee49ac9248ded78a2843e4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a38031973bee49ac9248ded78a2843e4.json"
+      },
+      "submission-8086d0fc533a4eabb061df6601d55b5b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-8086d0fc533a4eabb061df6601d55b5b.json"
+      },
+      "submission-cbcc326c8c1b40b8beafb5b33802bddf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-cbcc326c8c1b40b8beafb5b33802bddf.json"
+      },
+      "submission-ae6755767a574dd5b375bc66265f147b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ae6755767a574dd5b375bc66265f147b.json"
+      },
+      "submission-ee850f515b5d49718d5f55c4c1d36e61": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ee850f515b5d49718d5f55c4c1d36e61.json"
+      },
+      "submission-8e42a5752e9d454bb97823c6d38e4728": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-8e42a5752e9d454bb97823c6d38e4728.json"
+      },
+      "submission-ec634053934546af8e5da7dcb41717bd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ec634053934546af8e5da7dcb41717bd.json"
+      },
+      "submission-d3c59bbf96b7456c891afc06f2cd1a5f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-d3c59bbf96b7456c891afc06f2cd1a5f.json"
+      },
+      "submission-ba4b0efa5ad64f069964ee92cc43b432": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ba4b0efa5ad64f069964ee92cc43b432.json"
+      },
+      "submission-e2b3f903fe394533a660cc23bded2379": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-e2b3f903fe394533a660cc23bded2379.json"
+      },
+      "submission-be700e7c3fa742f1bb44a3dad42061cb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-be700e7c3fa742f1bb44a3dad42061cb.json"
+      },
+      "submission-03642230074a4ecfa828a594c9580e21": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-03642230074a4ecfa828a594c9580e21.json"
+      },
+      "submission-2bb54275ad0a4414918a4d338739fcf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-2bb54275ad0a4414918a4d338739fcf6.json"
+      },
+      "submission-387cf209ec6647bd9b65cedaac0cf8cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-387cf209ec6647bd9b65cedaac0cf8cf.json"
+      },
+      "submission-d82592dffc9d4a5893fbc6028fc438e7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-d82592dffc9d4a5893fbc6028fc438e7.json"
+      },
+      "submission-5a3be50f1bc74a1fbf2433e4ed473442": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-5a3be50f1bc74a1fbf2433e4ed473442.json"
+      },
+      "submission-014141e1cc2e474ebf95be149b343099": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-014141e1cc2e474ebf95be149b343099.json"
+      },
+      "submission-e083daeefc0f460f9a395b329006f127": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-e083daeefc0f460f9a395b329006f127.json"
+      },
+      "submission-08c5f95c1b1041d997809c01286e91f2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-08c5f95c1b1041d997809c01286e91f2.json"
+      },
+      "submission-445153ef4a5b4839a90c275d46a90023": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-445153ef4a5b4839a90c275d46a90023.json"
+      },
+      "submission-a72217bf43f74b4989a601a5add96b02": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a72217bf43f74b4989a601a5add96b02.json"
+      },
+      "submission-a30a3cfa85994b70bb34c3d0f3c815b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a30a3cfa85994b70bb34c3d0f3c815b7.json"
+      },
+      "submission-81bcf16eb8ab4b758bcc18dd09afd758": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-81bcf16eb8ab4b758bcc18dd09afd758.json"
+      },
+      "submission-afeecd9696b540cc9850784dce4b18b4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-afeecd9696b540cc9850784dce4b18b4.json"
+      },
+      "submission-e577e1a3e13643ada4cf00afb816084f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-e577e1a3e13643ada4cf00afb816084f.json"
+      },
+      "submission-5e447681f32f4bd982a11690ef2cf54d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-5e447681f32f4bd982a11690ef2cf54d.json"
+      },
+      "submission-fc067d03c1b4463ba575858c3fec5f3a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-fc067d03c1b4463ba575858c3fec5f3a.json"
+      },
+      "submission-aec0c0a0b7bc4c239f0718d86bc5a146": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-aec0c0a0b7bc4c239f0718d86bc5a146.json"
+      },
+      "submission-9f12ed3929394866acee13718713de2b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-9f12ed3929394866acee13718713de2b.json"
+      },
+      "submission-74d3be2ded2c4f38a1ff2c1973cd046c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-74d3be2ded2c4f38a1ff2c1973cd046c.json"
+      },
+      "submission-be2af26c5f2f43679ffe2592668f8388": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-be2af26c5f2f43679ffe2592668f8388.json"
+      },
+      "submission-8c1b3b1accac4862bebd937d58db3f94": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-8c1b3b1accac4862bebd937d58db3f94.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "71f53a32a0c74532a55ad33bc1e71086-question-0",
+        "version": 2,
+        "question": "In the ReadOnlySafe read-index flow, is a heartbeat response's Context validated against the outstanding read requests before it is used to confirm a read index, and what bounds the value used to slice unconfirmedReads?",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp",
+          "raft_readidx"
+        ],
+        "hypothesis": "Refined after resolving the gap: readOnly.recvAck does store a peer-supplied Context as a raw read-position ack with no check that the leader emitted it, and maybeAdvance slices unconfirmedReads by the resulting quorum position without clamping. But every legal producer in this snapshot echoes a value the live leader's heartbeatCtx produced (handleHeartbeat is the sole writer of MsgHeartbeatResp.Context), the readOnly instance is created only by raft.reset at a leadership transition, and the emitted position equals a message total that is non-decreasing, so the quorum position can never exceed confirmedReads+len(unconfirmedReads) in-model. The two consequences (slice-bounds panic; confirming a read no quorum observed) require a Context outside the set heartbeatCtx emitted, which no in-model producer supplies.",
+        "discriminator": "Resolved: enumerate the sites that create the readOnly instance (only raft.reset, called from becomeFollower/becomeCandidate/becomeLeader) and the writers of MsgHeartbeatResp.Context (only handleHeartbeat, echoing m.Context). None can deliver a value the leader did not emit while its instance was live, because a readOnly instance is only live while its node is leader in a single term and cross-term responses are dropped before stepLeader. If a later source read showed any other readOnly reassignment or Context producer (e.g. an application-visible heartbeat context), the in-model claim would revive.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "71f53a32a0c74532a55ad33bc1e71086-gap-0",
+            "question": "Is there any legal producer in this snapshot (or a mixed-version cluster running the v3.6.0 node) that delivers MsgHeartbeatResp.Context values the current leader's heartbeatCtx never emitted for its live readOnly instance - for example an in-flight heartbeat response that survives a same-term readOnly recreation, or a peer that echoes a context from a different node/term?",
+            "experiment_id": null,
+            "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+          }
+        ],
+        "history": [
+          {
+            "id": "71f53a32a0c74532a55ad33bc1e71086-question-0",
+            "version": 1,
+            "question": "In the ReadOnlySafe read-index flow, is a heartbeat response's Context validated against the outstanding read requests before it is used to confirm a read index, and what bounds the value used to slice unconfirmedReads?",
+            "source_ids": [
+              "ro_ack",
+              "raft_hbresp",
+              "raft_readidx"
+            ],
+            "hypothesis": "readOnly.recvAck decodes the peer-supplied Context as a raw uint64 read position with no check that it was produced by heartbeatCtx for an outstanding request, and readOnly.maybeAdvance slices unconfirmedReads by the quorum position without clamping. A Context larger than the number of outstanding reads would then confirm reads no quorum actually acknowledged, or panic with a slice-bounds error.",
+            "discriminator": "Identify any legal (non-Byzantine) producer of MsgHeartbeatResp whose Context is not a value the leader's own heartbeatCtx emitted for the current readOnly lifetime. If none exists, the premise fails and the behavior is unreachable in the crash-fault model; if one exists (or if the leader itself can supply a stale/oversized value), the safety and liveness consequences apply in-model.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+          }
+        ],
+        "operation_id": "a167f4c33dc94f34b03ea29dbe7ec15a"
+      },
+      {
+        "id": "109448522bc649dea46fc5461752da53-question-0",
+        "version": 2,
+        "question": "When a MsgReadIndex is postponed because the leader has not committed an entry in its term, is that queued duty eventually completed with a read index at least as large as the one the same request would have received at admission, including when the queue survives loss and later reacquisition of leadership (and when the node is deposed, removed, or restarted in between)?",
+        "source_ids": [
+          "q_admit",
+          "q_release_call",
+          "q_release_fn",
+          "q_reset",
+          "q_commit_mono",
+          "q_restore_guard",
+          "q_loadstate"
+        ],
+        "hypothesis": "The queue is not cleared by raft.reset (term or state change), so a request admitted at term T is released later, while the node is leader again at term T' > T. Release recomputes the index from the live r.raftLog.committed, and every write to raftLog.committed is non-decreasing (commitTo refuses to lower it; loadState and log restore are guarded to only raise it above the current value). The completed read index is therefore >= the committed index at admission, so the surviving duty cannot produce a stale read index.",
+        "discriminator": "Look for any site that lowers raftLog.committed after a request is queued, or any release path that reuses an index captured before admission instead of reading the live commit index. None would mean the stale-index suspicion is defeated; a lowering site or a cached-index release would revive it. Secondary: whether the queue can be released while the node is not the current leader (releasePendingReadIndexMessages is only called from the leader's MsgAppResp path and re-checks committedEntryInCurrentTerm).",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "109448522bc649dea46fc5461752da53-question-0",
+            "version": 1,
+            "question": "When a MsgReadIndex is postponed because the leader has not committed an entry in its term, is that queued duty eventually completed with a read index at least as large as the one the same request would have received at admission, including when the queue survives loss and later reacquisition of leadership (and when the node is deposed, removed, or restarted in between)?",
+            "source_ids": [
+              "q_admit",
+              "q_release_call",
+              "q_release_fn",
+              "q_reset",
+              "q_commit_mono",
+              "q_restore_guard",
+              "q_loadstate"
+            ],
+            "hypothesis": "The queue is not cleared by raft.reset (term or state change), so a request admitted at term T is released later, while the node is leader again at term T' > T. Release recomputes the index from the live r.raftLog.committed, and every write to raftLog.committed is non-decreasing (commitTo refuses to lower it; loadState and log restore are guarded to only raise it above the current value). The completed read index is therefore >= the committed index at admission, so the surviving duty cannot produce a stale read index.",
+            "discriminator": "Look for any site that lowers raftLog.committed after a request is queued, or any release path that reuses an index captured before admission instead of reading the live commit index. None would mean the stale-index suspicion is defeated; a lowering site or a cached-index release would revive it. Secondary: whether the queue can be released while the node is not the current leader (releasePendingReadIndexMessages is only called from the leader's MsgAppResp path and re-checks committedEntryInCurrentTerm).",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "109448522bc649dea46fc5461752da53"
+          }
+        ],
+        "operation_id": "a38031973bee49ac9248ded78a2843e4"
+      },
+      {
+        "id": "a38031973bee49ac9248ded78a2843e4-question-1",
+        "version": 2,
+        "question": "Once a leader puts a follower's Progress into StateSnapshot, which actors can restore replication to that follower, and is there an enabled repair when the follower applied the snapshot but the corresponding MsgAppResp is lost?",
+        "source_ids": [
+          "sn_entry",
+          "sn_recover",
+          "sn_status",
+          "sn_paused",
+          "sn_hbresp"
+        ],
+        "hypothesis": "The state pauses appends (IsPaused is unconditionally true in StateSnapshot), so the only exits are: the leader's MsgAppResp handler advancing pr.Match and hitting the StateSnapshot recovery arm, or an application ReportSnapshot call arriving as MsgSnapStatus. Both require an external event, so a follower that applied the snapshot whose MsgAppResp was lost, with no ReportSnapshot from the application, would remain paused.",
+        "discriminator": "Check whether the library reaches StateSnapshot without a matching application report obligation, and whether any timer or heartbeat path can exit StateSnapshot on its own. The README/Ready contract and the ReportSnapshot doc place that obligation on the application; a self-repair path that does not exist in the leader code would mean the duty is only repairable externally.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "a38031973bee49ac9248ded78a2843e4-question-1",
+            "version": 1,
+            "question": "Once a leader puts a follower's Progress into StateSnapshot, which actors can restore replication to that follower, and is there an enabled repair when the follower applied the snapshot but the corresponding MsgAppResp is lost?",
+            "source_ids": [
+              "sn_entry",
+              "sn_recover",
+              "sn_status",
+              "sn_paused",
+              "sn_hbresp"
+            ],
+            "hypothesis": "The state pauses appends (IsPaused is unconditionally true in StateSnapshot), so the only exits are: the leader's MsgAppResp handler advancing pr.Match and hitting the StateSnapshot recovery arm, or an application ReportSnapshot call arriving as MsgSnapStatus. Both require an external event, so a follower that applied the snapshot whose MsgAppResp was lost, with no ReportSnapshot from the application, would remain paused.",
+            "discriminator": "Check whether the library reaches StateSnapshot without a matching application report obligation, and whether any timer or heartbeat path can exit StateSnapshot on its own. The README/Ready contract and the ReportSnapshot doc place that obligation on the application; a self-repair path that does not exist in the leader code would mean the duty is only repairable externally.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "a38031973bee49ac9248ded78a2843e4"
+          }
+        ],
+        "operation_id": "8086d0fc533a4eabb061df6601d55b5b"
+      },
+      {
+        "id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+        "version": 2,
+        "question": "Can a caller that follows the documented ReadIndex retry contract grow the leader's per-request read state without bound? Specifically: does each retried MsgReadIndex (same RequestCtx) add one unconfirmedReads entry and one heartbeat broadcast that are never collapsed, and is there any in-model state (leader isolated from a quorum, checkQuorum disabled or not yet fired) under which the entries are never confirmed and never dropped?",
+        "source_ids": [
+          "ra_admit",
+          "ra_add",
+          "ra_send",
+          "ra_bcast",
+          "ra_contract"
+        ],
+        "hypothesis": "readOnly.addRequest appends unconditionally, without the context-keyed deduplication the v3.6.0 implementation performed, and sendMsgReadIndexResponse calls bcastHeartbeat for every admitted request. Entries leave unconfirmedReads only when a quorum acks the recorded position (readOnly.maybeAdvance), so a leader that cannot obtain quorum acks retains every retried request and rebroadcasts for each, which grows memory and generated traffic with the number of caller retries rather than with the number of distinct reads.",
+        "discriminator": "Establish whether the retry contract permits an unbounded number of retries with an identical RequestCtx while the leader stays in StateLeader without quorum confirmation (checkQuorum disabled, or the retry rate exceeding the election timeout). If that state is reachable under permitted use, the growth is an in-model bounded-resource concern; if the caller is required to bound retries or the leader always confirms or steps down first, the behavior is benign and the suspicion is refuted.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "ee850f515b5d49718d5f55c4c1d36e61-gap-1",
+            "question": "What bounds (if any) the number of outstanding read requests a client may have with the same RequestCtx while a leader is in StateLeader but unable to obtain quorum acknowledgements - is any bound stated by the ReadIndex contract, by etcd's usage, or enforced by the library (and does checkQuorum guarantee the leader steps down before the state persists)?",
+            "experiment_id": null,
+            "operation_id": "ee850f515b5d49718d5f55c4c1d36e61"
+          },
+          {
+            "id": "487d58f18c6c4153aff83de24c871db4-gap-3",
+            "question": "Knowledge ee850f515b5d49718d5f55c4c1d36e61-knowledge-0: The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+            "experiment_id": null,
+            "operation_id": "487d58f18c6c4153aff83de24c871db4"
+          },
+          {
+            "id": "487d58f18c6c4153aff83de24c871db4-gap-4",
+            "question": "Knowledge ee850f515b5d49718d5f55c4c1d36e61-knowledge-0: The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+            "experiment_id": "be2af26c5f2f43679ffe2592668f8388-experiment",
+            "operation_id": "487d58f18c6c4153aff83de24c871db4"
+          },
+          {
+            "id": "487d58f18c6c4153aff83de24c871db4-gap-5",
+            "question": "Knowledge ee850f515b5d49718d5f55c4c1d36e61-knowledge-0: The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+            "experiment_id": "d3c59bbf96b7456c891afc06f2cd1a5f-experiment",
+            "operation_id": "487d58f18c6c4153aff83de24c871db4"
+          },
+          {
+            "id": "487d58f18c6c4153aff83de24c871db4-gap-6",
+            "question": "Knowledge ee850f515b5d49718d5f55c4c1d36e61-knowledge-0: The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+            "experiment_id": "ba4b0efa5ad64f069964ee92cc43b432-experiment",
+            "operation_id": "487d58f18c6c4153aff83de24c871db4"
+          },
+          {
+            "id": "487d58f18c6c4153aff83de24c871db4-gap-7",
+            "question": "Knowledge ee850f515b5d49718d5f55c4c1d36e61-knowledge-0: The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+            "experiment_id": "8e42a5752e9d454bb97823c6d38e4728-experiment",
+            "operation_id": "487d58f18c6c4153aff83de24c871db4"
+          }
+        ],
+        "history": [
+          {
+            "id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+            "version": 1,
+            "question": "Can a caller that follows the documented ReadIndex retry contract grow the leader's per-request read state without bound? Specifically: does each retried MsgReadIndex (same RequestCtx) add one unconfirmedReads entry and one heartbeat broadcast that are never collapsed, and is there any in-model state (leader isolated from a quorum, checkQuorum disabled or not yet fired) under which the entries are never confirmed and never dropped?",
+            "source_ids": [
+              "ra_admit",
+              "ra_add",
+              "ra_send",
+              "ra_bcast",
+              "ra_contract"
+            ],
+            "hypothesis": "readOnly.addRequest appends unconditionally, without the context-keyed deduplication the v3.6.0 implementation performed, and sendMsgReadIndexResponse calls bcastHeartbeat for every admitted request. Entries leave unconfirmedReads only when a quorum acks the recorded position (readOnly.maybeAdvance), so a leader that cannot obtain quorum acks retains every retried request and rebroadcasts for each, which grows memory and generated traffic with the number of caller retries rather than with the number of distinct reads.",
+            "discriminator": "Establish whether the retry contract permits an unbounded number of retries with an identical RequestCtx while the leader stays in StateLeader without quorum confirmation (checkQuorum disabled, or the retry rate exceeding the election timeout). If that state is reachable under permitted use, the growth is an in-model bounded-resource concern; if the caller is required to bound retries or the leader always confirms or steps down first, the behavior is benign and the suspicion is refuted.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "ee850f515b5d49718d5f55c4c1d36e61"
+          }
+        ],
+        "operation_id": "387cf209ec6647bd9b65cedaac0cf8cf"
+      },
+      {
+        "id": "d82592dffc9d4a5893fbc6028fc438e7-question-0",
+        "version": 2,
+        "question": "Can a node that the configuration no longer contains have its proposals accepted and committed after it learns of a new leader? node.run() blocks the proposal channel only until the next observed leader change, and describes that behaviour as unsound; do the raft handlers then accept a proposal whose sender is not a member, and is sender eligibility a library duty or a caller duty?",
+        "source_ids": [
+          "node_gate",
+          "node_removal",
+          "lead_prop",
+          "follow_fwd"
+        ],
+        "hypothesis": "The Node facade re-enables the proposal channel whenever lead != r.lead and the new lead is not None, regardless of the node's own membership, so a removed node's client can keep proposing after any leadership change; the proposal is then forwarded by stepFollower to the current leader, and stepLeader's MsgProp handler writes it without consulting Progress[m.From], so the entry is appended and can be committed even though the sender is not in the configuration.",
+        "discriminator": "Decide who owns sender eligibility: if the library's documented contract places authorization on the caller (the application), then accepting a proposal from a non-member is out of scope and the suspicion is refuted; if node.go's own stated intent to block proposals from a removed node is the contract, then re-enabling the channel on a leader change is a defect. Concretely: check whether any handler or contract rejects MsgProp from an id absent from the configuration, and whether the application can observe that its request came from a removed member.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "d82592dffc9d4a5893fbc6028fc438e7-gap-2",
+            "question": "Does any part of the library contract, node documentation or Ready/Propose API make sender eligibility the caller's responsibility (so that a leader accepting a non-member's proposal is intended), or is node.go's 'block incoming proposals' the intended guarantee, which the leader-change path then breaks?",
+            "experiment_id": null,
+            "operation_id": "d82592dffc9d4a5893fbc6028fc438e7"
+          }
+        ],
+        "history": [
+          {
+            "id": "d82592dffc9d4a5893fbc6028fc438e7-question-0",
+            "version": 1,
+            "question": "Can a node that the configuration no longer contains have its proposals accepted and committed after it learns of a new leader? node.run() blocks the proposal channel only until the next observed leader change, and describes that behaviour as unsound; do the raft handlers then accept a proposal whose sender is not a member, and is sender eligibility a library duty or a caller duty?",
+            "source_ids": [
+              "node_gate",
+              "node_removal",
+              "lead_prop",
+              "follow_fwd"
+            ],
+            "hypothesis": "The Node facade re-enables the proposal channel whenever lead != r.lead and the new lead is not None, regardless of the node's own membership, so a removed node's client can keep proposing after any leadership change; the proposal is then forwarded by stepFollower to the current leader, and stepLeader's MsgProp handler writes it without consulting Progress[m.From], so the entry is appended and can be committed even though the sender is not in the configuration.",
+            "discriminator": "Decide who owns sender eligibility: if the library's documented contract places authorization on the caller (the application), then accepting a proposal from a non-member is out of scope and the suspicion is refuted; if node.go's own stated intent to block proposals from a removed node is the contract, then re-enabling the channel on a leader change is a defect. Concretely: check whether any handler or contract rejects MsgProp from an id absent from the configuration, and whether the application can observe that its request came from a removed member.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "d82592dffc9d4a5893fbc6028fc438e7"
+          }
+        ],
+        "operation_id": "014141e1cc2e474ebf95be149b343099"
+      },
+      {
+        "id": "e083daeefc0f460f9a395b329006f127-question-0",
+        "version": 2,
+        "question": "Can an empty ConfChangeV2 whose Transition is explicit rather than auto pass the leader's propose-time configuration validation while the configuration is joint, and then panic the process when the application applies the committed entry? Propose-time validation tests len(Changes) == 0 for leave-joint, while applyConfChange tests ConfChangeV2.LeaveJoint(), which also requires the Auto transition.",
+        "source_ids": [
+          "val_joint",
+          "apply_cc",
+          "cc_enter",
+          "pb_leave"
+        ],
+        "hypothesis": "The two leave-joint tests disagree for an empty change set with a non-Auto transition in a joint configuration: stepLeader treats it as a leave-joint request (wantsLeaveJoint true, alreadyJoint true, so no failed check and no entry replacement), but applyConfChange sees LeaveJoint false, takes the EnterJoint branch because EnterJoint reports ok for an explicit transition, calls Changer.EnterJoint on an already-joint tracker, receives the error and panics on the spot. The panic happens in the application's ApplyConfChange call for an entry the library accepted and committed.",
+        "discriminator": "Confirm both halves separately: (a) the entry appended by the validated proposal still has type EntryConfChangeV2 rather than being replaced by EntryNormal, which shows validation accepted it; (b) applying that same ConfChangeV2 panics with config is already joint. If either half fails - for instance if some later guard replaces or drops the entry, or if EnterJoint returns ok false - the suspicion is refuted. Also check whether the Auto-transition empty change still leaves the joint config correctly, which would show the defect is specific to the explicit transition rather than to empty changes.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "e083daeefc0f460f9a395b329006f127-question-0",
+            "version": 1,
+            "question": "Can an empty ConfChangeV2 whose Transition is explicit rather than auto pass the leader's propose-time configuration validation while the configuration is joint, and then panic the process when the application applies the committed entry? Propose-time validation tests len(Changes) == 0 for leave-joint, while applyConfChange tests ConfChangeV2.LeaveJoint(), which also requires the Auto transition.",
+            "source_ids": [
+              "val_joint",
+              "apply_cc",
+              "cc_enter",
+              "pb_leave"
+            ],
+            "hypothesis": "The two leave-joint tests disagree for an empty change set with a non-Auto transition in a joint configuration: stepLeader treats it as a leave-joint request (wantsLeaveJoint true, alreadyJoint true, so no failed check and no entry replacement), but applyConfChange sees LeaveJoint false, takes the EnterJoint branch because EnterJoint reports ok for an explicit transition, calls Changer.EnterJoint on an already-joint tracker, receives the error and panics on the spot. The panic happens in the application's ApplyConfChange call for an entry the library accepted and committed.",
+            "discriminator": "Confirm both halves separately: (a) the entry appended by the validated proposal still has type EntryConfChangeV2 rather than being replaced by EntryNormal, which shows validation accepted it; (b) applying that same ConfChangeV2 panics with config is already joint. If either half fails - for instance if some later guard replaces or drops the entry, or if EnterJoint returns ok false - the suspicion is refuted. Also check whether the Auto-transition empty change still leaves the joint config correctly, which would show the defect is specific to the explicit transition rather than to empty changes.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "e083daeefc0f460f9a395b329006f127"
+          }
+        ],
+        "operation_id": "445153ef4a5b4839a90c275d46a90023"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "71f53a32a0c74532a55ad33bc1e71086-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For ReadOnlySafe, the leader confirms reads as follows: sendMsgReadIndexResponse calls readOnly.addRequest(committed, m), self-acks by recvAck(r.id, heartbeatCtx()) and broadcasts a heartbeat carrying heartbeatCtx(); heartbeatCtx encodes confirmedReads+len(unconfirmedReads) in 8 little-endian bytes; on each MsgHeartbeatResp with non-empty Context the leader calls readOnly.recvAck(m.From, m.Context), which stores max(existing, binary.LittleEndian.Uint64(Context)) in acks[m.From]; maybeAdvance computes newConfirmedReads = quorum.JointConfig.CommittedIndex(ro) over acks (unacked voters count as 0), and if newConfirmedReads > confirmedReads it returns unconfirmedReads[:newConfirmedReads-confirmedReads] and advances confirmedReads. No comparison is made between the received Context and any value the leader emitted.",
+        "conditions": "Leader in StateLeader with ReadOnlySafe; the ack map and unconfirmedReads are per readOnly instance, recreated by raft.reset on each state/term change. Values in acks are positions (counts of admitted read requests), not log indexes.",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp",
+          "raft_readidx"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+      },
+      {
+        "id": "71f53a32a0c74532a55ad33bc1e71086-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Under the framework's own producers, every value written into readOnly.acks equals a value heartbeatCtx produced for this readOnly lifetime, and heartbeatCtx values are non-decreasing and at most the number of admitted read requests. Therefore for a faithful cluster the quorum position newConfirmedReads never exceeds confirmedReads+len(unconfirmedReads); the slicing in maybeAdvance is in range and each confirmed read corresponds to a heartbeat sent after that read was admitted.",
+        "conditions": "All peers echo MsgHeartbeatResp.Context exactly as produced by the leader's heartbeatCtx (the only context the checked-in follower path writes, via handleHeartbeat), and the leader's readOnly is not recreated between request admission and response handling except across state/term changes, after which lower-term responses are ignored by raft.Step.",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp",
+          "raft_readidx"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "71f53a32a0c74532a55ad33bc1e71086"
+      },
+      {
+        "id": "a167f4c33dc94f34b03ea29dbe7ec15a-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In this snapshot the ReadOnlySafe ack bookkeeping is in-model consistent: (1) r.readOnly is reassigned only in raft.reset (:809) and reset is called only by becomeFollower (:893), becomeCandidate (:908, term+1) and becomeLeader (:939, the candidate's term), so a readOnly instance is live only while its node is leader at one term; (2) raft.Step drops a lower-term MsgHeartbeatResp before dispatch (:1158-1175); (3) the only producer of MsgHeartbeatResp.Context is handleHeartbeat (:1837), echoing the leader's heartbeat Context, and vote contexts are sent on MsgVote (:1071); (4) heartbeatCtx emits exactly confirmedReads+len(unconfirmedReads), which addRequest only grows and maybeAdvance preserves. Therefore every value in readOnly.acks is at most the current message total, newConfirmedReads-confirmedReads can never exceed len(unconfirmedReads), and each returned read corresponds to a heartbeat emitted after that request was admitted and acknowledged by a quorum. The slice-bounds panic and premature confirmation observed when a probe supplied an out-of-contract Context are not reachable through the library's own producers.",
+        "conditions": "ReadOnlySafe; leadership terms strictly increase (becomeCandidate panics from StateLeader and increments the term); cluster members run this library's follower path (including a v3.6.0 node, which also echoes m.Context); no two leaders exist in the same term. Excludes a peer or intermediary that fabricates or corrupts MsgHeartbeatResp.Context, which is outside the crash-fault model.",
+        "source_ids": [
+          "src_reset",
+          "src_terms",
+          "src_hb_echo",
+          "src_step_term",
+          "ro_ack",
+          "raft_hbresp"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "a167f4c33dc94f34b03ea29dbe7ec15a"
+      },
+      {
+        "id": "109448522bc649dea46fc5461752da53-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "pendingReadIndexMessages lifecycle for MsgReadIndex on a leader: in stepLeader (:1355-1372) a request is answered immediately when the cluster is a singleton or when committedEntryInCurrentTerm() holds, and is otherwise appended to r.pendingReadIndexMessages without a term stamp; raft.reset (:781-812) does not clear the slice, so it survives step-downs, re-elections and being removed from the config; releasePendingReadIndexMessages (:2127-2144) is invoked only from the leader's MsgAppResp fast path after maybeCommit() returns true (:1546-1556), returns early with an error log if committedEntryInCurrentTerm() no longer holds, and otherwise swaps the slice out and passes each stored message to sendMsgReadIndexResponse, which captures the index as r.raftLog.committed at that moment (ReadOnlySafe also re-enters the addRequest/heartbeat confirmation flow for it).",
+        "conditions": "Node acts as leader; r.raftLog.committed is the only source of the read index. Commit index monotonicity holds because commitTo (:322-330) assigns only when l.committed < tocommit, log restore is reached only when the snapshot index exceeds the current committed (log.go :463-470 guard), and loadState (:2037-2047) rejects any state.commit below the current committed.",
+        "source_ids": [
+          "q_admit",
+          "q_release_call",
+          "q_release_fn",
+          "q_reset",
+          "q_commit_mono",
+          "q_restore_guard",
+          "q_loadstate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "109448522bc649dea46fc5461752da53"
+      },
+      {
+        "id": "a38031973bee49ac9248ded78a2843e4-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Leader-side StateSnapshot handling: maybeSendSnapshot (:666-694) refuses to send while pr.RecentActive is false, and otherwise calls pr.BecomeSnapshot(snapshotIndex) which sets State=StateSnapshot, PendingSnapshot=Next-1 and pauses the follower. While in that state Progress.IsPaused() returns true unconditionally (tracker/progress.go :262-282), so maybeSendAppend returns immediately, bcastAppend is a no-op for that peer, and the MsgHeartbeatResp branch's sendAppend (:1588-1596) also sends nothing. Exactly two producers can leave the state: (1) stepLeader's MsgAppResp handler (:1518-1546) when pr.MaybeUpdate(m.GetIndex()) is true (m.Index strictly greater than pr.Match) and then pr.Match+1 >= raftLog.firstIndex(), which runs BecomeProbe followed by BecomeReplicate; and (2) stepLeader's MsgSnapStatus handler (:1612-1634) from the application's ReportSnapshot, which returns early unless pr.State == StateSnapshot, then clears PendingSnapshot when the snapshot failed and calls BecomeProbe either way.",
+        "conditions": "Node is leader; the peer is a tracked follower or learner. The follower emits the MsgAppResp either by applying the snapshot (handleSnapshot sends MsgAppResp with its last index) or by ignoring an obsolete snapshot (handleSnapshot sends MsgAppResp with its committed index). ReportSnapshot reaches the leader as MsgSnapStatus only when the application calls it.",
+        "source_ids": [
+          "sn_entry",
+          "sn_recover",
+          "sn_status",
+          "sn_paused",
+          "sn_hbresp"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "a38031973bee49ac9248ded78a2843e4"
+      },
+      {
+        "id": "ae6755767a574dd5b375bc66265f147b-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "When readOnly.recvAck is given an 8-byte Context value larger than the number of outstanding read requests, the ReadOnlySafe confirmation path behaves as follows in this snapshot. With a quorum of such values (leader self-ack position 1 plus two peers at position 2^40, voters {1,2,3}), readOnly.maybeAdvance panics inside its slice expression: 'runtime error: slice bounds out of range [:1099511627776] with capacity 1'. With a single such value (two admitted reads, leader self-ack position 2, an honest peer at position 1, one peer at position 2 that received no heartbeat carrying position 2), maybeAdvance does not panic and instead returns both admitted reads (advanced=2, confirmed_reads=2), i.e. it confirms a read index that the forged voter never observed. Both outcomes were observed with the ack map, unconfirmedReads and confirmedReads driven directly; no raft instance, network or storage was involved.",
+        "conditions": "ReadOnlySafe; ack values are injected directly into the unexported readOnly via recvAck instead of being produced by the library's follower path (handleHeartbeat), which is the out-of-contract premise. Quorum position is the median of stored acks because CommittedIndex is evaluated over quorum.JointConfig{1,2,3},nil. Does not apply to ReadOnlyLeaseBased, which does not use the ack map.",
+        "source_ids": [
+          "ro_ack",
+          "raft_hbresp"
+        ],
+        "executions": {
+          "8dd8fb7e47a14057ba98a6755fdc5b49": [
+            1,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ae6755767a574dd5b375bc66265f147b"
+      },
+      {
+        "id": "ee850f515b5d49718d5f55c4c1d36e61-knowledge-0",
+        "revision": 2,
+        "kind": "behavior",
+        "statement": "ReadOnlySafe admission and growth, in this snapshot: every MsgReadIndex that reaches a leader is admitted individually. If the cluster is not a singleton and committedEntryInCurrentTerm holds, sendMsgReadIndexResponse adds one entry to readOnly.unconfirmedReads through readOnly.addRequest, which appends without any lookup of an existing request with the same context, and then calls bcastHeartbeat, which sends one heartbeat to every other tracked peer carrying r.readOnly.heartbeatCtx() - so one admitted request costs one heartbeat per peer, not a single message. If committedEntryInCurrentTerm does not hold, the raw message is appended to pendingReadIndexMessages and released only later, one response per queued message, each release again costing an admission plus a heartbeat per peer. Measured on a real three-node network with the leader isolated from both followers: 32 same-context requests produced unconfirmedReads length 32 with confirmedReads 0 and 64 heartbeat messages, one per peer per request.",
+        "conditions": "ReadOnlySafe, leader in StateLeader. Admission is per request and context-blind, so N retries with an identical context produce N entries; the outbound cost scales with N times the number of other tracked peers. Under a healthy quorum each retry is confirmed on the next heartbeat response, so the queue stays short. The node-level contract that makes retries the caller's duty is at node.go:218-224.",
+        "source_ids": [
+          "ra_admit",
+          "ra_send",
+          "ra_bcast"
+        ],
+        "executions": {
+          "e3bd14fe94534fbca3955cae4e521df7": [
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "ee850f515b5d49718d5f55c4c1d36e61-knowledge-0",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "ReadOnlySafe admission and growth, in this snapshot: every MsgReadIndex that reaches a leader is admitted individually - if the cluster is not a singleton and committedEntryInCurrentTerm() holds, sendMsgReadIndexResponse adds one entry to readOnly.unconfirmedReads via readOnly.addRequest (which appends without any lookup of an existing request with the same context) and then broadcasts a heartbeat carrying heartbeatCtx(); if committedEntryInCurrentTerm() does not hold, the raw message is appended to pendingReadIndexMessages and released (one response per queued message) only later, each release again going through addRequest plus a heartbeat broadcast. Entries are removed from unconfirmedReads only by readOnly.maybeAdvance, which requires the quorum ack position to exceed confirmedReads. Nothing in the admission path inspects the RequestCtx, so N retries with an identical context produce N unconfirmedReads entries and N heartbeat broadcasts.",
+            "conditions": "ReadOnlySafe, leader in StateLeader. The behavior is a property of admission, independent of whether the reads are eventually confirmed; under a healthy quorum each retry is confirmed quickly, so the queue stays short. The node-level contract that makes retries the caller's duty is stated at node.go:222-223 ('request can be lost without notice, therefore it is user's job to ensure read index retries').",
+            "source_ids": [
+              "ra_admit",
+              "ra_add",
+              "ra_send",
+              "ra_bcast",
+              "ra_contract"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "ee850f515b5d49718d5f55c4c1d36e61",
+            "correction": "The earlier revision said each admitted request broadcasts a heartbeat, which read as one message per request. Measurement and source show one heartbeat per other tracked peer per request, so the outbound amplification scales with the number of voters as well as with the retry count.",
+            "recorded_uses": [
+              "d3c59bbf96b7456c891afc06f2cd1a5f-experiment",
+              "be2af26c5f2f43679ffe2592668f8388-experiment",
+              "ee850f515b5d49718d5f55c4c1d36e61-interpretation-0",
+              "8e42a5752e9d454bb97823c6d38e4728-interpretation-0",
+              "ec634053934546af8e5da7dcb41717bd-interpretation-0",
+              "e2b3f903fe394533a660cc23bded2379-interpretation-0"
+            ],
+            "affected_uses": [
+              "8e42a5752e9d454bb97823c6d38e4728-interpretation-0",
+              "be2af26c5f2f43679ffe2592668f8388-experiment",
+              "d3c59bbf96b7456c891afc06f2cd1a5f-experiment",
+              "e2b3f903fe394533a660cc23bded2379-interpretation-0",
+              "ec634053934546af8e5da7dcb41717bd-interpretation-0",
+              "ee850f515b5d49718d5f55c4c1d36e61-interpretation-0"
+            ]
+          }
+        ],
+        "operation_id": "487d58f18c6c4153aff83de24c871db4"
+      },
+      {
+        "id": "ec634053934546af8e5da7dcb41717bd-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "For a real raft leader of a three-voter configuration that cannot obtain quorum acknowledgements, repeated local MsgReadIndex submissions with an identical RequestCtx accumulate without bound in pendingReadIndexMessages and are not reclaimed by an authority transition. Measured: with the node at term 1, committed 0, lastIndex 1, CheckQuorum false and the default ReadOnlySafe option, 64 retries produced pendingReadIndexMessages length 64 (one entry per retry, no collapsing) and readOnly.unconfirmedReads length 0 while the node was still StateLeader; after a higher-term MsgHeartbeat deposed it to StateFollower the queue was still length 64 and unconfirmedReads still 0. The growth count equals the retry count, so neither the library nor raft.reset (which recreates readOnly but leaves the queue) bounds or clears it.",
+        "conditions": "Library defaults as built by newTestRaft without CheckQuorum (false) and with ReadOnlySafe; the environment delivers no MsgAppResp or MsgHeartbeatResp, modelling a leader partitioned from its quorum. Callers retry with the same RequestCtx, which node.go:218-224 tells them to do and does not bound. Scope: the queued path (leader has not committed in its term); the admitted path is subject to the same per-request, context-blind admission and additionally broadcasts a heartbeat per request.",
+        "source_ids": [
+          "ra_admit",
+          "ra_reset",
+          "ra_contract"
+        ],
+        "executions": {
+          "b91fd4d8638c4446a332be9849f23f70": [
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ec634053934546af8e5da7dcb41717bd"
+      },
+      {
+        "id": "e2b3f903fe394533a660cc23bded2379-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "When a two-voter leader that has accumulated 64 queued read requests (pendingReadIndexMessages length 64, committed 0, committedEntryInCurrentTerm() false, unconfirmedReads 0) finally commits in its term through the normal MsgAppResp fast path, that single step empties the queue and re-admits everything: pendingReadIndexMessages becomes 0, readOnly.unconfirmedReads becomes 64 and 64 MsgHeartbeat messages are produced in the same step, with committed 1 and in_term true afterwards. So the retained queue is not merely passive memory: on release it becomes one read request plus one outbound heartbeat per queued entry, all at once.",
+        "conditions": "Library defaults (CheckQuorum false, ReadOnlySafe); the commit is produced by stepping the leader's own MsgAppResp and then node 2's MsgAppResp at lastIndex, which is the call site that invokes releasePendingReadIndexMessages - the harness never calls the release function directly. No heartbeat response is delivered afterwards, so the re-admitted requests stay unconfirmed.",
+        "source_ids": [
+          "ra_release",
+          "ra_release_fn",
+          "ra_send"
+        ],
+        "executions": {
+          "7e046ae9ebb44e58bb2a4800bdf14ef3": [
+            6
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "e2b3f903fe394533a660cc23bded2379"
+      },
+      {
+        "id": "03642230074a4ecfa828a594c9580e21-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "CheckQuorum bounds the growth window of accumulated read requests but does not reclaim them. With CheckQuorum enabled on a three-voter leader at election timeout 3 and no peer messages, 24 same-context retries submitted over three ticks ended with the node already StateFollower (the quorum view was lost and it stepped down within the election timeout), and eight further read requests submitted after the step-down left pendingReadIndexMessages at exactly its prior length of 24 with readOnly.unconfirmedReads 0, because a leaderless follower drops ReadIndex messages instead of queueing them. So under CheckQuorum the accumulation stops when the leader steps down, whereas with CheckQuorum disabled (the library default) nothing stops it; in both configurations the state already accumulated is retained.",
+        "conditions": "Real raft over voters {1,2,3} built from newTestConfig with CheckQuorum true, election timeout 3 ticks, ReadOnlySafe, no peer messages delivered. Retries use an identical RequestCtx (the documented retry pattern). The control says nothing about a network partition or about ReadOnlyLeaseBased, which requires CheckQuorum.",
+        "source_ids": [
+          "ckq_tick",
+          "ckq_check",
+          "ra_reset"
+        ],
+        "executions": {
+          "26c0509e6788479a87a674b2d686b134": [
+            8,
+            9
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "03642230074a4ecfa828a594c9580e21"
+      },
+      {
+        "id": "387cf209ec6647bd9b65cedaac0cf8cf-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The read state a quorum-less leader retains is caller-controlled in size. With CheckQuorum false over voters {1,2,3}, 64 ReadIndex requests each carrying its own freshly allocated 4096-byte RequestCtx were all retained in pendingReadIndexMessages: pending 64, summed retained Data length 262144 bytes, and 64 distinct backing buffers, so the total is genuine per-request retention rather than one shared slice counted 64 times. The retained payload per leader therefore equals the number of accepted requests times the caller-chosen context size, with no library-side limit on either factor.",
+        "conditions": "No MsgAppResp or MsgHeartbeatResp is delivered, so every request takes the queued path; each request carries a distinct buffer, modelling a caller issuing distinct reads (the ReadIndex API takes an opaque rctx []byte and documents no size limit). The count covers only the entry Data payloads held in pendingReadIndexMessages, not message structs, slice headers or allocator overhead, and no deployment memory limit is claimed.",
+        "source_ids": [
+          "ra_admit",
+          "ra_reset"
+        ],
+        "executions": {
+          "6eccd9a311b84ba4b6c02771f746dd50": [
+            11
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "387cf209ec6647bd9b65cedaac0cf8cf"
+      },
+      {
+        "id": "d82592dffc9d4a5893fbc6028fc438e7-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Proposal eligibility handling in this snapshot. In node.run, the proposal send channel is set to nil when the node learns that it was removed from the configuration by a config change it applied (only when it was in the config before), which blocks incoming proposals, but it is re-assigned to the real channel whenever the observed leader changes to a non-None value, independently of the node's membership; the accompanying in-tree comment states that this is not sound and likely has bugs. On the raft side, stepFollower's MsgProp case forwards the message to r.lead without any membership test, and stepLeader's MsgProp case only checks whether the leader itself is still a member (Progress[r.id] == nil) before appending, so a proposal whose From is not in the configuration is written to the log if it reaches the leader.",
+        "conditions": "Applies to the Node facade (the goroutine-driven run loop) plus the raft handlers; RawNode users bypass the facade and step messages directly, and DisableProposalForwarding only affects followers that are members. The behaviour concerns eligibility of the proposer, not voting or commit quorums, which continue to use the configuration.",
+        "source_ids": [
+          "node_gate",
+          "node_removal",
+          "lead_prop",
+          "follow_fwd"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "d82592dffc9d4a5893fbc6028fc438e7"
+      },
+      {
+        "id": "5a3be50f1bc74a1fbf2433e4ed473442-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The documented MsgProp contract assigns no proposer-eligibility check to the library. doc.go states that when MsgProp is passed to the leader's Step method the leader first calls appendEntry to append entries to its log and then broadcasts them, that MsgProp is dropped by a candidate, and that on a follower it is stored with the sender's ID and later forwarded to the leader; the contract is about redirection of proposals, not about authorizing the proposer. Consistently, the checked-in handlers do not consult membership for proposals: stepFollower forwards MsgProp to r.lead, and stepLeader's MsgProp case checks only whether the leader itself is still a member. The Node facade does block its own proposal channel when it applies a config change that removes it, but that is a local best-effort whose accompanying comment calls it unsound and notes that the channel is reset on a leader change.",
+        "conditions": "Applies to the Node and RawNode APIs in this snapshot, including a mixed cluster: the leader cannot in general verify the sender's identity beyond the self-declared From field, and the documented contract does not ask it to. Eligibility of voters and commit quorums still use the configuration; only proposer eligibility is unguarded.",
+        "source_ids": [
+          "doc_prop",
+          "node_gate",
+          "node_removal",
+          "lead_prop",
+          "follow_fwd"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "5a3be50f1bc74a1fbf2433e4ed473442"
+      },
+      {
+        "id": "014141e1cc2e474ebf95be149b343099-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The read state that a leader accumulates is volatile and cannot outlive the process. newRaft builds it fresh (readOnly via newReadOnly at raft.go:462; pendingReadIndexMessages is a slice field of the raft struct, raft.go:430-435, left nil), the only writers are the stepLeader MsgReadIndex append and the release path that swaps the slice out, and the Storage interface exposes only InitialState, Entries, Term, FirstIndex, LastIndex and Snapshot (storage.go:48-95) with no read-state member; there is no ReadState or readStates reference in storage.go or raftpb. A restarted node therefore begins with an empty pending queue and an empty ack map, so any accumulation is bounded by the process lifetime and cleared incidentally by a restart, even though the library never clears it while running.",
+        "conditions": "Applies to both StartNode and RestartNode paths, since both build the raft through newRaft; the statement is about library-side state only and says nothing about how a restart interacts with the caller's retries. It bounds the retry-growth finding rather than contradicting it: within one process lifetime there is still no bound and no reclamation.",
+        "source_ids": [
+          "ra_newraft",
+          "ra_field",
+          "ra_storage_iface"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "014141e1cc2e474ebf95be149b343099"
+      },
+      {
+        "id": "e083daeefc0f460f9a395b329006f127-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For an empty ConfChangeV2 with Transition = JointExplicit in a joint configuration: LeaveJoint() reports false and EnterJoint() reports ok true; stepLeader's propose-time validation computes wantsLeaveJoint from len(Changes) == 0 and, with alreadyJoint also true, produces no failed check, so the EntryConfChangeV2 is appended unchanged; applyConfChange then takes the EnterJoint branch and Changer.EnterJoint rejects an already-joint configuration, so applyConfChange panics with the error string config is already joint. Observed end to end on a real instance: after entering joint explicitly (voters [1 2 3 4] against outgoing [1 2 3]), the proposal step returned a nil error and left an EntryConfChangeV2 at the new last index, and applying it panicked with that exact string while the configuration was still joint.",
+        "conditions": "The configuration is joint and the client supplies a ConfChangeV2 with an explicit (JointExplicit or JointImplicit) transition and no changes; propose-time validation is at its default (enabled), and the leader is a member so the proposal is not dropped for that reason. Validation only replaces the entry when it computes a failed check, which does not happen in this case because an empty change set is read as leave-joint regardless of transition. Distinct from the Auto-transition empty ChangeV2, which is the documented leave-joint idiom and takes the LeaveJoint path.",
+        "source_ids": [
+          "val_joint",
+          "apply_cc",
+          "pb_leave"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "e083daeefc0f460f9a395b329006f127"
+      },
+      {
+        "id": "445153ef4a5b4839a90c275d46a90023-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on real instances: in a joint configuration (voters [1 2 3 4], outgoing [1 2 3]) an empty ConfChangeV2 with Transition JointExplicit passes propose-time validation and then panics on apply, while the same empty change set with the Auto transition leaves the joint configuration cleanly. Observed values: for the explicit form, LeaveJoint false, EnterJoint ok true, the proposal step returning no error and leaving an EntryConfChangeV2 at the new last index with its 2-byte payload intact, and applyConfChange panicking with the error string config is already joint while still_joint stayed true; for the Auto form, LeaveJoint true, EnterJoint ok false, no panic, joint_after false and voters [1 2 3 4]. The defect is therefore specific to the transition field: propose-time validation reads an empty change set as leave-joint regardless of transition, while the apply path requires Auto.",
+        "conditions": "Joint configuration; ConfChangeV2 with an explicit transition and no changes for the defect case, zero-valued ConfChangeV2 for the control; propose-time validation enabled (the default). The apply step was driven directly in both cases because a quorum-less instance cannot commit, and the explicit-form entry was shown to remain an EntryConfChangeV2, so nothing in the library prevents it from being replicated, committed and reaching the application's ApplyConfChange call.",
+        "source_ids": [
+          "val_joint",
+          "apply_cc",
+          "pb_leave"
+        ],
+        "executions": {
+          "896586fa6bf04a74877fe81547c2599f": [
+            1,
+            2,
+            4
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "445153ef4a5b4839a90c275d46a90023"
+      },
+      {
+        "id": "a30a3cfa85994b70bb34c3d0f3c815b7-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on a real instance: an empty ConfChangeV2 with Transition JointImplicit in a joint configuration behaves exactly like the explicit form. The tested change reported LeaveJoint false and EnterJoint ok true; submitting it as a MsgProp returned no error and left an EntryConfChangeV2 at the new last index, so propose-time validation accepted it; applying it panicked with the error string config is already joint and the configuration remained joint. The Auto-transition control in the same invocation reported LeaveJoint true and EnterJoint ok false and left the joint configuration without panicking (joint_after false, voters [1 2 3 4]). The trigger is therefore every non-Auto transition with an empty change set in a joint configuration, not one particular explicit value.",
+        "conditions": "Joint configuration entered with an explicit-transition add-node change; ConfChangeV2 with zero changes and Transition JointImplicit (defect) or the zero value (control); propose-time validation enabled; the apply step driven directly because a quorum-less instance cannot commit, with the entry shown to remain an EntryConfChangeV2 for the defect case.",
+        "source_ids": [
+          "val_joint",
+          "pb_leave",
+          "cc_enter"
+        ],
+        "executions": {
+          "a07650e44835449790f588dc30fb5df0": [
+            6,
+            7
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "a30a3cfa85994b70bb34c3d0f3c815b7"
+      },
+      {
+        "id": "81bcf16eb8ab4b758bcc18dd09afd758-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The propose-time conf-change validation has a guard that can decide the outcome before the transition mismatch is reached: in stepLeader's MsgProp handling, alreadyPending is computed as pendingConfIndex > r.raftLog.applied, and when that is true the failed check possible unapplied conf change applies, so the entry is rewritten to EntryNormal and the change is dropped regardless of its transition. Observed in a real three-node network where the joint configuration had been applied through applyConfChange but the application's applied index was never advanced: the empty JointExplicit change was proposed, the entry at the new last index came out as EntryNormal, and the malformed change was therefore dropped rather than replicated. In the direct-instance receipts pendingConfIndex had been left at the value becomeLeader set before appending the empty entry (0) while applied was also 0, so alreadyPending was false and the same change was accepted as EntryConfChangeV2. The applied index is advanced by the application through appliedTo when it acknowledges applied entries, so in normal operation applied catches up with the pending configuration change and the guard does not fire.",
+        "conditions": "Leader in StateLeader proposing a ConfChangeV2; validation enabled; alreadyPending is true exactly when a configuration change is in the log but not yet acknowledged as applied by the application. This guard is about unapplied conf changes, not about the transition field, so it is a precondition on the defect rather than a fix for it.",
+        "source_ids": [
+          "val_guard",
+          "note_apply"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "81bcf16eb8ab4b758bcc18dd09afd758"
+      },
+      {
+        "id": "e577e1a3e13643ada4cf00afb816084f-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "End-to-end observation in a real three-node network: with the joint configuration active and the application caught up so that pendingConfIndex equals applied (2 and 2, already_pending false), an empty ConfChangeV2 whose transition is explicit was proposed and took the configuration-change path rather than being rewritten - the entry at index 3 read back as EntryConfChangeV2 and the commit index reached it (committed 3). Applying that committed entry the way an application must panicked with the error string config is already joint, and the configuration was still joint afterwards. The earlier variant of the same test, which proposed the same change without acknowledging applied entries, left the entry at index 3 as EntryNormal and therefore never reached the apply path, which is consistent with the pending-conf guard being the deciding factor in that run.",
+        "conditions": "Real three-node network built with the package test helpers, leader 1 elected, joint configuration entered with an explicit-transition add-node change applied by every application; application progress simulated with raftLog.appliedTo(committed), the effect of Advance. The committed-entry read-back is the direct evidence; the receipt's declared comparisons were not evaluated because the harness contained two tests emitting identically named events.",
+        "source_ids": [
+          "val_guard",
+          "note_apply",
+          "val_joint"
+        ],
+        "executions": {
+          "58945529ae764a599616bc1cf8629dd4": [
+            11,
+            12,
+            13
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "e577e1a3e13643ada4cf00afb816084f"
+      },
+      {
+        "id": "74d3be2ded2c4f38a1ff2c1973cd046c-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on real leaders: a follower's Progress enters StateSnapshot through the production snapshot path (log compacted past the peer's next index, storage snapshot present, peer recently active) with match 1, PendingSnapshot 2 and IsPaused true, and both documented exits were then observed. A peer MsgAppResp at the snapshot index left the Progress in StateReplicate with match 2 and cleared the pause; an application report delivered as a rejecting MsgSnapStatus, applied to a Progress put into StateSnapshot with PendingSnapshot 1, left it in StateProbe with PendingSnapshot cleared to 0 and appends still paused. So the leader resumes replication to a paused follower through either producer, and no timer or heartbeat path does so on its own.",
+        "conditions": "Three-voter raft instances built with newTestRaft; the snapshot state reached by maybeSendAppend rather than by direct assignment for the peer-driven case; the application-driven case assigns BecomeSnapshot(1) directly and then steps the rejection, which is how ReportSnapshot delivers a failure. The case where the peer's MsgAppResp is lost and no report arrives is not covered and remains a source-based account.",
+        "source_ids": [
+          "sn_entry",
+          "sn_recover",
+          "sn_status"
+        ],
+        "executions": {
+          "2df1aae4d1d24ede9b0a2990938e27b3": [
+            1,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "74d3be2ded2c4f38a1ff2c1973cd046c"
+      },
+      {
+        "id": "8c1b3b1accac4862bebd937d58db3f94-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "Measured on a real three-node network: after leader 1 was elected (committed 1, committedEntryInCurrentTerm true, CheckQuorum false, ReadOnlySafe) and then isolated from both followers, 32 same-context ReadIndex requests were all admitted as unconfirmed reads with confirmed 0 while the leader remained StateLeader, and the leader emitted 64 heartbeat messages, one to each of the two peers per request. So the outbound cost of a retry is one heartbeat per peer rather than a single message, scaling with the number of voters, and the retained read state grows by one entry per request in the same step.",
+        "conditions": "Real three-node raft network built with the package test helpers; the partition is expressed with the network helper's isolate for peers 2 and 3; CheckQuorum left at the library default of false so the leader is not required to step down; ReadOnlySafe is the default option. Outbound messages were counted and cleared each round, so the figure is the heartbeats produced, not a growing buffer. No claim is made about a real transport.",
+        "source_ids": [
+          "ra_admit",
+          "ra_send",
+          "ra_bcast"
+        ],
+        "executions": {
+          "e3bd14fe94534fbca3955cae4e521df7": [
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8c1b3b1accac4862bebd937d58db3f94"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "487d58f18c6c4153aff83de24c871db4",
+      "action": "update",
+      "no_change": false,
+      "references": {}
+    },
+    "applied_operations": {
+      "submission-71f53a32a0c74532a55ad33bc1e71086": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-71f53a32a0c74532a55ad33bc1e71086.json"
+      },
+      "submission-a167f4c33dc94f34b03ea29dbe7ec15a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a167f4c33dc94f34b03ea29dbe7ec15a.json"
+      },
+      "submission-109448522bc649dea46fc5461752da53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-109448522bc649dea46fc5461752da53.json"
+      },
+      "submission-a38031973bee49ac9248ded78a2843e4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a38031973bee49ac9248ded78a2843e4.json"
+      },
+      "submission-8086d0fc533a4eabb061df6601d55b5b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-8086d0fc533a4eabb061df6601d55b5b.json"
+      },
+      "submission-cbcc326c8c1b40b8beafb5b33802bddf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-cbcc326c8c1b40b8beafb5b33802bddf.json"
+      },
+      "submission-ae6755767a574dd5b375bc66265f147b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ae6755767a574dd5b375bc66265f147b.json"
+      },
+      "submission-ee850f515b5d49718d5f55c4c1d36e61": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ee850f515b5d49718d5f55c4c1d36e61.json"
+      },
+      "submission-8e42a5752e9d454bb97823c6d38e4728": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-8e42a5752e9d454bb97823c6d38e4728.json"
+      },
+      "submission-ec634053934546af8e5da7dcb41717bd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ec634053934546af8e5da7dcb41717bd.json"
+      },
+      "submission-d3c59bbf96b7456c891afc06f2cd1a5f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-d3c59bbf96b7456c891afc06f2cd1a5f.json"
+      },
+      "submission-ba4b0efa5ad64f069964ee92cc43b432": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-ba4b0efa5ad64f069964ee92cc43b432.json"
+      },
+      "submission-e2b3f903fe394533a660cc23bded2379": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-e2b3f903fe394533a660cc23bded2379.json"
+      },
+      "submission-be700e7c3fa742f1bb44a3dad42061cb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-be700e7c3fa742f1bb44a3dad42061cb.json"
+      },
+      "submission-03642230074a4ecfa828a594c9580e21": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-03642230074a4ecfa828a594c9580e21.json"
+      },
+      "submission-2bb54275ad0a4414918a4d338739fcf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-2bb54275ad0a4414918a4d338739fcf6.json"
+      },
+      "submission-387cf209ec6647bd9b65cedaac0cf8cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-387cf209ec6647bd9b65cedaac0cf8cf.json"
+      },
+      "submission-d82592dffc9d4a5893fbc6028fc438e7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-d82592dffc9d4a5893fbc6028fc438e7.json"
+      },
+      "submission-5a3be50f1bc74a1fbf2433e4ed473442": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-5a3be50f1bc74a1fbf2433e4ed473442.json"
+      },
+      "submission-014141e1cc2e474ebf95be149b343099": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-014141e1cc2e474ebf95be149b343099.json"
+      },
+      "submission-e083daeefc0f460f9a395b329006f127": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-e083daeefc0f460f9a395b329006f127.json"
+      },
+      "submission-08c5f95c1b1041d997809c01286e91f2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-08c5f95c1b1041d997809c01286e91f2.json"
+      },
+      "submission-445153ef4a5b4839a90c275d46a90023": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-445153ef4a5b4839a90c275d46a90023.json"
+      },
+      "submission-a72217bf43f74b4989a601a5add96b02": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a72217bf43f74b4989a601a5add96b02.json"
+      },
+      "submission-a30a3cfa85994b70bb34c3d0f3c815b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-a30a3cfa85994b70bb34c3d0f3c815b7.json"
+      },
+      "submission-81bcf16eb8ab4b758bcc18dd09afd758": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-81bcf16eb8ab4b758bcc18dd09afd758.json"
+      },
+      "submission-afeecd9696b540cc9850784dce4b18b4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-afeecd9696b540cc9850784dce4b18b4.json"
+      },
+      "submission-e577e1a3e13643ada4cf00afb816084f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-e577e1a3e13643ada4cf00afb816084f.json"
+      },
+      "submission-5e447681f32f4bd982a11690ef2cf54d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-5e447681f32f4bd982a11690ef2cf54d.json"
+      },
+      "submission-fc067d03c1b4463ba575858c3fec5f3a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-fc067d03c1b4463ba575858c3fec5f3a.json"
+      },
+      "submission-aec0c0a0b7bc4c239f0718d86bc5a146": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-aec0c0a0b7bc4c239f0718d86bc5a146.json"
+      },
+      "submission-9f12ed3929394866acee13718713de2b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-9f12ed3929394866acee13718713de2b.json"
+      },
+      "submission-74d3be2ded2c4f38a1ff2c1973cd046c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-74d3be2ded2c4f38a1ff2c1973cd046c.json"
+      },
+      "submission-be2af26c5f2f43679ffe2592668f8388": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-be2af26c5f2f43679ffe2592668f8388.json"
+      },
+      "submission-8c1b3b1accac4862bebd937d58db3f94": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-8c1b3b1accac4862bebd937d58db3f94.json"
+      },
+      "submission-487d58f18c6c4153aff83de24c871db4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_21-21-39-etcd_raft-real-run/semantic-commits/submission-487d58f18c6c4153aff83de24c871db4.json"
+      }
+    }
+  }
+}

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from consensus_assurance.core.types import FixedExperiment
 from consensus_assurance.workflow.experiments import assessment
-from consensus_assurance.workflow.knowledge import open_gaps
+from consensus_assurance.workflow.knowledge import gap_answers, open_gaps
 from consensus_assurance.workflow.research import costs
 
 COMPARISON_LABELS = {'holds':'declared predicate holds', 'violated':'declared predicate does not hold', 'unknown':'comparison undetermined'}
@@ -34,7 +34,9 @@ def interpretation_rows(value, conclusions, label):
     if value.limitations:
         rows.append('Interpretation limitations: ' + '; '.join(value.limitations))
     if value.answers:
-        rows.append('Gap answers: ' + '; '.join(k + ': ' + (v if v is not None else 'previous answer withdrawn; necessary gap remains open') for k,v in value.answers.items()))
+        rows.append('Gap responses: ' + '; '.join(k + ': ' +
+            ('model declares resolved: ' if v.resolved else 'gap remains open: ') + v.explanation
+            for k,v in value.answers.items()))
     if value.failure_attribution:
         failure = value.failure_attribution
         rows.append('Submitted model independent-failure attribution: '
@@ -53,7 +55,7 @@ def render_report(state, root):
     rows = ['# Consensus audit research report', '',
         f"Method `{state.framework_revision}`; mode `{state.mode}/{state.analysis_mode}`; elapsed {state.elapsed_seconds / 60:.2f} minutes.",
         f"Stop reason: {state.stop_reason}", '',
-        'Mechanical results evaluate declared predicates. Model defect claims address applicability, causes and counterevidence; independent verification is separate. Each question uses its latest interpretation; an omitted defect claim does not inherit an earlier assertion. Historical interpretations and raw evidence remain available.',
+        'Mechanical results evaluate declared predicates. Model defect claims address applicability, causes and counterevidence; independent verification is separate. Each question uses its latest interpretation; an explicit null claim does not inherit an earlier assertion. Historical interpretations and raw evidence remain available.',
         '', '## Explicit model defect claims (subject to independent verification)', '']
     if not claimed:
         rows.append('No current explicit defect assertion; this does not establish that the target has no defects.')
@@ -76,13 +78,15 @@ def render_report(state, root):
             rows.append('Hypothesis: ' + q.hypothesis)
         if q.discriminator:
             rows.append('Registered discriminator: ' + q.discriminator)
-        if q.counterevidence:
-            rows.append('Question counterevidence: ' + '; '.join(q.counterevidence))
-        if q.limitations:
-            rows.append('Question boundaries: ' + '; '.join(q.limitations))
         pending = open_gaps(state, q.id)
         if pending:
-            rows.extend(['', 'Unanswered necessary gaps:', '', *[f'- `{g.id}`: {g.question}' for g in pending]])
+            answers = gap_answers(state, q.id)
+            rows.extend(['', 'Unresolved necessary gaps:', ''])
+            for g in pending:
+                response = answers.get(g.id)
+                detail = (' Latest response (gap remains open): ' + response.explanation
+                    if response and (not opinions or g.id not in opinions[-1].answers) else '')
+                rows.append(f'- `{g.id}`: {g.question}' + detail)
         if q.resume_conditions:
             rows.append('Resume conditions: ' + '; '.join(q.resume_conditions))
         for raw in state.experiments:

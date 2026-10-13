@@ -1,0 +1,235 @@
+{
+  "rationale": "First orientation pass on the captured snapshot. The captured tree (agent-source/, excluding the nested fuzzy/ and raft-compat/ modules) is byte-for-byte identical to the released copy of the same revision available in the local Go module cache (github.com/hashicorp/raft@v1.7.3): diff -rq reports no differing file and md5sums of raft.go and replication.go match, so there is no injected mutation to localize and the finding is a genuine defect of this revision. I started from the public configuration/context API: a caller's decision to issue a compare-and-swap configuration change depends on knowing the index of the current configuration entry. GetConfiguration() (api.go:895-903) builds a configurationsFuture from the atomic latestConfiguration copy and never sets latestIndex, while future.go:267-270 returns latestIndex as Index(), and Stats() (api.go:1183-1189) publishes exactly that value as latest_configuration_index. The main thread does hold the real index (raft.go:2216-2240, served over configurationsCh at raft.go:882-890, which is the path snapshot.go uses), so the defect is a partial producer: the authoritative index exists but is never carried to the API consumer, and the published value is a constant 0. I also recorded a second, independent source-witnessed suspicion about a duty lost when authority is lost by process shutdown (queued apply futures), with its discriminator, but no execution for it this turn.",
+  "sources": [
+    {
+      "id": "getconfig",
+      "file": "api.go",
+      "start_line": 895,
+      "end_line": 903,
+      "kind": "code_observation"
+    },
+    {
+      "id": "stats",
+      "file": "api.go",
+      "start_line": 1183,
+      "end_line": 1190,
+      "kind": "code_observation"
+    },
+    {
+      "id": "futureindex",
+      "file": "future.go",
+      "start_line": 255,
+      "end_line": 270,
+      "kind": "code_observation"
+    },
+    {
+      "id": "getlatest",
+      "file": "raft.go",
+      "start_line": 2216,
+      "end_line": 2240,
+      "kind": "code_observation"
+    },
+    {
+      "id": "configsch",
+      "file": "raft.go",
+      "start_line": 882,
+      "end_line": 890,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nextconfig",
+      "file": "configuration.go",
+      "start_line": 228,
+      "end_line": 231,
+      "kind": "code_observation"
+    },
+    {
+      "id": "addvoter",
+      "file": "api.go",
+      "start_line": 938,
+      "end_line": 957,
+      "kind": "code_observation"
+    },
+    {
+      "id": "shutdown",
+      "file": "api.go",
+      "start_line": 1009,
+      "end_line": 1025,
+      "kind": "code_observation"
+    },
+    {
+      "id": "applybarrier",
+      "file": "api.go",
+      "start_line": 826,
+      "end_line": 878,
+      "kind": "code_observation"
+    },
+    {
+      "id": "aftershutdown",
+      "file": "raft_test.go",
+      "start_line": 30,
+      "end_line": 45,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@config_index_basis",
+      "question": "For a running cluster, does the public configuration API expose the index of the latest configuration entry, and what value does a caller actually receive from ConfigurationFuture.Index()?",
+      "source_ids": [
+        "getconfig",
+        "futureindex",
+        "getlatest",
+        "configsch",
+        "stats"
+      ],
+      "hypothesis": "GetConfiguration() constructs configurationsFuture{latest: r.getLatestConfiguration()} and responds immediately, so latestIndex/committedIndex stay zero and Index() returns 0 for every call, independent of cluster state; the real r.configurations.latestIndex is transferred to callers only through configurationsCh. Stats() publishes the same zero as latest_configuration_index, so the reported configuration index is a constant while the reported configuration itself is live.",
+      "discriminator": "On one running bootstrapped leader, sample f.Index() and Stats()[\"latest_configuration_index\"] together with the main-thread latestIndex obtained from the same instance over configurationsCh; if the public values track the real index the hypothesis is wrong, if the public values stay 0 while the main-thread index is >= 1 it holds.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    },
+    {
+      "id": null,
+      "ref": "@queued_future_shutdown",
+      "question": "When authority over a node is lost by Shutdown() rather than by stepping down, does an already-accepted Apply/Barrier duty (a logFuture sitting in the buffered applyCh) still have a completion path?",
+      "source_ids": [
+        "shutdown",
+        "applybarrier",
+        "aftershutdown"
+      ],
+      "hypothesis": "Apply and Barrier hand the caller a logFuture as soon as the send into the buffered applyCh succeeds; logFuture carries no ShutdownCh, Shutdown() only closes shutdownCh and never drains applyCh, and run()/runFSM/runSnapshots exit on shutdownCh. A future left in the buffer therefore has no producer left to respond it and Error() blocks indefinitely, which the repository's own test file already notes at raft_test.go:40-42.",
+      "discriminator": "Freeze the main loop with a delivered RPC whose RespChan is never read, enqueue one Barrier, call Shutdown(), and observe whether the future is ever responded: if some path responds it within the same interval the suspicion is defeated; a completion in that interval must name the responding producer.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@public_index_constant",
+      "kind": "behavior",
+      "statement": "Raft.GetConfiguration() returns a configurationsFuture whose configurations field carries only latest (the atomic latestConfiguration copy), and ConfigurationFuture.Index() returns configurations.latestIndex, so the value a caller receives from Index() is 0 on every call regardless of the cluster's committed or latest configuration index. The authoritative index r.configurations.latestIndex lives only on the main thread and reaches callers solely through the configurationsCh request path (raft.go:882-890, snapshot.go:155).",
+      "conditions": "Any Raft instance, running or started with skipStartup (including the package-level GetConfiguration helper, api.go:445-458 which the doc claims has identical behavior); GetConfiguration is documented as returning the latest configuration, which may be uncommitted.",
+      "source_ids": [
+        "getconfig",
+        "futureindex",
+        "getlatest",
+        "configsch"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@stats_index_constant",
+      "kind": "behavior",
+      "statement": "Raft.Stats() sets latest_configuration_index from the future returned by GetConfiguration(), so the published value is the constant string \"0\" even on a bootstrapped cluster whose configuration entry sits at index >= 1, while the same future supplies a non-empty latest_configuration. A Stats() consumer therefore cannot distinguish clusters by configuration index, and the key is constant rather than observed.",
+      "conditions": "Any node that serves Stats() while its GetConfiguration branch runs; applies to leader and follower alike.",
+      "source_ids": [
+        "stats",
+        "getconfig",
+        "futureindex"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@previndex_zero_disables_cas",
+      "kind": "behavior",
+      "statement": "nextConfiguration applies the caller's precondition only when change.prevIndex > 0; AddVoter/AddNonvoter/RemoveServer/DemoteVoter pass the caller-supplied prevIndex through unchanged, so passing 0 (the value the public API returns for the configuration index) silently converts a conditional configuration change into an unconditional one.",
+      "conditions": "The leader-loop configuration change path of this revision; requires the caller to have obtained prevIndex from the public API.",
+      "source_ids": [
+        "nextconfig",
+        "addvoter"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@config_index_basis",
+      "question": "On a running bootstrapped cluster with a committed configuration entry, what values do GetConfiguration().Index() and Stats()[\"latest_configuration_index\"] actually carry relative to the main thread's latestIndex for the same node?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@config_index_basis",
+      "experiment_id": null,
+      "source_ids": [
+        "getconfig",
+        "futureindex",
+        "getlatest",
+        "configsch",
+        "stats",
+        "nextconfig",
+        "addvoter"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Source reading fixes the mechanism without needing a measurement: GetConfiguration() responds a configurationsFuture built from configurations{latest: r.getLatestConfiguration()} (api.go:900) and getLatestConfiguration only loads the Configuration, not its index (raft.go:2232-2240); Index() is then latestIndex of that struct (future.go:267-270), i.e. 0. The real index is available in-process - the main loop answers configurationsCh with r.configurations.Clone(), which carries latestIndex and committedIndex (raft.go:889) and is what snapshot.go consumes - so this is not a case where the information does not exist, but one where the public producer drops it. The consumer duty is concrete and documented: ConfigurationFuture embeds IndexFuture ('Index holds the index of the newly applied log entry', future.go:27-33), and the documented use of that index is the configuration compare-and-swap: AddVoter and friends describe prevIndex as 'the index of the only configuration upon which this change may be applied; if another configuration entry has been added in the meantime, this request will fail' (api.go:941-944). A caller that reads the index from the only public source and passes it back supplies 0, and nextConfiguration treats prevIndex == 0 as 'no precondition' (configuration.go:229), so the guard is silently disabled - the request loses the very protection the API promises, and the loss is invisible because the call still succeeds. The same zero is republished as latest_configuration_index in Stats() (api.go:1188), where a constant '0' also misrepresents the node's configuration state to operators. The pending harness (assurance_generated_test.go) is the discriminating observation: it samples the public values next to the main-thread latestIndex on one running bootstrapped leader, which will either confirm the constant zero or defeat the account. Implications are scoped to callers that rely on the index (CAS preconditions, correlating a configuration with a log position); the configuration contents themselves are live and correct, so this is not a consensus-safety defect.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [],
+      "limitations": [
+        "No execution yet in this turn: the account rests on source reasoning and on the documented API meaning; the harness has been written but has not run, so the observed value is still unknown.",
+        "Severity is bounded: callers that ignore Index() are unaffected, and the returned Configuration is the true latest configuration."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@config_index_basis",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "getconfig",
+      "futureindex",
+      "getlatest",
+      "configsch",
+      "stats"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Read, from one running bootstrapped three-node cluster, the public configuration index (GetConfiguration().Index(), Stats()[\"latest_configuration_index\"]) and the main-thread latestIndex/committedIndex of the same node, and emit them as one CA_EVENT JSON line.",
+      "assumptions": [
+        "MakeCluster(3, t, nil) performs a real bootstrap, so the cluster has a real configuration entry at index 1 and a genuinely elected leader.",
+        "The configurationsCh request is the same producer path snapshot.go uses to obtain the committed configuration index, so it reads the main thread's authoritative values rather than a supplied premise.",
+        "The one committed Apply is only there to move applied/commit indexes past the configuration entry so that the sampled state is unambiguous."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is a single TestAssurance-prefixed test in the captured package. Initialization is the package's own test facility: MakeCluster(3, t, nil) with no injected Config, which bootstraps and elects a leader from real instances in one process; c.Leader() fails the test unless exactly one node is in Leader state. The test then commits one client command through the public Apply API so applied_index and commit_index are past the bootstrapped configuration entry, sends a real configurationsFuture to the leader's configurationsCh (setting ShutdownCh so the request cannot hang) to read the main thread's latestIndex/committedIndex and server count, calls the public GetConfiguration() and Stats() on that same instance, and prints one CA_EVENT JSON line containing the leader address, both indexes from the main thread, the public index, both server counts, and the Stats strings, so the comparison is between independently produced values on one node.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

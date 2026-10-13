@@ -1,0 +1,58 @@
+{
+  "id": "fb6f285736fa49b5af424be6a078aa1e-experiment",
+  "investigation_id": "184de281ab83410ab0d2356656267a9c-question-1",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// TestAssurance_AddNonvoterControl is the control for the AddVoter suffrage\n// witness: the same cluster shape, the same merge-and-connect join, the same\n// disconnect of one original voter and the same bounded apply, with only the\n// public join call changed from AddVoter to AddNonvoter. It shows whether the\n// disconnect discriminator really distinguishes a voting member from a\n// non-voting one: with the added member holding no vote, a majority of the\n// voters is unreachable once one original voter is gone, so the command must\n// not commit.\nfunc TestAssurance_AddNonvoterControl(t *testing.T) {\n\tc := MakeCluster(2, t, nil)\n\tdefer c.Close()\n\n\toriginals := append([]*Raft(nil), c.rafts...)\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\tleader := c.Leader()\n\tnewNode := c1.rafts[0]\n\tvar peer *Raft\n\tfor _, r := range originals {\n\t\tif r != leader {\n\t\t\tpeer = r\n\t\t}\n\t}\n\tif peer == nil {\n\t\tt.Fatalf(\"could not identify the other original voter\")\n\t}\n\n\taddErr := \"\"\n\taddIndex := uint64(0)\n\taddDone := make(chan error, 1)\n\tfuture := leader.AddNonvoter(newNode.localID, newNode.localAddr, 0, 5*time.Second)\n\tgo func() { addDone <- future.Error() }()\n\tselect {\n\tcase err := <-addDone:\n\t\tif err != nil {\n\t\t\taddErr = err.Error()\n\t\t} else {\n\t\t\taddIndex = future.Index()\n\t\t}\n\tcase <-time.After(10 * time.Second):\n\t\taddErr = \"addnonvoter future did not return\"\n\t}\n\n\tleaderSuffrage := \"absent\"\n\tfor _, s := range leader.getLatestConfiguration().Servers {\n\t\tif s.ID == newNode.localID {\n\t\t\tleaderSuffrage = s.Suffrage.String()\n\t\t}\n\t}\n\tvoters := 0\n\tfor _, s := range leader.getLatestConfiguration().Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\n\tc.Disconnect(peer.localAddr)\n\n\tapplyDone := make(chan error, 1)\n\tapplied := leader.Apply([]byte(\"assurance-addnonvoter\"), 5*time.Second)\n\tgo func() { applyDone <- applied.Error() }()\n\tapplyResult := \"no_completion\"\n\twaitStart := time.Now()\n\tselect {\n\tcase err := <-applyDone:\n\t\tif err != nil {\n\t\t\tapplyResult = \"error:\" + err.Error()\n\t\t} else {\n\t\t\tapplyResult = \"committed\"\n\t\t}\n\tcase <-time.After(8 * time.Second):\n\t}\n\twaitedMs := time.Since(waitStart).Milliseconds()\n\n\tnewLast := newNode.getLastIndex()\n\tleaderState := leader.State().String()\n\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"addnonvoter_suffrage\\\",\\\"leader_addr\\\":%q,\\\"new_node_addr\\\":%q,\"+\n\t\t\"\\\"disconnected_addr\\\":%q,\\\"add_err\\\":%q,\\\"add_index\\\":%d,\"+\n\t\t\"\\\"leader_view_suffrage\\\":%q,\\\"voters_in_config\\\":%d,\"+\n\t\t\"\\\"apply_with_one_original_voter_gone\\\":%q,\\\"apply_waited_ms\\\":%d,\"+\n\t\t\"\\\"new_node_last_index\\\":%d,\\\"leader_state\\\":%q}\\n\",\n\t\tstring(leader.localAddr), string(newNode.localAddr), string(peer.localAddr),\n\t\taddErr, addIndex, leaderSuffrage, voters,\n\t\tapplyResult, waitedMs, newLast, leaderState)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "addvoter",
+      "cfgaddvoter",
+      "cfgtestaddvoter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Control for the AddVoter suffrage witness on the same cluster shape: join a fresh, empty node with the public AddNonvoter call instead, record the suffrage the leader wrote for it and the voter count, then disconnect one original voter and record whether a command still commits - which it should not, because a majority of the remaining voters is unreachable.",
+      "assumptions": [
+        "MakeCluster(2) merged with MakeClusterNoBootstrap(1) and fully connected is the same join path the AddVoter witness used, so the only difference between the two executions is the public call that adds the node.",
+        "AddNonvoter is a supported public call at protocol version 3 and yields a member that receives log entries but holds no vote.",
+        "With one of the two original voters disconnected and the added member holding no vote, no majority of voters is reachable, so the command must not commit; a commit here would falsify the disconnect discriminator used by the witness."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed control test in the captured package, identical to the AddVoter witness except for the join call. It bootstraps a real two-node cluster with MakeCluster(2, t, nil) and keeps a copy of the original members, creates a fresh single-node cluster with MakeClusterNoBootstrap(1, t, nil), merges and fully connects them, takes the elected leader and the fresh node, and identifies the other original voter. The join is the public leader.AddNonvoter(newNode.localID, newNode.localAddr, 0, 5s), waited on under a bounded interval, recording add_err and the entry index. The test records the suffrage of the new member in the leader's latest configuration and the number of voters there, calls c.Disconnect on the other original voter's address, then applies one command through the public API and waits on its future under a bounded interval, recording addnonvoter_suffrage with the apply result, the waited interval, the new node's last index and the leader's state, so the control's decisive operands (suffrage, voter count, and whether the command can still commit) come from the same cluster in one execution.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "09193ea9b7ee4df99810e6eee7058028",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "fb6f285736fa49b5af424be6a078aa1e",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

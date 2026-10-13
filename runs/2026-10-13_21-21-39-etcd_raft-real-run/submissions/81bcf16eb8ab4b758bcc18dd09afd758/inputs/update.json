@@ -1,0 +1,75 @@
+{
+  "rationale": "Recording the honest result of the attempt to close the end-to-end limitation on the conf-change finding, and the boundary it exposed. Driving a real three-node network did not demonstrate a committed malformed change: because that harness never advances the application's applied index, the leader's pendingConfIndex was still greater than raftLog.applied when the malformed change was proposed, so the propose-time alreadyPending guard fired, the entry was rewritten to EntryNormal, and the malformed change was dropped before replication. So the guard, not the transition mismatch, decided that run. This is useful boundary evidence rather than support: it shows the defect needs the precondition pendingConfIndex <= raftLog.applied at propose time, which holds in normal operation once the application has applied the joint change (appliedTo advances applied past it) and which held in the direct-instance receipts where pendingConfIndex was left at its becomeLeader value of 0 while applied was 0. I record the guard behaviour as a fact and add the precondition to the interpretation's conditions and limitations; the claim itself is unchanged and the end-to-end commit demonstration remains open.",
+  "sources": [
+    {
+      "id": "val_guard",
+      "file": "raft.go",
+      "start_line": 1318,
+      "end_line": 1342,
+      "kind": "code_observation"
+    },
+    {
+      "id": "val_joint",
+      "file": "raft.go",
+      "start_line": 1325,
+      "end_line": 1342,
+      "kind": "code_observation"
+    },
+    {
+      "id": "note_apply",
+      "file": "raft.go",
+      "start_line": 737,
+      "end_line": 748,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@K_confchange_pending_guard",
+      "kind": "behavior",
+      "statement": "The propose-time conf-change validation has a guard that can decide the outcome before the transition mismatch is reached: in stepLeader's MsgProp handling, alreadyPending is computed as pendingConfIndex > r.raftLog.applied, and when that is true the failed check possible unapplied conf change applies, so the entry is rewritten to EntryNormal and the change is dropped regardless of its transition. Observed in a real three-node network where the joint configuration had been applied through applyConfChange but the application's applied index was never advanced: the empty JointExplicit change was proposed, the entry at the new last index came out as EntryNormal, and the malformed change was therefore dropped rather than replicated. In the direct-instance receipts pendingConfIndex had been left at the value becomeLeader set before appending the empty entry (0) while applied was also 0, so alreadyPending was false and the same change was accepted as EntryConfChangeV2. The applied index is advanced by the application through appliedTo when it acknowledges applied entries, so in normal operation applied catches up with the pending configuration change and the guard does not fire.",
+      "conditions": "Leader in StateLeader proposing a ConfChangeV2; validation enabled; alreadyPending is true exactly when a configuration change is in the log but not yet acknowledged as applied by the application. This guard is about unapplied conf changes, not about the transition field, so it is a precondition on the defect rather than a fix for it.",
+      "source_ids": [
+        "val_guard",
+        "note_apply"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "e083daeefc0f460f9a395b329006f127-question-0",
+      "source_ids": [
+        "val_guard",
+        "val_joint",
+        "note_apply"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "knowledge": [
+        {
+          "entry_id": "@K_confchange_pending_guard",
+          "revision": 1,
+          "assertion": "a pending unapplied conf change makes validation rewrite the entry to EntryNormal and drop the change before the transition mismatch is reached"
+        },
+        {
+          "entry_id": "445153ef4a5b4839a90c275d46a90023-knowledge-0",
+          "revision": 1,
+          "assertion": "the explicit-transition empty change passed validation and panicked on apply when no conf change was pending unapplied"
+        },
+        {
+          "entry_id": "a30a3cfa85994b70bb34c3d0f3c815b7-knowledge-0",
+          "revision": 1,
+          "assertion": "the implicit-transition empty change behaved identically"
+        }
+      ],
+      "rationale": "Boundary revision, no new receipt: the attempt to demonstrate the defect end to end produced counterevidence about a precondition instead of support, and I am recording it as such. Setup of the attempt: a real three-node network, leader 1 elected, the joint configuration entered with an explicit-transition change which every peer's application applied through applyConfChange, then the empty JointExplicit change proposed on the leader and the resulting entry inspected. Result: the entry at the new last index came out as EntryNormal, not EntryConfChangeV2, so the malformed change was dropped before replication; the pattern is explained by the propose-time alreadyPending guard, because that harness never advanced raftLog.applied (no Ready and Advance were driven), so pendingConfIndex was still greater than applied when the change was proposed and the failed check possible unapplied conf change replaced the entry. The panic I saw afterwards came from calling applyConfChange directly on the change object, which is exactly the shortcut the limitation already flags, so that run demonstrates nothing about a committed entry. What this changes: the defect now carries an explicit precondition, pendingConfIndex <= raftLog.applied at propose time, and the guard is recorded as a second mechanism that can intercept the malformed change whenever a configuration change is still unapplied. Why the claim is not weakened by that: the precondition is about application progress, not about the transition field, and in normal operation the application acknowledges applied entries through appliedTo, which advances applied past the joint change and clears alreadyPending; in the direct-instance receipts the guard was already inactive (pendingConfIndex 0, applied 0) and both non-Auto forms were accepted as EntryConfChangeV2 and panicked on apply, with the Auto form as control. So the asserted defect stands with sharper conditions: while joint, with no conf change pending unapplied, a non-Auto empty ConfChangeV2 is accepted, replicated and panics on the documented apply path. Still open and explicitly not claimed: that a real cluster reaches the panic through a genuine commit, because the end-to-end demonstration needs a harness that drives the application side (Ready and Advance) so applied catches up before the malformed change is proposed; the earlier receipt shows the entry stays an EntryConfChangeV2 when the guard is inactive, which is what such a cluster would replicate. Also recorded as harness knowledge only, not target knowledge: the test network helper cannot represent a configuration containing an id absent from the network, which is why the first attempt panicked inside the helper rather than in the library.",
+      "limitations": [
+        "The end-to-end demonstration remains open: the network attempt dropped the change through the pending-conf check because that harness did not advance the applied index, so a genuine commit of the malformed change has not been shown.",
+        "The defect requires pendingConfIndex <= raftLog.applied at propose time; a lagging application is protected by the guard, and no claim is made about how often applications lag.",
+        "The apply step in the receipts is still driven directly rather than through CommittedEntries, for the reason given above.",
+        "The claimed consequence remains a process panic in the application's ApplyConfChange call; no state corruption, data loss or safety violation is claimed, and an application that rejects the change avoids the panic.",
+        "Only the three transition values the library defines were covered, in the explicit joint-configuration shape; a joint state reached through AutoLeave was not exercised."
+      ]
+    }
+  ]
+}

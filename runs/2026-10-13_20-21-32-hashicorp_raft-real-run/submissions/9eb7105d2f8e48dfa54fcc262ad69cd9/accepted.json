@@ -1,0 +1,294 @@
+{
+  "rationale": "The multi-voter variant that question-0 listed as unwitnessed is now built and probed. A three-voter cluster takes one deliberate snapshot (automatic snapshots disabled so nothing newer can cover the change), grows to five voters, and the leader is restarted from its own stores: with RestoreCommittedLogs on it comes back holding the snapshot's three-voter configuration at index 1 while its own log's latest configuration is index 14 with five servers; without the flag the same restart keeps index 14 with five servers. That addresses the single-voter limitation with a real membership change, not just a bootstrap entry. A second consequence was attempted in the same harness: after restarting, the node is partitioned together with one committed voter so that the remaining three voters hold a majority of the committed five-voter configuration while the restarted node believes the quorum is two. In the probe the restarted node did not campaign to leadership (became_leader false in both modes) although the majority side did keep a leader, so that consequence is recorded as an attempted discrimination that did not emerge rather than as a claim; only the configuration comparison is declared. Nothing else is restated.",
+  "sources": [
+    {
+      "id": "api_restore_committed_call",
+      "file": "api.go",
+      "start_line": 604,
+      "end_line": 620,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_committed_body",
+      "file": "api.go",
+      "start_line": 724,
+      "end_line": 754,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_snapshot_config",
+      "file": "api.go",
+      "start_line": 655,
+      "end_line": 681,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_addvoter",
+      "file": "api.go",
+      "start_line": 994,
+      "end_line": 1005,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_follower_election_abort",
+      "file": "raft.go",
+      "start_line": 228,
+      "end_line": 246,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_restore_committed_doc",
+      "file": "config.go",
+      "start_line": 242,
+      "end_line": 254,
+      "kind": "document_statement"
+    },
+    {
+      "id": "log_commit_tracking_iface",
+      "file": "log.go",
+      "start_line": 194,
+      "end_line": 219,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@multivoter",
+      "question": "Does the configuration loss also occur for a real membership change in a multi-voter cluster, and can the resulting stale membership produce a decision the committed configuration would not allow?",
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_restore_snapshot_config",
+        "api_addvoter",
+        "raft_follower_election_abort",
+        "raft_quorum_size"
+      ],
+      "hypothesis": "A node restarted with RestoreCommittedLogs keeps the snapshot's configuration when committed membership changes sit below the restored commit index, so its quorum arithmetic reflects an obsolete membership.",
+      "discriminator": "Grow a snapshot-age three-voter cluster to five voters, restart the leader, and compare the configuration index and server count with the log's latest configuration; then isolate the restarted node with one committed voter and see whether it can win with its smaller quorum.",
+      "disposition": null,
+      "parent_id": "ef5ddbf78bd4456ea51537bd60a61a80-question-0",
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@authority_behavior",
+      "kind": "behavior",
+      "statement": "A node restarted with Config.RestoreCommittedLogs whose rebuilt configuration is empty stays a Follower and never campaigns: the latest configuration is empty, so runFollower takes the 'no known peers, aborting election' branch and quorumSize() returns one, while the same node restarted without the flag rebuilds the committed configuration and returns to Leader.",
+      "conditions": "Single-voter configuration bootstrapped in the log, Config.RestoreCommittedLogs=true with CommitTrackingLogStore, no snapshot so the startup configuration scan starts above the committed configuration entry; observed over a 1500 ms window with a 50 ms election timeout.",
+      "source_ids": [
+        "api_restore_committed_call",
+        "raft_follower_election_abort",
+        "raft_quorum_size",
+        "config_restore_committed_doc"
+      ],
+      "executions": {
+        "f5cb1459db5e418d9a9aa6987ef76dfc": [
+          11,
+          13
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "ef5ddbf78bd4456ea51537bd60a61a80-question-0",
+      "question": "Does the same loss of configuration occur when a snapshot exists whose configuration index is below the index of a committed LogConfiguration entry (entries in (snapshotIndex, restored commitIndex])?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@multivoter",
+      "experiment_id": null,
+      "source_ids": [
+        "api_restore_committed_call",
+        "api_restore_committed_body",
+        "api_restore_snapshot_config",
+        "api_addvoter",
+        "raft_quorum_size"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Source: the mechanism of the parent question applies to a real membership change, not only to a bootstrap entry: restoreFromCommittedLogs (api.go:724-754) sets lastApplied to the persisted commit index before the scan at api.go:604-620, restoreSnapshot (api.go:655-681) can only supply the snapshot's configuration, and AddVoter (api.go:994-1005) writes a later LogConfiguration that is re-read only if it sits above the restored commit index. A native construction probe reproduced the predicted difference with five committed voters: with the flag on the restarted leader came back with after_latest_index 1 and after_servers 3 (the snapshot's bootstrap configuration) against expected_latest_index 14 and expected_servers 5, while the flag-off control came back with index 14 and five servers; the pre-restart state was index 14 with five servers in both modes, so the change itself committed in both. A second consequence was attempted and did not emerge: after the restart the node was partitioned together with one committed voter while the remaining three voters kept a majority of the committed five-voter configuration, and the restarted node never reached Leader in either mode (became_leader false, majority_side_leader true, reachable_votes 2 against committed_quorum 3), so an election won with a minority of the committed configuration is not claimed. Only the configuration comparison is declared, and only its receipt can make it complete.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The flag-off control keeps the five-server configuration through the same membership change and restart, isolating the flagged recovery path.",
+        "The attempted minority-election consequence did not emerge in the probe: the restarted node stayed out of leadership in both modes, so a safety consequence beyond the lost configuration remains unestablished."
+      ],
+      "limitations": [
+        "No receipt yet for the multi-voter scenario; the account rests on source reading plus a native probe.",
+        "The minority-election consequence is explicitly not claimed; the partition stage is retained as an exploratory negative with its operands.",
+        "The probe used the in-memory commit-tracking store and one deliberate snapshot; other snapshot timings are not explored."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@multivoter",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "api_restore_committed_call",
+      "api_restore_committed_body",
+      "api_restore_snapshot_config",
+      "api_addvoter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Boot three voters with RestoreCommittedLogs and CommitTrackingLogs, disable automatic snapshots and take exactly one snapshot while the configuration is still the bootstrap one, add two further voters so the committed configuration has five servers, commit more entries, then restart the node that was leading from its own stores and compare the configuration it holds with the log's latest configuration. Run the same sequence with the flag on and off.",
+      "assumptions": [
+        "The single deliberate snapshot carries only the bootstrap configuration, so it cannot represent the later membership change.",
+        "Automatic snapshots are disabled, so no newer snapshot can cover the change.",
+        "Adding the two voters commits because the leader still holds a majority of the committed configuration."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites.",
+        "Any claim about an election won with the stale quorum; the partition stage of the harness is exploratory and produced no such leader.",
+        "The other questions, unchanged here."
+      ],
+      "parameters": {
+        "voters_before": 3,
+        "voters_after": 5,
+        "snapshots": 1,
+        "restarted_node": "leader"
+      }
+    },
+    "prefix": "The harness uses the package's own test facilities: MakeClusterCustom with Peers 3, CommitTrackingLogs and RestoreCommittedLogs; ten Apply calls; an explicit Snapshot(); MakeClusterNoBootstrap(2) merged with FullyConnect and two AddVoter calls; ten further Apply calls; then Shutdown and NewRaft on the same logs, stable and snapshots stores with a fresh inmem transport, followed by FullyConnect on the rewired transports. It emits a startup_before_restart event carrying the snapshot index, the snapshot's configuration index, the expected configuration index and server count, then a multivoter_after_restart event with the configuration observed after NewRaft returns and the operand of the comparison.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "The library owns the membership view a node resumes with; enabling RestoreCommittedLogs must not let an obsolete snapshot configuration govern the node's quorum arithmetic.",
+    "prerequisites": [
+      {
+        "alias": "mv_on",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "mv_on",
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "mv_off",
+        "event": "startup_before_restart",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "mv_off",
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "expected_servers",
+            "op": "eq",
+            "value": 5,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "multivoter_after_restart",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mv_on",
+        "assertion": {
+          "field": "config_matches",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "After restarting from a log whose latest configuration has five servers while the snapshot carries three, the node's configuration index and server count are expected to match the log; the defect prediction is that it falls back to the snapshot's configuration."
+      },
+      {
+        "event": "multivoter_after_restart",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "mv_off",
+        "assertion": {
+          "field": "config_matches",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "Control: the identical restart without the flag is expected to keep the five-server configuration, isolating the recovery path rather than the restart and the membership change."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

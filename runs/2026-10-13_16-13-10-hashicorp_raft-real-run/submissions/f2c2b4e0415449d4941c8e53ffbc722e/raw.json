@@ -1,0 +1,53 @@
+{
+  "rationale": "The index question is settled and witnessed, so this turn returns to the second open A2 question: whether a duty the public API has already accepted still has a completion path when authority is lost by Shutdown rather than by stepping down. Source reading gives the mechanism in three parts that are each independently checkable. (1) The caller's timeout only guards acceptance: Apply/ApplyLog and Barrier use it solely in the select that sends the future into applyCh (api.go:829-851, 859-877), so a bounded timeout says nothing about completion. (2) The returned logFuture carries no ShutdownCh - deferError.Error() therefore waits on the internal error channel alone (future.go:113-118), while the futures this revision does wire to shutdownCh are the restore and snapshot-internal ones (raft.go:1169, raft.go:1914, snapshot.go:152) - so nothing wakes the caller on shutdown. (3) Shutdown() closes shutdownCh and sets state Shutdown (api.go:1012-1025) but drains nothing; the main loop leaves its select on shutdownCh and run() returns, and runLeader's defer only responds futures already on leaderState.inflight (raft.go:502-560), not futures sitting in applyCh. BatchApplyCh (config.go:169-174) is the documented option that lets acceptance and consumption come apart, and its own doc comment already admits it 'breaks the timeout guarantee on Apply'. The repository's own test file notes the same class of stuck future at raft_test.go:40-42. I am not asserting the defect from reading alone: the recorded discriminator needs an execution, so this turn submits only the experiment and the supporting behaviors, with the interpretation to follow from the receipt.",
+  "sources": [
+    {"id": "batchapplyconfig", "file": "config.go", "start_line": 169, "end_line": 174, "kind": "code_observation"},
+    {"id": "defererror", "file": "future.go", "start_line": 90, "end_line": 131, "kind": "code_observation"},
+    {"id": "restorefuturech", "file": "raft.go", "start_line": 1166, "end_line": 1171, "kind": "code_observation"},
+    {"id": "runleaderdefer", "file": "raft.go", "start_line": 502, "end_line": 560, "kind": "code_observation"}
+  ],
+  "investigations": [
+    {
+      "id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+      "hypothesis": "Apply and Barrier hand the caller a logFuture as soon as the send into applyCh succeeds; with BatchApplyCh the channel is buffered, so acceptance and consumption are separate events. That logFuture has no ShutdownCh, Shutdown() closes shutdownCh and sets state Shutdown without draining applyCh, and both the main loop and runFSM leave on shutdownCh, so a future left in the buffer has no producer that can respond it: Error() blocks indefinitely and the caller's timeout, which only guarded the enqueue, cannot save it. runLeader's defer responds only futures on leaderState.inflight, so it does not cover a future that was never dispatched.",
+      "discriminator": "Occupy the main loop inside a handler (a public Restore with a caller-supplied reader that stalls on its first Read, which is the handshake), accept one Barrier future through the ordinary public path so it lands in the buffered applyCh, then call Shutdown() and observe whether the future is ever responded: a completion would defeat the suspicion and must name the responding producer, while non-completion together with the future still being queued in applyCh shows the duty was accepted and then lost."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@timeout_guards_enqueue_only",
+      "kind": "behavior",
+      "statement": "Apply/ApplyLog and Barrier use the caller's timeout only in the select that enqueues the logFuture into applyCh; the returned logFuture has no ShutdownCh (only internal restore and snapshot futures set one, raft.go:1169, raft.go:1914, snapshot.go:152), so once the send succeeds the caller's Error() waits on the internal error channel alone and neither the timeout nor Shutdown() bounds completion.",
+      "conditions": "Any caller that keeps the future returned by Apply/ApplyLog/Barrier; the window requires acceptance to succeed, which BatchApplyCh (config.go:169-174) permits without a consumer, and its documentation already states that it breaks the timeout guarantee on Apply.",
+      "source_ids": ["applybarrier", "batchapplyconfig", "defererror", "restorefuturech"]
+    },
+    {
+      "ref": "@shutdown_leaves_buffer_undrained",
+      "kind": "behavior",
+      "statement": "Shutdown() closes shutdownCh and sets state Shutdown but does not drain or respond to futures already queued in applyCh; the main loop leaves its select on shutdownCh and run() returns, and runLeader's defer responds only futures already recorded on leaderState.inflight, so a duty that reached the buffer but was never dispatched has no remaining producer to complete it.",
+      "conditions": "Applies whenever a logFuture was accepted into applyCh while the main loop was occupied elsewhere and the node is then shut down; the repository's own test file already notes stuck Barrier/VerifyLeader/GetConfiguration futures after shutdown at raft_test.go:40-42.",
+      "source_ids": ["shutdown", "applybarrier", "runleaderdefer", "aftershutdown"]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+      "question": "After the public API has handed a caller a Barrier future under BatchApplyCh, does any producer respond that future once Shutdown() has been called, and is the accepted duty still sitting in applyCh at that point?"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "031156ce4e3d4bf5a8845619024ff0c4-question-1",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["applybarrier", "batchapplyconfig", "defererror", "shutdown", "runleaderdefer"],
+    "scope": {
+      "description": "On one real bootstrapped cluster, accept a Barrier future while the main loop is occupied by a public Restore whose caller-supplied reader stalls, then call Shutdown() and emit one CA_EVENT JSON line recording whether the accepted future ever completed, how many duties remained queued in applyCh, the channel capacity, and the node state before acceptance and after shutdown.",
+      "assumptions": [
+        "MakeCluster(3, conf) with conf.BatchApplyCh = true is a supported public configuration; BatchApplyCh buffers applyCh to MaxAppendEntries (config.go:169-174), which is what allows acceptance without a consumer.",
+        "Occupying the main loop with Restore and a reader that blocks on its first Read models a caller-supplied backup stream that stalls; the reader's first Read is the handshake proving the loop is inside that handler and can no longer select on applyCh.",
+        "The control Barrier on the undisturbed leader establishes that the same call does complete while a producer is available, so a later non-completion is not the call being unusable in this harness.",
+        "The reader is released after sampling so the occupied handler can return and the node can shut down cleanly; the release happens after the observation and cannot affect it."
+      ]
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test in the captured package. It builds a real three-node cluster with MakeCluster(3, t, inmemConfig(t)) after setting BatchApplyCh = true and takes the single elected leader via c.Leader(). First it runs the control: leader.Barrier(0).Error() on the undisturbed leader, recorded as control_barrier_err. Then it occupies the main loop through the public API by calling leader.Restore(&SnapshotMeta{Version:1, Index:1, Term:1, Size:1}, reader, 0) in a goroutine, where reader is a caller-supplied io.Reader whose first Read closes a started channel and then blocks until released; receiving on started is the freeze handshake. While the loop is inside that handler the test accepts the duty through the ordinary public path by calling leader.Barrier(0) in a goroutine and taking the returned future, recording the node state at acceptance. It then calls leader.Shutdown() without waiting on the shutdown future and, for a bounded interval, watches whether duty.Error() ever returns, recording result as no_completion or completed:<err> plus waited_ms; it samples len(leader.applyCh) and cap(leader.applyCh) and the node state afterwards, which shows whether the accepted duty is still sitting in the buffer with no consumer. Finally it releases the reader, records the error the Restore call returns once the handler resumes, and prints one CA_EVENT JSON line with all of these operands, so the decisive facts are the completion result, the queue depth, and the two node states observed on one instance in one execution."
+  }
+}

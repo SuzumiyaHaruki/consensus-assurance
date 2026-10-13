@@ -1,0 +1,107 @@
+{
+  "id": "5d2b027fa7f84dc4a73721f7b5f69a87-experiment",
+  "investigation_id": "877a07ed685d42b597310ae204aaf472-question-0",
+  "version": 2,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceEmit(t *testing.T, fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssurance_InstallSnapshotSnapshotDelta drives a fresh node to receive an\n// InstallSnapshot from the leader and then samples its own snapshot trigger.\nfunc TestAssurance_InstallSnapshotSnapshotDelta(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 0\n\tc := MakeCluster(2, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tif err := leader.Apply([]byte(\"a\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\tt.Fatalf(\"apply a: %v\", err)\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tif err := leader.Apply([]byte(\"b\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\tt.Fatalf(\"apply b: %v\", err)\n\t}\n\tleaderSnap, _ := leader.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":          \"leader_prepared\",\n\t\t\"leader_id\":      string(leader.localID),\n\t\t\"snapshot_index\": leaderSnap,\n\t\t\"commit_index\":   leader.getCommitIndex(),\n\t})\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tdefer c1.Close()\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\ttarget := c1.rafts[0]\n\tfuture := leader.AddVoter(target.localID, target.localAddr, 0, 0)\n\taddErr := future.Error()\n\n\t// Let the new voter catch up fully, then isolate it so the leader can\n\t// snapshot and compact with no entries left above the snapshot index.\n\ttime.Sleep(500 * time.Millisecond)\n\tc.Disconnect(target.localAddr)\n\tfor i := 0; i < 3; i++ {\n\t\tif err := leader.Apply([]byte(\"x\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply x: %v\", err)\n\t\t}\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"second snapshot: %v\", err)\n\t}\n\tquietSnap, _ := leader.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":            \"leader_snapshot_while_target_isolated\",\n\t\t\"leader_snapshot\":  quietSnap,\n\t\t\"leader_last_log\":  leader.getLastIndex(),\n\t\t\"target_isolation\": string(target.localAddr),\n\t})\n\tc.FullyConnect()\n\n\tdeadline := time.Now().Add(5 * time.Second)\n\tvar installedIdx uint64\n\tfor time.Now().Before(deadline) {\n\t\tinstalledIdx, _ = target.getLastSnapshot()\n\t\tif installedIdx >= quietSnap && quietSnap > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\ttime.Sleep(150 * time.Millisecond)\n\tstoreLast, _ := target.logs.LastIndex()\n\tsnapIdx, _ := target.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"target_after_install\",\n\t\t\"addvoter_err\":       fmt.Sprintf(\"%v\", addErr),\n\t\t\"target_id\":          string(target.localID),\n\t\t\"installed_index\":    installedIdx,\n\t\t\"store_last\":         storeLast,\n\t\t\"snapshot_index\":     snapIdx,\n\t\t\"applied_index\":      target.getLastApplied(),\n\t\t\"commit_index\":       target.getCommitIndex(),\n\t\t\"store_emptied\":      storeLast < snapIdx,\n\t\t\"should_snapshot\":    target.shouldSnapshot(),\n\t\t\"snapshot_threshold\": conf.SnapshotThreshold,\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "should_snapshot",
+      "compact_trailing",
+      "install_snapshot",
+      "replicate_to"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One process: two real raft instances bootstrapped with TrailingLogs=0 plus a third fresh instance merged into the same transport set. The leader applies an entry, takes a snapshot, applies another, then adds the fresh node with AddVoter and lets it catch up for 500ms. The new voter is then isolated at the transport level, the leader applies three more commands and takes a second snapshot (its own log compacted up to that index), the transport is reconnected, and the harness waits until the isolated node's cached snapshot index reaches the leader's snapshot index before sampling, after a further 150ms, its log store last index, snapshot index, applied index, commit index, store_emptied and shouldSnapshot.",
+      "assumptions": [],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "MakeCluster(2, t, conf) with conf.TrailingLogs=0 supplies the two Voters and the leader; MakeClusterNoBootstrap(1, t, nil) supplies the third instance with an empty log, default trailing count and default threshold, which is the node whose verdict is measured. Merge plus FullyConnect wire the transports; cluster.Disconnect on the third node's address isolates it in both directions and FullyConnect restores it, so the leader cannot reach it while it snapshots and compacts, and after reconnection the leader's replication for that peer must fall back to sending its latest snapshot (the existing replicateTo path that switches to SEND_SNAP when the previous log entry is unavailable). No production logic is modified; the sampling is of the third node's own runtime state, and the wait is on the observed snapshot index rather than a fixed delay.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "7841d374df6147d684b985415a34be14",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "5d2b027fa7f84dc4a73721f7b5f69a87",
+  "previous_id": "ef0d190c93aa4f129c7604aa7ffd6c03-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceEmit(t *testing.T, fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssurance_InstallSnapshotSnapshotDelta drives a fresh node to receive an\n// InstallSnapshot from the leader and then samples its own snapshot trigger.\nfunc TestAssurance_InstallSnapshotSnapshotDelta(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 0\n\tc := MakeCluster(2, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tif err := leader.Apply([]byte(\"a\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\tt.Fatalf(\"apply a: %v\", err)\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tif err := leader.Apply([]byte(\"b\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\tt.Fatalf(\"apply b: %v\", err)\n\t}\n\tleaderSnap, _ := leader.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":          \"leader_prepared\",\n\t\t\"leader_id\":      string(leader.localID),\n\t\t\"snapshot_index\": leaderSnap,\n\t\t\"commit_index\":   leader.getCommitIndex(),\n\t})\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tdefer c1.Close()\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\ttarget := c1.rafts[0]\n\tfuture := leader.AddVoter(target.localID, target.localAddr, 0, 0)\n\taddErr := future.Error()\n\n\tdeadline := time.Now().Add(5 * time.Second)\n\tvar installedIdx uint64\n\tfor time.Now().Before(deadline) {\n\t\tinstalledIdx, _ = target.getLastSnapshot()\n\t\tif installedIdx > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\tstoreLast, _ := target.logs.LastIndex()\n\tsnapIdx, _ := target.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"target_after_install\",\n\t\t\"addvoter_err\":       fmt.Sprintf(\"%v\", addErr),\n\t\t\"target_id\":          string(target.localID),\n\t\t\"installed_index\":    installedIdx,\n\t\t\"store_last\":         storeLast,\n\t\t\"snapshot_index\":     snapIdx,\n\t\t\"applied_index\":      target.getLastApplied(),\n\t\t\"commit_index\":       target.getCommitIndex(),\n\t\t\"store_emptied\":      storeLast < snapIdx,\n\t\t\"should_snapshot\":    target.shouldSnapshot(),\n\t\t\"snapshot_threshold\": conf.SnapshotThreshold,\n\t})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": []
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceEmit(t *testing.T, fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssurance_InstallSnapshotSnapshotDelta drives a fresh node to receive an\n// InstallSnapshot from the leader and then samples its own snapshot trigger.\nfunc TestAssurance_InstallSnapshotSnapshotDelta(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 0\n\tc := MakeCluster(2, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tif err := leader.Apply([]byte(\"a\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\tt.Fatalf(\"apply a: %v\", err)\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tif err := leader.Apply([]byte(\"b\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\tt.Fatalf(\"apply b: %v\", err)\n\t}\n\tleaderSnap, _ := leader.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":          \"leader_prepared\",\n\t\t\"leader_id\":      string(leader.localID),\n\t\t\"snapshot_index\": leaderSnap,\n\t\t\"commit_index\":   leader.getCommitIndex(),\n\t})\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tdefer c1.Close()\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\ttarget := c1.rafts[0]\n\tfuture := leader.AddVoter(target.localID, target.localAddr, 0, 0)\n\taddErr := future.Error()\n\n\t// Let the new voter catch up fully, then isolate it so the leader can\n\t// snapshot and compact with no entries left above the snapshot index.\n\ttime.Sleep(500 * time.Millisecond)\n\tc.Disconnect(target.localAddr)\n\tfor i := 0; i < 3; i++ {\n\t\tif err := leader.Apply([]byte(\"x\"), conf.HeartbeatTimeout).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply x: %v\", err)\n\t\t}\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"second snapshot: %v\", err)\n\t}\n\tquietSnap, _ := leader.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":            \"leader_snapshot_while_target_isolated\",\n\t\t\"leader_snapshot\":  quietSnap,\n\t\t\"leader_last_log\":  leader.getLastIndex(),\n\t\t\"target_isolation\": string(target.localAddr),\n\t})\n\tc.FullyConnect()\n\n\tdeadline := time.Now().Add(5 * time.Second)\n\tvar installedIdx uint64\n\tfor time.Now().Before(deadline) {\n\t\tinstalledIdx, _ = target.getLastSnapshot()\n\t\tif installedIdx >= quietSnap && quietSnap > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\ttime.Sleep(150 * time.Millisecond)\n\tstoreLast, _ := target.logs.LastIndex()\n\tsnapIdx, _ := target.getLastSnapshot()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"target_after_install\",\n\t\t\"addvoter_err\":       fmt.Sprintf(\"%v\", addErr),\n\t\t\"target_id\":          string(target.localID),\n\t\t\"installed_index\":    installedIdx,\n\t\t\"store_last\":         storeLast,\n\t\t\"snapshot_index\":     snapIdx,\n\t\t\"applied_index\":      target.getLastApplied(),\n\t\t\"commit_index\":       target.getCommitIndex(),\n\t\t\"store_emptied\":      storeLast < snapIdx,\n\t\t\"should_snapshot\":    target.shouldSnapshot(),\n\t\t\"snapshot_threshold\": conf.SnapshotThreshold,\n\t})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": []
+      }
+    },
+    "source_ids": {
+      "before": [
+        "should_snapshot",
+        "compact_trailing",
+        "install_snapshot"
+      ],
+      "after": [
+        "should_snapshot",
+        "compact_trailing",
+        "install_snapshot",
+        "replicate_to"
+      ]
+    },
+    "scope": {
+      "before": {
+        "description": "One process, two real raft instances bootstrapped over InmemTransport with TrailingLogs=0 plus a third fresh unbootstrapped instance merged into the same transport set. The leader applies one command, takes a user snapshot (compacting its log), applies a second command, then adds the fresh node with AddVoter and waits up to five seconds for that node's cached snapshot index to become non-zero. The fresh node's log store last index, snapshot index, applied index, commit index, store_emptied and shouldSnapshot are then recorded, together with the leader's prepared snapshot index and the AddVoter result.",
+        "assumptions": [],
+        "excluded": [],
+        "parameters": {}
+      },
+      "after": {
+        "description": "One process: two real raft instances bootstrapped with TrailingLogs=0 plus a third fresh instance merged into the same transport set. The leader applies an entry, takes a snapshot, applies another, then adds the fresh node with AddVoter and lets it catch up for 500ms. The new voter is then isolated at the transport level, the leader applies three more commands and takes a second snapshot (its own log compacted up to that index), the transport is reconnected, and the harness waits until the isolated node's cached snapshot index reaches the leader's snapshot index before sampling, after a further 150ms, its log store last index, snapshot index, applied index, commit index, store_emptied and shouldSnapshot.",
+        "assumptions": [],
+        "excluded": [],
+        "parameters": {}
+      }
+    },
+    "prefix": {
+      "before": "MakeCluster(2, t, conf) with conf.TrailingLogs=0 gives two real Voters over InmemTransport with InmemStore logs and stable state, and waits for a leader; MakeClusterNoBootstrap(1, t, nil) creates the third instance with an empty log and no configuration; Merge plus FullyConnect wire all three transports so the fresh node is reachable. The leader's own snapshot path (Raft.Snapshot -> takeSnapshot -> compactLogs) removes the logs up to the snapshot index, so the fresh node cannot be caught up by log entries alone and the leader must ship a snapshot; the harness waits for the target's snapshot index rather than for a fixed delay so the sample is taken after the install actually happened. No production logic is modified; all observations are package-internal reads of the runtime objects.",
+      "after": "MakeCluster(2, t, conf) with conf.TrailingLogs=0 supplies the two Voters and the leader; MakeClusterNoBootstrap(1, t, nil) supplies the third instance with an empty log, default trailing count and default threshold, which is the node whose verdict is measured. Merge plus FullyConnect wire the transports; cluster.Disconnect on the third node's address isolates it in both directions and FullyConnect restores it, so the leader cannot reach it while it snapshots and compacts, and after reconnection the leader's replication for that peer must fall back to sending its latest snapshot (the existing replicateTo path that switches to SEND_SNAP when the previous log entry is unavailable). No production logic is modified; the sampling is of the third node's own runtime state, and the wait is on the observed snapshot index rather than a fixed delay."
+    }
+  },
+  "revision_reason": "The previous construction never left the follower below its snapshot index because AddVoter appended a configuration entry above the installed snapshot and replication kept the log filled. This revision isolates the added voter before taking the leader's snapshot, so after reconnection the follower must install a snapshot at an index above whatever stale log entries it still holds, which is the state the source reading predicts and the previous run could not reach."
+}

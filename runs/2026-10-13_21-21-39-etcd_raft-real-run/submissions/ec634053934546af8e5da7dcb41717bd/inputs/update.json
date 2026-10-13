@@ -1,0 +1,82 @@
+{
+  "rationale": "The growth experiment executed (receipt b91fd4d8638c4446a332be9849f23f70, experiment 8e42a5752e9d454bb97823c6d38e4728-experiment, status completed, outcome tests_passed, exit 0, no changed target files) and I read its receipt before writing. Both comparisons hold with complete admissions: index 0 is the setup (real leader, term 1, committed 0, lastIndex 1, CheckQuorum false, ReadOnlySafe, 3 voters), index 1 shows 64 same-context retries yielding pending=64 with unconfirmed=0 while still StateLeader, and index 2 shows pending_after=64 with unconfirmed_after=0 after a higher-term heartbeat deposed the node to StateFollower. That converts the previously native-feedback probe into retained evidence, so I promote the measured counts to a durable fact and revise the asserted defect account to cite the receipt and drop the limitation that no receipt existed.",
+  "sources": [
+    {
+      "id": "ra_admit",
+      "file": "raft.go",
+      "start_line": 1355,
+      "end_line": 1372,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_reset",
+      "file": "raft.go",
+      "start_line": 781,
+      "end_line": 812,
+      "kind": "code_observation"
+    },
+    {
+      "id": "ra_contract",
+      "file": "node.go",
+      "start_line": 218,
+      "end_line": 224,
+      "kind": "document_statement"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@K_read_pending_growth",
+      "kind": "fact",
+      "statement": "For a real raft leader of a three-voter configuration that cannot obtain quorum acknowledgements, repeated local MsgReadIndex submissions with an identical RequestCtx accumulate without bound in pendingReadIndexMessages and are not reclaimed by an authority transition. Measured: with the node at term 1, committed 0, lastIndex 1, CheckQuorum false and the default ReadOnlySafe option, 64 retries produced pendingReadIndexMessages length 64 (one entry per retry, no collapsing) and readOnly.unconfirmedReads length 0 while the node was still StateLeader; after a higher-term MsgHeartbeat deposed it to StateFollower the queue was still length 64 and unconfirmedReads still 0. The growth count equals the retry count, so neither the library nor raft.reset (which recreates readOnly but leaves the queue) bounds or clears it.",
+      "conditions": "Library defaults as built by newTestRaft without CheckQuorum (false) and with ReadOnlySafe; the environment delivers no MsgAppResp or MsgHeartbeatResp, modelling a leader partitioned from its quorum. Callers retry with the same RequestCtx, which node.go:218-224 tells them to do and does not bound. Scope: the queued path (leader has not committed in its term); the admitted path is subject to the same per-request, context-blind admission and additionally broadcasts a heartbeat per request.",
+      "source_ids": [
+        "ra_admit",
+        "ra_reset",
+        "ra_contract"
+      ],
+      "executions": {
+        "b91fd4d8638c4446a332be9849f23f70": [1, 2]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+      "experiment_id": "8e42a5752e9d454bb97823c6d38e4728-experiment",
+      "source_ids": [
+        "ra_admit",
+        "ra_reset",
+        "ra_contract"
+      ],
+      "executions": {
+        "b91fd4d8638c4446a332be9849f23f70": [1, 2]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "knowledge": [
+        {
+          "entry_id": "@K_read_pending_growth",
+          "revision": 1,
+          "assertion": "64 same-context retries accumulate 64 pending read requests and the count survives deposition"
+        },
+        {
+          "entry_id": "ee850f515b5d49718d5f55c4c1d36e61-knowledge-0",
+          "revision": 1,
+          "assertion": "admission is per request and context-blind, and released requests each trigger another admission plus a heartbeat broadcast"
+        },
+        {
+          "entry_id": "109448522bc649dea46fc5461752da53-knowledge-0",
+          "revision": 1,
+          "assertion": "raft.reset does not clear the queued read state and release requires this node to lead again and commit"
+        }
+      ],
+      "rationale": "Measured interpretation, superseding the earlier account of the same investigation that rested on native feedback. Receipt b91fd4d8638c4446a332be9849f23f70 (experiment 8e42a5752e9d454bb97823c6d38e4728-experiment) ran in the isolated workspace; status completed, outcome tests_passed, exit 0, no changed target files, no parsing errors. Decisive parsed indices: index 0 is the admission and applicability record - a real raft instance at StateLeader with term 1, committed 0, lastIndex 1, CheckQuorum false, ReadOnlySafe true and voter_count 3, which is exactly the configuration the defect conditions name; index 1 is the growth probe, rounds 64 with pending 64, unconfirmed 0 and state_after StateLeader; index 2 follows the higher-term heartbeat, with state_after StateFollower and pending_after 64, unconfirmed_after 0. The controller recorded holds for both declared comparisons (pending == 64 against admission index 0; pending_after == 64 against the same admission), each with comparison_complete true, no missing indices and no diagnostics. What that establishes: with the library defaults, a leader that cannot reach a quorum accepts one queued read request per caller retry with no collapsing, keeps growing while it stays leader, and retains the whole queue when it is deposed, so the state is bounded only by the caller's retry behaviour and is never reclaimed by the library. The defect claim stays asserted and its scope is unchanged: the complaint is the missing bound and the retention of caller-supplied request state, not the refusal to answer reads without quorum, which is correct. Conditions required, all permitted: three-voter legitimate leader; CheckQuorum false (library default; ReadOnlySafe does not require it, unlike lease-based reads); caller retrying with an identical RequestCtx, which node.go:218-224 instructs and does not bound. Counterevidence and limits considered: (a) a quorum-less leader must not answer, so nonprogress alone is not the defect; (b) the caller recreates the obligation on every retry, but with no observable signal that its request is still queued and no stated limit, the missing bound is a library-side property; (c) with a healthy quorum each retry is confirmed on the next heartbeat response, so this is not a steady-state cost; (d) the removal of context-keyed handling is the v3.7.0 stale-index fix (CHANGELOG/CHANGELOG-3.7.md, PR 397) and I do not contest it, only the absence of a size limit around it; (e) the harness delivers no responses at all, so the mechanism (not any particular network schedule) is what is measured. Severity remains explicitly unassessed: no footprint measurement, no OOM and no liveness failure is claimed, only unbounded, un-collapsed accumulation with no library-side reclamation.",
+      "limitations": [
+        "Severity is unassessed: the claim is that the library imposes no bound and never reclaims the queued state, not that a given deployment exhausts memory.",
+        "The experiment drives a direct raft FSM with no responses delivered, so the trigger (partition from quorum with CheckQuorum disabled) is modelled rather than exercised over a network.",
+        "etcd's own retry policy was not examined, so the practical retry bound in the primary downstream user is unknown.",
+        "The measured growth is the queued path; the admitted path's per-request heartbeat broadcast is source-based only, since a healthy quorum would confirm those reads."
+      ]
+    }
+  ]
+}

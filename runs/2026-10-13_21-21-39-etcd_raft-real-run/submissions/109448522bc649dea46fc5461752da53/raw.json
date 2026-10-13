@@ -1,0 +1,116 @@
+{
+  "rationale": "Reselection after the read-index ack question was explained and its defect claim refuted. The next sourced question is about a queued duty surviving an authority transition: stepLeader postpones a MsgReadIndex when the leader has not yet committed an entry in its term, and the queue is not cleared by raft.reset, so a request admitted under one leadership term can be completed under a later term of the same node. I traced whether that surviving duty can produce a read index older than what the request would have received at admission, because a stale index here would be a linearizability defect of exactly the kind the v3.7.0 read-index rewrite (CHANGELOG/CHANGELOG-3.7.md, PR 397) was meant to prevent. This is an explored negative: the release path recomputes the index from the live commit index, and every write to raftLog.committed is guarded to be non-decreasing, so no in-model path yields a stale index. I recorded the lifecycle behavior and the explained negative rather than a defect.",
+  "sources": [
+    {
+      "id": "q_admit",
+      "file": "raft.go",
+      "start_line": 1355,
+      "end_line": 1372,
+      "kind": "code_observation"
+    },
+    {
+      "id": "q_release_call",
+      "file": "raft.go",
+      "start_line": 1546,
+      "end_line": 1556,
+      "kind": "code_observation"
+    },
+    {
+      "id": "q_release_fn",
+      "file": "raft.go",
+      "start_line": 2127,
+      "end_line": 2162,
+      "kind": "code_observation"
+    },
+    {
+      "id": "q_reset",
+      "file": "raft.go",
+      "start_line": 781,
+      "end_line": 812,
+      "kind": "code_observation"
+    },
+    {
+      "id": "q_commit_mono",
+      "file": "log.go",
+      "start_line": 322,
+      "end_line": 330,
+      "kind": "code_observation"
+    },
+    {
+      "id": "q_restore_guard",
+      "file": "log.go",
+      "start_line": 463,
+      "end_line": 470,
+      "kind": "code_observation"
+    },
+    {
+      "id": "q_loadstate",
+      "file": "raft.go",
+      "start_line": 2037,
+      "end_line": 2047,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@pending_read_terms",
+      "question": "When a MsgReadIndex is postponed because the leader has not committed an entry in its term, is that queued duty eventually completed with a read index at least as large as the one the same request would have received at admission, including when the queue survives loss and later reacquisition of leadership (and when the node is deposed, removed, or restarted in between)?",
+      "source_ids": [
+        "q_admit",
+        "q_release_call",
+        "q_release_fn",
+        "q_reset",
+        "q_commit_mono",
+        "q_restore_guard",
+        "q_loadstate"
+      ],
+      "hypothesis": "The queue is not cleared by raft.reset (term or state change), so a request admitted at term T is released later, while the node is leader again at term T' > T. Release recomputes the index from the live r.raftLog.committed, and every write to raftLog.committed is non-decreasing (commitTo refuses to lower it; loadState and log restore are guarded to only raise it above the current value). The completed read index is therefore >= the committed index at admission, so the surviving duty cannot produce a stale read index.",
+      "discriminator": "Look for any site that lowers raftLog.committed after a request is queued, or any release path that reuses an index captured before admission instead of reading the live commit index. None would mean the stale-index suspicion is defeated; a lowering site or a cached-index release would revive it. Secondary: whether the queue can be released while the node is not the current leader (releasePendingReadIndexMessages is only called from the leader's MsgAppResp path and re-checks committedEntryInCurrentTerm)."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@K_pending_lifecycle",
+      "kind": "behavior",
+      "statement": "pendingReadIndexMessages lifecycle for MsgReadIndex on a leader: in stepLeader (:1355-1372) a request is answered immediately when the cluster is a singleton or when committedEntryInCurrentTerm() holds, and is otherwise appended to r.pendingReadIndexMessages without a term stamp; raft.reset (:781-812) does not clear the slice, so it survives step-downs, re-elections and being removed from the config; releasePendingReadIndexMessages (:2127-2144) is invoked only from the leader's MsgAppResp fast path after maybeCommit() returns true (:1546-1556), returns early with an error log if committedEntryInCurrentTerm() no longer holds, and otherwise swaps the slice out and passes each stored message to sendMsgReadIndexResponse, which captures the index as r.raftLog.committed at that moment (ReadOnlySafe also re-enters the addRequest/heartbeat confirmation flow for it).",
+      "conditions": "Node acts as leader; r.raftLog.committed is the only source of the read index. Commit index monotonicity holds because commitTo (:322-330) assigns only when l.committed < tocommit, log restore is reached only when the snapshot index exceeds the current committed (log.go :463-470 guard), and loadState (:2037-2047) rejects any state.commit below the current committed.",
+      "source_ids": [
+        "q_admit",
+        "q_release_call",
+        "q_release_fn",
+        "q_reset",
+        "q_commit_mono",
+        "q_restore_guard",
+        "q_loadstate"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@pending_read_terms",
+      "source_ids": [
+        "q_admit",
+        "q_release_call",
+        "q_release_fn",
+        "q_reset",
+        "q_commit_mono",
+        "q_restore_guard",
+        "q_loadstate"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "knowledge": [
+        {
+          "entry_id": "@K_pending_lifecycle",
+          "revision": 1,
+          "assertion": "the postponed read duty survives reset and is released with a freshly read, monotonically non-decreasing commit index"
+        }
+      ],
+      "rationale": "Source-only account, no retained execution (native feedback only when it could change the reading). Predicate under test: does a postponed MsgReadIndex ever get completed with a read index below its admission-time committed index after surviving an authority transition? Admission: stepLeader queues the message whenever committedEntryInCurrentTerm() is false (:1355-1372); the message carries no index and no term, so nothing about admission is cached. Survival: raft.reset (:781-812) reassigns readOnly and clears votes, progress, pendingConfIndex and uncommittedSize but never touches pendingReadIndexMessages, so the slice persists across step-down, re-election and removal; the deferral is therefore a real queued duty that outlives the leadership under which it was accepted. Completion: releasePendingReadIndexMessages is reached only from the leader's MsgAppResp path where maybeCommit() returned true (:1546-1556) and re-checks committedEntryInCurrentTerm() before acting, so release happens under current leadership in the current term; the index passed to sendMsgReadIndexResponse is r.raftLog.committed read at that moment, not a value captured earlier. Monotonicity: commitTo only assigns when l.committed < tocommit (log.go :322-330); log restore is reached only after the guard that the snapshot index exceeds the current committed (log.go :463-470); loadState panics unless state.commit is >= committed and <= lastIndex (raft.go :2037-2047); maybeAppend commits min(upstream commit, lastnewi). Hence committed never decreases across the serialized event sequence, release is strictly later than admission, and the completed index is >= the admission-time index. The suspicion of a stale read index from a surviving queue is therefore defeated in-model. Retained and still relevant: (a) the queue is deliberately not cleared, so a request queued under a term whose successor leadership never commits in term leaves the duty pending until the client's documented retry; (b) the release path is the only completion producer, so if the node never leads again the duty is never completed by this node - this matches the documented contract that ReadIndex requests can be lost and are the caller's retry responsibility, so it is a contract property rather than a defect; (c) this is a source-only conclusion, so a later retained execution would be needed to turn it into an observation. Independent uncertainty not promoted to a claim: because release recomputes the index, a request postponed under an earlier term can be answered with an index above what it needed, which is safe for linearizability but means the answered index does not identify the request's original position.",
+      "limitations": [
+        "Source-only refutation: no retained receipt exercises the queue-survives-term-change path; the argument rests on the listed guard sites being exhaustive for writes to raftLog.committed.",
+        "The monotonicity argument is stated under the library's normal serialized Step/Ready execution; it says nothing about an application that mutates Storage or HardState out of band, which is outside the target's responsibility."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "rationale": "One more check with a real safety stake fits in the remaining minutes: liveBootstrap writes the current term as one, and a node that had already adopted a higher term would be taken backwards, which is the same monotonicity violation the heartbeat regression witnesses, reached by a different door. The guard is what settles it, and it holds. liveBootstrap goes through BootstrapCluster, which refuses to proceed when HasExistingState reports state, and that function reports state as soon as the persisted current term is above zero; every term adoption in this package persists before it stores, so a node that has seen any term at all - through a vote request, an append, or its own election - cannot reach the line that writes one. The suspicion therefore does not survive, and I record the negative with its guard rather than leaving it as an unstated worry: the unconditional write is safe only because of the caller-side guard, which is worth naming since it is the kind of protection a later change could remove without noticing.",
+  "sources": [
+    {"id": "livebootstrap", "file": "raft.go", "start_line": 261, "end_line": 282, "kind": "code_observation"},
+    {"id": "bootstrapguard", "file": "api.go", "start_line": 252, "end_line": 264, "kind": "code_observation"}
+  ],
+  "knowledge": [
+    {
+      "ref": "@live_bootstrap_term_guard",
+      "kind": "behavior",
+      "statement": "liveBootstrap seeds a running node by calling BootstrapCluster and then writing the current term as one, which would take a node that had already adopted a higher term backwards. The write is protected by the caller-side guard rather than by itself: BootstrapCluster first calls HasExistingState, which reports existing state as soon as the persisted current term is above zero, and every term adoption in this package persists the term before storing it in memory, so a node that has observed any term at all - through a vote request, an append from a leader, or its own election - cannot reach that line. The unconditional write is therefore safe only because the guard refuses the call first.",
+      "conditions": "This revision, a running node calling the public BootstrapCluster or live bootstrap; the protection depends on the guard in BootstrapCluster and on setCurrentTerm persisting before it stores, so removing the guard or reversing that order would let the write lower a term.",
+      "source_ids": ["livebootstrap", "bootstrapguard"]
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@live_bootstrap_term",
+      "question": "Can live bootstrap write a current term lower than one the node has already adopted and persisted, taking it backwards the way the heartbeat interleaving can?",
+      "source_ids": ["livebootstrap", "bootstrapguard"],
+      "hypothesis": "The live bootstrap path writes the term as one unconditionally, so if it could be reached on a node that had already adopted a higher term the node would go backwards; the guard in BootstrapCluster refuses when any state exists, and a nonzero persisted term counts as state, so the path cannot be reached after any term has been observed.",
+      "discriminator": "Check whether the unconditional write has a guard and whether every writer of the term persists it: if term adoption always persists and the guard treats a nonzero persisted term as existing state, the write cannot lower it. Reading settles it, so no execution is spent."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@live_bootstrap_term",
+      "source_ids": ["livebootstrap", "bootstrapguard"],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "The suspicion was that live bootstrap could take a node's term backwards, which would be a second route to the monotonicity violation this run already witnessed through the heartbeat path. It cannot, and the reason is worth stating precisely because it is a protection rather than an absence of one: the path writes the term as one, but it does so through BootstrapCluster, which first asks whether any state exists and refuses when the persisted current term is above zero, and since every term adoption in this package persists the term before storing it in memory, there is no way to have observed a term without that guard firing. So the unconditional write is safe only in the company of the caller-side guard, and the negative is scoped to that: the claim is that the guard covers the path as the code stands, not that the write would be safe on its own. I also note the shape this shares with the finding I did record - the same invariant, the same absence of any check at the point of the write, and a different protection upstream - because that is the kind of protection a later change could remove without noticing, and naming it here is what makes the difference visible.",
+      "counterevidence": [
+        "The check is source-level: it establishes that the guard exists and that term writes persist first, not that no other entry point writes the term unconditionally.",
+        "The protection lives in the caller, so the write itself remains unguarded and would be a defect if a future caller reached it another way.",
+        "Nothing here changes the witnessed regression, which arises from concurrent writers rather than from a single unguarded write on a non-concurrent path."
+      ],
+      "limitations": [
+        "No execution: the claim rests on the guard and on the persist-before-store order in setCurrentTerm.",
+        "It covers the two entry points that write the term as part of bootstrap, not every writer of the term in the package."
+      ]
+    }
+  ]
+}

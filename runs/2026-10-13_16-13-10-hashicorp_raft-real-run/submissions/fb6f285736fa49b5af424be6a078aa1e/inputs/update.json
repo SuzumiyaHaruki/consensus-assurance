@@ -1,0 +1,55 @@
+{
+  "rationale": "The end-to-end witness for the AddVoter question completed (CheckRun 75d8b1b6b9f544acac8a3a21d02ff4e9, exit 0) and confirmed the source-decided account on a real cluster, including the availability consequence. The public AddVoter call succeeded (add_err empty, entry index 3) and both views agree the added member is a voter: the leader's latest configuration and the new node's own latest configuration both report suffrage Voter, and the configuration holds three voters. With one original voter disconnected, a command applied afterwards still committed, and the commitment arithmetic makes that decisive: with three voters and one of the original two unreachable, the quorum of two can only be satisfied if the freshly added member has the new entry, so its acknowledgement was counted. That is the exact protection the documentation promises and the implementation does not provide: the AddVoter doc comment tells a caller the server joins as a staging member promoted once it is ready, while the member counts in elections and in the leader's quorum from the entry that adds it. I recorded the observation as a fact, wrote one interpretation that now carries an execution rather than reading alone, and queued a control that keeps the harness identical but joins the node with AddNonvoter, so the same disconnect should leave no reachable majority and the command should fail to commit. That control exists to show the discriminator really separates a voting member from a non-voting one rather than the commit having come from some other path.",
+  "knowledge": [
+    {
+      "ref": "@observed_addvoter_counts_immediately",
+      "kind": "fact",
+      "statement": "On one real cluster a fresh, empty node joined through the public AddVoter call became a voting member in the entry that added it: the leader's latest configuration and the new node's own latest configuration both reported suffrage Voter with three voters in the configuration, and after one original voter was disconnected a command applied subsequently still committed, which requires the newly added member's acknowledgement because only two voters remained reachable out of the three needed for a majority of three.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(2) merged with a MakeClusterNoBootstrap(1) node and fully connected, join through the public AddVoter API with protocol version 3; one original voter disconnected through the test facility before the apply; apply waited on under a bounded interval.",
+      "source_ids": ["addvoter", "cfgaddvoter", "cfgtestaddvoter"],
+      "executions": {"75d8b1b6b9f544acac8a3a21d02ff4e9": [0]},
+      "knowledge": [
+        {
+          "entry_id": "184de281ab83410ab0d2356656267a9c-knowledge-1",
+          "revision": 1,
+          "assertion": "the AddVoter path writes Suffrage Voter into the very entry that adds the member, so no Staging state is entered and the promotion duty the doc describes is owed by nobody"
+        }
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "184de281ab83410ab0d2356656267a9c-question-1",
+      "experiment_id": "4ec0b60ba6bf4a158b1b72b0c7ca21ad-experiment",
+      "source_ids": ["addvoter", "cfgaddvoter", "cfgcommands", "cfgpromote", "cfgtestaddvoter", "stagingdoc", "stagingplaceholder"],
+      "executions": {"75d8b1b6b9f544acac8a3a21d02ff4e9": [0]},
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "The source reading said the documented staging phase does not exist because the only public path that adds a member writes a voter and nothing issues Promote; the execution now shows the consequence on a real cluster rather than only the mechanism. The join itself succeeded through the public API (add_err empty, index 3), and the member is a voter in both views - the leader's latest configuration and the new node's own configuration each report suffrage Voter, with three voters in the configuration - so the state the documentation describes is not merely unreachable in source, it is absent after the call that the documentation describes. The decisive availability operand is the apply after one original voter was disconnected: it committed, and with three voters of which one of the original two was unreachable, the majority of two cannot be assembled without the newly added member's acknowledgement, so the commit shows the fresh member counted in the leader's quorum. The documentation's promise is the opposite of that: api.go's AddVoter comment says the server is added as a staging server and promoted by the leader once it is ready, and membership.md lists catching new servers up before granting them a vote as a goal, while the command table and the unit expectations show the library intends and tests the immediate-voter behaviour. So the defect is the documented contract, not the implementation: a caller who plans around the documented staging protection has a member counting in elections and in the commitment quorum immediately, and the promotion duty the doc mentions is owed by nobody. The scope stays narrow and I keep it that way: no consensus-safety rule is broken, because a member whose log is behind cannot win an election, and the cost is availability arithmetic and caller expectations. The control I queued is what keeps this honest, since the commit could in principle have come from a path other than the new member; if the same harness with AddNonvoter also commits after the disconnect, the discriminator is wrong and this account would need rework.",
+      "counterevidence": [
+        "The commit after the disconnect is an inference about which acknowledgement satisfied the quorum: it follows from the configuration arithmetic (three voters, one unreachable, majority two) rather than from a per-server match-index trace, which is why the AddNonvoter control is queued rather than assumed.",
+        "The doc comment is prose and membership.md is a design proposal, so a reviewer may treat this as stale documentation to be corrected rather than a violated requirement; the implementation matches its unit expectations.",
+        "Consensus safety is unaffected: voters compare logs, so a member that has not caught up cannot win an election.",
+        "The disconnect was done through the test facility rather than by a real crash or partition, so the operand shows reachability as the harness models it."
+      ],
+      "limitations": [
+        "One cluster and one execution: the witness is a single join with a single disconnect, and the control is queued rather than already run.",
+        "The measured effect is about when the member counts, not about whether it caught up; the new node's last index after the run is recorded but no intermediate replication timeline was sampled."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "184de281ab83410ab0d2356656267a9c-question-1",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["addvoter", "cfgaddvoter", "cfgtestaddvoter"],
+    "scope": {
+      "description": "Control for the AddVoter suffrage witness on the same cluster shape: join a fresh, empty node with the public AddNonvoter call instead, record the suffrage the leader wrote for it and the voter count, then disconnect one original voter and record whether a command still commits - which it should not, because a majority of the remaining voters is unreachable.",
+      "assumptions": [
+        "MakeCluster(2) merged with MakeClusterNoBootstrap(1) and fully connected is the same join path the AddVoter witness used, so the only difference between the two executions is the public call that adds the node.",
+        "AddNonvoter is a supported public call at protocol version 3 and yields a member that receives log entries but holds no vote.",
+        "With one of the two original voters disconnected and the added member holding no vote, no majority of voters is reachable, so the command must not commit; a commit here would falsify the disconnect discriminator used by the witness."
+      ]
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed control test in the captured package, identical to the AddVoter witness except for the join call. It bootstraps a real two-node cluster with MakeCluster(2, t, nil) and keeps a copy of the original members, creates a fresh single-node cluster with MakeClusterNoBootstrap(1, t, nil), merges and fully connects them, takes the elected leader and the fresh node, and identifies the other original voter. The join is the public leader.AddNonvoter(newNode.localID, newNode.localAddr, 0, 5s), waited on under a bounded interval, recording add_err and the entry index. The test records the suffrage of the new member in the leader's latest configuration and the number of voters there, calls c.Disconnect on the other original voter's address, then applies one command through the public API and waits on its future under a bounded interval, recording addnonvoter_suffrage with the apply result, the waited interval, the new node's last index and the leader's state, so the control's decisive operands (suffrage, voter count, and whether the command can still commit) come from the same cluster in one execution."
+  }
+}

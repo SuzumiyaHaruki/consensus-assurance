@@ -1,0 +1,90 @@
+{
+  "rationale": "The fast-path harness ran (CheckRun d8502f6858ca421a80fe527efafffdd8, exit 0) and witnessed what the source predicted: with the node in Leader state at term 2 and the main loop provably inside its own restore handler (freeze_handshake=inside_restore_read), one empty heartbeat carrying term 3 was delivered the way a fast-path transport delivers it - synchronously to the installed handler on the caller's goroutine - and the response came back successful, while the node's term had already become 3 and its state had already become Follower at the moment of sampling, still inside the freeze window. After releasing the handler both values stayed the same and the restore returned its error, so the transition happened in that window and not by some other route. Since state and currentTerm are read and written atomically in this package, the samples are not a torn read: any goroutine can see the change, which is exactly why the mutation is visible off the main thread. What this establishes is a behaviour and an invariant violation - appendEntries is documented as main-thread-only and is executed off the main thread on a path the network transport takes for every empty heartbeat - and it does not establish harm, so I record the claim as unresolved rather than asserted: the transition itself is one Raft tolerates, the fast path deliberately excludes entries and commit-index updates so it cannot append logs, and the leading candidate for a concrete consequence (a read-modify-write on the term in the candidate path racing a higher term written off-thread, which would persist a lower term) is source-supported but not witnessed. The gap I register asks exactly that question so the next step is a consequence witness rather than a restatement of the symptom.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@heartbeat_fastpath_runs_appendentries",
+      "kind": "behavior",
+      "statement": "The network transport classifies an AppendEntries request as a heartbeat only when the term is set, a leader address is present, the previous log entry and term are zero, there are no entries and the leader commit index is zero, and it then dispatches that request synchronously to the installed handler on the connection goroutine before waiting for the response. The installed handler is Raft.processHeartbeat, which calls appendEntries; both are documented as main-thread-only, and appendEntries runs its term logic before anything about entries matters, so an empty heartbeat with a term above the node's current term calls setState(Follower) and setCurrentTerm from that goroutine. The in-memory transport's SetHeartbeatHandler is a no-op, so this path exists only for transports that implement it.",
+      "conditions": "This revision, any node whose transport implements the heartbeat fast path (for example NetworkTransport) and that has been configured through NewRaft, which installs processHeartbeat as the handler; empty heartbeats from a peer with a higher term are enough to take it.",
+      "source_ids": [
+        "netxpheartbeat",
+        "processheartbeat",
+        "appendentriesmain",
+        "inmemnosupport"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@observed_heartbeat_off_main_thread",
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance in Leader state at term 2, with its main loop provably blocked inside a handler, one empty heartbeat carrying term 3 was dispatched through a transport that installs the handler the way the network transport does and returned success, and the node's term already read 3 and its state already read Follower at the moment of sampling inside that window; both values were unchanged after the handler was released. The term adoption and the leader-to-follower transition therefore happened on the calling goroutine, not on the node's main loop.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node bootstrapped with BootstrapCluster and started with NewRaft over an in-memory transport wrapped by a local transport that fast-paths strictly empty AppendEntries requests; main loop occupied by a public Restore whose caller-supplied reader blocks on its first Read; term and state read through the package's atomic getters.",
+      "source_ids": [
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat",
+        "inmemnosupport"
+      ],
+      "executions": {
+        "d8502f6858ca421a80fe527efafffdd8": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "question": "Does the off-main-thread execution of appendEntries produce an observable harmful outcome - for example a persisted term lower than one already adopted, a term or state transition lost against a concurrent main-thread transition, or a leader acting on cleared state after the fast path flips it?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "experiment_id": "f157eb97c74f4bed855c7bd324f3879a-experiment",
+      "source_ids": [
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat",
+        "inmemnosupport"
+      ],
+      "executions": {
+        "d8502f6858ca421a80fe527efafffdd8": [
+          0
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "unresolved",
+      "rationale": "The declared discriminator asked for a term or leader-state change sampled while the main loop was provably occupied, and that is what the run reports: term_before 2 with state_before Leader, the heartbeat delivered on the caller's goroutine returning success, and term_while_loop_blocked 3 with state_while_loop_blocked Follower sampled before the handler was released, with both values unchanged afterwards. Because this package reads and writes the term and state atomically, the samples cannot be a torn read, and because the only other writer of those fields is the main loop, which was inside the restore handler at that moment, the write is attributable to the fast-path goroutine. So the behaviour is witnessed and the package's own stated invariant is violated on a path the network transport takes for every empty heartbeat, which is the part that makes it more than a curiosity: the check-marked guard keeps entries and commit-index updates out of the fast path, but it does not keep the term logic out, and that logic runs before the guard's subject matter is even consulted. What the execution does not establish is harm, and I am not going to dress the observation up as a defect: the transition it produces is one Raft tolerates, the node ends in a consistent higher term as a follower, and the callers of the node see nothing else different in the sampled operands. The concrete consequences remain candidates, not findings: an unguarded read-modify-write on the term in the candidate path would persist a lower term if a higher one is written off-thread in between, and a leader that continues its loop iteration after its state was cleared off-thread keeps acting as leader for that iteration. Both follow from the same off-main-thread execution this run witnesses, and neither is demonstrated here, so the claim stays unresolved and the gap records the question the next experiment should answer.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The observed transition is one Raft tolerates: a node adopting a higher term and becoming a follower is the normal depose path, and the end state after release was identical to the state sampled inside the window.",
+        "The fast path's classification excludes entries and the leader commit index, so the off-main-thread call cannot append log entries or advance the commit index; the exposure is confined to term, leader identity, last-contact and state.",
+        "The harness supplies the transport wrapper rather than using the real network transport, so the execution mirrors the network transport's dispatch and guard instead of exercising its socket path; the wrapper is the piece that makes the production handler reachable in-process.",
+        "This backend runs tests without the race detector, so the data-race character of the shared writes is argued from the code (plain atomic stores, no mutual exclusion around read-modify-write sequences) rather than measured."
+      ],
+      "limitations": [
+        "One node, one heartbeat, one sample: the execution witnesses that the fast path can mutate term and state off the main thread, not how often it does or under which concurrent main-thread states.",
+        "No harmful outcome was observed, and the candidate consequences listed are source-supported only; until one is witnessed, this remains an invariant violation with an open consequence question.",
+        "The frozen main loop was inside a Restore handler rather than in an election or replication step, so the run does not cover a concurrent main-thread transition racing the fast path."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,205 @@
+{
+  "id": "ef5ddbf78bd4456ea51537bd60a61a80-experiment",
+  "investigation_id": "ef5ddbf78bd4456ea51537bd60a61a80-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// restartAfterRecovery boots a single-node cluster, commits entries that\n// include the bootstrap configuration entry, then restarts the node from the\n// same on-disk state and reports the configuration the node holds in memory\n// after NewRaft returns.\n//\n// No snapshot is ever taken, so restoreSnapshot cannot supply a configuration;\n// the log is the only source of the configuration (LogStore is also the\n// CommitTrackingLogStore whose persisted commit index drives\n// restoreFromCommittedLogs).\nfunc restartAfterRecovery(t *testing.T, restoreCommittedLogs bool) {\n\tconf := inmemConfig(t)\n\tconf.RestoreCommittedLogs = restoreCommittedLogs\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 1 << 40\n\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tleader := c.Leader()\n\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply err: %v\", err)\n\t\t}\n\t}\n\n\tbeforeLatestIndex := leader.configurations.latestIndex\n\tbeforeCommittedIndex := leader.configurations.committedIndex\n\tbeforeServers := len(leader.configurations.latest.Servers)\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\n\tmode := map[bool]string{true: \"on\", false: \"off\"}[restoreCommittedLogs]\n\tsetup := map[string]interface{}{\n\t\t\"event\":                  \"startup_before_restart\",\n\t\t\"mode\":                   mode,\n\t\t\"phase\":                  \"before_restart\",\n\t\t\"restore_committed_logs\": restoreCommittedLogs,\n\t\t\"snapshots\":              len(snaps),\n\t\t\"before_latest_index\":    beforeLatestIndex,\n\t\t\"before_committed_index\": beforeCommittedIndex,\n\t\t\"before_servers\":         beforeServers,\n\t\t\"peers\":                  opts.Peers,\n\t\t\"applied_entries\":        10,\n\t}\n\tsetupBytes, err := json.Marshal(setup)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal setup: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(setupBytes))\n\n\t// Restart from the same logs/stable/snapshots stores.\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown err: %v\", err)\n\t}\n\t_, trans2 := NewInmemTransport(leader.trans.LocalAddr())\n\tcfg := leader.config()\n\trestarted, err := NewRaft(&cfg, leader.fsm, leader.logs, leader.stable, leader.snapshots, trans2)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft err: %v\", err)\n\t}\n\tc.rafts[0] = restarted\n\tdefer c.Close()\n\n\tafter := restarted.getLatestConfiguration()\n\n\tevent := map[string]interface{}{\n\t\t\"event\":                  \"restart_after_recovery\",\n\t\t\"phase\":                  \"after_restart\",\n\t\t\"mode\":                   mode,\n\t\t\"restore_committed_logs\": restoreCommittedLogs,\n\t\t\"snapshots\":              len(snaps),\n\t\t\"before_latest_index\":    beforeLatestIndex,\n\t\t\"before_committed_index\": beforeCommittedIndex,\n\t\t\"before_servers\":         beforeServers,\n\t\t\"after_latest_index\":     restarted.configurations.latestIndex,\n\t\t\"after_committed_index\":  restarted.configurations.committedIndex,\n\t\t\"after_servers\":          len(after.Servers),\n\t\t\"after_has_vote\":         hasVote(after, restarted.localID),\n\t\t\"after_quorum_size\":      restarted.quorumSize(),\n\t\t\"after_commit_index\":     restarted.getCommitIndex(),\n\t\t\"after_last_applied\":     restarted.getLastApplied(),\n\t\t\"after_last_log_index\":   restarted.getLastIndex(),\n\t}\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc TestAssuranceRestartConfigurationRecovery(t *testing.T) {\n\trestartAfterRecovery(t, true)\n\trestartAfterRecovery(t, false)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "mode_on",
+          "event": "startup_before_restart",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "on",
+              "reference": null
+            },
+            {
+              "field": "snapshots",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            },
+            {
+              "field": "before_latest_index",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "mode_off",
+          "event": "startup_before_restart",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "off",
+              "reference": null
+            },
+            {
+              "field": "snapshots",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            },
+            {
+              "field": "before_latest_index",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "api_restore_committed_call",
+      "api_restore_committed_body",
+      "config_restore_committed_doc",
+      "log_commit_tracking_iface"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Bootstrap a single-node cluster whose LogStore is a CommitTrackingLogStore, commit ten commands (leaving the bootstrap LogConfiguration at index 1 committed), shut the node down without any snapshot, restart it from the identical logs/stable/snapshots stores and emit the configuration observed immediately after NewRaft returns. Run the identical sequence twice, with Config.RestoreCommittedLogs true and false.",
+      "assumptions": [
+        "The in-memory commit-tracking store stands in for a durable CommitTrackingLogStore per the interface contract in log.go:194-219.",
+        "No snapshot is taken, so the snapshot path cannot supply a configuration.",
+        "Restarting a one-node configuration is a legal deployment of the library; the difference between the two cases is only whether restoreFromCommittedLogs advanced lastApplied."
+      ],
+      "excluded": [
+        "Whole-package or repository test suites; only the two named cases run.",
+        "Any snapshot-present scenario, which is left to the registered gap.",
+        "The separate suspicion that restoreFromCommittedLogs' processLogs call can block NewRaft before runFSM starts."
+      ],
+      "parameters": {
+        "peers": 1,
+        "applied_entries": 10,
+        "snapshots_taken": 0,
+        "modes": [
+          "on",
+          "off"
+        ]
+      }
+    },
+    "prefix": "The harness uses the package's own test facilities: inmemConfig, MakeClusterOpts{Peers:1, Bootstrap:true, CommitTrackingLogs:true} and MakeClusterCustom, so BootstrapCluster writes the LogConfiguration entry at index 1 and NewRaft runs the real startup path. SnapshotThreshold/SnapshotInterval/TrailingLogs are raised so no snapshot exists. Ten Apply calls are awaited, then the node is Shutdown and NewRaft is called again with the same logs, stable and snapshots stores and a fresh inmem transport, as the package's own restart test does. The event is emitted after NewRaft returns; no leader-dependent step is assumed at restart time. The harness first emits a startup_before_restart event describing the committed configuration index and server count observed before shutdown (the setup the result event depends on), then the restart_after_recovery result event; both events carry the same mode/phase identity so the two cases stay distinguishable.",
+    "requirement": null,
+    "responsibility": "The library owns the precondition that a node's in-memory configuration reflects the committed configuration in its own log at startup; the caller only selects Config.RestoreCommittedLogs and supplies a CommitTrackingLogStore.",
+    "comparisons": [
+      {
+        "event": "restart_after_recovery",
+        "identity_fields": [
+          "mode",
+          "phase"
+        ],
+        "admission_alias": "mode_on",
+        "assertion": {
+          "field": "after_latest_index",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "With RestoreCommittedLogs on and no snapshot, the restarted node's latest configuration index is expected to equal the committed configuration index observed before the restart (1); the defect prediction is that it is 0."
+      },
+      {
+        "event": "restart_after_recovery",
+        "identity_fields": [
+          "mode",
+          "phase"
+        ],
+        "admission_alias": "mode_on",
+        "assertion": {
+          "field": "after_has_vote",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "The restarted node's configuration is expected to contain itself as a voter; the defect prediction is that it does not."
+      },
+      {
+        "event": "restart_after_recovery",
+        "identity_fields": [
+          "mode",
+          "phase"
+        ],
+        "admission_alias": "mode_off",
+        "assertion": {
+          "field": "after_latest_index",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "restore_committed_logs",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "snapshots",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "Control: with RestoreCommittedLogs off the same restart is expected to keep the committed configuration (index 1, one voter), isolating the flagged recovery path as the cause."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "5c746d29242b4f9d86ccfda9aefed009",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "ef5ddbf78bd4456ea51537bd60a61a80",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

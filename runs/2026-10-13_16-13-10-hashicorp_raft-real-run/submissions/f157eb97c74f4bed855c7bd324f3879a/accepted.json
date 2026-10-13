@@ -1,0 +1,58 @@
+{
+  "rationale": "This turn turns the heartbeat question from a design argument into a runnable witness. The obstacle recorded last turn was that the in-memory transport no-ops SetHeartbeatHandler (inmem_transport.go:72-75), so the fast path is unreachable in every harness shape used so far. The harness therefore supplies the missing piece instead of relying on real sockets: a thin transport wrapper around the in-memory transport that stores the handler the way the network transport does and dispatches a strictly empty AppendEntries request to it on the caller's goroutine, using the same classification the network transport applies (term set, leader address present, no previous log entry, no entries, no leader commit index, from net_transport.go:675-686). That lets the question be asked without changing any production code: build one real node over that transport, let it become leader, occupy its main loop with the already validated Restore stall handshake, then deliver one empty heartbeat whose term is one above the node's current term and read the node's term and leader state while the loop is provably still inside the handler. If the term and state have already moved at that instant, appendEntries ran off the main thread, which the package says must not happen (raft.go:1415-1440); if nothing changed until the loop resumed, the suspicion is defeated. I am not asserting a defect yet: the mutation I expect is a term/state transition that Raft tolerates, so the honest endpoint for the execution is a behaviour with an invariant violation, and the consequence question stays open.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": "raft.go marks processHeartbeat and appendEntries as main-thread-only, yet api.go installs processHeartbeat as the transport's heartbeat handler; the network transport classifies a strictly empty AppendEntries request (no previous entry, no entries, no leader commit index) as a heartbeat and dispatches it from its connection goroutine. That request still runs appendEntries' term logic before anything about entries matters, so an empty heartbeat carrying a term above the node's current term calls setState(Follower) and setCurrentTerm from that goroutine, mutating state the rest of the package treats as owned by the main thread. The in-memory transport used by the test facility explicitly does not support the handler, so the path is unreachable in the harness shapes used so far; a wrapper transport that installs the handler and fast-paths empty heartbeats the way the network transport does removes that obstacle without touching production code.",
+      "discriminator": "Use a transport that implements the fast path the way the network transport does - forwarding strictly empty AppendEntries requests to the installed handler on the caller's goroutine - occupy the main loop deterministically with the already-validated Restore stall handshake, then deliver one empty heartbeat whose term is above the node's current term and read the node's term and leader state while the main loop is still inside its handler. A term or leader-state change observed inside that window witnesses off-main-thread mutation; no change, or a change only after the loop resumes, would defeat the suspicion. Queued for execution with exactly that harness.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": [],
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "processheartbeat",
+      "appendentriesmain",
+      "netxpheartbeat",
+      "inmemnosupport"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "On one real single-node Raft instance built over a transport that implements the heartbeat fast path, occupy the main loop inside a handler, deliver one empty heartbeat with a term above the node's current term, and emit one CA_EVENT JSON line recording the term and leader state sampled while the loop is still blocked, together with the heartbeat response and the states after the loop resumes.",
+      "assumptions": [
+        "The wrapper transport reproduces the network transport's classification and dispatch faithfully (term set, leader address present, zero previous entry and term, no entries, zero leader commit index) and installs the handler exactly as NewRaft expects, so the handler under test is the production processHeartbeat and the appendEntries it calls.",
+        "The freeze handshake used here is the one already validated elsewhere in this run: the caller-supplied reader's first Read proves the main loop is inside its handler, so any term or state read before releasing it cannot have been produced by the main loop.",
+        "One node bootstrapped as the only voter becomes leader on its own, so no peer traffic interferes with the sample.",
+        "A term and state change in that window is a behaviour of the fast path; whether it has a harmful consequence is a separate question, and this execution does not claim one."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test in the captured package plus two helper types it defines locally. It creates a real in-memory transport, wraps it in fastPathTransport, sets the config's LocalID to that address, bootstraps a single-voter configuration with BootstrapCluster and starts the node with NewRaft using an in-memory store, snapshot store and MockFSM, then waits (bounded) for the node to reach Leader state. It occupies the main loop by calling the public Restore with a caller-supplied reader whose first Read closes a channel and then blocks; receiving on that channel is the freeze handshake. While the loop is blocked it samples the node's term and state, builds an empty AppendEntriesRequest with a leader address and a term one above the current term, and delivers it through fastPathTransport.deliverHeartbeat, which applies the network transport's classification and invokes the installed handler on this goroutine, recording the returned success flag or error. It then samples the term and state again while the loop is still blocked, releases the reader so the occupied handler can return, records the Restore error and the states after release, prints one CA_EVENT JSON line with all operands, and shuts the node down.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

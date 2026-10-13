@@ -1,0 +1,60 @@
+{
+  "id": "07b73952c24749f9a57c8fa1603e4d72-experiment",
+  "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// fastPathTransport forwards everything to an in-memory transport but, like the\n// network transport, installs and honours a heartbeat handler: a strictly empty\n// AppendEntries request is dispatched to that handler on the caller's goroutine\n// and the response comes back on the supplied channel.\ntype fastPathTransport struct {\n\t*InmemTransport\n\n\thbLock sync.Mutex\n\thbFn   func(RPC)\n}\n\nfunc (t *fastPathTransport) SetHeartbeatHandler(cb func(RPC)) {\n\tt.hbLock.Lock()\n\tt.hbFn = cb\n\tt.hbLock.Unlock()\n}\n\nfunc (t *fastPathTransport) deliverHeartbeat(req *AppendEntriesRequest, wait time.Duration) (*AppendEntriesResponse, error) {\n\tt.hbLock.Lock()\n\tfn := t.hbFn\n\tt.hbLock.Unlock()\n\tif fn == nil {\n\t\treturn nil, fmt.Errorf(\"no heartbeat handler installed\")\n\t}\n\tif !(req.Term != 0 && req.RPCHeader.Addr != nil &&\n\t\treq.PrevLogEntry == 0 && req.PrevLogTerm == 0 &&\n\t\tlen(req.Entries) == 0 && req.LeaderCommitIndex == 0) {\n\t\treturn nil, fmt.Errorf(\"request would not be classified as a heartbeat\")\n\t}\n\trespCh := make(chan RPCResponse, 1)\n\tfn(RPC{Command: req, RespChan: respCh})\n\tselect {\n\tcase r := <-respCh:\n\t\tif r.Error != nil {\n\t\t\treturn nil, r.Error\n\t\t}\n\t\tresp, ok := r.Response.(*AppendEntriesResponse)\n\t\tif !ok {\n\t\t\treturn nil, fmt.Errorf(\"unexpected heartbeat response type\")\n\t\t}\n\t\treturn resp, nil\n\tcase <-time.After(wait):\n\t\treturn nil, fmt.Errorf(\"no response within %s\", wait)\n\t}\n}\n\n// TestAssurance_TermRegressionNaturalTiming asks how often the interleaving\n// behind the durable term regression happens on its own, with no instrumented\n// store holding anything open: the node is kept cycling between being deposed\n// by empty heartbeats and starting its own election, while the heartbeat stream\n// continues, and the term is sampled continuously for a fall below the highest\n// term the node has already adopted. Any fall observed here is a monotonicity\n// violation under natural timing; no fall in the window bounds the rate rather\n// than refuting the mechanism.\nfunc TestAssurance_TermRegressionNaturalTiming(t *testing.T) {\n\taddr, itrans := NewInmemTransport(\"\")\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(addr)\n\ttrans := &fastPathTransport{InmemTransport: itrans}\n\tstore := NewInmemStore()\n\tsnaps := NewInmemSnapshotStore()\n\tfsm := &MockFSM{}\n\tconfiguration := Configuration{Servers: []Server{{\n\t\tSuffrage: Voter,\n\t\tID:       ServerID(addr),\n\t\tAddress:  addr,\n\t}}}\n\n\tif err := BootstrapCluster(conf, store, store, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tnode, err := NewRaft(conf, fsm, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\n\tlimit := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(limit) && node.getState() != Leader {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tpeerAddr := trans.EncodePeer(ServerID(\"peer-1\"), ServerAddress(\"peer-1\"))\n\tnewHeartbeat := func(term uint64) *AppendEntriesRequest {\n\t\treturn &AppendEntriesRequest{\n\t\t\tRPCHeader: RPCHeader{\n\t\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\t\tID:              []byte(\"peer-1\"),\n\t\t\t\tAddr:            peerAddr,\n\t\t\t},\n\t\t\tTerm:   term,\n\t\t\tLeader: peerAddr,\n\t\t}\n\t}\n\n\tmaxAdopted := node.getCurrentTerm()\n\tdeliveries := 0\n\tfailed := 0\n\tsamples := 0\n\tfalls := 0\n\tfirstFall := \"\"\n\tdeadline := time.Now().Add(6 * time.Second)\n\n\tfor time.Now().Before(deadline) {\n\t\t// Let an election start: stop pushing for about one election interval.\n\t\ttime.Sleep(60 * time.Millisecond)\n\t\t// Then push a short burst of heartbeats, each a few terms higher, which\n\t\t// is when a write can land inside an election's read-modify-write.\n\t\tfor i := 0; i < 12 && time.Now().Before(deadline); i++ {\n\t\t\tterm := node.getCurrentTerm()\n\t\t\tdeliveries++\n\t\t\tif resp, err := trans.deliverHeartbeat(newHeartbeat(term+3), 2*time.Second); err == nil && resp.Success {\n\t\t\t\tif adopted := node.getCurrentTerm(); adopted > maxAdopted {\n\t\t\t\t\tmaxAdopted = adopted\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tfailed++\n\t\t\t}\n\t\t\tcur := node.getCurrentTerm()\n\t\t\tsamples++\n\t\t\tif cur > maxAdopted {\n\t\t\t\tmaxAdopted = cur\n\t\t\t}\n\t\t\tif cur < maxAdopted {\n\t\t\t\tfalls++\n\t\t\t\tif firstFall == \"\" {\n\t\t\t\t\tfirstFall = fmt.Sprintf(\"adopted=%d observed=%d after %d deliveries\", maxAdopted, cur, deliveries)\n\t\t\t\t}\n\t\t\t}\n\t\t\ttime.Sleep(2 * time.Millisecond)\n\t\t}\n\t}\n\n\tfinalTerm := node.getCurrentTerm()\n\tfinalState := node.getState().String()\n\tpersisted, _ := store.GetUint64(keyCurrentTerm)\n\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"term_regression_natural\\\",\\\"node_addr\\\":%q,\\\"deliveries\\\":%d,\"+\n\t\t\"\\\"failed_deliveries\\\":%d,\\\"samples\\\":%d,\\\"falls\\\":%d,\\\"first_fall\\\":%q,\"+\n\t\t\"\\\"max_adopted\\\":%d,\\\"final_term\\\":%d,\\\"final_persisted\\\":%d,\\\"final_state\\\":%q}\\n\",\n\t\tstring(addr), deliveries, failed, samples, falls, firstFall,\n\t\tmaxAdopted, finalTerm, persisted, finalState)\n\n\t_ = node.Shutdown().Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "electself",
+      "processheartbeat",
+      "appendentriesmain",
+      "netxpheartbeat"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Natural-timing probe for the term-regression interleaving: on a real single-node cluster with no instrumented store, cycle the node between being deposed by empty heartbeats and starting its own election while continuing to deliver heartbeats, sample the term continuously, and emit one CA_EVENT JSON line counting deliveries, samples, failures and falls together with the highest adopted term and the final term, persisted term and state.",
+      "assumptions": [
+        "The node is a single voter, so every election it starts is winnable and every depose is real, which keeps the cycles frequent without peers.",
+        "The term only ever increases in this implementation unless the off-thread write overwrites a higher one, so a sampled term below the highest adopted term is a monotonicity violation rather than a legitimate decrease.",
+        "Deliveries, not elapsed time, are the denominator of the rate: a window a microsecond wide cannot be expected to be hit in a short probe, so an observed zero bounds the rate at that delivery count and does not refute the mechanism.",
+        "The heartbeat that triggers the off-thread write comes from the harness wrapper, which mirrors the network transport's classification and dispatch rather than exercising its socket path."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test plus the local transport wrapper it shares with the other fast-path experiments. It creates an in-memory transport, wraps it so strictly empty AppendEntries requests are dispatched to the installed handler on the caller's goroutine with a bounded response wait, bootstraps a single-voter configuration with BootstrapCluster and starts the node with NewRaft over a plain in-memory store, snapshot store and MockFSM, then waits (bounded) for Leader state. It records the highest adopted term as the node's term at that point, then loops for six seconds: it sleeps about one election interval so the node can start an election, then delivers a short burst of empty heartbeats, each three terms above the node's current term, spaced a couple of milliseconds apart. After each delivery it reads the node's term and raises the highest adopted term when the node has moved up, and counts a fall whenever the sampled term is below the highest adopted term, recording the first such fall with its operands. It finishes by printing one CA_EVENT JSON line with the delivery count, failure count, sample count, fall count, the first fall, the highest adopted term, the final term, the persisted term and the node's final state, then shuts the node down.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "09193ea9b7ee4df99810e6eee7058028",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "07b73952c24749f9a57c8fa1603e4d72",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

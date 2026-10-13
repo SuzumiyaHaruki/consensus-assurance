@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 
 
@@ -119,9 +119,6 @@ class Material(Record):
     content_digest: str
 
 
-ActivityClass = Literal["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
-
-
 class KnowledgeUse(Record):
     entry_id: str
     revision: int = Field(ge=1)
@@ -143,6 +140,11 @@ class Gap(Record):
     operation_id: str
 
 
+class GapAnswer(Record):
+    explanation: str = Field(min_length=1)
+    resolved: StrictBool
+
+
 class Investigation(Record):
     id: str
     version: int = 1
@@ -153,8 +155,6 @@ class Investigation(Record):
     disposition: Literal["active", "paused", "explained", "closed"] = "active"
     parent_id: str | None = None
     knowledge: list[KnowledgeUse] = []
-    counterevidence: list[str] = []
-    limitations: list[str] = []
     resume_conditions: list[str] = []
     gaps: list[Gap] = []
     history: list[dict] = []
@@ -183,7 +183,7 @@ class Interpretation(Record):
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
     defect_claim: Literal["asserted", "refuted", "unresolved"] | None = None
     rationale: str = Field(min_length=1)
-    answers: dict[str, str | None] = {}
+    answers: dict[str, GapAnswer] = {}
     knowledge: list[KnowledgeUse] = []
     counterevidence: list[str] = []
     limitations: list[str] = []

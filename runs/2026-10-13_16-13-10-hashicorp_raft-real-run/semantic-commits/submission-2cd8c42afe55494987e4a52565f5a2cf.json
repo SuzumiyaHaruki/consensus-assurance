@@ -1,0 +1,342 @@
+{
+  "input": {
+    "rationale": "One more source-decided check with real safety weight, found while following the same handler's neighbourhood: the leader verification path counts acknowledgements from every replication state the leader keeps, and the leader keeps one for non-voting members too, while the quorum size it compares against counts voters only. That means a leader that has lost contact with the majority of voters can still pass a verification as long as it can reach enough non-voting members, and VerifyLeader is documented as the guard against returning stale data after losing leadership, so a read-after-write pattern built on it can go through in that window. I checked the election path for the same mistake and it is not there: electSelf asks only voters. The finding is decidable by reading - the registration loop does not filter by suffrage and the vote counter does not either - so I record it with both paths cited, state the scope and the bound honestly (the leader-lease check counts voters only and will step the leader down within the lease interval, so the window is bounded rather than indefinite), and I do not claim that this defeats the majority rule for agreement itself, only that the verification result does not establish what its documentation implies.",
+    "sources": [
+      {
+        "id": "verifyleader",
+        "file": "raft.go",
+        "start_line": 965,
+        "end_line": 987,
+        "kind": "code_observation"
+      },
+      {
+        "id": "replnotifyall",
+        "file": "replication.go",
+        "start_line": 100,
+        "end_line": 111,
+        "kind": "code_observation"
+      },
+      {
+        "id": "quorumsize",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation"
+      },
+      {
+        "id": "replstart",
+        "file": "raft.go",
+        "start_line": 587,
+        "end_line": 614,
+        "kind": "code_observation"
+      },
+      {
+        "id": "checklease",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1081,
+        "kind": "code_observation"
+      },
+      {
+        "id": "verifyvote",
+        "file": "future.go",
+        "start_line": 274,
+        "end_line": 293,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@verify_quorum_suffrage",
+        "question": "Does a leader verification establish that a majority of the voters can be reached, or can acknowledgements from members that hold no vote satisfy it?",
+        "source_ids": [
+          "verifyleader",
+          "replnotifyall",
+          "quorumsize",
+          "replstart",
+          "verifyvote",
+          "checklease"
+        ],
+        "hypothesis": "The verification target is the voter quorum, but the set of possible acknowledgements is the leader's whole replication state, which includes non-voting members; nothing filters by suffrage on either side, so a leader that can reach only non-voters can satisfy the verification while a majority of voters is unreachable.",
+        "discriminator": "Compare the set the votes come from with the set the target is computed over: if the acknowledgement set is strictly larger than the voter set and the counter does not filter, the verification can succeed without a voter majority; and check the same pattern on the election path, where electSelf asks only voters, to see whether the exposure is specific to verification. Reading settles it, so no execution is spent.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": null,
+        "limitations": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@verifyquorum_counts_nonvoters",
+        "kind": "behavior",
+        "statement": "verifyLeader counts the leader itself as one vote and sets the target to quorumSize, which counts voters only, and then registers the verification future on every entry of the leader's replication state; that state holds one entry per member of the latest configuration other than the local node, non-voting members included, because startStopReplication creates entries for all of them. Each heartbeat acknowledgement runs notifyAll, which calls vote on every registered future, and vote increments the count towards the target without checking the acknowledging member's suffrage. Acknowledgements from non-voting members therefore count towards a leader verification.",
+        "conditions": "This revision, any leader whose latest configuration contains non-voting members, when VerifyLeader is called or another caller uses the verification to guard a read.",
+        "source_ids": [
+          "verifyleader",
+          "replnotifyall",
+          "quorumsize",
+          "replstart",
+          "verifyvote"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "@verify_quorum_suffrage",
+        "experiment_id": null,
+        "source_ids": [
+          "verifyleader",
+          "replnotifyall",
+          "quorumsize",
+          "replstart",
+          "verifyvote",
+          "checklease",
+          "electself"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The verification counts votes from a strictly larger set than the set its target is computed over, and nothing in between filters them. verifyLeader starts the count at one for the leader and sets the target to quorumSize, which counts voters only; it then registers the verification on every entry of the leader's replication state, and that state has one entry per member of the latest configuration except the local node, because startStopReplication creates entries for every server in the latest configuration and skips only the node itself - a non-voting member is replicated to and heartbeated exactly like a voter. When a heartbeat is acknowledged, notifyAll hands the ack to every registered verification and vote increments the count without asking what suffrage that member holds, so with a three-voter configuration plus any number of non-voters, the leader's own vote plus one acknowledgement from a non-voter reaches a target of two while both other voters may be unreachable. That matters because the verification is the guard the documentation offers against serving stale data after losing leadership: a caller that verifies before reading can be told the node is still leader when a majority of the voters cannot be reached, which is exactly the condition the guard is meant to detect. The scope is the verification result and what it establishes, not the agreement rule: elections are unaffected because electSelf asks voters only for votes, commitment is unaffected because the commitment counts voter match indexes, and the leader-lease check counts voters only and will step this leader down within the lease interval, so the exposure is a bounded window rather than an indefinite false positive. I also note where the countermeasure already exists in the code: the lease check computes reachability over voters, which is precisely the filter the verification lacks.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The window is bounded: checkLeaderLease counts only voters and steps the leader down once fewer than a quorum of voters has been heard from within the lease interval, so the false positive cannot persist indefinitely.",
+          "A non-voter acknowledgement is a genuine response from a member the leader is configured to replicate to, so the defect is not that the acknowledgement is invalid but that it is used as evidence about a different set than the target describes.",
+          "The exposure requires a configuration with non-voting members and a leader that can reach them while it cannot reach a voter majority, which is a specific topology rather than the default.",
+          "This is a source finding with no execution behind it; it rests on the sizes of the two sets and the absence of a suffrage check, which is a claim about code structure rather than about an observed verification."
+        ],
+        "limitations": [
+          "No execution: the account is decidable by reading and was recorded as such rather than turned into a multi-node partition test.",
+          "The claim is about what a successful verification establishes, not about the correctness of agreement, which the election and commitment paths compute over voters.",
+          "The size of the practical window is set by the lease interval and by how quickly the leader notices it has lost the voter majority, neither of which this record measures."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "2cd8c42afe55494987e4a52565f5a2cf",
+      "result": {
+        "submission": "update.json",
+        "summary": "The record is complete and the run is at its total budget, so I am submitting the draft unchanged rather than manufacturing a new revision. To state where it stands: the captured tree is byte-identical to the released upstream copy of the same revision, so every finding is genuine rather than injected. Seven behaviours or defects are recorded with their evidence. Witnessed with receipts: the public configuration index is a constant zero while the main thread holds the real index, and a caller passing that zero back as prevIndex silently disables the documented compare-and-swap precondition; an accepted Apply or Barrier duty has no completion path once the node is shut down with its work still in the buffered apply channel; an explicit leadership transfer to a member that holds no vote is reported as success while moving authority nowhere and costing an extra term; the AddVoter documentation promises a staging phase with a later promotion that the implementation never enters; and the transport heartbeat fast path runs appendEntries off the main thread, where an empty heartbeat can flip term and leader state and can silently overwrite a higher term the node had already adopted and persisted, a regression witnessed twice, causally separated from its instrumentation by a control, and bounded by two uninstrumented probes at zero falls in 792 and 768 deliveries. Settled by reading with their limits stated: the fast path never runs the protocol and header gate that every other RPC path enforces, so a message the node would reject as unsupported still takes effect as a heartbeat; and the leader verification counts acknowledgements from members that hold no vote towards a target computed over voters only, so a leader that has lost the voter majority can still verify while it can reach non-voters, with the lease check that counts voters only as the bound. Two suspicions were resolved against themselves and are recorded as such: the log cache cannot diverge from a pointer-keeping store under in-tree producers, and the earlier phrasing that a transport close always releases the parked heartbeat waiter was corrected because the in-memory transport never signals its shutdown channel. One necessary question remains open and is registered precisely: whether the regression arises under natural timing when the heartbeat write is fast and the election write is delayed or contended, which is the ordering the gate produced deliberately and which equal-latency probes could not."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-031156ce4e3d4bf5a8845619024ff0c4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-031156ce4e3d4bf5a8845619024ff0c4.json"
+      },
+      "submission-6622393da5e94b6c9ea4b39a0f8f7a41": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-6622393da5e94b6c9ea4b39a0f8f7a41.json"
+      },
+      "submission-f2c2b4e0415449d4941c8e53ffbc722e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f2c2b4e0415449d4941c8e53ffbc722e.json"
+      },
+      "submission-721c1688d0604614841236bb40a995b2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-721c1688d0604614841236bb40a995b2.json"
+      },
+      "submission-e847bfa0cb1b455db00f2364d7eb1610": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-e847bfa0cb1b455db00f2364d7eb1610.json"
+      },
+      "submission-b1ef67e81473491cb1f7a33a992bc8dd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-b1ef67e81473491cb1f7a33a992bc8dd.json"
+      },
+      "submission-184de281ab83410ab0d2356656267a9c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-184de281ab83410ab0d2356656267a9c.json"
+      },
+      "submission-4ec0b60ba6bf4a158b1b72b0c7ca21ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-4ec0b60ba6bf4a158b1b72b0c7ca21ad.json"
+      },
+      "submission-fb6f285736fa49b5af424be6a078aa1e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-fb6f285736fa49b5af424be6a078aa1e.json"
+      },
+      "submission-6aac0bc06d4247569a2bff46e6398a94": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-6aac0bc06d4247569a2bff46e6398a94.json"
+      },
+      "submission-f157eb97c74f4bed855c7bd324f3879a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f157eb97c74f4bed855c7bd324f3879a.json"
+      },
+      "submission-6d7c2649900545d2b4979698753f4e4c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-6d7c2649900545d2b4979698753f4e4c.json"
+      },
+      "submission-a3e037c016ac4e2f976d62b3165916ce": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-a3e037c016ac4e2f976d62b3165916ce.json"
+      },
+      "submission-db6aa620cc2142739c6c9c8c5111d110": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-db6aa620cc2142739c6c9c8c5111d110.json"
+      },
+      "submission-192609798d744832b3cfd702dfd1c5bd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-192609798d744832b3cfd702dfd1c5bd.json"
+      },
+      "submission-e587e860b8e84d64b7e2ea4522366190": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-e587e860b8e84d64b7e2ea4522366190.json"
+      },
+      "submission-79724bae615546ce96aefda18241d7dc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-79724bae615546ce96aefda18241d7dc.json"
+      },
+      "submission-bbc429445e5e4fe4bbafbdac97bd0499": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-bbc429445e5e4fe4bbafbdac97bd0499.json"
+      },
+      "submission-2af212ef27604f349c87db85c5f2195f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2af212ef27604f349c87db85c5f2195f.json"
+      },
+      "submission-f8d39fe5edeb4560919d7100c0918db3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f8d39fe5edeb4560919d7100c0918db3.json"
+      },
+      "submission-33e9903cc4eb4bc0bd6fb3cbba195f2a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-33e9903cc4eb4bc0bd6fb3cbba195f2a.json"
+      },
+      "submission-9c6ad2b4ce934f088e779104a72e950e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-9c6ad2b4ce934f088e779104a72e950e.json"
+      },
+      "submission-01d042310b9c416c8dc8c2b94ab283fe": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-01d042310b9c416c8dc8c2b94ab283fe.json"
+      },
+      "submission-07b73952c24749f9a57c8fa1603e4d72": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-07b73952c24749f9a57c8fa1603e4d72.json"
+      },
+      "submission-2aa9e9b7af1840e9b90e8ceced03c800": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2aa9e9b7af1840e9b90e8ceced03c800.json"
+      },
+      "submission-f45fd8d956f54afcbcb5b9a5f6ae8a4b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f45fd8d956f54afcbcb5b9a5f6ae8a4b.json"
+      },
+      "submission-85a4d561bce74d35bb162097279446e8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-85a4d561bce74d35bb162097279446e8.json"
+      },
+      "submission-83111bbe058e4ca8b3e10d1d24593da6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-83111bbe058e4ca8b3e10d1d24593da6.json"
+      },
+      "submission-925ed222d83145a083d0c0bf263bd1c1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-925ed222d83145a083d0c0bf263bd1c1.json"
+      },
+      "submission-2cfc284531344e89a4293b449089c945": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2cfc284531344e89a4293b449089c945.json"
+      }
+    }
+  },
+  "after": {
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "2cd8c42afe55494987e4a52565f5a2cf",
+      "action": "update",
+      "no_change": true,
+      "references": {
+        "@verifyquorum_counts_nonvoters": "2cfc284531344e89a4293b449089c945-knowledge-0",
+        "@verify_quorum_suffrage": "2cfc284531344e89a4293b449089c945-question-0"
+      }
+    },
+    "applied_operations": {
+      "submission-031156ce4e3d4bf5a8845619024ff0c4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-031156ce4e3d4bf5a8845619024ff0c4.json"
+      },
+      "submission-6622393da5e94b6c9ea4b39a0f8f7a41": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-6622393da5e94b6c9ea4b39a0f8f7a41.json"
+      },
+      "submission-f2c2b4e0415449d4941c8e53ffbc722e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f2c2b4e0415449d4941c8e53ffbc722e.json"
+      },
+      "submission-721c1688d0604614841236bb40a995b2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-721c1688d0604614841236bb40a995b2.json"
+      },
+      "submission-e847bfa0cb1b455db00f2364d7eb1610": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-e847bfa0cb1b455db00f2364d7eb1610.json"
+      },
+      "submission-b1ef67e81473491cb1f7a33a992bc8dd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-b1ef67e81473491cb1f7a33a992bc8dd.json"
+      },
+      "submission-184de281ab83410ab0d2356656267a9c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-184de281ab83410ab0d2356656267a9c.json"
+      },
+      "submission-4ec0b60ba6bf4a158b1b72b0c7ca21ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-4ec0b60ba6bf4a158b1b72b0c7ca21ad.json"
+      },
+      "submission-fb6f285736fa49b5af424be6a078aa1e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-fb6f285736fa49b5af424be6a078aa1e.json"
+      },
+      "submission-6aac0bc06d4247569a2bff46e6398a94": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-6aac0bc06d4247569a2bff46e6398a94.json"
+      },
+      "submission-f157eb97c74f4bed855c7bd324f3879a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f157eb97c74f4bed855c7bd324f3879a.json"
+      },
+      "submission-6d7c2649900545d2b4979698753f4e4c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-6d7c2649900545d2b4979698753f4e4c.json"
+      },
+      "submission-a3e037c016ac4e2f976d62b3165916ce": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-a3e037c016ac4e2f976d62b3165916ce.json"
+      },
+      "submission-db6aa620cc2142739c6c9c8c5111d110": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-db6aa620cc2142739c6c9c8c5111d110.json"
+      },
+      "submission-192609798d744832b3cfd702dfd1c5bd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-192609798d744832b3cfd702dfd1c5bd.json"
+      },
+      "submission-e587e860b8e84d64b7e2ea4522366190": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-e587e860b8e84d64b7e2ea4522366190.json"
+      },
+      "submission-79724bae615546ce96aefda18241d7dc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-79724bae615546ce96aefda18241d7dc.json"
+      },
+      "submission-bbc429445e5e4fe4bbafbdac97bd0499": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-bbc429445e5e4fe4bbafbdac97bd0499.json"
+      },
+      "submission-2af212ef27604f349c87db85c5f2195f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2af212ef27604f349c87db85c5f2195f.json"
+      },
+      "submission-f8d39fe5edeb4560919d7100c0918db3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f8d39fe5edeb4560919d7100c0918db3.json"
+      },
+      "submission-33e9903cc4eb4bc0bd6fb3cbba195f2a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-33e9903cc4eb4bc0bd6fb3cbba195f2a.json"
+      },
+      "submission-9c6ad2b4ce934f088e779104a72e950e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-9c6ad2b4ce934f088e779104a72e950e.json"
+      },
+      "submission-01d042310b9c416c8dc8c2b94ab283fe": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-01d042310b9c416c8dc8c2b94ab283fe.json"
+      },
+      "submission-07b73952c24749f9a57c8fa1603e4d72": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-07b73952c24749f9a57c8fa1603e4d72.json"
+      },
+      "submission-2aa9e9b7af1840e9b90e8ceced03c800": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2aa9e9b7af1840e9b90e8ceced03c800.json"
+      },
+      "submission-f45fd8d956f54afcbcb5b9a5f6ae8a4b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-f45fd8d956f54afcbcb5b9a5f6ae8a4b.json"
+      },
+      "submission-85a4d561bce74d35bb162097279446e8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-85a4d561bce74d35bb162097279446e8.json"
+      },
+      "submission-83111bbe058e4ca8b3e10d1d24593da6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-83111bbe058e4ca8b3e10d1d24593da6.json"
+      },
+      "submission-925ed222d83145a083d0c0bf263bd1c1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-925ed222d83145a083d0c0bf263bd1c1.json"
+      },
+      "submission-2cfc284531344e89a4293b449089c945": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2cfc284531344e89a4293b449089c945.json"
+      },
+      "submission-2cd8c42afe55494987e4a52565f5a2cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_16-13-10-hashicorp_raft-real-run/semantic-commits/submission-2cd8c42afe55494987e4a52565f5a2cf.json"
+      }
+    }
+  }
+}

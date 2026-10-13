@@ -1,0 +1,128 @@
+{
+  "rationale": "The explicit-transfer harness completed on a clean copy (CheckRun 2b61659461634c04b53ec61c35541227, exit 0) and its single parsed event answers the open question with a mixed result that needs to be stated precisely. The named target really held no vote (target_suffrage=Nonvoter) and the caller's future reported success (transfer_err empty), yet the named target never reached Leader during the window (target_ever_leader=false) and ended as Follower; the cluster's maximum term moved from 2 to 4 and the only server seen leading was the original leader, which is in Leader state at the end. So the request was accepted and reported as done while the authority it was supposed to move did not move to the named server, and the cluster paid two term advances for it. The impossibility of the target winning is source-fixed rather than window-dependent: electSelf casts a self-vote only for a server whose Suffrage is Voter (raft.go:2015-2040), voters reject a RequestVote from a member that holds no vote (raft.go:1678-1684), and only voters ever start elections (raft.go:242-250); the TimeoutNow handler sets Candidate and the transfer flag without checking suffrage (raft.go:2209-2214), and the candidate loop then skips pre-vote and runs a real election (raft.go:294-300). What remains weaker than the rest is attribution of the term movement to the campaign itself, because this execution has no same-window control: that is what the newly queued control case addresses by running the identical transfer path with a voter as the target. I record the witnessed fact, answer the gap, assert the scoped defect, and keep the attribution gap visible rather than smoothing it over.",
+  "sources": [
+    {
+      "id": "xferrespond",
+      "file": "raft.go",
+      "start_line": 691,
+      "end_line": 759,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "721c1688d0604614841236bb40a995b2-question-1",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": "LeadershipTransferToServer forwards the caller's id and address to the transfer routine, which only requires a replication state for that server, so a vote-less member is accepted as a target. On that target the TimeoutNow handler sets Candidate and the leadership-transfer flag unconditionally and the candidate loop skips pre-vote because of that flag, so the target runs a real election at term+1; but electSelf casts a self-vote only when the local server is a Voter in the latest configuration, and voters receiving a RequestVote from a member that holds no vote reject it - after already adopting the higher term. The requested transfer is therefore unachievable: the named target can never win, while its higher-term vote request deposes the sitting leader, and the caller's future is answered without error because losing leadership during a transfer is reported as success. Observed on one real cluster: the named non-voter never led, the caller's future reported no error, and the term advanced from 2 to 4 with the original leader holding leadership again at the end.",
+      "discriminator": "Demote one real follower to a non-voter through the public API, then call LeadershipTransferToServer on that member and sample the real nodes for a bounded interval: whether the named target ever reaches Leader, which servers do lead, whether the original leader still leads at the end, the reported transfer error, and the term before and after. Executed: target_ever_leader=false, transfer_err empty (reported success), term 2 -> 4, and the original leader in Leader state at the end. The named target reaching Leader would have defeated the suspicion; it did not.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@observed_transfer_to_voteless_target",
+      "kind": "fact",
+      "statement": "On one real four-node cluster whose named transfer target held no vote (target_suffrage=Nonvoter), LeadershipTransferToServer returned a future reporting no error, the named target never reached Leader in the 3 s observation window and ended in state Follower, the maximum cluster term advanced from 2 to 4, and the only server observed leading was the original leader, which was in Leader state at the end. The requested transfer of authority to the named server therefore did not take effect and was not reported as a failure.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; MakeCluster(4) with the target demoted by a committed DemoteVoter in the same run; target chosen from nodes in Follower state and still replicated to by the leader; Observation window 3 s, sampled every 20 ms.",
+      "source_ids": [
+        "xferapi",
+        "timeoutnow",
+        "xferprevoteskip",
+        "electself",
+        "requestvoteorder",
+        "xferrespond"
+      ],
+      "executions": {
+        "2b61659461634c04b53ec61c35541227": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "721c1688d0604614841236bb40a995b2-question-1",
+      "experiment_id": "721c1688d0604614841236bb40a995b2-experiment",
+      "source_ids": [
+        "xferapi",
+        "timeoutnow",
+        "xferprevoteskip",
+        "electself",
+        "requestvoteorder",
+        "pickserver",
+        "followervotegate",
+        "xferrespond"
+      ],
+      "executions": {
+        "2b61659461634c04b53ec61c35541227": [
+          0
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "The declared discriminator resolved against the harmless reading: the named target never reached Leader, so the transfer did not accomplish what the API call names. The decisive operands from that one execution are target_suffrage=Nonvoter (the target really held no vote, confirmed from the leader's latest configuration), transfer_err empty (the caller was told the transfer was not a failure), target_ever_leader=false with target_state_at_end=Follower, leaders_seen containing only the original leader, and term_before=2 to term_after=4. The impossibility is source-fixed and independent of the window: a server without a vote has no self-vote in electSelf (a vote is cast only when the iterated server's Suffrage is Voter, raft.go:2015-2040), voters reject its RequestVote after the term adoption that precedes the rejection (raft.go:1664-1684), and a non-voter never starts an election on its own (raft.go:242-250) - so no vote-less member can ever be elected in this revision, and the explicit transfer path accepted one anyway because it only looks for a replication state (raft.go:765-783). The cost side is what the term movement shows: the transfer candidate ran a real election (TimeoutNow sets Candidate and the transfer flag, raft.go:2209-2214, and that flag suppresses pre-vote in the candidate loop, raft.go:294-300), voters adopted the higher term and stepped down before rejecting, and with the term at 4 the sitting leader at term 2 cannot still have been leader, so leadership was lost and had to be re-won. The asymmetry with the implicit path, which deliberately skips non-voters when picking a server (raft.go:2163-2182), shows the explicit input is accepted where the implicit path would have refused it. The report to the caller is the part that turns this from an operator mistake into a defect of the library: the transfer case answers nil when leadership is lost during a transfer because that is the expected outcome (raft.go:734-739), so a caller that named a vote-less server receives the same success signal as a caller whose transfer worked, and cannot tell that authority never reached the named node.",
+      "answers": {
+        "721c1688d0604614841236bb40a995b2-gap-2": "No: the named vote-less target never acquired leadership (target_ever_leader=false over the 3 s window, ending in state Follower) while the caller's future reported no error (transfer_err empty), and the cluster's maximum term advanced from 2 to 4 with the original leader in Leader state at the end (CheckRun 2b61659461634c04b53ec61c35541227, parsed event 0). Source shows the negative is structural: a non-voter gets no self-vote and voters reject its request."
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "This execution contains no same-window control, so the term advance is attributed to the transfer campaign on the source argument that a Leader never campaigns itself and that a voter adopts a higher term before rejecting it; the control just queued (same path, voter target) separates 'the mechanism does not work here' from 'the mechanism works and a vote-less target cannot take the leadership', but it does not by itself exclude spontaneous election noise in a 3 s window.",
+        "The end state is the same as the start (the original leader leads again), so a caller that inspects only who leads afterwards sees no damage; the observed harm is the term movement and the inferred loss of leadership in between, not a lasting loss.",
+        "The target's vote was removed by the caller's own previous API call in the same run, so this is not a case where the library silently mis-states an operator-managed configuration; the operator asked for the demotion, then asked for a transfer to the demoted node."
+      ],
+      "limitations": [
+        "Single execution and a single target; the claim that a vote-less member can never win rests on the election code paths above, not on repeated runs.",
+        "The caller's success value is explained by the lost-leadership branch (raft.go:734-739); the same CheckRun's DEBUG log names that branch ('lost leadership during transfer (expected)'), which corroborates the reading but is the library's own message text rather than an independent probe of the returned value.",
+        "The intermediate sequence is observed in the run's own log rather than merely inferred: at 16:26:25.836 the target enters candidate state at term=3 with no pre-vote success line and asks all three voters for a vote while never logging a self-vote, each voter logs term adoption ('lost leadership because received a requestVote with a newer term') immediately followed by 'rejecting vote request since node is not a voter: from=927e473c...', and at 16:26:25.894 the original leader campaigns at term=4 (pre-vote tally 2 of votesNeeded 2) and re-enters leader state; these are the library's own log messages, while the sampled CA_EVENT operands remain the states, term endpoints and window.",
+        "Because the term-3 campaign skipped pre-vote while both genuine elections in the same run recorded a successful pre-vote first, the log also distinguishes the transfer path from an ordinary election; what it does not provide is a run of the same window without the transfer call, which is why the control case is queued rather than assumed."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "721c1688d0604614841236bb40a995b2-question-1",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "xferapi",
+      "timeoutnow",
+      "electself"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Control case on the same explicit leadership-transfer path: on a real four-node cluster, name a server that still holds its vote as the transfer target and emit one CA_EVENT JSON line recording the reported transfer error, whether the named target ever reached Leader, which servers led during a bounded interval, the end states of the original leader and the target, and the term before and after.",
+      "assumptions": [
+        "MakeCluster(4, t, nil) with no demotion is the same cluster shape as the vote-less case, so the configuration, the catch-up wait and the TimeoutNow delivery are unchanged and only the target's suffrage differs.",
+        "The target is again chosen from nodes in Follower state, so it is a viable replication peer and the transfer routine's catch-up wait can be satisfied.",
+        "The control is a same-cause case, not a requirement check: it separates 'transfer works in this harness' from 'a vote-less target cannot take leadership', and its outcome does not by itself settle the attribution of the earlier term movement."
+      ],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "The harness (draft/assurance_generated_test.go) is one TestAssurance-prefixed test in the captured package, identical to the vote-less-target case except that the target is never demoted. It bootstraps a real four-voter cluster with MakeCluster(4, t, nil), takes the single elected leader via c.Leader(), waits for a follower using c.WaitEvent and c.GetInState, confirms from the leader's latest configuration that the target's suffrage is Voter, samples the maximum current term across c.rafts, calls leader.LeadershipTransferToServer(target.localID, target.localAddr) through the public API and records the error its future reports, then polls every 20 ms for up to 3 s across all nodes in c.rafts recording every address observed in Leader state, whether the named target was ever among them, and whether the original leader led again. It finishes by recording the maximum term after the window and the end states of the original leader and the target, and prints one CA_EVENT line tagged transfer_to_voter so the control event is distinguishable from the vote-less-target event in the same investigation.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

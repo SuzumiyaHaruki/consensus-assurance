@@ -1,0 +1,145 @@
+{
+  "rationale": "Closing the end-to-end limitation on the conf-change finding. The previous network attempt dropped the malformed change because the pending-conf guard fired: the harness had never advanced the application's applied index. The harness now acknowledges applied entries the way Advance does (raftLog.appliedTo(committed) on every peer) after every application applies the joint change, and then proposes the empty JointExplicit change on the real three-node leader. A local run shows the guard cleared (pending_conf_idx 2, applied 2, already_pending false), the malformed change accepted as EntryConfChangeV2 at index 3, that index committed (committed 3, committed_reached true), and applying it panicking with config is already joint while still joint. So the malformed change really does reach the application through a genuine commit. Submitted as a successor experiment for the same investigation so the controller can produce the receipt; the asserted claim is unchanged and this removes its most consequential limitation.",
+  "sources": [
+    {
+      "id": "val_guard",
+      "file": "raft.go",
+      "start_line": 1318,
+      "end_line": 1342,
+      "kind": "code_observation"
+    },
+    {
+      "id": "note_apply",
+      "file": "raft.go",
+      "start_line": 737,
+      "end_line": 748,
+      "kind": "code_observation"
+    },
+    {
+      "id": "val_joint",
+      "file": "raft.go",
+      "start_line": 1325,
+      "end_line": 1342,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "e083daeefc0f460f9a395b329006f127-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "val_guard",
+      "note_apply",
+      "val_joint"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "End-to-end demonstration on a real three-node network: with the application caught up (no conf change pending unapplied), propose an empty ConfChangeV2 whose transition is explicit, show the entry is accepted as a configuration change and commits, and show that applying the committed entry panics.",
+      "assumptions": [
+        "Real three-node raft network built with the package test helpers; leader 1 is elected by a MsgHup.",
+        "The joint configuration is entered by proposing and committing ConfChangeV2{Transition: JointExplicit, Changes: [add node 2, already a voter]} and having every application apply it, so the joint config is {1,2,3} against {1,2,3} and no node outside the network is referenced.",
+        "Application progress is simulated by calling raftLog.appliedTo(committed) on each peer after the joint change commits, which is the effect of acknowledging applied entries through Advance; this clears the pending-conf guard.",
+        "The malformed change is proposed through raft.Step as an EntryConfChangeV2 carrying ConfChangeV2{Transition: JointExplicit} with zero changes, and the entry is read back from the leader's log at the index it was appended to."
+      ],
+      "excluded": [
+        "Any claim about client-side construction of change messages; the library's acceptance, replication and apply paths are what is measured.",
+        "Configurations containing nodes absent from the network, which the test helper cannot represent."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "transition": "JointExplicit",
+        "changes": 0,
+        "add_node": 2
+      }
+    },
+    "prefix": "TestAssuranceCommittedEmptyNonAutoConfChange builds newNetwork(nil, nil, nil), elects leader 1 with a MsgHup, records the index the joint change will occupy, and proposes ConfChangeV2{Transition: JointExplicit, Changes: [AddNode 2]} as an EntryConfChangeV2 through MsgProp. Once the network has delivered it, every peer's application applies that change and acknowledges applied entries up to its commit index, and a setup event records joint state, voters, outgoing voters, committed, applied, pendingConfIndex and alreadyPending. The test then records the index the malformed change will occupy, proposes ConfChangeV2{Transition: JointExplicit} with zero changes, and emits a probe event with that index, the type of the entry actually in the log, the commit index and whether the commit index reached the entry. Finally it applies the malformed change inside a recover and emits whether it panicked, the panic text and whether the configuration is still joint.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "committed_nonauto_setup",
+        "event": "committed_cc_setup",
+        "conditions": [
+          {
+            "field": "already_pending",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "committed_cc_probe",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "committed_nonauto_setup",
+        "assertion": {
+          "field": "entry_type",
+          "op": "eq",
+          "value": "EntryConfChangeV2",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "With the guard cleared, the malformed change is accepted and replicated as a configuration-change entry rather than rewritten."
+      },
+      {
+        "event": "committed_cc_probe",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "committed_nonauto_setup",
+        "assertion": {
+          "field": "committed_reached",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "That entry genuinely commits, so an application would see it in the committed entries it is required to apply."
+      },
+      {
+        "event": "committed_cc_apply",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "committed_nonauto_setup",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Applying the committed configuration-change entry panics, which is the documented application action for a committed change it does not reject."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "81bcf16eb8ab4b758bcc18dd09afd758-knowledge-0",
+        "revision": 1,
+        "assertion": "the pending-conf guard rewrites the entry to EntryNormal unless the application has acknowledged applied entries"
+      },
+      {
+        "entry_id": "445153ef4a5b4839a90c275d46a90023-knowledge-0",
+        "revision": 1,
+        "assertion": "with the guard inactive the explicit-transition empty change stayed an EntryConfChangeV2 and panicked on apply"
+      }
+    ],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

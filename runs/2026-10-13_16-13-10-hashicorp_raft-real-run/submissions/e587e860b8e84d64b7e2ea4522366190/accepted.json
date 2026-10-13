@@ -1,0 +1,93 @@
+{
+  "rationale": "The consequence harness ran (CheckRun d5d2d6e4b4304f65ba05d1869b42fa3c, exit 0) and produced the harmful outcome the gap asked about, with the arithmetic of the code paths leaving no other reading. The node was Leader at term 2 and was deposed by an empty heartbeat one term above; the instrumented store opened its gate (gate_opened true), which proves a main-loop term write was in flight - the election that read term 3, computed 4 and was held before its store. While it was held, one empty heartbeat with term 13 was delivered on the fast path and the node adopted it completely: term_after_heartbeat 13 and persisted_after_heartbeat 13. After the held write was released the node's term became 5 and its persisted term became 5 - lower than a term it had already adopted and durably recorded, and the node went on to lead at term 5 (state_after_release Leader). Terms in this package are only ever written as a read-plus-one or as an adopted higher term, so a write of 5 after 13 cannot be a legitimate election; it can only come from a write computed against a stale read, which is exactly the write the gate held open. That makes the earlier unresolved claim resolvable: the off-main-thread term write is not merely a violated invariant, it can overwrite a higher term the node already persisted, and because the store is the durable record, the regression survives a restart. I record the fact and the source behaviour behind it, answer the harmful-consequence gap, and register the cluster-level follow-up question about what peers at the higher term do with a node that has gone backwards, which is source-supported but not yet witnessed.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@unguarded_term_read_modify_write",
+      "kind": "behavior",
+      "statement": "The candidate path computes the next term as the current term plus one and then writes it through setCurrentTerm, which persists the value and stores it in memory, with no compare, lock or ordering guard around the read-modify-write pair; the term adoption path in appendEntries likewise reads the current term and writes a higher one. Because the heartbeat fast path runs appendEntries on the transport's goroutine, a higher term can be written from outside the main loop between the election's read and its write, and the election's lower value then overwrites it in memory and in the stable store.",
+      "conditions": "This revision, any node whose transport implements the heartbeat fast path and which is simultaneously in an election on the main thread; the window is the interval between the term read and the term store in the candidate path, and a stable-store write of the current term is the durable record that makes the regression survive a restart.",
+      "source_ids": [
+        "electself",
+        "appendentriesmain",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@observed_durable_term_regression",
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance, after the node was deposed from leadership at term 2 to term 3 and its own election was held inside its term write, one empty heartbeat carrying term 13 delivered on the fast path was fully adopted (in-memory term 13 and persisted term 13); when the held write was released the node's term and persisted term both became 5, lower than the term it had already adopted and durably recorded, and the node then reached Leader state at that lower term.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node bootstrapped with BootstrapCluster and started with NewRaft over an in-memory transport wrapped by a local transport that fast-paths strictly empty AppendEntries requests, with an instrumented stable store that holds the next write of the current term open once it is armed; depose done by a real empty heartbeat with a higher term so the following election is timer-driven.",
+      "source_ids": [
+        "electself",
+        "appendentriesmain",
+        "processheartbeat",
+        "netxpheartbeat"
+      ],
+      "executions": {
+        "d5d2d6e4b4304f65ba05d1869b42fa3c": [
+          0
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "question": "What happens at cluster level when a node whose persisted term has gone backwards rejoins or campaigns while its peers are at the higher term it already adopted - are its messages rejected, does it stall until it re-adopts the higher term, and does the durable inconsistency matter across a restart?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "experiment_id": "192609798d744832b3cfd702dfd1c5bd-experiment",
+      "source_ids": [
+        "processheartbeat",
+        "appendentriesmain",
+        "netxpheartbeat",
+        "inmemnosupport",
+        "electself"
+      ],
+      "executions": {
+        "d5d2d6e4b4304f65ba05d1869b42fa3c": [
+          0
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "The declared discriminator was that a term after release lower than the term adopted during the hold would witness a durable term regression, and that is exactly what the run reports: the node was Leader at term 2, a real empty heartbeat deposed it to term 3, the gate opened (proving a main-loop term write was in flight, the election that read 3 and computed 4), an empty heartbeat with term 13 delivered on the fast path was adopted in full (term 13 and persisted term 13), and after the held write was released the term and the persisted term were both 5, with the node reaching Leader state at that term. The numbers are not a coincidence that needs interpretation: in this package a term is only ever written as the current term plus one or as an adopted higher term, so a value of 5 appearing after 13 can only come from a write computed against a stale read, which is the write the gate held open and which the election then continued from. That upgrades the earlier account for this question from an unresolved invariant violation to an asserted defect with a witnessed harmful outcome: the off-main-thread heartbeat path can write a term that the main loop's own election overwrites with a lower one, and because setCurrentTerm records the value in the stable store as well as in memory, the node keeps a durable record of a term lower than one it had already acknowledged, which is what a restart would recover. The scope of the defect is the interaction, not either half alone: on a purely main-threaded path the two writes cannot interleave, and the fast path's guard keeps entries and commit-index updates out of the empty heartbeat, so the exposure is the term (and, by the same mechanism, the leader identity and state) written off the main thread while the main loop is between its read and its write. I answer the harmful-consequence gap with this and register the cluster-level question as the next step, since what a peer at term 13 does with a node that has gone back to 5 is a prediction from the vote and append paths rather than something this single-node run shows.",
+      "answers": {
+        "6d7c2649900545d2b4979698753f4e4c-gap-3": "Yes, and the harmful outcome observed is a durable term regression: with the main loop's election write held open, one empty heartbeat carrying term 13 delivered on the fast path was adopted in memory and in the stable store, and after the held write landed the node's term and persisted term were both 5 and it led at that term - a term lower than one it had already adopted and persisted (CheckRun d5d2d6e4b4304f65ba05d1869b42fa3c, parsed event 0)."
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The window was widened by the instrumented store: in production the gap between the election's read and its store is microseconds long, so the interleaving needs a heartbeat to arrive inside that interval; the run establishes that the ordering is possible and harmful, not how likely it is.",
+        "The heartbeat that triggers the off-thread write is delivered by the harness's wrapper transport, which mirrors the network transport's classification, synchronous dispatch and response wait rather than exercising its socket path.",
+        "The node was single-voter, so nothing else could have written the term; that removes competing explanations for the regression but also means the cluster-level consequences were not exercised.",
+        "The regression requires a transport that implements the heartbeat fast path, and the term write it performs is one the main loop would otherwise do only after checking that the new term is higher."
+      ],
+      "limitations": [
+        "One execution, one interleaving: the run witnesses that this ordering is possible and what it does to the durable term, not the probability of hitting it under real scheduling.",
+        "The gap operand in the harness is the durable store's own write, so the hold point is inside setCurrentTerm; the run does not measure how often the same ordering could occur through a different interleaving point such as the state write.",
+        "This is a single-node observation; the peer-side consequences of a regressed term are predicted from the vote and append paths and are left as the registered follow-up question."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,55 @@
+{
+  "rationale": "The post-shutdown harness ran (CheckRun d5ac2dbfe86e438f8cd995156206efe2, exit 0) and answered the narrower gap cleanly, with a within-run control. While the node was live, the same fast-path delivery received a response with Success true and the node's term moved from 2 to 3, so the delivery path really does reach the production handler and run its term logic. After Shutdown, with the transport deliberately left open and the node in state Shutdown at term 3, the identical delivery received nothing: the bounded wait expired after 2000 ms and the term stayed at 3. The unchanged term is the operand that makes this more than a timed-out request - it shows the handler returned before running appendEntries, which matches the shutdown check at the top of processHeartbeat returning without responding while the caller waits on the response channel it supplied. So an RPC accepted on the fast path has no completion path once the receiver is down, and the waiting caller is only released when the transport is closed. The harm is modest and I scope it that way: in the ordinary lifecycle a caller that waits on the shutdown future closes the transport and releases the waiter, and in this package that future is the documented way to wait, so the exposure belongs to callers that shut the node down without waiting, and to the peer whose connection goroutine is then parked. I record the observation and the behaviour behind it, answer the response-completion gap, and leave the broader harmful-consequence gap open rather than stretching this evidence over it.",
+  "knowledge": [
+    {
+      "ref": "@heartbeat_shutdown_early_return",
+      "kind": "behavior",
+      "statement": "processHeartbeat begins by checking the node's shutdown channel and returning immediately when it is closed, before it inspects the command and before appendEntries runs, and that branch never calls Respond. On the fast path the transport has already handed the request to the handler and is waiting on the response channel it supplied, and its only escape is the transport's own shutdown channel, so a heartbeat accepted on that path while the node is shut down receives no response until the transport is closed.",
+      "conditions": "This revision, any transport that installs the heartbeat handler (for example NetworkTransport) and any node whose shutdown channel is closed while its transport remains open; the ordinary Raft.Shutdown caller that waits on the returned future closes the transport and releases the waiter.",
+      "source_ids": ["processheartbeat", "netxpheartbeat", "appendentriesmain"]
+    },
+    {
+      "ref": "@observed_heartbeat_no_response_after_shutdown",
+      "kind": "fact",
+      "statement": "On one real single-node Raft instance over a transport that implements the heartbeat fast path, an empty heartbeat delivered while the node was live was answered successfully and moved its term from 2 to 3, while the identical delivery after Shutdown - node in state Shutdown at term 3 with its transport left open - received no response within the 2000 ms bound and left the term at 3, showing the handler returned before running the term logic.",
+      "conditions": "Captured snapshot 09193ea9b7ee4df99810e6eee7058028; single-voter node bootstrapped with BootstrapCluster and started with NewRaft over an in-memory transport wrapped by a local transport that fast-paths strictly empty AppendEntries requests on the caller's goroutine and waits on the supplied response channel; Shutdown called without waiting on the returned future so the transport stays open.",
+      "source_ids": ["processheartbeat", "netxpheartbeat", "appendentriesmain"],
+      "executions": {"d5ac2dbfe86e438f8cd995156206efe2": [0]}
+    }
+  ],
+  "investigations": [
+    {
+      "id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "discriminator": "Use a transport that implements the fast path the way the network transport does - forwarding strictly empty AppendEntries requests to the installed handler on the caller's goroutine - occupy the main loop deterministically with the already-validated Restore stall handshake, then deliver one empty heartbeat whose term is above the node's current term and read the node's term and leader state while the main loop is still inside its handler. A term or leader-state change observed inside that window witnesses off-main-thread mutation; no change, or a change only after the loop resumes, would defeat the suspicion. Executed: the term and state had already moved inside the window. A second, narrower facet was added and executed as well - what the same handler does with an accepted heartbeat once the node is down but its transport is open - because it needed no interleaving to be witnessable.",
+      "limitations": [
+        "The broader harmful-consequence gap has no deterministic in-process witness with the tools available here: it needs the off-thread store to land inside the main loop's read-modify-write of the term, which is a two-instruction window in the candidate path, and this backend runs tests without the race detector, so that consequence can be argued from the code but not witnessed in this run.",
+        "The narrower post-shutdown facet was witnessable precisely because it needs no interleaving: the handler's shutdown branch is taken before any term logic runs, so the outcome is decided by the node's state rather than by timing.",
+        "The fast path is reachable only through a transport that installs the handler; the in-memory transport used by the test facility does not, so every execution here supplies a wrapper that mirrors the network transport's classification and dispatch rather than exercising its socket path."
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "6aac0bc06d4247569a2bff46e6398a94-question-0",
+      "experiment_id": "a3e037c016ac4e2f976d62b3165916ce-experiment",
+      "source_ids": ["processheartbeat", "appendentriesmain", "netxpheartbeat", "inmemnosupport"],
+      "executions": {"d5ac2dbfe86e438f8cd995156206efe2": [0]},
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "The declared discriminator for this facet was that the term operand would make the outcome interpretable rather than merely timed, and it does. The control delivery on the live node returned a response with Success true and moved the term from 2 to 3, which shows the fast-path delivery reaches the production handler and that the operand reacts when the handler runs. The post-shutdown delivery, with the node in state Shutdown at term 3 and its transport still open, produced no response inside the 2000 ms bound and left the term untouched, so the handler did not run appendEntries and instead returned at its shutdown check - the branch that has no Respond call. Read with the transport's own code, the consequence is concrete: the dispatcher has already handed the request to the handler and is parked on the response channel, whose only escape is the transport's shutdown, so an RPC accepted on this path while the receiver is down is never answered, and the caller is released only when the transport is closed. That is the same shape as the earlier shutdown finding for accepted apply duties, reached through a different door: work is accepted and then silently dropped when authority or liveness goes away. I am keeping the severity honest. In the ordinary lifecycle a caller that waits on the shutdown future closes the transport and the waiter is released with the transport-shutdown error, and that future is the documented way to wait, so the exposure lives in the window a caller opens by shutting the node down without waiting, which is a common simplification rather than an exotic misuse, and in the peer whose connection goroutine is parked for as long as the receiver's transport outlives the node. The broader consequence question I registered earlier - whether the off-main-thread execution of appendEntries can lose a term or a transition - is not answered by this evidence and remains open; this run answers only the response-completion question for a node that is already down.",
+      "answers": {
+        "a3e037c016ac4e2f976d62b3165916ce-gap-4": "No response is ever delivered on that path while the node is down and its transport is open: with the node in state Shutdown at term 3 the delivery received nothing within the 2000 ms bound and the term stayed at 3, while the same delivery on the live node was answered successfully and moved the term 2 to 3 - so the handler returns at its shutdown check before running the term logic and never responds (CheckRun d5ac2dbfe86e438f8cd995156206efe2, parsed event 0)."
+      },
+      "counterevidence": [
+        "The missing response is bounded by transport lifetime: Raft.Shutdown's future closes the transport when it is waited on, and the transport's own shutdown channel releases the parked waiter with a transport-shutdown error, so a caller that follows the documented shutdown path does not observe this.",
+        "The parked caller is the heartbeat path for a peer that is already gone from the cluster's perspective, so the cluster-level consequence is limited to a stalled per-peer heartbeat delivery and a parked goroutine rather than to agreement or commit behaviour.",
+        "The run uses the wrapper transport rather than the real network transport, so the parked goroutine is reproduced in-process; the network transport's connection goroutine is the production analogue by construction of the same dispatch and wait.",
+        "One delivery after shutdown at one term is a single observation; the claim that no completion path exists rests on the handler's source (no Respond on that branch) plus the transport's escape condition, not on repeated timing."
+      ],
+      "limitations": [
+        "The 2000 ms bound is the observation window, not the claim: the claim that the response never arrives rests on the source reading of the shutdown branch and on the transport's single escape, which this run cannot exercise because closing the transport is exactly what releases the waiter.",
+        "Only one node and one post-shutdown delivery were exercised; whether a real peer ever sends a heartbeat into that window is a deployment question that this run does not measure."
+      ]
+    }
+  ]
+}

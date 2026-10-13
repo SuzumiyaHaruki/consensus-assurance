@@ -67,15 +67,21 @@ def lineage(state, id):
     return result
 
 
-def open_gaps(state, investigation_id, experiment_id=None):
-    owner = investigation(state, investigation_id)
+def gap_answers(state, investigation_id, experiment_id=None):
     applicable = lineage(state, experiment_id) if experiment_id else set()
     answers = {}
     for i in state.interpretations:
         if i.investigation_id == investigation_id and (
                 experiment_id is None or i.experiment_id is None or i.experiment_id in applicable):
             answers.update(i.answers)
-    return [g for g in owner.gaps if not answers.get(g.id) and
+    return answers
+
+
+def open_gaps(state, investigation_id, experiment_id=None):
+    owner = investigation(state, investigation_id)
+    applicable = lineage(state, experiment_id) if experiment_id else set()
+    answers = gap_answers(state, investigation_id, experiment_id)
+    return [g for g in owner.gaps if (g.id not in answers or not answers[g.id].resolved) and
             (experiment_id is None or g.experiment_id is None or g.experiment_id in applicable)]
 
 
@@ -167,7 +173,10 @@ def update_knowledge(state, root, changes, operation, aliases):
                 continue
         used = list(use_paths(state, old.id)) if old else []
         if not set(change.affected_uses) <= set(used):
-            raise ValueError('Correction names an object without the referenced knowledge revision')
+            raise ValueError(f'Invalid affected_uses IDs: {sorted(set(change.affected_uses) - set(used))}; '
+                f'valid recorded use IDs: {sorted(used)}. Keep changed_premise as a semantic explanation; '
+                'do not invent dependencies. Use affected_uses=[] if no recorded use is affected, '
+                'or correct the original investigation directly when applicable.')
         value = KnowledgeEntry(id=id, operation_id=operation, **data)
         if old:
             value.revision = old.revision + 1
@@ -245,8 +254,8 @@ def interpret(state, root, changes, operation, aliases):
                         joint_history=change.joint_history, failure=change.failure_attribution,
                         support=change.conclusion in {'violated', 'holds'})
         gaps = {g.id: g for g in owner.gaps}
-        if not set(change.answers) <= gaps.keys() or any(v is not None and not v.strip() for v in change.answers.values()):
-            raise ValueError('Answer this investigation\'s exact registered gaps substantively, or use null to withdraw an answer')
+        if not set(change.answers) <= gaps.keys() or any(not v.explanation.strip() for v in change.answers.values()):
+            raise ValueError('Respond to this investigation\'s exact registered gaps with a substantive explanation and explicit resolved judgment')
         if change.experiment_id and any(gaps[id].experiment_id and
                 gaps[id].experiment_id not in lineage(state, change.experiment_id) for id in change.answers):
             raise ValueError('Answer only gaps belonging to this experiment lineage, or give a source-only correction')

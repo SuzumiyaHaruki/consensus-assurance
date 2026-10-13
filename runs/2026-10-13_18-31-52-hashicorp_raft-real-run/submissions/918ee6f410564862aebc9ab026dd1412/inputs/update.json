@@ -1,0 +1,73 @@
+{
+  "rationale": "Both open questions are settled (commit eligibility refuted the non-voter suspicion with a retained witness; the AddVoter configuration lag was explained as a bounded transient). I reselected along the same axes onto the history/persistence mechanism that the earlier work leaned on but never examined directly: whether a restarted node reuses its durable last-vote (term plus candidate) so that a single node cannot cast two different votes in one term. Reading the restart path and the vote handler gives a concrete, cheaply testable account, and the registered discriminator uses only real producers (a real RequestVote RPC through the node's transport consumer and a real restart over the same stores). This turn is source-only; no measured interpretation is claimed without the receipt.",
+  "sources": [
+    {
+      "id": "restart_term_log",
+      "file": "api.go",
+      "start_line": 508,
+      "end_line": 520,
+      "kind": "code_observation"
+    },
+    {
+      "id": "restart_apply_state",
+      "file": "api.go",
+      "start_line": 588,
+      "end_line": 591,
+      "kind": "code_observation"
+    },
+    {
+      "id": "stable_keys",
+      "file": "raft.go",
+      "start_line": 27,
+      "end_line": 29,
+      "kind": "code_observation"
+    },
+    {
+      "id": "dup_vote_check",
+      "file": "raft.go",
+      "start_line": 1685,
+      "end_line": 1704,
+      "kind": "code_observation"
+    },
+    {
+      "id": "persist_vote",
+      "file": "raft.go",
+      "start_line": 2130,
+      "end_line": 2138,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_restart_vote",
+      "question": "After a restart, does a node reuse its durable last-vote (term and candidate) so that it cannot grant a second, different vote in the same term, and does its restored currentTerm still deny votes from older terms?",
+      "source_ids": [
+        "restart_term_log",
+        "restart_apply_state",
+        "stable_keys",
+        "dup_vote_check",
+        "persist_vote"
+      ],
+      "hypothesis": "The vote is recorded in StableStore before the response is granted, and restart restores only currentTerm and the last log entry, not any in-memory vote state; therefore the same-term duplicate decision is made from the durable last-vote keys and survives a restart, while the restored currentTerm denies older-term requests.",
+      "discriminator": "In one process, with a real InmemStore-backed node, send a RequestVote for candidate A in term T through the node's transport consumer and confirm it is granted (the node persists LastVoteTerm=T/LastVoteCand=A); restart the node over the same stores; then require that a RequestVote for a different candidate B in the same term T is denied, that a repeat request for A in term T is still granted, and that any candidate in a term below T is denied. The predicate is the granted flag plus the term actually reached, not the response text."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_restart_vote",
+      "source_ids": [
+        "restart_term_log",
+        "restart_apply_state",
+        "dup_vote_check",
+        "persist_vote"
+      ],
+      "rationale": "Source-only account of the restart/vote relationship. On startup the node restores currentTerm from the CurrentTerm stable key and the last log entry through setCurrentTerm/setLastLog, and nothing else vote-related is restored, so any same-term duplicate decision must come from the durable keys. In the vote handler the duplicate check reads LastVoteTerm and LastVoteCand from StableStore, returns granted only when the stored candidate bytes equal the requesting candidate, and otherwise returns without setting Granted, so a second different candidate in the same term is denied regardless of restart. persistVote writes the term first and then the candidate before the handler sets Granted, so an acknowledged vote is durable before the response. The older-term rejection is the earlier term comparison, and the restored currentTerm is what makes it effective after a restart. This is a source-explained negative - a protection that defeats an obvious candidate defect - so no defect is asserted and the discriminator is left for execution rather than inferred from reading.",
+      "conclusion": "explained",
+      "defect_claim": null,
+      "limitations": [
+        "Source-only: the restart behaviour is read from the constructors and handlers, not yet observed; in particular the claim that a new Raft instance does not consult any other persisted vote artefact rests on reading NewRaft and restoreSnapshot.",
+        "The account covers the vote path only; it does not evaluate whether a restart can otherwise reuse stale term or log state in a way that breaks safety (for example a truncated log tail)."
+      ]
+    }
+  ]
+}

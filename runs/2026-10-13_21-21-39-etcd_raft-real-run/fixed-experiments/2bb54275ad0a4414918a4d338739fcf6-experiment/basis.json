@@ -1,0 +1,138 @@
+{
+  "id": "2bb54275ad0a4414918a4d338739fcf6-experiment",
+  "investigation_id": "ee850f515b5d49718d5f55c4c1d36e61-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// caEvent emits a single machine-parsable event line.\nfunc caEvent(t *testing.T, v map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(v)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceReadIndexPendingGrowth drives a real leader that cannot obtain\n// quorum acknowledgements (no MsgAppResp / MsgHeartbeatResp is ever delivered)\n// and retries ReadIndex with the same RequestCtx.\nfunc TestAssuranceReadIndexPendingGrowth(t *testing.T) {\n\tr := newTestRaft(1, 3, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\tcaEvent(t, map[string]any{\n\t\t\"event\":          \"read_growth_setup\",\n\t\t\"alias\":          \"isolated_leader\",\n\t\t\"state\":          r.state.String(),\n\t\t\"term\":           r.Term,\n\t\t\"committed\":      r.raftLog.committed,\n\t\t\"last_index\":     r.raftLog.lastIndex(),\n\t\t\"check_quorum\":   r.checkQuorum,\n\t\t\"read_only_safe\": r.readOnly.option == ReadOnlySafe,\n\t\t\"voter_count\":    len(r.trk.Voters.IDs()),\n\t})\n\n\trounds := 64\n\tctx := []byte(\"same-ctx\")\n\tfor i := 0; i < rounds; i++ {\n\t\t_ = r.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: ctx}}})\n\t\t// Drop outbound traffic so growth is measured in raft state, not in msgs.\n\t\tr.msgs = nil\n\t\tr.msgsAfterAppend = nil\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":       \"read_growth_probe\",\n\t\t\"alias\":       \"isolated_leader\",\n\t\t\"rounds\":      rounds,\n\t\t\"pending\":     len(r.pendingReadIndexMessages),\n\t\t\"unconfirmed\": len(r.readOnly.unconfirmedReads),\n\t\t\"state_after\": r.state.String(),\n\t})\n\n\t// A higher-term heartbeat deposes the node; the queued duty is not cleared.\n\t_ = r.Step(&pb.Message{From: new(uint64(2)), Term: new(r.Term + 1), Type: pb.MsgHeartbeat.Enum()})\n\tcaEvent(t, map[string]any{\n\t\t\"event\":             \"read_growth_after_stepdown\",\n\t\t\"alias\":             \"isolated_leader\",\n\t\t\"state_after\":       r.state.String(),\n\t\t\"pending_after\":     len(r.pendingReadIndexMessages),\n\t\t\"unconfirmed_after\": len(r.readOnly.unconfirmedReads),\n\t})\n}\n\n// TestAssuranceReadIndexAdmittedGrowth drives the admitted (not queued) path: a\n// leader that has committed in its term but whose followers stop acknowledging\n// heartbeats still admits every retried ReadIndex into unconfirmedReads and\n// broadcasts a heartbeat per request.\nfunc TestAssuranceReadIndexAdmittedGrowth(t *testing.T) {\n\tr := newTestRaft(1, 3, 1, newTestMemoryStorage(withPeers(1, 2)))\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\t// Deliver the leader's own self-ack for the empty entry, then let node 2\n\t// acknowledge it, so the leader commits in its term.\n\tfor _, m := range r.msgsAfterAppend {\n\t\t_ = r.Step(m)\n\t}\n\t_ = r.Step(&pb.Message{From: new(uint64(2)), Type: pb.MsgAppResp.Enum(), Index: new(r.raftLog.lastIndex())})\n\tr.msgs = nil\n\tr.msgsAfterAppend = nil\n\tcaEvent(t, map[string]any{\n\t\t\"event\":          \"read_admitted_setup\",\n\t\t\"alias\":          \"committed_no_acks\",\n\t\t\"state\":          r.state.String(),\n\t\t\"term\":           r.Term,\n\t\t\"committed\":      r.raftLog.committed,\n\t\t\"last_index\":     r.raftLog.lastIndex(),\n\t\t\"in_term\":        r.committedEntryInCurrentTerm(),\n\t\t\"check_quorum\":   r.checkQuorum,\n\t\t\"read_only_safe\": r.readOnly.option == ReadOnlySafe,\n\t\t\"voter_count\":    len(r.trk.Voters.IDs()),\n\t})\n\n\trounds := 64\n\tbroadcasts := 0\n\tctx := []byte(\"same-ctx\")\n\tfor i := 0; i < rounds; i++ {\n\t\t_ = r.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: ctx}}})\n\t\tfor _, m := range r.msgs {\n\t\t\tif m.GetType() == pb.MsgHeartbeat {\n\t\t\t\tbroadcasts++\n\t\t\t}\n\t\t}\n\t\tr.msgs = nil\n\t\tr.msgsAfterAppend = nil\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":       \"read_admitted_probe\",\n\t\t\"alias\":       \"committed_no_acks\",\n\t\t\"rounds\":      rounds,\n\t\t\"unconfirmed\": len(r.readOnly.unconfirmedReads),\n\t\t\"broadcasts\":  broadcasts,\n\t\t\"pending\":     len(r.pendingReadIndexMessages),\n\t\t\"confirmed\":   r.readOnly.confirmedReads,\n\t\t\"state_after\": r.state.String(),\n\t})\n}\n\n// TestAssuranceReadIndexQueuedDrainBurst measures what happens when a leader\n// that accumulated queued read requests finally commits in its term: the whole\n// queue is released in one step, each entry re-admitted and rebroadcast.\nfunc TestAssuranceReadIndexQueuedDrainBurst(t *testing.T) {\n\tr := newTestRaft(1, 3, 1, newTestMemoryStorage(withPeers(1, 2)))\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\tr.msgs = nil\n\tr.msgsAfterAppend = nil\n\n\trounds := 64\n\tctx := []byte(\"same-ctx\")\n\tfor i := 0; i < rounds; i++ {\n\t\t_ = r.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: ctx}}})\n\t\tr.msgs = nil\n\t\tr.msgsAfterAppend = nil\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":       \"read_drain_setup\",\n\t\t\"alias\":       \"queued_then_commit\",\n\t\t\"rounds\":      rounds,\n\t\t\"pending\":     len(r.pendingReadIndexMessages),\n\t\t\"committed\":   r.raftLog.committed,\n\t\t\"in_term\":     r.committedEntryInCurrentTerm(),\n\t\t\"unconfirmed\": len(r.readOnly.unconfirmedReads),\n\t})\n\n\t// Now let the leader commit in its term: its own ack, then node 2's ack for\n\t// the empty entry. The follower's MsgAppResp takes the leader fast path that\n\t// calls releasePendingReadIndexMessages.\n\t_ = r.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgAppResp.Enum(), Index: new(r.raftLog.lastIndex())})\n\t_ = r.Step(&pb.Message{From: new(uint64(2)), Type: pb.MsgAppResp.Enum(), Index: new(r.raftLog.lastIndex())})\n\tbroadcasts := 0\n\tfor _, m := range r.msgs {\n\t\tif m.GetType() == pb.MsgHeartbeat {\n\t\t\tbroadcasts++\n\t\t}\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":       \"read_drain_after_commit\",\n\t\t\"alias\":       \"queued_then_commit\",\n\t\t\"committed\":   r.raftLog.committed,\n\t\t\"in_term\":     r.committedEntryInCurrentTerm(),\n\t\t\"pending\":     len(r.pendingReadIndexMessages),\n\t\t\"unconfirmed\": len(r.readOnly.unconfirmedReads),\n\t\t\"broadcasts\":  broadcasts,\n\t\t\"state_after\": r.state.String(),\n\t})\n}\n\n// TestAssuranceReadIndexGrowthWithCheckQuorum is the control for the growth\n// claim: with CheckQuorum enabled the leader loses its quorum view within an\n// election timeout, so growth should stop - but nothing reclaims what was\n// already accumulated.\nfunc TestAssuranceReadIndexGrowthWithCheckQuorum(t *testing.T) {\n\tcfg := newTestConfig(1, 3, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tcfg.CheckQuorum = true\n\tr := newRaft(cfg)\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\tr.msgs = nil\n\tr.msgsAfterAppend = nil\n\n\tcaEvent(t, map[string]any{\n\t\t\"event\":        \"read_ckq_setup\",\n\t\t\"alias\":        \"check_quorum_on\",\n\t\t\"check_quorum\": r.checkQuorum,\n\t\t\"state\":        r.state.String(),\n\t\t\"election\":     r.electionTimeout,\n\t\t\"voter_count\":  len(r.trk.Voters.IDs()),\n\t})\n\n\tctx := []byte(\"same-ctx\")\n\trounds := 0\n\tfor tick := 0; tick < 3 && r.state == StateLeader; tick++ {\n\t\tfor i := 0; i < 8; i++ {\n\t\t\t_ = r.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: ctx}}})\n\t\t\trounds++\n\t\t\tr.msgs = nil\n\t\t\tr.msgsAfterAppend = nil\n\t\t}\n\t\tr.tick()\n\t}\n\tpendingBefore := len(r.pendingReadIndexMessages)\n\tcaEvent(t, map[string]any{\n\t\t\"event\":           \"read_ckq_before\",\n\t\t\"alias\":           \"check_quorum_on\",\n\t\t\"check_quorum\":    true,\n\t\t\"rounds\":          rounds,\n\t\t\"state\":           r.state.String(),\n\t\t\"window_closed\":   r.state != StateLeader,\n\t\t\"pending_before\":  pendingBefore,\n\t\t\"unconfirmed\":     len(r.readOnly.unconfirmedReads),\n\t\t\"voter_count\":     len(r.trk.Voters.IDs()),\n\t})\n\n\tfor i := 0; i < 8; i++ {\n\t\t_ = r.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: ctx}}})\n\t\tr.msgs = nil\n\t\tr.msgsAfterAppend = nil\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":             \"read_ckq_after\",\n\t\t\"alias\":             \"check_quorum_on\",\n\t\t\"state_after\":       r.state.String(),\n\t\t\"pending_before\":    pendingBefore,\n\t\t\"pending_after\":     len(r.pendingReadIndexMessages),\n\t\t\"pending_unchanged\": len(r.pendingReadIndexMessages) == pendingBefore,\n\t\t\"unconfirmed_after\": len(r.readOnly.unconfirmedReads),\n\t})\n}\n\n// TestAssuranceReadIndexRetainedBytes measures how much caller-supplied payload\n// the leader pins when many distinct read requests are accepted while it cannot\n// obtain quorum acknowledgements. Each request carries its own RequestCtx\n// buffer, as a caller issuing distinct reads would.\nfunc TestAssuranceReadIndexRetainedBytes(t *testing.T) {\n\tr := newTestRaft(1, 3, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\tr.msgs = nil\n\tr.msgsAfterAppend = nil\n\n\tconst ctxBytes = 4096\n\tconst rounds = 64\n\tcaEvent(t, map[string]any{\n\t\t\"event\":        \"read_bytes_setup\",\n\t\t\"alias\":        \"retained_bytes\",\n\t\t\"check_quorum\": r.checkQuorum,\n\t\t\"state\":        r.state.String(),\n\t\t\"voter_count\":  len(r.trk.Voters.IDs()),\n\t\t\"ctx_bytes\":    ctxBytes,\n\t\t\"rounds\":       rounds,\n\t})\n\n\tfor i := 0; i < rounds; i++ {\n\t\tctx := make([]byte, ctxBytes)\n\t\tcopy(ctx, []byte(\"distinct-read-context\"))\n\t\t_ = r.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: ctx}}})\n\t\tr.msgs = nil\n\t\tr.msgsAfterAppend = nil\n\t}\n\n\tretained := 0\n\tdistinct := map[*byte]struct{}{}\n\tfor _, m := range r.pendingReadIndexMessages {\n\t\tfor _, e := range m.GetEntries() {\n\t\t\tdata := e.GetData()\n\t\t\tretained += len(data)\n\t\t\tif len(data) > 0 {\n\t\t\t\tdistinct[&data[0]] = struct{}{}\n\t\t\t}\n\t\t}\n\t}\n\tcaEvent(t, map[string]any{\n\t\t\"event\":               \"read_bytes_probe\",\n\t\t\"alias\":               \"retained_bytes\",\n\t\t\"pending\":             len(r.pendingReadIndexMessages),\n\t\t\"retained_ctx_bytes\":  retained,\n\t\t\"distinct_ctx_buffers\": len(distinct),\n\t\t\"ctx_bytes\":           ctxBytes,\n\t\t\"rounds\":              rounds,\n\t\t\"state_after\":         r.state.String(),\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "retained_bytes_on",
+          "event": "read_bytes_setup",
+          "conditions": [
+            {
+              "field": "state",
+              "op": "eq",
+              "value": "StateLeader",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "ra_admit",
+      "ra_reset",
+      "ra_contract"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Measure how much caller-supplied payload the leader retains when many distinct ReadIndex requests are accepted while it cannot obtain quorum acknowledgements, and verify that each retained payload is a distinct buffer rather than one shared slice counted repeatedly.",
+      "assumptions": [
+        "Real raft over voters {1,2,3} built with newTestRaft (CheckQuorum false, ReadOnlySafe); no MsgAppResp or MsgHeartbeatResp is delivered, so every read takes the queued path.",
+        "64 requests are submitted, each carrying its own freshly allocated 4096-byte RequestCtx, modelling a caller issuing distinct reads (the ReadIndex API takes an opaque rctx []byte and documents no size limit).",
+        "Retention is summed over the Data fields of the entries held in pendingReadIndexMessages, and the number of distinct backing buffers is counted by taking the address of each buffer's first byte, so a shared slice would appear as distinct_ctx_buffers < pending."
+      ],
+      "excluded": [
+        "Any claim about total process footprint (allocator overhead, per-message structs and slice headers are not counted) or about a specific deployment's memory limit.",
+        "Any claim that a caller must not send large contexts; only that the library accepts and retains whatever it is given."
+      ],
+      "parameters": {
+        "voters": [
+          1,
+          2,
+          3
+        ],
+        "rounds": 64,
+        "ctx_bytes": 4096,
+        "check_quorum": false
+      }
+    },
+    "prefix": "TestAssuranceReadIndexRetainedBytes builds newTestRaft(1,3,1,newTestMemoryStorage(withPeers(1,2,3))), promotes it with becomeCandidate/becomeLeader, clears the outbound buffers, and emits a setup event with CheckQuorum, state, voter count, the per-request context size and the round count. It then submits 64 MsgReadIndex messages, each with its own 4096-byte Data buffer, clearing outbound traffic each round, and finally emits a probe event with the pending queue length, the summed retained Data length, the number of distinct backing buffers and the node state.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "read_bytes_probe",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "retained_bytes_on",
+        "assertion": {
+          "field": "pending",
+          "op": "eq",
+          "value": 64,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Every one of the 64 distinct read requests is retained."
+      },
+      {
+        "event": "read_bytes_probe",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "retained_bytes_on",
+        "assertion": {
+          "field": "retained_ctx_bytes",
+          "op": "eq",
+          "value": 262144,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The retained caller payload is 64 times 4096 bytes, i.e. the retry count multiplied by the caller-chosen context size."
+      },
+      {
+        "event": "read_bytes_probe",
+        "identity_fields": [
+          "alias"
+        ],
+        "admission_alias": "retained_bytes_on",
+        "assertion": {
+          "field": "distinct_ctx_buffers",
+          "op": "eq",
+          "value": 64,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The byte total is genuine retention: the 64 payloads sit in 64 distinct buffers, so the sum is not one shared slice counted repeatedly."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "ec634053934546af8e5da7dcb41717bd-knowledge-0",
+        "revision": 1,
+        "assertion": "the queued path retains one message per request and is not reclaimed"
+      }
+    ]
+  },
+  "snapshot_id": "96808b54ce424b1b869534401691d5ef",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "2bb54275ad0a4414918a4d338739fcf6",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

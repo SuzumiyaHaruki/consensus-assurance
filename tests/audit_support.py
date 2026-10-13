@@ -103,6 +103,6 @@ def opinion(state, **changes):
     a=state['experiments'][-1]
     c=next(c for c in reversed(state['checks']) if c.get('experiment_id')==a['id'])
     value=dict(investigation_id=a['investigation_id'],experiment_id=a['id'],source_ids=['code','doc'],
-               executions={c['id']:[1]},conclusion='violated',rationale='Compare the actual return with independent admitted input')
+               executions={c['id']:[1]},conclusion='violated',defect_claim=None,rationale='Compare the actual return with independent admitted input')
     value.update(changes)
     return {'rationale':'Interpret the saved receipt','interpretations':[value]}, {}

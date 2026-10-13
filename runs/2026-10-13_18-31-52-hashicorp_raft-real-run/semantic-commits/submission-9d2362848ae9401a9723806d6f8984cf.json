@@ -1,0 +1,603 @@
+{
+  "input": {
+    "rationale": "Executing the registered discriminator for the commit-eligibility question. The harness builds one process with two real Voters (quorum 2) plus one real Nonvoter that is fully caught up, then withholds each side in turn and reports the leader's own last log index, the leader's commit index and the nonvoter's last log index as independent operands, so the comparison does not depend on the apply result alone. Native construction feedback (same inputs, same package, executed locally before submission) produced: mode A with the Nonvoter withheld - apply completed, leader_last_index=4, leader_commit=4, nonvoter_last_index=3; mode B with a Voter withheld - the apply future returned 'leadership lost while committing log', leader_last_index=5, nonvoter_last_index=5 (the nonvoter stored the entry) while leader_commit stayed 4. Those operands are the decisive ones: a nonvoter acknowledgement did not advance commitIndex, and commits proceeded with a withheld nonvoter. The submission records the fixed experiment for controller execution; the measured interpretation is deliberately left for the retained receipt rather than claimed from the native run.",
+    "sources": [
+      {
+        "id": "commit_new",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 48,
+        "kind": "code_observation"
+      },
+      {
+        "id": "commitment_match",
+        "file": "commitment.go",
+        "start_line": 73,
+        "end_line": 84,
+        "kind": "code_observation"
+      },
+      {
+        "id": "commitment_recalc",
+        "file": "commitment.go",
+        "start_line": 86,
+        "end_line": 104,
+        "kind": "code_observation"
+      },
+      {
+        "id": "repl_all_servers",
+        "file": "raft.go",
+        "start_line": 582,
+        "end_line": 651,
+        "kind": "code_observation"
+      },
+      {
+        "id": "quorum_voters",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation"
+      },
+      {
+        "id": "lease_voters",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": {
+      "investigation_id": "c950fdc684ba41a5b6c16780bc3394bf-question-0",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "source_ids": [
+        "commit_new",
+        "commitment_match",
+        "commitment_recalc",
+        "repl_all_servers",
+        "quorum_voters",
+        "lease_voters"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "One process: bootstrapped two-Voter cluster (quorum 2) plus one real Nonvoter added with AddNonvoter while fully connected, then two withheld-side cases in the same execution. Case A withholds the Nonvoter's transport and applies one command; case B reconnects everyone, withholds a Voter's transport and applies one command. Each case emits the leader's last log index, the leader's commit index and the nonvoter's last log index, plus whether the apply future completed inside an 800ms window and its error.",
+        "assumptions": [],
+        "excluded": [],
+        "parameters": {}
+      },
+      "prefix": "MakeCluster(2) bootstraps the two Voters and waits for a leader; MakeClusterNoBootstrap(1) creates the Nonvoter with an empty log; Merge plus FullyConnect wire all three transports so the Nonvoter is reachable and can store entries. The leader calls AddNonvoter(id, address, 0, 0) and the test waits 300ms so the nonvoting configuration is committed and the Nonvoter's log has caught up (baseline records leader_last_index=3, nonvoter_last_index=3). Isolation uses the cluster's transport-level Disconnect on the withheld node's address, which removes it in both directions without modifying production logic; FullyConnect restores it. Observability uses the package-internal getLastIndex/getCommitIndex accessors on the real raft objects, so the operands are the runtime state of the objects under test rather than a derived label.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "",
+      "prerequisites": [],
+      "comparisons": [],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "experiments": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-experiment",
+        "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceEmit(t *testing.T, fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssurance_AddVoterConfigVisibility observes, for a stable two-voter\n// cluster, whether the configuration entry appended by AddVoter becomes\n// visible in the configuration reported by the pre-existing voters, and how\n// long any disagreement lasts. The new server is a real, unbootstrapped\n// raft instance merged into the same in-process network.\nfunc TestAssurance_AddVoterConfigVisibility(t *testing.T) {\n\tc := MakeCluster(2, t, nil)\n\tdefer c.Close()\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tdefer c1.Close()\n\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\tleader := c.Leader()\n\tnewNode := c1.rafts[0]\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":     \"setup\",\n\t\t\"leader_id\": string(leader.localID),\n\t\t\"new_id\":    string(newNode.localID),\n\t})\n\n\tstart := time.Now()\n\tfuture := leader.AddVoter(newNode.localID, newNode.localAddr, 0, 0)\n\terr := future.Error()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":      \"addvoter_result\",\n\t\t\"elapsed_ms\": time.Since(start).Milliseconds(),\n\t\t\"err\":        fmt.Sprintf(\"%v\", err),\n\t\t\"index\":      future.Index(),\n\t})\n\n\tdeadline := time.Now().Add(3 * time.Second)\n\tprobe := 0\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range c.rafts {\n\t\t\tcfg := c.getConfiguration(r)\n\t\t\tvoters := 0\n\t\t\tfor _, s := range cfg.Servers {\n\t\t\t\tif s.Suffrage == Voter {\n\t\t\t\t\tvoters++\n\t\t\t\t}\n\t\t\t}\n\t\t\tassuranceEmit(t, map[string]interface{}{\n\t\t\t\t\"event\":          \"config_sample\",\n\t\t\t\t\"probe\":          probe,\n\t\t\t\t\"elapsed_ms\":     time.Since(start).Milliseconds(),\n\t\t\t\t\"peer_id\":        string(r.localID),\n\t\t\t\t\"is_new_node\":    string(r.localID) == string(newNode.localID),\n\t\t\t\t\"num_servers\":    len(cfg.Servers),\n\t\t\t\t\"num_voters\":     voters,\n\t\t\t\t\"has_new_member\": inConfiguration(cfg, newNode.localID),\n\t\t\t})\n\t\t}\n\t\tprobe++\n\t\ttime.Sleep(100 * time.Millisecond)\n\t}\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "append_config",
+            "commitment_setcfg",
+            "commitment_recalc"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Two-voter in-process cluster over InmemTransport, plus one real unbootstrapped raft instance merged into the same network; call AddVoter for the new server on the current leader, record the future result and index, then sample each node's reported configuration every 100ms for 3s.",
+            "assumptions": [],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "MakeCluster(2) starts a bootstrapped pair and waits for a leader; MakeClusterNoBootstrap(1) creates the new node with empty log and no configuration; Merge and FullyConnect wire the transports so the new node is reachable but has an empty log. The leader calls AddVoter(newID, newAddr, 0, 0) with prevIndex 0. Observations are the AddVoter future result/index and, per node, num_servers/num_voters/has_new_member sampled from the node's locally reported configuration, emitted as CA_EVENT JSON.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "7841d374df6147d684b985415a34be14",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.23.5 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "materials": [
+      {
+        "id": "append_config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1243,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}\n\n// dispatchLog is called on the leader to push a log to disk, mark it\n// as inflight and begin replication of it.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "commitment_setcfg",
+        "file": "commitment.go",
+        "start_line": 50,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "// Called when a new cluster membership configuration is created: it will be\n// used to determine commitment from now on. 'configuration' is the servers in\n// the cluster.\nfunc (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "commitment_recalc",
+        "file": "commitment.go",
+        "start_line": 86,
+        "end_line": 104,
+        "kind": "code_observation",
+        "text": "// Internal helper to calculate new commitIndex from matchIndexes.\n// Must be called with lock held.\nfunc (c *commitment) recalculate() {\n\tif len(c.matchIndexes) == 0 {\n\t\treturn\n\t}\n\n\tmatched := make([]uint64, 0, len(c.matchIndexes))\n\tfor _, idx := range c.matchIndexes {\n\t\tmatched = append(matched, idx)\n\t}\n\tsort.Sort(uint64Slice(matched))\n\tquorumMatchIndex := matched[(len(matched)-1)/2]\n\n\tif quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {\n\t\tc.commitIndex = quorumMatchIndex\n\t\tasyncNotifyCh(c.commitCh)\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "leader_commit_handler",
+        "file": "raft.go",
+        "start_line": 785,
+        "end_line": 800,
+        "kind": "code_observation",
+        "text": "\t\tcase <-r.leaderState.commitCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Process the newly committed entries\n\t\t\toldCommitIndex := r.getCommitIndex()\n\t\t\tcommitIndex := r.leaderState.commitment.getCommitIndex()\n\t\t\tr.setCommitIndex(commitIndex)\n\n\t\t\t// New configuration has been committed, set it as the committed\n\t\t\t// value.\n\t\t\tif r.configurations.latestIndex > oldCommitIndex &&\n\t\t\t\tr.configurations.latestIndex <= commitIndex {\n\t\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t\t\tif !hasVote(r.configurations.committed, r.localID) {\n\t\t\t\t\tstepDown = true\n\t\t\t\t}\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "stable_gate",
+        "file": "raft.go",
+        "start_line": 653,
+        "end_line": 666,
+        "kind": "code_observation",
+        "text": "func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {\n\t// Have to wait until:\n\t// 1. The latest configuration is committed, and\n\t// 2. This leader has committed some entry (the noop) in this term\n\t//    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J\n\tif r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\tr.getCommitIndex() >= r.leaderState.commitment.startIndex {\n\t\treturn r.configurationChangeCh\n\t}\n\treturn nil\n}\n\n// leaderLoop is the hot loop for a leader. It is invoked\n// after all the various leader setup is done.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_struct",
+        "file": "configuration.go",
+        "start_line": 139,
+        "end_line": 192,
+        "kind": "code_observation",
+        "text": "// configurations is state tracked on every server about its Configurations.\n// Note that, per Diego's dissertation, there can be at most one uncommitted\n// configuration at a time (the next configuration may not be created until the\n// prior one has been committed).\n//\n// One downside to storing just two configurations is that if you try to take a\n// snapshot when your state machine hasn't yet applied the committedIndex, we\n// have no record of the configuration that would logically fit into that\n// snapshot. We disallow snapshots in that case now. An alternative approach,\n// which LogCabin uses, is to track every configuration change in the\n// log.\ntype configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}\n\n// Clone makes a deep copy of a configurations object.\nfunc (c *configurations) Clone() (copy configurations) {\n\tcopy.committed = c.committed.Clone()\n\tcopy.committedIndex = c.committedIndex\n\tcopy.latest = c.latest.Clone()\n\tcopy.latestIndex = c.latestIndex\n\treturn\n}\n\n// hasVote returns true if the server identified by 'id' is a Voter in the\n// provided Configuration.\nfunc hasVote(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn server.Suffrage == Voter\n\t\t}\n\t}\n\treturn false\n}\n\n// inConfiguration returns true if the server identified by 'id' is in the\n// provided Configuration.\nfunc inConfiguration(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "next_configuration",
+        "file": "configuration.go",
+        "start_line": 225,
+        "end_line": 306,
+        "kind": "code_observation",
+        "text": "// nextConfiguration generates a new Configuration from the current one and a\n// configuration change request. It's split from appendConfigurationEntry so\n// that it can be unit tested easily.\nfunc nextConfiguration(current Configuration, currentIndex uint64, change configurationChangeRequest) (Configuration, error) {\n\tif change.prevIndex > 0 && change.prevIndex != currentIndex {\n\t\treturn Configuration{}, fmt.Errorf(\"configuration changed since %v (latest is %v)\", change.prevIndex, currentIndex)\n\t}\n\n\tconfiguration := current.Clone()\n\tswitch change.command {\n\tcase AddVoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Voter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage == Voter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase AddNonvoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Nonvoter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage != Nonvoter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase DemoteVoter:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Nonvoter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase RemoveServer:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers = append(configuration.Servers[:i], configuration.Servers[i+1:]...)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase Promote:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID && server.Suffrage == Staging {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Voter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n\n\t// Make sure we didn't do something bad like remove the last voter\n\tif err := checkConfiguration(configuration); err != nil {\n\t\treturn Configuration{}, err\n\t}\n\n\treturn configuration, nil\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "addnonvoter_rows",
+        "file": "configuration_test.go",
+        "start_line": 195,
+        "end_line": 202,
+        "kind": "test_expectation",
+        "text": "\t// AddNonvoter: was missing.\n\t{singleServer, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Nonvoter id2 addr2}]}\"},\n\t// AddNonvoter: was Voter.\n\t{singleServer, AddNonvoter, 1, \"{[{Voter id1 addr1}]}\"},\n\t// AddNonvoter: was Staging.\n\t{oneOfEach, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Staging id2 addr2} {Nonvoter id3 addr3x}]}\"},\n\t// AddNonvoter: was Nonvoter.\n\t{oneOfEach, AddNonvoter, 3, \"{[{Voter id1 addr1x} {Staging id2 addr2x} {Nonvoter id3 addr3}]}\"},",
+        "content_digest": "3e0e33568dc16ce536ebcda005e712b6e71dbc8052093ecf41f9ce2f7a00decf"
+      },
+      {
+        "id": "follower_cfg_update",
+        "file": "raft.go",
+        "start_line": 1546,
+        "end_line": 1559,
+        "kind": "code_observation",
+        "text": "\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_cfg_entry",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_latest_vs_committed",
+        "file": "configuration.go",
+        "start_line": 150,
+        "end_line": 161,
+        "kind": "code_observation",
+        "text": "type configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "commit_new",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 48,
+        "kind": "code_observation",
+        "text": "func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64) *commitment {\n\tmatchIndexes := make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tmatchIndexes[server.ID] = 0\n\t\t}\n\t}\n\treturn &commitment{\n\t\tcommitCh:     commitCh,\n\t\tmatchIndexes: matchIndexes,\n\t\tcommitIndex:  0,\n\t\tstartIndex:   startIndex,\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "repl_all_servers",
+        "file": "raft.go",
+        "start_line": 582,
+        "end_line": 651,
+        "kind": "code_observation",
+        "text": "func (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})\n\t\t} else if ok {\n\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\tif peer.Address != server.Address {\n\t\t\t\tr.logger.Info(\"updating peer\", \"peer\", server.ID)\n\t\t\t\ts.peerLock.Lock()\n\t\t\t\ts.peer = server\n\t\t\t\ts.peerLock.Unlock()\n\t\t\t}\n\t\t}\n\t}\n\n\t// Stop replication goroutines that need stopping\n\tfor serverID, repl := range r.leaderState.replState {\n\t\tif inConfig[serverID] {\n\t\t\tcontinue\n\t\t}\n\t\t// Replicate up to lastIdx and stop\n\t\tr.logger.Info(\"removed peer, stopping replication\", \"peer\", serverID, \"last-index\", lastIdx)\n\t\trepl.stopCh <- lastIdx\n\t\tclose(repl.stopCh)\n\t\tdelete(r.leaderState.replState, serverID)\n\t\tr.observe(PeerObservation{Peer: repl.peer, Removed: true})\n\t}\n\n\t// Update peers metric\n\tmetrics.SetGauge([]string{\"raft\", \"peers\"}, float32(len(r.configurations.latest.Servers)))\n}\n\n// configurationChangeChIfStable returns r.configurationChangeCh if it's safe\n// to process requests from it, or nil otherwise. This must only be called\n// from the main thread.\n//\n// Note that if the conditions here were to change outside of leaderLoop to take",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "quorum_voters",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "lease_voters",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_logs",
+        "file": "raft.go",
+        "start_line": 1292,
+        "end_line": 1361,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\n\t// Store maxAppendEntries for this call in case it ever becomes reloadable. We\n\t// need to use the same value for all lines here to get the expected result.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\n\tbatch := make([]*commitTuple, 0, maxAppendEntries)\n\n\t// Apply all the preceding logs\n\tfor idx := lastApplied + 1; idx <= index; idx++ {\n\t\tvar preparedLog *commitTuple\n\t\t// Get the log, either from the future or from our log store\n\t\tfuture, futureOk := futures[idx]\n\t\tif futureOk {\n\t\t\tpreparedLog = r.prepareLog(&future.log, future)\n\t\t} else {\n\t\t\tl := new(Log)\n\t\t\tif err := r.logs.GetLog(idx, l); err != nil {\n\t\t\t\tr.logger.Error(\"failed to get log\", \"index\", idx, \"error\", err)\n\t\t\t\tpanic(err)\n\t\t\t}\n\t\t\tpreparedLog = r.prepareLog(l, nil)\n\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n\n\t// Update the lastApplied index and term\n\tr.setLastApplied(index)\n}\n\n// processLog is invoked to process the application of a single committed log entry.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "9d2362848ae9401a9723806d6f8984cf",
+      "result": {
+        "submission": "update.json",
+        "summary": "Submitted the fixed mixed-suffrage experiment for the commit-eligibility question: one process with two real Voters (quorum 2) plus one fully caught-up real Nonvoter, applying one command while the Nonvoter is withheld and one while a Voter is withheld, emitting the leader's last log index, the leader's commit index and the nonvoter's last log index as independent operands. Native construction feedback with identical inputs showed mode A committing with the Nonvoter withheld (leader_commit 3->4) and mode B leaving leader_commit at 4 while the Nonvoter had stored entry 5 and the apply returned 'leadership lost while committing log', i.e. a nonvoter acknowledgement did not advance commitIndex; the measured interpretation is left for the retained controller receipt. Added supporting sources for commitment.match plus the replication/quorum/lease voter-only sets."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-de0a5cb4de1e4d848d1f15c13e12e4ec": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-de0a5cb4de1e4d848d1f15c13e12e4ec.json"
+      },
+      "submission-3eb084cec7344a50b70253044fa3ffdb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-3eb084cec7344a50b70253044fa3ffdb.json"
+      },
+      "submission-c950fdc684ba41a5b6c16780bc3394bf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-c950fdc684ba41a5b6c16780bc3394bf.json"
+      }
+    }
+  },
+  "after": {
+    "experiments": [
+      {
+        "id": "de0a5cb4de1e4d848d1f15c13e12e4ec-experiment",
+        "investigation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceEmit(t *testing.T, fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssurance_AddVoterConfigVisibility observes, for a stable two-voter\n// cluster, whether the configuration entry appended by AddVoter becomes\n// visible in the configuration reported by the pre-existing voters, and how\n// long any disagreement lasts. The new server is a real, unbootstrapped\n// raft instance merged into the same in-process network.\nfunc TestAssurance_AddVoterConfigVisibility(t *testing.T) {\n\tc := MakeCluster(2, t, nil)\n\tdefer c.Close()\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tdefer c1.Close()\n\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\tleader := c.Leader()\n\tnewNode := c1.rafts[0]\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":     \"setup\",\n\t\t\"leader_id\": string(leader.localID),\n\t\t\"new_id\":    string(newNode.localID),\n\t})\n\n\tstart := time.Now()\n\tfuture := leader.AddVoter(newNode.localID, newNode.localAddr, 0, 0)\n\terr := future.Error()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":      \"addvoter_result\",\n\t\t\"elapsed_ms\": time.Since(start).Milliseconds(),\n\t\t\"err\":        fmt.Sprintf(\"%v\", err),\n\t\t\"index\":      future.Index(),\n\t})\n\n\tdeadline := time.Now().Add(3 * time.Second)\n\tprobe := 0\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range c.rafts {\n\t\t\tcfg := c.getConfiguration(r)\n\t\t\tvoters := 0\n\t\t\tfor _, s := range cfg.Servers {\n\t\t\t\tif s.Suffrage == Voter {\n\t\t\t\t\tvoters++\n\t\t\t\t}\n\t\t\t}\n\t\t\tassuranceEmit(t, map[string]interface{}{\n\t\t\t\t\"event\":          \"config_sample\",\n\t\t\t\t\"probe\":          probe,\n\t\t\t\t\"elapsed_ms\":     time.Since(start).Milliseconds(),\n\t\t\t\t\"peer_id\":        string(r.localID),\n\t\t\t\t\"is_new_node\":    string(r.localID) == string(newNode.localID),\n\t\t\t\t\"num_servers\":    len(cfg.Servers),\n\t\t\t\t\"num_voters\":     voters,\n\t\t\t\t\"has_new_member\": inConfiguration(cfg, newNode.localID),\n\t\t\t})\n\t\t}\n\t\tprobe++\n\t\ttime.Sleep(100 * time.Millisecond)\n\t}\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "append_config",
+            "commitment_setcfg",
+            "commitment_recalc"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Two-voter in-process cluster over InmemTransport, plus one real unbootstrapped raft instance merged into the same network; call AddVoter for the new server on the current leader, record the future result and index, then sample each node's reported configuration every 100ms for 3s.",
+            "assumptions": [],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "MakeCluster(2) starts a bootstrapped pair and waits for a leader; MakeClusterNoBootstrap(1) creates the new node with empty log and no configuration; Merge and FullyConnect wire the transports so the new node is reachable but has an empty log. The leader calls AddVoter(newID, newAddr, 0, 0) with prevIndex 0. Observations are the AddVoter future result/index and, per node, num_servers/num_voters/has_new_member sampled from the node's locally reported configuration, emitted as CA_EVENT JSON.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "7841d374df6147d684b985415a34be14",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.23.5 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "de0a5cb4de1e4d848d1f15c13e12e4ec",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      },
+      {
+        "id": "9d2362848ae9401a9723806d6f8984cf-experiment",
+        "investigation_id": "c950fdc684ba41a5b6c16780bc3394bf-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceEmit(t *testing.T, fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// boundedApply enqueues cmd on the leader and reports whether the apply future\n// completed inside window. It never blocks the test past the window.\nfunc boundedApply(leader *Raft, cmd string, window time.Duration) (committed bool, err error) {\n\tfuture := leader.Apply([]byte(cmd), window)\n\tdone := make(chan error, 1)\n\tgo func() { done <- future.Error() }()\n\tselect {\n\tcase e := <-done:\n\t\treturn true, e\n\tcase <-time.After(window):\n\t\treturn false, nil\n\t}\n}\n\n// TestAssurance_NonvoterCommitEligibility checks whether a nonvoter's\n// acknowledgement can advance the leader's commit index. The cluster is two\n// Voters (quorum 2) plus one real Nonvoter that is fully caught up. Withholding\n// the nonvoter must not affect commitment; withholding a voter must stall it\n// even though the nonvoter keeps storing entries.\nfunc TestAssurance_NonvoterCommitEligibility(t *testing.T) {\n\tc := MakeCluster(2, t, nil)\n\tdefer c.Close()\n\n\tc1 := MakeClusterNoBootstrap(1, t, nil)\n\tdefer c1.Close()\n\n\tc.Merge(c1)\n\tc.FullyConnect()\n\n\tleader := c.Leader()\n\tnonvoter := c1.rafts[0]\n\n\tfuture := leader.AddNonvoter(nonvoter.localID, nonvoter.localAddr, 0, 0)\n\terr := future.Error()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":             \"addnonvoter_result\",\n\t\t\"err\":               fmt.Sprintf(\"%v\", err),\n\t\t\"index\":             future.Index(),\n\t\t\"leader_id\":         string(leader.localID),\n\t\t\"nonvoter_id\":       string(nonvoter.localID),\n\t\t\"nonvoter_addr\":     string(nonvoter.localAddr),\n\t\t\"leader_last_index\": leader.getLastIndex(),\n\t\t\"leader_commit\":     leader.getCommitIndex(),\n\t})\n\n\t// Let the new configuration and the nonvoter catch up.\n\ttime.Sleep(300 * time.Millisecond)\n\n\tvar voterFollower *Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader && r.localID != nonvoter.localID {\n\t\t\tvoterFollower = r\n\t\t}\n\t}\n\tif voterFollower == nil {\n\t\tt.Fatalf(\"no voter follower found\")\n\t}\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"baseline\",\n\t\t\"leader_commit\":      leader.getCommitIndex(),\n\t\t\"leader_last_index\":  leader.getLastIndex(),\n\t\t\"voter_last_index\":   voterFollower.getLastIndex(),\n\t\t\"nonvoter_last_index\": nonvoter.getLastIndex(),\n\t})\n\n\t// Mode A: the Nonvoter is withheld; the two Voters are healthy.\n\tc.Disconnect(nonvoter.localAddr)\n\tcommitA, errA := boundedApply(leader, \"mode-a\", 800*time.Millisecond)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"mode_a_nv_isolated\",\n\t\t\"committed_in_window\": commitA,\n\t\t\"err\":                fmt.Sprintf(\"%v\", errA),\n\t\t\"leader_last_index\":  leader.getLastIndex(),\n\t\t\"leader_commit\":      leader.getCommitIndex(),\n\t\t\"nonvoter_last_index\": nonvoter.getLastIndex(),\n\t})\n\n\t// Reconnect everyone, let the pipeline settle.\n\tc.FullyConnect()\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// Mode B: a Voter is withheld; the Nonvoter is healthy and can store logs.\n\tc.Disconnect(voterFollower.localAddr)\n\tbeforeLast := leader.getLastIndex()\n\tcommitB, errB := boundedApply(leader, \"mode-b\", 800*time.Millisecond)\n\tleaderLast := leader.getLastIndex()\n\tleaderCommit := leader.getCommitIndex()\n\ttime.Sleep(300 * time.Millisecond)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":               \"mode_b_voter_isolated\",\n\t\t\"committed_in_window\": commitB,\n\t\t\"err\":                 fmt.Sprintf(\"%v\", errB),\n\t\t\"leader_last_before\":  beforeLast,\n\t\t\"leader_last_index\":   leaderLast,\n\t\t\"leader_commit\":       leaderCommit,\n\t\t\"nonvoter_last_index\": nonvoter.getLastIndex(),\n\t\t\"nonvoter_has_entry\":  nonvoter.getLastIndex() >= leaderLast,\n\t})\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "commit_new",
+            "commitment_match",
+            "commitment_recalc",
+            "repl_all_servers",
+            "quorum_voters",
+            "lease_voters"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "One process: bootstrapped two-Voter cluster (quorum 2) plus one real Nonvoter added with AddNonvoter while fully connected, then two withheld-side cases in the same execution. Case A withholds the Nonvoter's transport and applies one command; case B reconnects everyone, withholds a Voter's transport and applies one command. Each case emits the leader's last log index, the leader's commit index and the nonvoter's last log index, plus whether the apply future completed inside an 800ms window and its error.",
+            "assumptions": [],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "MakeCluster(2) bootstraps the two Voters and waits for a leader; MakeClusterNoBootstrap(1) creates the Nonvoter with an empty log; Merge plus FullyConnect wire all three transports so the Nonvoter is reachable and can store entries. The leader calls AddNonvoter(id, address, 0, 0) and the test waits 300ms so the nonvoting configuration is committed and the Nonvoter's log has caught up (baseline records leader_last_index=3, nonvoter_last_index=3). Isolation uses the cluster's transport-level Disconnect on the withheld node's address, which removes it in both directions without modifying production logic; FullyConnect restores it. Observability uses the package-internal getLastIndex/getCommitIndex accessors on the real raft objects, so the operands are the runtime state of the objects under test rather than a derived label.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "7841d374df6147d684b985415a34be14",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.23.5 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "9d2362848ae9401a9723806d6f8984cf",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "materials": [
+      {
+        "id": "append_config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1243,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}\n\n// dispatchLog is called on the leader to push a log to disk, mark it\n// as inflight and begin replication of it.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "commitment_setcfg",
+        "file": "commitment.go",
+        "start_line": 50,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "// Called when a new cluster membership configuration is created: it will be\n// used to determine commitment from now on. 'configuration' is the servers in\n// the cluster.\nfunc (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "commitment_recalc",
+        "file": "commitment.go",
+        "start_line": 86,
+        "end_line": 104,
+        "kind": "code_observation",
+        "text": "// Internal helper to calculate new commitIndex from matchIndexes.\n// Must be called with lock held.\nfunc (c *commitment) recalculate() {\n\tif len(c.matchIndexes) == 0 {\n\t\treturn\n\t}\n\n\tmatched := make([]uint64, 0, len(c.matchIndexes))\n\tfor _, idx := range c.matchIndexes {\n\t\tmatched = append(matched, idx)\n\t}\n\tsort.Sort(uint64Slice(matched))\n\tquorumMatchIndex := matched[(len(matched)-1)/2]\n\n\tif quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {\n\t\tc.commitIndex = quorumMatchIndex\n\t\tasyncNotifyCh(c.commitCh)\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "leader_commit_handler",
+        "file": "raft.go",
+        "start_line": 785,
+        "end_line": 800,
+        "kind": "code_observation",
+        "text": "\t\tcase <-r.leaderState.commitCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Process the newly committed entries\n\t\t\toldCommitIndex := r.getCommitIndex()\n\t\t\tcommitIndex := r.leaderState.commitment.getCommitIndex()\n\t\t\tr.setCommitIndex(commitIndex)\n\n\t\t\t// New configuration has been committed, set it as the committed\n\t\t\t// value.\n\t\t\tif r.configurations.latestIndex > oldCommitIndex &&\n\t\t\t\tr.configurations.latestIndex <= commitIndex {\n\t\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t\t\tif !hasVote(r.configurations.committed, r.localID) {\n\t\t\t\t\tstepDown = true\n\t\t\t\t}\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "stable_gate",
+        "file": "raft.go",
+        "start_line": 653,
+        "end_line": 666,
+        "kind": "code_observation",
+        "text": "func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {\n\t// Have to wait until:\n\t// 1. The latest configuration is committed, and\n\t// 2. This leader has committed some entry (the noop) in this term\n\t//    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J\n\tif r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\tr.getCommitIndex() >= r.leaderState.commitment.startIndex {\n\t\treturn r.configurationChangeCh\n\t}\n\treturn nil\n}\n\n// leaderLoop is the hot loop for a leader. It is invoked\n// after all the various leader setup is done.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_struct",
+        "file": "configuration.go",
+        "start_line": 139,
+        "end_line": 192,
+        "kind": "code_observation",
+        "text": "// configurations is state tracked on every server about its Configurations.\n// Note that, per Diego's dissertation, there can be at most one uncommitted\n// configuration at a time (the next configuration may not be created until the\n// prior one has been committed).\n//\n// One downside to storing just two configurations is that if you try to take a\n// snapshot when your state machine hasn't yet applied the committedIndex, we\n// have no record of the configuration that would logically fit into that\n// snapshot. We disallow snapshots in that case now. An alternative approach,\n// which LogCabin uses, is to track every configuration change in the\n// log.\ntype configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}\n\n// Clone makes a deep copy of a configurations object.\nfunc (c *configurations) Clone() (copy configurations) {\n\tcopy.committed = c.committed.Clone()\n\tcopy.committedIndex = c.committedIndex\n\tcopy.latest = c.latest.Clone()\n\tcopy.latestIndex = c.latestIndex\n\treturn\n}\n\n// hasVote returns true if the server identified by 'id' is a Voter in the\n// provided Configuration.\nfunc hasVote(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn server.Suffrage == Voter\n\t\t}\n\t}\n\treturn false\n}\n\n// inConfiguration returns true if the server identified by 'id' is in the\n// provided Configuration.\nfunc inConfiguration(configuration Configuration, id ServerID) bool {\n\tfor _, server := range configuration.Servers {\n\t\tif server.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "next_configuration",
+        "file": "configuration.go",
+        "start_line": 225,
+        "end_line": 306,
+        "kind": "code_observation",
+        "text": "// nextConfiguration generates a new Configuration from the current one and a\n// configuration change request. It's split from appendConfigurationEntry so\n// that it can be unit tested easily.\nfunc nextConfiguration(current Configuration, currentIndex uint64, change configurationChangeRequest) (Configuration, error) {\n\tif change.prevIndex > 0 && change.prevIndex != currentIndex {\n\t\treturn Configuration{}, fmt.Errorf(\"configuration changed since %v (latest is %v)\", change.prevIndex, currentIndex)\n\t}\n\n\tconfiguration := current.Clone()\n\tswitch change.command {\n\tcase AddVoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Voter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage == Voter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase AddNonvoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Nonvoter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage != Nonvoter {\n\t\t\t\t\tconfiguration.Servers[i].Address = change.serverAddress\n\t\t\t\t} else {\n\t\t\t\t\tconfiguration.Servers[i] = newServer\n\t\t\t\t}\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !found {\n\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase DemoteVoter:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Nonvoter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase RemoveServer:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tconfiguration.Servers = append(configuration.Servers[:i], configuration.Servers[i+1:]...)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\tcase Promote:\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID && server.Suffrage == Staging {\n\t\t\t\tconfiguration.Servers[i].Suffrage = Voter\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n\n\t// Make sure we didn't do something bad like remove the last voter\n\tif err := checkConfiguration(configuration); err != nil {\n\t\treturn Configuration{}, err\n\t}\n\n\treturn configuration, nil\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "addnonvoter_rows",
+        "file": "configuration_test.go",
+        "start_line": 195,
+        "end_line": 202,
+        "kind": "test_expectation",
+        "text": "\t// AddNonvoter: was missing.\n\t{singleServer, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Nonvoter id2 addr2}]}\"},\n\t// AddNonvoter: was Voter.\n\t{singleServer, AddNonvoter, 1, \"{[{Voter id1 addr1}]}\"},\n\t// AddNonvoter: was Staging.\n\t{oneOfEach, AddNonvoter, 2, \"{[{Voter id1 addr1x} {Staging id2 addr2} {Nonvoter id3 addr3x}]}\"},\n\t// AddNonvoter: was Nonvoter.\n\t{oneOfEach, AddNonvoter, 3, \"{[{Voter id1 addr1x} {Staging id2 addr2x} {Nonvoter id3 addr3}]}\"},",
+        "content_digest": "3e0e33568dc16ce536ebcda005e712b6e71dbc8052093ecf41f9ce2f7a00decf"
+      },
+      {
+        "id": "follower_cfg_update",
+        "file": "raft.go",
+        "start_line": 1546,
+        "end_line": 1559,
+        "kind": "code_observation",
+        "text": "\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_cfg_entry",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "cfg_latest_vs_committed",
+        "file": "configuration.go",
+        "start_line": 150,
+        "end_line": 161,
+        "kind": "code_observation",
+        "text": "type configurations struct {\n\t// committed is the latest configuration in the log/snapshot that has been\n\t// committed (the one with the largest index).\n\tcommitted Configuration\n\t// committedIndex is the log index where 'committed' was written.\n\tcommittedIndex uint64\n\t// latest is the latest configuration in the log/snapshot (may be committed\n\t// or uncommitted)\n\tlatest Configuration\n\t// latestIndex is the log index where 'latest' was written.\n\tlatestIndex uint64\n}",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "commit_new",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 48,
+        "kind": "code_observation",
+        "text": "func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64) *commitment {\n\tmatchIndexes := make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tmatchIndexes[server.ID] = 0\n\t\t}\n\t}\n\treturn &commitment{\n\t\tcommitCh:     commitCh,\n\t\tmatchIndexes: matchIndexes,\n\t\tcommitIndex:  0,\n\t\tstartIndex:   startIndex,\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "repl_all_servers",
+        "file": "raft.go",
+        "start_line": 582,
+        "end_line": 651,
+        "kind": "code_observation",
+        "text": "func (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})\n\t\t} else if ok {\n\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\tif peer.Address != server.Address {\n\t\t\t\tr.logger.Info(\"updating peer\", \"peer\", server.ID)\n\t\t\t\ts.peerLock.Lock()\n\t\t\t\ts.peer = server\n\t\t\t\ts.peerLock.Unlock()\n\t\t\t}\n\t\t}\n\t}\n\n\t// Stop replication goroutines that need stopping\n\tfor serverID, repl := range r.leaderState.replState {\n\t\tif inConfig[serverID] {\n\t\t\tcontinue\n\t\t}\n\t\t// Replicate up to lastIdx and stop\n\t\tr.logger.Info(\"removed peer, stopping replication\", \"peer\", serverID, \"last-index\", lastIdx)\n\t\trepl.stopCh <- lastIdx\n\t\tclose(repl.stopCh)\n\t\tdelete(r.leaderState.replState, serverID)\n\t\tr.observe(PeerObservation{Peer: repl.peer, Removed: true})\n\t}\n\n\t// Update peers metric\n\tmetrics.SetGauge([]string{\"raft\", \"peers\"}, float32(len(r.configurations.latest.Servers)))\n}\n\n// configurationChangeChIfStable returns r.configurationChangeCh if it's safe\n// to process requests from it, or nil otherwise. This must only be called\n// from the main thread.\n//\n// Note that if the conditions here were to change outside of leaderLoop to take",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "quorum_voters",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "lease_voters",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "process_logs",
+        "file": "raft.go",
+        "start_line": 1292,
+        "end_line": 1361,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\n\t// Store maxAppendEntries for this call in case it ever becomes reloadable. We\n\t// need to use the same value for all lines here to get the expected result.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\n\tbatch := make([]*commitTuple, 0, maxAppendEntries)\n\n\t// Apply all the preceding logs\n\tfor idx := lastApplied + 1; idx <= index; idx++ {\n\t\tvar preparedLog *commitTuple\n\t\t// Get the log, either from the future or from our log store\n\t\tfuture, futureOk := futures[idx]\n\t\tif futureOk {\n\t\t\tpreparedLog = r.prepareLog(&future.log, future)\n\t\t} else {\n\t\t\tl := new(Log)\n\t\t\tif err := r.logs.GetLog(idx, l); err != nil {\n\t\t\t\tr.logger.Error(\"failed to get log\", \"index\", idx, \"error\", err)\n\t\t\t\tpanic(err)\n\t\t\t}\n\t\t\tpreparedLog = r.prepareLog(l, nil)\n\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n\n\t// Update the lastApplied index and term\n\tr.setLastApplied(index)\n}\n\n// processLog is invoked to process the application of a single committed log entry.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "commitment_match",
+        "file": "commitment.go",
+        "start_line": 73,
+        "end_line": 84,
+        "kind": "code_observation",
+        "text": "// Match is called once a server completes writing entries to disk: either the\n// leader has written the new entry or a follower has replied to an\n// AppendEntries RPC. The given server's disk agrees with this server's log up\n// through the given index.\nfunc (c *commitment) match(server ServerID, matchIndex uint64) {\n\tc.Lock()\n\tdefer c.Unlock()\n\tif prev, hasVote := c.matchIndexes[server]; hasVote && matchIndex > prev {\n\t\tc.matchIndexes[server] = matchIndex\n\t\tc.recalculate()\n\t}\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "9d2362848ae9401a9723806d6f8984cf",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "experiment_id": "9d2362848ae9401a9723806d6f8984cf-experiment"
+    },
+    "applied_operations": {
+      "submission-de0a5cb4de1e4d848d1f15c13e12e4ec": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-de0a5cb4de1e4d848d1f15c13e12e4ec.json"
+      },
+      "submission-3eb084cec7344a50b70253044fa3ffdb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-3eb084cec7344a50b70253044fa3ffdb.json"
+      },
+      "submission-c950fdc684ba41a5b6c16780bc3394bf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-c950fdc684ba41a5b6c16780bc3394bf.json"
+      },
+      "submission-9d2362848ae9401a9723806d6f8984cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_18-31-52-hashicorp_raft-real-run/semantic-commits/submission-9d2362848ae9401a9723806d6f8984cf.json"
+      }
+    }
+  }
+}
