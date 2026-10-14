@@ -1,0 +1,641 @@
+{
+  "input": {
+    "rationale": "Newest 2026-dated area of the snapshot: the opt-in RestoreCommittedLogs startup replay over a CommitTrackingLogStore (api.go, raft.go, log.go, config.go). Source tracing shows the startup replay feeds the FSM mutation channel with a blocking send while the only consumer goroutine (runFSM) has not been started yet, and the replay batch size is MaxAppendEntries against a fixed 128-slot buffer. This turns into a permanent non-return of NewRaft once the replay window exceeds the buffer. Submitting a focused multi-case probe (same real stores, restart-only differences) to record the actual return/non-return and the blocked stack in a retained execution, together with the window census and batch arithmetic as inspectable operands.",
+    "sources": [
+      {
+        "id": "api_channel",
+        "file": "api.go",
+        "start_line": 558,
+        "end_line": 562,
+        "kind": "code_observation"
+      },
+      {
+        "id": "api_startup_order",
+        "file": "api.go",
+        "start_line": 600,
+        "end_line": 640,
+        "kind": "code_observation"
+      },
+      {
+        "id": "api_restore_committed",
+        "file": "api.go",
+        "start_line": 724,
+        "end_line": 754,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_applybatch_send",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1313,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_batch_loop",
+        "file": "raft.go",
+        "start_line": 1314,
+        "end_line": 1360,
+        "kind": "code_observation"
+      },
+      {
+        "id": "fsm_consumer",
+        "file": "fsm.go",
+        "start_line": 236,
+        "end_line": 246,
+        "kind": "code_observation"
+      },
+      {
+        "id": "config_restore_committed_doc",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "document_statement"
+      },
+      {
+        "id": "config_defaults",
+        "file": "config.go",
+        "start_line": 329,
+        "end_line": 343,
+        "kind": "code_observation"
+      },
+      {
+        "id": "log_commit_tracking_iface",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 221,
+        "kind": "interface_statement"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@startup_replay_liveness",
+        "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "log_commit_tracking_iface"
+        ],
+        "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+        "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "@replay_feeds_fsm_before_runfsm",
+            "revision": 1,
+            "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+          },
+          {
+            "entry_id": "@replay_buffer_bound",
+            "revision": 1,
+            "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+          }
+        ],
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@replay_feeds_fsm_before_runfsm",
+        "kind": "behavior",
+        "statement": "When RestoreCommittedLogs is enabled and the log store implements CommitTrackingLogStore, NewRaft calls restoreFromCommittedLogs, which sets the commit index from the store and calls processLogs(commitIndex, nil); processLogs delivers the entries in batches of at most config().MaxAppendEntries to the FSM by a blocking select-send on r.fsmMutateCh (created with capacity 128). The only reader of r.fsmMutateCh is runFSM, which NewRaft starts with r.goFunc(r.runFSM) after restoreFromCommittedLogs returns, so during the startup replay nothing consumes the channel.",
+        "conditions": "RestoreCommittedLogs=true, a LogStore implementing CommitTrackingLogStore, NewRaft startup path (conf.skipStartup false), entries above r.getLastApplied() present in the log store up to the persisted commit index.",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@replay_buffer_bound",
+        "kind": "fact",
+        "statement": "For the startup replay, non-return of NewRaft follows from the size of the replay window: with W FSM-bound entries (LogCommand, LogBarrier and LogConfiguration above protocol version 2, per prepareLog) delivered in ceil(W/MaxAppendEntries) batches against a 128-slot fsmMutateCh, the send only fits while ceil(W/MaxAppendEntries) <= 128. Beyond that the startup goroutine blocks in the replay send with no consumer and no way for the caller to reach Shutdown, because NewRaft has not returned a *Raft.",
+        "conditions": "Same conditions as the behavior entry, plus W > 128*MaxAppendEntries; MaxAppendEntries is bounded by ValidateConfig to 1..1024, so the bound is 128*MaxAppendEntries committed-but-unapplied entries (8192 at the 64-entry default).",
+        "source_ids": [
+          "api_channel",
+          "raft_batch_loop",
+          "raft_applybatch_send",
+          "fsm_consumer",
+          "config_defaults",
+          "config_restore_committed_doc"
+        ],
+        "executions": {},
+        "knowledge": [
+          {
+            "entry_id": "@replay_feeds_fsm_before_runfsm",
+            "revision": 1,
+            "assertion": "The replay send happens before any consumer of fsmMutateCh exists."
+          }
+        ],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "@startup_replay_liveness",
+        "experiment_id": null,
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults",
+          "log_commit_tracking_iface"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Source-only account: RestoreCommittedLogs is documented to replay all known-committed logs on disk before NewRaft completes (config.go 243-254), and restoreFromCommittedLogs does exactly that by calling processLogs before runFSM is started (api.go 606 vs 637). processLogs' applyBatch performs a blocking send on fsmMutateCh (raft.go 1306) whose capacity is 128 (api.go 560) while batching entries at MaxAppendEntries (raft.go 1318, 1345-1348), and runFSM (fsm.go 241) is the only reader of that channel anywhere in the package. Therefore the startup replay can only fit 128*MaxAppendEntries FSM-bound entries; past that the constructor cannot complete, and the escape in applyBatch (the shutdownCh arm) is unreachable because the caller has no *Raft to shut down before NewRaft returns. The sizing is inside the documented use case: DefaultConfig pairs MaxAppendEntries=64 with SnapshotThreshold=8192 and a 120s SnapshotInterval, so a node committing more than 8192 entries between snapshot checks - exactly the follower/restart situation the option targets - comes back with a replay window above the bound. The submitted experiment records the retained-execution state of this account (return vs non-return, window census, batch estimate, blocked stack) for five restart-only cases; the account above is a source derivation, not a reading of that run.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "@replay_feeds_fsm_before_runfsm",
+            "revision": 1,
+            "assertion": "Startup replay blocking-sends FSM batches before runFSM is started."
+          },
+          {
+            "entry_id": "@replay_buffer_bound",
+            "revision": 1,
+            "assertion": "Non-return once FSM-bound window entries exceed 128*MaxAppendEntries."
+          }
+        ],
+        "counterevidence": [
+          "The option is off by default (config.go 243-254, RestoreCommittedLogs false in DefaultConfig), so a cluster that does not opt into it cannot reach this path; the defect is scoped to that opt-in configuration.",
+          "raft.go 1305-1307 also arms a shutdownCh arm, so the blocked send is not unconditionally permanent: it can be released by Shutdown - but only by a caller that already holds the *Raft, which NewRaft has not yet returned, and by nothing internal (NewRaft starts no routines before this call).",
+          "An implementation that used an unbounded or larger FSM channel, or started runFSM first, would not show this; the account is specific to this snapshot's ordering and capacity."
+        ],
+        "limitations": [
+          "The precise batch/window boundary (window in FSM-bound entries vs 128*MaxAppendEntries) is derived from source; the submitted probe brackets it with observed windows rather than pinning the exact entry count at which the last fitting send is reached.",
+          "The startup replay also holds up to 128 batches (each up to MaxAppendEntries commit tuples) in the channel, so memory use grows with MaxAppendEntries; this submission does not measure that.",
+          "Whether a node that blocks here can be recovered by an operator (for example via configuration change) is not investigated; the claim is limited to NewRaft not returning and no internal repair being enabled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "@startup_replay_liveness",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "source_ids": [
+        "api_startup_order",
+        "api_restore_committed",
+        "api_channel",
+        "raft_applybatch_send",
+        "raft_batch_loop",
+        "fsm_consumer",
+        "config_restore_committed_doc",
+        "config_defaults"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "Five restart-only cases over the real hashicorp/raft single-voter node (in-memory transport, real commit-tracking log store): produce a committed log with the actual leader, stop the node, then call NewRaft again over the unchanged stores with a fresh transport on the same address, and record whether NewRaft returns. Cases vary only the size of the committed-but-unapplied startup replay window (applies before the restart, plus an optional manual snapshot before shutdown) and MaxAppendEntries.",
+        "assumptions": [
+          "RestoreCommittedLogs=true with a CommitTrackingLogStore, which is the documented opt-in configuration for this feature.",
+          "Automatic snapshotting is disabled (SnapshotThreshold=math.MaxUint64, SnapshotInterval=1h) so the replay window is set explicitly instead of by timer; this models a node whose newest snapshot lags its commit index, which the default 120s SnapshotInterval plus 8192 SnapshotThreshold also produce at higher write rates.",
+          "Restarted instances are constructed with a null logger so that no logging occurs after the test completes; logging is not part of the observed mechanism.",
+          "The bounded 5s wait is not the evidence: a returning restart is expected to be ~ms, and the blocked case is additionally recorded as a goroutine stack in the startup replay path."
+        ],
+        "excluded": [
+          "Multi-voter clusters, network faults, and on-disk (bolt) log stores are excluded; the mechanism observed is in the startup replay path, not in replication.",
+          "The FSM's own semantics are excluded: MockFSM only records applied logs, and no FSM behavior is asserted."
+        ],
+        "parameters": {
+          "cases": "small_window_default_batch(applied=4000), mid_window_default_batch(applied=1000), mid_window_small_batch(applied=1000,MaxAppendEntries=4), large_window_default_batch(applied=12000), large_window_after_snapshot(applied=12000,snapshot before shutdown)",
+          "restart_wait_seconds": 5,
+          "recorded_operands": "persisted_commit_index, last_log_index, snapshot_index, last_applied_before_restart, replay_window, fsm_bound_entries_in_window (entry-type census using the prepareLog rule), max_append_entries, fsm_mutate_ch_capacity (read from the running instance), estimated_replay_batches, restart_returned, restart_elapsed_ms, restart_error, restart_stack_frames"
+        }
+      },
+      "prefix": "Each case builds one real single-voter cluster with opts{Peers:1, Bootstrap:true, CommitTrackingLogs:true} so the log store, stable store, snapshot store and FSM are produced by the target itself: the leader dispatches and commits the applied commands through the normal leaderLoop/dispatchLogs path, which stages the commit index via StageCommitIndex and stores the entries. Before shutdown the harness reads the store's persisted commit index, the last log index, cap(fsmMutateCh), the configured MaxAppendEntries, and censuses the entry types in the replay window with GetLog using the same rule as Raft.prepareLog. For the snapshot case it takes a user snapshot before shutdown and uses that snapshot's index as the restart's last-applied point. It then calls leader.Shutdown(), creates a fresh NewInmemTransport on the same address, and calls NewRaft over the unchanged logs/stable/snapshots instances as the target's own restart tests do, in a goroutine that reports completion through a channel; the harness waits up to 5s and, if nothing arrived, samples all goroutine stacks and keeps the one on the startup replay path. No production code is modified; the harness only reads state and drives the exported lifecycle.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "",
+      "prerequisites": [],
+      "comparisons": [],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "interpretations": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c",
+      "result": {
+        "submission": "update.json",
+        "summary": "Sourced defect account for the opt-in RestoreCommittedLogs startup replay: NewRaft feeds the FSM by a blocking send on the 128-slot fsmMutateCh (api.go 560, raft.go 1306) in batches of MaxAppendEntries before the only consumer, runFSM, is started (api.go 606 vs 637; fsm.go 241), so a committed-but-unapplied replay window above 128*MaxAppendEntries (8192 at the default) can never be drained and NewRaft cannot return — with no internal repair, since the caller holds no *Raft to call Shutdown. Recorded sources, two knowledge entries, one active investigation, and a source-only interpretation (defect_claim asserted, conclusion conditional) that flags the opt-in scope and the untested exact boundary. Submitted a focused five-case probe (real single-voter node, real commit-tracking store, restart over unchanged stores) that varies only the replay window and MaxAppendEntries; it reports the persisted commit index, the prepareLog-rule entry census over the window, the batch estimate, the read-back channel capacity, the restart return/non-return, and the blocked goroutine stack, so the retained execution can confirm or defeat the mechanism. Verified locally with native feedback: windows 4001 and 1000 return in ~1ms, window 12001 (188 batches) and window 1001 with MaxAppendEntries=4 (250 batches) do not return, and the same 12000-entry state returns in 2ms once a snapshot before shutdown shrinks the window to 0; the blocked stack sits in processLogs -> restoreFromCommittedLogs -> NewRaft."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "version": 1,
+        "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "log_commit_tracking_iface"
+        ],
+        "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+        "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+          }
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "When RestoreCommittedLogs is enabled and the log store implements CommitTrackingLogStore, NewRaft calls restoreFromCommittedLogs, which sets the commit index from the store and calls processLogs(commitIndex, nil); processLogs delivers the entries in batches of at most config().MaxAppendEntries to the FSM by a blocking select-send on r.fsmMutateCh (created with capacity 128). The only reader of r.fsmMutateCh is runFSM, which NewRaft starts with r.goFunc(r.runFSM) after restoreFromCommittedLogs returns, so during the startup replay nothing consumes the channel.",
+        "conditions": "RestoreCommittedLogs=true, a LogStore implementing CommitTrackingLogStore, NewRaft startup path (conf.skipStartup false), entries above r.getLastApplied() present in the log store up to the persisted commit index.",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+      },
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "For the startup replay, non-return of NewRaft follows from the size of the replay window: with W FSM-bound entries (LogCommand, LogBarrier and LogConfiguration above protocol version 2, per prepareLog) delivered in ceil(W/MaxAppendEntries) batches against a 128-slot fsmMutateCh, the send only fits while ceil(W/MaxAppendEntries) <= 128. Beyond that the startup goroutine blocks in the replay send with no consumer and no way for the caller to reach Shutdown, because NewRaft has not returned a *Raft.",
+        "conditions": "Same conditions as the behavior entry, plus W > 128*MaxAppendEntries; MaxAppendEntries is bounded by ValidateConfig to 1..1024, so the bound is 128*MaxAppendEntries committed-but-unapplied entries (8192 at the 64-entry default).",
+        "source_ids": [
+          "api_channel",
+          "raft_batch_loop",
+          "raft_applybatch_send",
+          "fsm_consumer",
+          "config_defaults",
+          "config_restore_committed_doc"
+        ],
+        "executions": {},
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "The replay send happens before any consumer of fsmMutateCh exists."
+          }
+        ],
+        "history": [],
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-experiment",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright (c) 2026. Assurance harness artifact (draft, not part of the target source).\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"math\"\n\t\"os\"\n\t\"runtime\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\n// caRestartWait bounds how long the harness waits for a restarted node's\n// NewRaft call to return before recording it as non-returning.\nconst caRestartWait = 5 * time.Second\n\ntype caReplayCase struct {\n\tname               string\n\tapplied            int\n\tsnapshotBeforeStop bool\n\tmaxAppendEntries   int // 0 keeps the captured default\n}\n\ntype caReplayResult struct {\n\tCase               string   `json:\"case\"`\n\tApplied            int      `json:\"applied\"`\n\tMaxAppendEntries   int      `json:\"max_append_entries\"`\n\tFSMBufferCapacity  int      `json:\"fsm_mutate_ch_capacity\"`\n\tPersistedCommitIdx uint64   `json:\"persisted_commit_index\"`\n\tLastLogIndex       uint64   `json:\"last_log_index\"`\n\tSnapshotPresent    bool     `json:\"snapshot_present\"`\n\tSnapshotIndex      uint64   `json:\"snapshot_index\"`\n\tLastAppliedAtStart uint64   `json:\"last_applied_before_restart\"`\n\tReplayWindow       uint64   `json:\"replay_window\"`\n\tFSMBoundInWindow   uint64   `json:\"fsm_bound_entries_in_window\"`\n\tEstimatedBatches   uint64   `json:\"estimated_replay_batches\"`\n\tRestartReturned    bool     `json:\"restart_returned\"`\n\tRestartElapsedMs   int64    `json:\"restart_elapsed_ms\"`\n\tRestartError       string   `json:\"restart_error\"`\n\tRestartFrames      []string `json:\"restart_stack_frames\"`\n}\n\nfunc caEmit(t *testing.T, res caReplayResult) {\n\tt.Helper()\n\tblob, err := json.Marshal(res)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal result: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\n// TestAssurance_RestoreCommittedLogs_StartupReplay observes whether NewRaft\n// returns when RestoreCommittedLogs replays a startup window of\n// (last snapshot index, persisted commit index] committed entries.\n//\n// Each case runs the real single-voter Raft node (in-memory transport, real\n// commit-tracking log store) to produce the persisted commit index and log\n// contents, shuts it down, and then calls NewRaft again over the same stores.\n// The cases differ only in how many entries are committed before the restart\n// and whether a snapshot is taken before shutdown, i.e. in the size of the\n// startup replay window.\nfunc TestAssurance_RestoreCommittedLogs_StartupReplay(t *testing.T) {\n\tcases := []caReplayCase{\n\t\t{name: \"small_window_default_batch\", applied: 4000},\n\t\t{name: \"mid_window_default_batch\", applied: 1000},\n\t\t{name: \"mid_window_small_batch\", applied: 1000, maxAppendEntries: 4},\n\t\t{name: \"large_window_default_batch\", applied: 12000},\n\t\t{name: \"large_window_after_snapshot\", applied: 12000, snapshotBeforeStop: true},\n\t}\n\tfor _, tc := range cases {\n\t\tres := caRunReplayCase(t, tc)\n\t\tcaEmit(t, res)\n\t}\n}\n\nfunc caRunReplayCase(t *testing.T, tc caReplayCase) caReplayResult {\n\tt.Helper()\n\n\tres := caReplayResult{Case: tc.name, Applied: tc.applied}\n\n\t// Automatic snapshotting is disabled so that the startup replay window is\n\t// determined only by the explicit applies and the optional manual\n\t// snapshot. This is a legal configuration and models a node whose newest\n\t// snapshot lags its commit index (which also happens with default settings\n\t// when more than SnapshotThreshold entries are committed between the\n\t// periodic snapshot checks).\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.NewNullLogger()\n\tconf.RestoreCommittedLogs = true\n\tconf.SnapshotThreshold = math.MaxUint64\n\tconf.SnapshotInterval = time.Hour\n\tif tc.maxAppendEntries > 0 {\n\t\tconf.MaxAppendEntries = tc.maxAppendEntries\n\t}\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t})\n\n\tleader := c.Leader()\n\n\tvar last Future\n\tfor i := 0; i < tc.applied; i++ {\n\t\tlast = leader.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0)\n\t}\n\tif err := last.Error(); err != nil {\n\t\tt.Fatalf(\"apply %d: %v\", tc.applied, err)\n\t}\n\n\tlogs := leader.logs\n\tstable := leader.stable\n\tsnaps := leader.snapshots\n\tfsm := leader.fsm\n\taddr := leader.trans.LocalAddr()\n\n\tstore, ok := logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tt.Fatalf(\"log store %T does not implement CommitTrackingLogStore\", logs)\n\t}\n\tcommitIdx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex: %v\", err)\n\t}\n\tlastLogIdx, err := logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex: %v\", err)\n\t}\n\tres.PersistedCommitIdx = commitIdx\n\tres.LastLogIndex = lastLogIdx\n\tres.MaxAppendEntries = leader.config().MaxAppendEntries\n\tres.FSMBufferCapacity = cap(leader.fsmMutateCh)\n\n\tvar lastAppliedAtStart uint64\n\tif tc.snapshotBeforeStop {\n\t\tif err := leader.Snapshot().Error(); err != nil {\n\t\t\tt.Fatalf(\"snapshot: %v\", err)\n\t\t}\n\t\tsnapsList, err := snaps.List()\n\t\tif err != nil || len(snapsList) == 0 {\n\t\t\tt.Fatalf(\"snapshot list: %v (%d)\", err, len(snapsList))\n\t\t}\n\t\tres.SnapshotPresent = true\n\t\tres.SnapshotIndex = snapsList[0].Index\n\t\tlastAppliedAtStart = snapsList[0].Index\n\t}\n\tres.LastAppliedAtStart = lastAppliedAtStart\n\tif commitIdx > lastAppliedAtStart {\n\t\tres.ReplayWindow = commitIdx - lastAppliedAtStart\n\t}\n\n\t// Census the entry types inside the startup replay window using the same\n\t// rule as Raft.prepareLog, so the batch arithmetic below rests on observed\n\t// log contents rather than on an assumed layout.\n\tfsmBound, err := caCountFSMBound(logs, lastAppliedAtStart+1, commitIdx, leader.protocolVersion)\n\tif err != nil {\n\t\tt.Fatalf(\"census replay window: %v\", err)\n\t}\n\tres.FSMBoundInWindow = fsmBound\n\tif res.MaxAppendEntries > 0 {\n\t\tres.EstimatedBatches = (fsmBound + uint64(res.MaxAppendEntries) - 1) / uint64(res.MaxAppendEntries)\n\t}\n\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\n\t// Restart the node over the same durable stores, exactly as the target's\n\t// own restart tests do, with a fresh transport on the same address.\n\tcfg := *conf\n\tcfg.Logger = hclog.NewNullLogger()\n\n\tdoneCh := make(chan error, 1)\n\tgo func() {\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\tdoneCh <- fmt.Errorf(\"panic: %v\", r)\n\t\t\t}\n\t\t}()\n\t\t_, trans2 := NewInmemTransport(addr)\n\t\t_, err := NewRaft(&cfg, fsm, logs, stable, snaps, trans2)\n\t\tdoneCh <- err\n\t}()\n\n\tstart := time.Now()\n\tselect {\n\tcase rerr := <-doneCh:\n\t\tres.RestartReturned = true\n\t\tif rerr != nil {\n\t\t\tres.RestartError = rerr.Error()\n\t\t}\n\tcase <-time.After(caRestartWait):\n\t\tres.RestartFrames = caBlockedReplayFrames()\n\t}\n\tres.RestartElapsedMs = time.Since(start).Milliseconds()\n\n\tfor _, d := range c.dirs {\n\t\t_ = os.RemoveAll(d)\n\t}\n\treturn res\n}\n\n// caCountFSMBound counts the entries in [1, upTo] that Raft.prepareLog turns\n// into an entry delivered to the FSM (LogCommand, LogBarrier and, above\n// protocol version 2, LogConfiguration). No-ops and the deprecated peer entry\n// types are not delivered.\nfunc caCountFSMBound(logs LogStore, from, upTo uint64, protocol ProtocolVersion) (uint64, error) {\n\tvar bound uint64\n\tif from == 0 {\n\t\tfrom = 1\n\t}\n\tfor idx := from; idx <= upTo; idx++ {\n\t\tvar l Log\n\t\tif err := logs.GetLog(idx, &l); err != nil {\n\t\t\treturn bound, fmt.Errorf(\"GetLog(%d): %w\", idx, err)\n\t\t}\n\t\tswitch l.Type {\n\t\tcase LogCommand, LogBarrier:\n\t\t\tbound++\n\t\tcase LogConfiguration:\n\t\t\tif protocol > 2 {\n\t\t\t\tbound++\n\t\t\t}\n\t\t}\n\t}\n\treturn bound, nil\n}\n\n// caBlockedReplayFrames samples the goroutine dump and returns the stack of the\n// goroutine that has not returned out of the startup replay path, so the\n// blocking mechanism is inspectable rather than inferred. A send blocked\n// inside a select is reported by the runtime with a [select] state header, so\n// the block is identified by its frames rather than by its state name.\nfunc caBlockedReplayFrames() []string {\n\tbuf := make([]byte, 1<<20)\n\tn := runtime.Stack(buf, true)\n\tlines := strings.Split(string(buf[:n]), \"\\n\")\n\n\tvar frames []string\n\tfor i := 0; i < len(lines); i++ {\n\t\tif !strings.HasPrefix(lines[i], \"goroutine \") {\n\t\t\tcontinue\n\t\t}\n\t\tvar block []string\n\t\tfor j := i; j < len(lines) && strings.TrimSpace(lines[j]) != \"\"; j++ {\n\t\t\tblock = append(block, strings.TrimSpace(lines[j]))\n\t\t}\n\t\tjoined := strings.Join(block, \"\\n\")\n\t\tif strings.Contains(joined, \"processLogs\") && strings.Contains(joined, \"restoreFromCommittedLogs\") {\n\t\t\tfor _, f := range block {\n\t\t\t\tif strings.HasPrefix(f, \"goroutine \") || strings.Contains(f, \".go:\") {\n\t\t\t\t\tframes = append(frames, f)\n\t\t\t\t\tif len(frames) >= 10 {\n\t\t\t\t\t\tbreak\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t}\n\treturn frames\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "api_startup_order",
+            "api_restore_committed",
+            "api_channel",
+            "raft_applybatch_send",
+            "raft_batch_loop",
+            "fsm_consumer",
+            "config_restore_committed_doc",
+            "config_defaults"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Five restart-only cases over the real hashicorp/raft single-voter node (in-memory transport, real commit-tracking log store): produce a committed log with the actual leader, stop the node, then call NewRaft again over the unchanged stores with a fresh transport on the same address, and record whether NewRaft returns. Cases vary only the size of the committed-but-unapplied startup replay window (applies before the restart, plus an optional manual snapshot before shutdown) and MaxAppendEntries.",
+            "assumptions": [
+              "RestoreCommittedLogs=true with a CommitTrackingLogStore, which is the documented opt-in configuration for this feature.",
+              "Automatic snapshotting is disabled (SnapshotThreshold=math.MaxUint64, SnapshotInterval=1h) so the replay window is set explicitly instead of by timer; this models a node whose newest snapshot lags its commit index, which the default 120s SnapshotInterval plus 8192 SnapshotThreshold also produce at higher write rates.",
+              "Restarted instances are constructed with a null logger so that no logging occurs after the test completes; logging is not part of the observed mechanism.",
+              "The bounded 5s wait is not the evidence: a returning restart is expected to be ~ms, and the blocked case is additionally recorded as a goroutine stack in the startup replay path."
+            ],
+            "excluded": [
+              "Multi-voter clusters, network faults, and on-disk (bolt) log stores are excluded; the mechanism observed is in the startup replay path, not in replication.",
+              "The FSM's own semantics are excluded: MockFSM only records applied logs, and no FSM behavior is asserted."
+            ],
+            "parameters": {
+              "cases": "small_window_default_batch(applied=4000), mid_window_default_batch(applied=1000), mid_window_small_batch(applied=1000,MaxAppendEntries=4), large_window_default_batch(applied=12000), large_window_after_snapshot(applied=12000,snapshot before shutdown)",
+              "restart_wait_seconds": 5,
+              "recorded_operands": "persisted_commit_index, last_log_index, snapshot_index, last_applied_before_restart, replay_window, fsm_bound_entries_in_window (entry-type census using the prepareLog rule), max_append_entries, fsm_mutate_ch_capacity (read from the running instance), estimated_replay_batches, restart_returned, restart_elapsed_ms, restart_error, restart_stack_frames"
+            }
+          },
+          "prefix": "Each case builds one real single-voter cluster with opts{Peers:1, Bootstrap:true, CommitTrackingLogs:true} so the log store, stable store, snapshot store and FSM are produced by the target itself: the leader dispatches and commits the applied commands through the normal leaderLoop/dispatchLogs path, which stages the commit index via StageCommitIndex and stores the entries. Before shutdown the harness reads the store's persisted commit index, the last log index, cap(fsmMutateCh), the configured MaxAppendEntries, and censuses the entry types in the replay window with GetLog using the same rule as Raft.prepareLog. For the snapshot case it takes a user snapshot before shutdown and uses that snapshot's index as the restart's last-applied point. It then calls leader.Shutdown(), creates a fresh NewInmemTransport on the same address, and calls NewRaft over the unchanged logs/stable/snapshots instances as the target's own restart tests do, in a goroutine that reports completion through a channel; the harness waits up to 5s and, if nothing arrived, samples all goroutine stacks and keeps the one on the startup replay path. No production code is modified; the harness only reads state and drives the exported lifecycle.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "a9b23cffeb2849bb8cf827344104972c",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults",
+          "log_commit_tracking_iface"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Source-only account: RestoreCommittedLogs is documented to replay all known-committed logs on disk before NewRaft completes (config.go 243-254), and restoreFromCommittedLogs does exactly that by calling processLogs before runFSM is started (api.go 606 vs 637). processLogs' applyBatch performs a blocking send on fsmMutateCh (raft.go 1306) whose capacity is 128 (api.go 560) while batching entries at MaxAppendEntries (raft.go 1318, 1345-1348), and runFSM (fsm.go 241) is the only reader of that channel anywhere in the package. Therefore the startup replay can only fit 128*MaxAppendEntries FSM-bound entries; past that the constructor cannot complete, and the escape in applyBatch (the shutdownCh arm) is unreachable because the caller has no *Raft to shut down before NewRaft returns. The sizing is inside the documented use case: DefaultConfig pairs MaxAppendEntries=64 with SnapshotThreshold=8192 and a 120s SnapshotInterval, so a node committing more than 8192 entries between snapshot checks - exactly the follower/restart situation the option targets - comes back with a replay window above the bound. The submitted experiment records the retained-execution state of this account (return vs non-return, window census, batch estimate, blocked stack) for five restart-only cases; the account above is a source derivation, not a reading of that run.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "Startup replay blocking-sends FSM batches before runFSM is started."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return once FSM-bound window entries exceed 128*MaxAppendEntries."
+          }
+        ],
+        "counterevidence": [
+          "The option is off by default (config.go 243-254, RestoreCommittedLogs false in DefaultConfig), so a cluster that does not opt into it cannot reach this path; the defect is scoped to that opt-in configuration.",
+          "raft.go 1305-1307 also arms a shutdownCh arm, so the blocked send is not unconditionally permanent: it can be released by Shutdown - but only by a caller that already holds the *Raft, which NewRaft has not yet returned, and by nothing internal (NewRaft starts no routines before this call).",
+          "An implementation that used an unbounded or larger FSM channel, or started runFSM first, would not show this; the account is specific to this snapshot's ordering and capacity."
+        ],
+        "limitations": [
+          "The precise batch/window boundary (window in FSM-bound entries vs 128*MaxAppendEntries) is derived from source; the submitted probe brackets it with observed windows rather than pinning the exact entry count at which the last fitting send is reached.",
+          "The startup replay also holds up to 128 batches (each up to MaxAppendEntries commit tuples) in the channel, so memory use grows with MaxAppendEntries; this submission does not measure that.",
+          "Whether a node that blocks here can be recovered by an operator (for example via configuration change) is not investigated; the claim is limited to NewRaft not returning and no internal repair being enabled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+      }
+    ],
+    "materials": [
+      {
+        "id": "api_channel",
+        "file": "api.go",
+        "start_line": 558,
+        "end_line": 562,
+        "kind": "code_observation",
+        "text": "\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),\n\t\tfsmSnapshotCh:         make(chan *reqSnapshotFuture),\n\t\tleaderCh:              make(chan bool, 1),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_startup_order",
+        "file": "api.go",
+        "start_line": 600,
+        "end_line": 640,
+        "kind": "code_observation",
+        "text": "\n\t// Attempt to restore a snapshot if there are any.\n\tif err := r.restoreSnapshot(); err != nil {\n\t\treturn nil, err\n\t}\n\n\tif err := r.restoreFromCommittedLogs(); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Scan through the log for any configuration change entries.\n\tsnapshotIndex, _ := r.getLastSnapshot()\n\tlastappliedIndex := r.getLastApplied()\n\tfor index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {\n\t\tvar entry Log\n\t\tif err := r.logs.GetLog(index, &entry); err != nil {\n\t\t\tr.logger.Error(\"failed to get log\", \"index\", index, \"error\", err)\n\t\t\tpanic(err)\n\t\t}\n\t\tif err := r.processConfigurationLogEntry(&entry); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n\tr.logger.Info(\"initial configuration\",\n\t\t\"index\", r.configurations.latestIndex,\n\t\t\"servers\", hclog.Fmt(\"%+v\", r.configurations.latest.Servers))\n\n\t// Setup a heartbeat fast-path to avoid head-of-line\n\t// blocking where possible. It MUST be safe for this\n\t// to be called concurrently with a blocking RPC.\n\ttrans.SetHeartbeatHandler(r.processHeartbeat)\n\n\tif conf.skipStartup {\n\t\treturn r, nil\n\t}\n\t// Start the background work.\n\tr.goFunc(r.run)\n\tr.goFunc(r.runFSM)\n\tr.goFunc(r.runSnapshots)\n\treturn r, nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_committed",
+        "file": "api.go",
+        "start_line": 724,
+        "end_line": 754,
+        "kind": "code_observation",
+        "text": "func (r *Raft) restoreFromCommittedLogs() error {\n\tif !r.RestoreCommittedLogs {\n\t\treturn nil\n\t}\n\n\t// If the store implements CommitTrackingLogStore, we can read the commit index from the store.\n\t// This is useful when the store is able to track the commit index and we can avoid replaying logs.\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tr.logger.Warn(\"restore committed logs enabled but log store does not support it\", \"log_store\", fmt.Sprintf(\"%T\", r.logs))\n\t\treturn ErrIncompatibleLogStore\n\t}\n\n\tcommitIndex, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get commit index from store\", \"error\", err)\n\t\treturn err\n\t}\n\n\tlastIndex, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index from store\", \"error\", err)\n\t\treturn err\n\t}\n\tif commitIndex > lastIndex {\n\t\tcommitIndex = lastIndex\n\t}\n\n\tr.setCommitIndex(commitIndex)\n\tr.processLogs(commitIndex, nil)\n\treturn nil",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "raft_applybatch_send",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1313,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_batch_loop",
+        "file": "raft.go",
+        "start_line": 1314,
+        "end_line": 1360,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Store maxAppendEntries for this call in case it ever becomes reloadable. We\n\t// need to use the same value for all lines here to get the expected result.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\n\tbatch := make([]*commitTuple, 0, maxAppendEntries)\n\n\t// Apply all the preceding logs\n\tfor idx := lastApplied + 1; idx <= index; idx++ {\n\t\tvar preparedLog *commitTuple\n\t\t// Get the log, either from the future or from our log store\n\t\tfuture, futureOk := futures[idx]\n\t\tif futureOk {\n\t\t\tpreparedLog = r.prepareLog(&future.log, future)\n\t\t} else {\n\t\t\tl := new(Log)\n\t\t\tif err := r.logs.GetLog(idx, l); err != nil {\n\t\t\t\tr.logger.Error(\"failed to get log\", \"index\", idx, \"error\", err)\n\t\t\t\tpanic(err)\n\t\t\t}\n\t\t\tpreparedLog = r.prepareLog(l, nil)\n\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "fsm_consumer",
+        "file": "fsm.go",
+        "start_line": 236,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "\n\tfor {\n\t\tsaturation.sleeping()\n\n\t\tselect {\n\t\tcase ptr := <-r.fsmMutateCh:\n\t\t\tsaturation.working()\n\n\t\t\tswitch req := ptr.(type) {\n\t\t\tcase []*commitTuple:\n\t\t\t\tapplyBatch(req)",
+        "content_digest": "87043c532565c2027473e38fbe2089a0dcebba6f58d1b05262eb13a14e179df3"
+      },
+      {
+        "id": "config_restore_committed_doc",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "document_statement",
+        "text": "\t// RestoreCommittedLogs controls if the Raft server should use the restore committed logs\n\t// mechanism. Restore committed logs requires a LogStore implementation that\n\t// support commit tracking. When such a store is used and this config\n\t// enabled, raft nodes will replay all known-committed logs on disk\n\t// before completing `NewRaft` on startup. This is mainly useful where\n\t// the application allows relaxed-consistency reads from followers as it\n\t// will reduce how far behind the follower's FSM is when it starts. If all reads\n\t// are forwarded to the leader then there won't be observable benefit from this feature.\n\t//\n\t// Notice: If this is enabled, the log store MUST implement the CommitTrackingLogStore\n\t// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.\n\tRestoreCommittedLogs bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "config_defaults",
+        "file": "config.go",
+        "start_line": 329,
+        "end_line": 343,
+        "kind": "code_observation",
+        "text": "func DefaultConfig() *Config {\n\treturn &Config{\n\t\tProtocolVersion:    ProtocolVersionMax,\n\t\tHeartbeatTimeout:   1000 * time.Millisecond,\n\t\tElectionTimeout:    1000 * time.Millisecond,\n\t\tCommitTimeout:      50 * time.Millisecond,\n\t\tMaxAppendEntries:   64,\n\t\tShutdownOnRemove:   true,\n\t\tTrailingLogs:       10240,\n\t\tSnapshotInterval:   120 * time.Second,\n\t\tSnapshotThreshold:  8192,\n\t\tLeaderLeaseTimeout: 500 * time.Millisecond,\n\t\tLogLevel:           \"DEBUG\",\n\t}\n}",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "log_commit_tracking_iface",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 221,
+        "kind": "interface_statement",
+        "text": "type CommitTrackingLogStore interface {\n\tLogStore\n\n\t// StageCommitIndex stages a new commit index to be persisted.\n\t// The staged commit index MUST only be persisted in a manner that is atomic\n\t// with the following StoreLogs call in the face of a crash.\n\t// This allows the Raft implementation to optimize commit index updates\n\t// without risking inconsistency between the commit index and the log entries.\n\t//\n\t// The implementation MUST NOT persist this value separately from the log entries.\n\t// Instead, it should stage the value to be written atomically with the next\n\t// StoreLogs call.\n\t//\n\t// GetCommitIndex MUST never return a value higher than the last index in the log,\n\t// even if a higher value has been staged with this method.\n\t//\n\t// idx is the new commit index to stage.\n\tStageCommitIndex(idx uint64) error\n\n\t// GetCommitIndex returns the latest persisted commit index from the latest log entry\n\t// in the store at startup.\n\t//\n\t// GetCommitIndex should not return a value higher than the last index in the log.\n\t// If that happens, the last index in the log will be used.\n\t//\n\t// When no commit index is found in the log store, return (0, nil).\n\tGetCommitIndex() (uint64, error)\n}",
+        "content_digest": "7a890bd749cd6863faef212b586320b8c6d9574bb7158f56c4e022408abff0b4"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@replay_feeds_fsm_before_runfsm": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+        "@replay_buffer_bound": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+        "@startup_replay_liveness": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "api_channel"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "api_startup_order"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "api_restore_committed"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_applybatch_send"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_batch_loop"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "fsm_consumer"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "config_restore_committed_doc"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "config_defaults"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "log_commit_tracking_iface"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@replay_feeds_fsm_before_runfsm"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@replay_buffer_bound"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@startup_replay_liveness"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "@startup_replay_liveness"
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "c4168d1deb72421a8935ea2ddc7d9b7c-experiment"
+    },
+    "applied_operations": {
+      "submission-c4168d1deb72421a8935ea2ddc7d9b7c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-c4168d1deb72421a8935ea2ddc7d9b7c.json"
+      }
+    }
+  }
+}

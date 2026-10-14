@@ -1,0 +1,61 @@
+{
+  "rationale": "While looking for a further lead in the recovery and resynchronization mechanism I examined a suspicion that did not survive the sources, and it is worth recording as an excluded cause with its basis rather than leaving it unrecorded: the replication backoff that a leader applies to a failing follower is capped (failureWait 10ms doubled up to maxFailureScale 12, so its ceiling is about 10.24s) and it is cleared by any successful replication, including a rejected append that asks for older logs, so a follower that recovers after a long outage is caught up within one backoff interval rather than left stalled indefinitely. The question is registered with a source-only answer and a refuted claim so a later reader can see what was checked and why it is not a defect.",
+  "sources": [
+    {
+      "id": "replication_retry_backoff",
+      "file": "replication.go",
+      "start_line": 205,
+      "end_line": 262,
+      "kind": "code_observation"
+    },
+    {
+      "id": "util_backoff_formula",
+      "file": "util.go",
+      "start_line": 129,
+      "end_line": 152,
+      "kind": "code_observation"
+    },
+    {
+      "id": "replication_heartbeat_backoff",
+      "file": "replication.go",
+      "start_line": 405,
+      "end_line": 420,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@replication_backoff_recovery",
+      "question": "Does the replication retry backoff a leader applies to a failing follower leave that follower without log replication for an unbounded time after it recovers, because the heartbeat path's successes do not clear the replication failure count?",
+      "source_ids": [
+        "replication_retry_backoff",
+        "util_backoff_formula",
+        "replication_heartbeat_backoff"
+      ],
+      "hypothesis": "replicateTo sleeps backoff(failureWait, s.failures, maxFailureScale) before each attempt and counts every transport error or rejected append in s.failures, while the peer's heartbeat goroutine keeps its own separate failure counter and does not touch s.failures, so a follower that recovers after many consecutive failures could wait for the replication backoff rather than being caught up as soon as it is reachable again.",
+      "discriminator": "Compare the two failure counters and the backoff ceiling: if the replication backoff is capped at a small value and any successful replication clears it, the delay after recovery is bounded by that ceiling; if it grows without bound or is only cleared by a full catch-up, a recovered follower could be stranded. A measurement would partition a follower long enough to accumulate failures, heal it, and time the catch-up against a short-outage control.",
+      "disposition": "explained"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@replication_backoff_recovery",
+      "source_ids": [
+        "replication_retry_backoff",
+        "util_backoff_formula",
+        "replication_heartbeat_backoff"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Source-only answer, no execution. The suspicion is defeated by the arithmetic of the backoff: util.go's backoff doubles failureWait only while the round number is above two and never beyond limit, so with failureWait 10ms and maxFailureScale 12 the ceiling is 10ms*2^10, about 10.24s, and it cannot grow further no matter how long the follower stays unreachable. The count that feeds it is cleared in the same function that uses it: a successful append clears s.failures, and a rejected append that asks for older logs with NoRetryBackoff set clears it as well, so the first attempt that reaches a recovered follower resets the penalty. The heartbeat goroutine's separate counter and its own capped backoff matter for the leader's lease and for verifications, not for this, and the two paths cannot disagree indefinitely because the replication attempt itself is what clears the penalty. What remains is a bounded delay of at most one backoff interval after a long outage - a deliberate curtailment of retry rate rather than a stall - and the correct reading is that the leader resumes replication to a recovered follower within that bound, not that the follower is stranded.",
+      "counterevidence": [
+        "The bound is a delay, not zero: after roughly twelve consecutive failures the leader does wait about ten seconds between attempts, and if a quorum depends on that follower then commits wait with it; the refutation is about unboundedness, not about the delay existing.",
+        "Only the source was read for this answer: no execution timed a long outage and its recovery, so the claim is that the mechanism cannot stall indefinitely, not that the delay is short in any particular deployment."
+      ],
+      "limitations": [
+        "This answers a suspicion raised during exploration and does not itself constitute a finding; it is recorded so the excluded cause and its basis remain visible.",
+        "The quantitative bound is derived from the constants in the captured snapshot (failureWait, maxFailureScale) and would change if those changed."
+      ]
+    }
+  ]
+}

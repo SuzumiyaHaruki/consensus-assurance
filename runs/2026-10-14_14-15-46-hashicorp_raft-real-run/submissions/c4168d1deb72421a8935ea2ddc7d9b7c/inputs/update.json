@@ -1,0 +1,209 @@
+{
+  "rationale": "Newest 2026-dated area of the snapshot: the opt-in RestoreCommittedLogs startup replay over a CommitTrackingLogStore (api.go, raft.go, log.go, config.go). Source tracing shows the startup replay feeds the FSM mutation channel with a blocking send while the only consumer goroutine (runFSM) has not been started yet, and the replay batch size is MaxAppendEntries against a fixed 128-slot buffer. This turns into a permanent non-return of NewRaft once the replay window exceeds the buffer. Submitting a focused multi-case probe (same real stores, restart-only differences) to record the actual return/non-return and the blocked stack in a retained execution, together with the window census and batch arithmetic as inspectable operands.",
+  "sources": [
+    {
+      "id": "api_channel",
+      "file": "api.go",
+      "start_line": 558,
+      "end_line": 562,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_startup_order",
+      "file": "api.go",
+      "start_line": 600,
+      "end_line": 640,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_restore_committed",
+      "file": "api.go",
+      "start_line": 724,
+      "end_line": 754,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_applybatch_send",
+      "file": "raft.go",
+      "start_line": 1296,
+      "end_line": 1313,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_batch_loop",
+      "file": "raft.go",
+      "start_line": 1314,
+      "end_line": 1360,
+      "kind": "code_observation"
+    },
+    {
+      "id": "fsm_consumer",
+      "file": "fsm.go",
+      "start_line": 236,
+      "end_line": 246,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_restore_committed_doc",
+      "file": "config.go",
+      "start_line": 243,
+      "end_line": 254,
+      "kind": "document_statement"
+    },
+    {
+      "id": "config_defaults",
+      "file": "config.go",
+      "start_line": 329,
+      "end_line": 343,
+      "kind": "code_observation"
+    },
+    {
+      "id": "log_commit_tracking_iface",
+      "file": "log.go",
+      "start_line": 194,
+      "end_line": 221,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@startup_replay_liveness",
+      "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+      "source_ids": [
+        "api_startup_order",
+        "api_restore_committed",
+        "api_channel",
+        "raft_applybatch_send",
+        "raft_batch_loop",
+        "fsm_consumer",
+        "config_restore_committed_doc",
+        "log_commit_tracking_iface"
+      ],
+      "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+      "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+      "knowledge": [
+        {
+          "entry_id": "@replay_feeds_fsm_before_runfsm",
+          "revision": 1,
+          "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+        },
+        {
+          "entry_id": "@replay_buffer_bound",
+          "revision": 1,
+          "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+        }
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@replay_feeds_fsm_before_runfsm",
+      "kind": "behavior",
+      "statement": "When RestoreCommittedLogs is enabled and the log store implements CommitTrackingLogStore, NewRaft calls restoreFromCommittedLogs, which sets the commit index from the store and calls processLogs(commitIndex, nil); processLogs delivers the entries in batches of at most config().MaxAppendEntries to the FSM by a blocking select-send on r.fsmMutateCh (created with capacity 128). The only reader of r.fsmMutateCh is runFSM, which NewRaft starts with r.goFunc(r.runFSM) after restoreFromCommittedLogs returns, so during the startup replay nothing consumes the channel.",
+      "conditions": "RestoreCommittedLogs=true, a LogStore implementing CommitTrackingLogStore, NewRaft startup path (conf.skipStartup false), entries above r.getLastApplied() present in the log store up to the persisted commit index.",
+      "source_ids": [
+        "api_startup_order",
+        "api_restore_committed",
+        "api_channel",
+        "raft_applybatch_send",
+        "raft_batch_loop",
+        "fsm_consumer"
+      ]
+    },
+    {
+      "ref": "@replay_buffer_bound",
+      "kind": "fact",
+      "statement": "For the startup replay, non-return of NewRaft follows from the size of the replay window: with W FSM-bound entries (LogCommand, LogBarrier and LogConfiguration above protocol version 2, per prepareLog) delivered in ceil(W/MaxAppendEntries) batches against a 128-slot fsmMutateCh, the send only fits while ceil(W/MaxAppendEntries) <= 128. Beyond that the startup goroutine blocks in the replay send with no consumer and no way for the caller to reach Shutdown, because NewRaft has not returned a *Raft.",
+      "conditions": "Same conditions as the behavior entry, plus W > 128*MaxAppendEntries; MaxAppendEntries is bounded by ValidateConfig to 1..1024, so the bound is 128*MaxAppendEntries committed-but-unapplied entries (8192 at the 64-entry default).",
+      "source_ids": [
+        "api_channel",
+        "raft_batch_loop",
+        "raft_applybatch_send",
+        "fsm_consumer",
+        "config_defaults",
+        "config_restore_committed_doc"
+      ],
+      "knowledge": [
+        {
+          "entry_id": "@replay_feeds_fsm_before_runfsm",
+          "revision": 1,
+          "assertion": "The replay send happens before any consumer of fsmMutateCh exists."
+        }
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@startup_replay_liveness",
+      "source_ids": [
+        "api_startup_order",
+        "api_restore_committed",
+        "api_channel",
+        "raft_applybatch_send",
+        "raft_batch_loop",
+        "fsm_consumer",
+        "config_restore_committed_doc",
+        "config_defaults",
+        "log_commit_tracking_iface"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Source-only account: RestoreCommittedLogs is documented to replay all known-committed logs on disk before NewRaft completes (config.go 243-254), and restoreFromCommittedLogs does exactly that by calling processLogs before runFSM is started (api.go 606 vs 637). processLogs' applyBatch performs a blocking send on fsmMutateCh (raft.go 1306) whose capacity is 128 (api.go 560) while batching entries at MaxAppendEntries (raft.go 1318, 1345-1348), and runFSM (fsm.go 241) is the only reader of that channel anywhere in the package. Therefore the startup replay can only fit 128*MaxAppendEntries FSM-bound entries; past that the constructor cannot complete, and the escape in applyBatch (the shutdownCh arm) is unreachable because the caller has no *Raft to shut down before NewRaft returns. The sizing is inside the documented use case: DefaultConfig pairs MaxAppendEntries=64 with SnapshotThreshold=8192 and a 120s SnapshotInterval, so a node committing more than 8192 entries between snapshot checks - exactly the follower/restart situation the option targets - comes back with a replay window above the bound. The submitted experiment records the retained-execution state of this account (return vs non-return, window census, batch estimate, blocked stack) for five restart-only cases; the account above is a source derivation, not a reading of that run.",
+      "knowledge": [
+        {
+          "entry_id": "@replay_feeds_fsm_before_runfsm",
+          "revision": 1,
+          "assertion": "Startup replay blocking-sends FSM batches before runFSM is started."
+        },
+        {
+          "entry_id": "@replay_buffer_bound",
+          "revision": 1,
+          "assertion": "Non-return once FSM-bound window entries exceed 128*MaxAppendEntries."
+        }
+      ],
+      "counterevidence": [
+        "The option is off by default (config.go 243-254, RestoreCommittedLogs false in DefaultConfig), so a cluster that does not opt into it cannot reach this path; the defect is scoped to that opt-in configuration.",
+        "raft.go 1305-1307 also arms a shutdownCh arm, so the blocked send is not unconditionally permanent: it can be released by Shutdown - but only by a caller that already holds the *Raft, which NewRaft has not yet returned, and by nothing internal (NewRaft starts no routines before this call).",
+        "An implementation that used an unbounded or larger FSM channel, or started runFSM first, would not show this; the account is specific to this snapshot's ordering and capacity."
+      ],
+      "limitations": [
+        "The precise batch/window boundary (window in FSM-bound entries vs 128*MaxAppendEntries) is derived from source; the submitted probe brackets it with observed windows rather than pinning the exact entry count at which the last fitting send is reached.",
+        "The startup replay also holds up to 128 batches (each up to MaxAppendEntries commit tuples) in the channel, so memory use grows with MaxAppendEntries; this submission does not measure that.",
+        "Whether a node that blocks here can be recovered by an operator (for example via configuration change) is not investigated; the claim is limited to NewRaft not returning and no internal repair being enabled."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@startup_replay_liveness",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "api_startup_order",
+      "api_restore_committed",
+      "api_channel",
+      "raft_applybatch_send",
+      "raft_batch_loop",
+      "fsm_consumer",
+      "config_restore_committed_doc",
+      "config_defaults"
+    ],
+    "scope": {
+      "description": "Five restart-only cases over the real hashicorp/raft single-voter node (in-memory transport, real commit-tracking log store): produce a committed log with the actual leader, stop the node, then call NewRaft again over the unchanged stores with a fresh transport on the same address, and record whether NewRaft returns. Cases vary only the size of the committed-but-unapplied startup replay window (applies before the restart, plus an optional manual snapshot before shutdown) and MaxAppendEntries.",
+      "assumptions": [
+        "RestoreCommittedLogs=true with a CommitTrackingLogStore, which is the documented opt-in configuration for this feature.",
+        "Automatic snapshotting is disabled (SnapshotThreshold=math.MaxUint64, SnapshotInterval=1h) so the replay window is set explicitly instead of by timer; this models a node whose newest snapshot lags its commit index, which the default 120s SnapshotInterval plus 8192 SnapshotThreshold also produce at higher write rates.",
+        "Restarted instances are constructed with a null logger so that no logging occurs after the test completes; logging is not part of the observed mechanism.",
+        "The bounded 5s wait is not the evidence: a returning restart is expected to be ~ms, and the blocked case is additionally recorded as a goroutine stack in the startup replay path."
+      ],
+      "excluded": [
+        "Multi-voter clusters, network faults, and on-disk (bolt) log stores are excluded; the mechanism observed is in the startup replay path, not in replication.",
+        "The FSM's own semantics are excluded: MockFSM only records applied logs, and no FSM behavior is asserted."
+      ],
+      "parameters": {
+        "cases": "small_window_default_batch(applied=4000), mid_window_default_batch(applied=1000), mid_window_small_batch(applied=1000,MaxAppendEntries=4), large_window_default_batch(applied=12000), large_window_after_snapshot(applied=12000,snapshot before shutdown)",
+        "restart_wait_seconds": 5,
+        "recorded_operands": "persisted_commit_index, last_log_index, snapshot_index, last_applied_before_restart, replay_window, fsm_bound_entries_in_window (entry-type census using the prepareLog rule), max_append_entries, fsm_mutate_ch_capacity (read from the running instance), estimated_replay_batches, restart_returned, restart_elapsed_ms, restart_error, restart_stack_frames"
+      }
+    },
+    "prefix": "Each case builds one real single-voter cluster with opts{Peers:1, Bootstrap:true, CommitTrackingLogs:true} so the log store, stable store, snapshot store and FSM are produced by the target itself: the leader dispatches and commits the applied commands through the normal leaderLoop/dispatchLogs path, which stages the commit index via StageCommitIndex and stores the entries. Before shutdown the harness reads the store's persisted commit index, the last log index, cap(fsmMutateCh), the configured MaxAppendEntries, and censuses the entry types in the replay window with GetLog using the same rule as Raft.prepareLog. For the snapshot case it takes a user snapshot before shutdown and uses that snapshot's index as the restart's last-applied point. It then calls leader.Shutdown(), creates a fresh NewInmemTransport on the same address, and calls NewRaft over the unchanged logs/stable/snapshots instances as the target's own restart tests do, in a goroutine that reports completion through a channel; the harness waits up to 5s and, if nothing arrived, samples all goroutine stacks and keeps the one on the startup replay path. No production code is modified; the harness only reads state and drives the exported lifecycle."
+  }
+}

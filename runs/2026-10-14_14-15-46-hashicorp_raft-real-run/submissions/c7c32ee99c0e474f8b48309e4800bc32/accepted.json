@@ -1,0 +1,153 @@
+{
+  "rationale": "Turning to the configuration and participant eligibility mechanism, which the earlier questions did not touch, I noticed a mismatch between AddVoter's documented contract and what the code does: the captured comment says the given server is added as a staging server that the leader promotes once it is ready, while the configuration change installs it as a Voter immediately. If the documented workflow (add first, start later) is what an operator follows, then adding a server that is not yet running changes the commit quorum at once, and when the living voters are fewer than the new quorum the cluster can neither commit nor elect. This submission registers that question and submits a two-case probe: an unreachable address added to a single-voter cluster and to a three-voter cluster, with the resulting configuration, quorum, apply outcome, leader state and whether the same API can remove the server again. Native feedback from the local dry run, explicitly not retained evidence, is the reason this is worth a receipt: on the single-voter cluster the added server appeared as a Voter, the leader stepped down without any leader being elected afterwards, applies and removal both came back as not-leader, and the config still listed two voters; on the three-voter cluster the same steps left the leader in place, applies succeeded and removal succeeded.",
+  "sources": [
+    {
+      "id": "api_addvoter_contract",
+      "file": "api.go",
+      "start_line": 986,
+      "end_line": 1005,
+      "kind": "document_statement"
+    },
+    {
+      "id": "configuration_addvoter_voter",
+      "file": "configuration.go",
+      "start_line": 231,
+      "end_line": 250,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@addvoter_dead_server_quorum",
+      "question": "Does AddVoter install the new server as a Voter immediately, in contrast to its documented staging behaviour, so that adding a server that is not yet running can leave a cluster unable to commit or to elect, and unable to undo the change through the same API?",
+      "source_ids": [
+        "api_addvoter_contract",
+        "configuration_addvoter_voter"
+      ],
+      "hypothesis": "AddVoter's comment promises that the server is added as a staging server and promoted once it is ready, but nextConfiguration's AddVoter branch builds the new Server with Suffrage Voter, and Staging is deprecated and unused, so the change takes effect as a full membership change as soon as it is committed. When the number of living voters is below the resulting quorum - for example a single-voter cluster that adds one unreachable server - the leader can no longer contact a quorum, steps down through its lease check, and the cluster has no way back through the API because an election needs the same quorum and config changes require a leader.",
+      "discriminator": "Add an address that no transport answers through the exported AddVoter API, on a single-voter cluster and on a three-voter cluster, and record the resulting configuration (the added server's suffrage and the quorum), whether a subsequent apply succeeds, whether any leader exists afterwards, and whether RemoveServer for the added server succeeds. The hypothesis predicts failure of apply and removal with no leader on the single-voter cluster, and unremarkable success on the three-voter cluster where the living voters still satisfy the quorum.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@addvoter_dead_server_quorum",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "api_addvoter_contract",
+      "configuration_addvoter_voter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two cases over real clusters with the in-memory transport: a single-voter cluster and a three-voter cluster, each healthy and committing before the change. In each case the harness records a baseline apply, adds a server address that no transport answers through the exported AddVoter API, records the resulting configuration (voters, the added server's suffrage, the quorum and whether the quorum exceeds the living voters), then attempts an apply and reports whether it succeeded, which state the node is in and how many leaders the cluster has, and finally attempts RemoveServer for the added server and reports whether that succeeded and what the configuration lists afterwards.",
+      "assumptions": [
+        "The added server is represented by a freshly created in-memory transport address that is never connected to the cluster, so no peer can answer it; this is the state of a server that has not been started yet.",
+        "The documented workflow under test is the one AddVoter's comment describes - add the server, then bring it up - so the probe follows the documentation rather than inventing a use the API does not describe.",
+        "Captured in-memory timeouts are used, so the lease and election timers are the ones the target's own tests run with, and each future is waited for with a bound and reported as resolved or not rather than assumed."
+      ],
+      "excluded": [
+        "No on-disk store, no network transport and no multi-process execution; the added server is never started, which is the premise of the case rather than an omission.",
+        "The probe does not test the promotion path the documentation describes, because no such path exists in the captured code to test."
+      ],
+      "parameters": {
+        "cases": "trial 0 single-voter cluster plus one unreachable voter; trial 1 three-voter cluster plus one unreachable voter",
+        "recorded_operands": "voters_in_config, living_voters_in_config, quorum_size, dead_server_suffrage, add_completed, add_error, quorum_requires_dead_server, apply_completed, apply_succeeded, apply_error, leader_state, leaders_in_cluster, remove_completed, remove_succeeded, remove_error, voters_in_config_after"
+      }
+    },
+    "prefix": "Each case builds a real cluster with MakeCluster and the captured in-memory timeouts, takes the elected leader, and creates a fresh in-memory transport address that is never connected to the cluster to stand for a server that has not been started. It confirms the cluster commits a command before the change, then calls the exported AddVoter with that address, waits for the returned future with a bound, and reads back the configuration to report the added server's suffrage, the number of voters, how many of them are living, and whether the quorum exceeds the living voters. After letting the lease timer run, it attempts an apply with a bounded wait and reports whether the future resolved, whether it succeeded, the error, the node's state and how many leaders the cluster has. Finally it attempts RemoveServer for the added server with a bounded wait and reports whether that succeeded and what the configuration lists afterwards. Only the TestAssurance-prefixed test in this harness is selected and no production file is modified.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "pre",
+        "event": "add_dead_voter_config",
+        "conditions": []
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "add_dead_voter_apply",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "apply_succeeded",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "quorum_requires_dead_server",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "When the quorum after the change exceeds the living voters, a subsequent apply does not succeed."
+      },
+      {
+        "event": "add_dead_voter_apply",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "apply_succeeded",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "quorum_requires_dead_server",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: when the living voters still satisfy the quorum the same change leaves applies working."
+      },
+      {
+        "event": "add_dead_voter_remove",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "remove_succeeded",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "quorum_requires_dead_server",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "When the quorum needs the unreachable server, the change cannot be undone through RemoveServer either, so there is no in-band repair."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

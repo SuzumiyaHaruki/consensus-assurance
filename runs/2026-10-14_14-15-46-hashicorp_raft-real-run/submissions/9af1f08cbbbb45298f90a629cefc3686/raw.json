@@ -1,0 +1,121 @@
+{
+  "rationale": "The retained execution of the interrupted-transfer probe answered the stranding question, and re-reading the send path shows why: the deferError send is on a channel created with capacity 1 (raft.go 603) and the transfer goroutine only reaches a send after receiving the response to the previous deferError, which requires the replicator to have consumed it, so the buffer is empty at every send and the send never needs a reader. With that premise defeated at the mechanism level, the hypothesis is refuted rather than merely unwitnessed. The same reading answers the parent TimeoutNow question: the producer reaches trans.TimeoutNow only while it is still the leader inside the transfer path, and the drain loop's exit and the send are adjacent statements with no blocking point, so no internal producer supplies a transfer message that no longer reflects the current leader; the handler's missing term and sender validation is a hardening gap with no reachable internal trigger. This update records both refutations with their sources, the executions the first one rests on, and the exact observations that agree with the source account, and it marks both questions answered so the remaining budget goes to a fresh relationship rather than to this thread.",
+  "sources": [
+    {
+      "id": "raft_transfer_defererr_buffer",
+      "file": "raft.go",
+      "start_line": 596,
+      "end_line": 612,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_leadership_transfer_drain",
+      "file": "raft.go",
+      "start_line": 991,
+      "end_line": 1030,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_verifyleader_votes",
+      "file": "raft.go",
+      "start_line": 966,
+      "end_line": 995,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorumsize_voters",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1098,
+      "kind": "code_observation"
+    },
+    {
+      "id": "replication_notifyall",
+      "file": "replication.go",
+      "start_line": 100,
+      "end_line": 112,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+      "disposition": "explained"
+    },
+    {
+      "id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+      "disposition": "explained",
+      "resume_conditions": []
+    },
+    {
+      "ref": "@verifyleader_nonvoter_acks",
+      "question": "Does VerifyLeader confirm leadership using acknowledgements that do not count toward the voter quorum, so that a leader separated from every other voter but still able to reach a nonvoter reports itself verified?",
+      "source_ids": [
+        "raft_verifyleader_votes",
+        "raft_quorumsize_voters",
+        "replication_notifyall"
+      ],
+      "hypothesis": "verifyLeader seeds votes with the leader's own vote and registers the verify future with every followerReplication in leaderState.replState, which startStopReplication creates for every server in the latest configuration including nonvoters; each successful AppendEntries response then calls notifyAll, which casts a vote for every registered future. Since quorumSize counts only voters, acknowledgements from nonvoters can complete the voter quorum, so a leader whose only reachable peers are nonvoters returns a successful VerifyLeader while it cannot contact a majority of voters - and while another leader may already have been elected among the voters it cannot reach.",
+      "discriminator": "Run a real cluster of three voters plus one nonvoter, elect the leader, confirm it can verify normally, then partition the leader together with the nonvoter away from the other two voters and call VerifyLeader on the leader before the new term reaches the nonvoter. Predict: the future returns nil with votes counting only the leader's own vote plus the nonvoter's acknowledgement, while the leader's configurations.latest contains three voters, so the confirmation is made against a quorum of voters it cannot reach; a control in which the nonvoter is also cut off must fail the verification instead.",
+      "disposition": "active"
+    }
+  ],
+
+  "interpretations": [
+    {
+      "investigation_id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+      "experiment_id": "9a28fea90bc64596b790f2372fc4c716-experiment",
+      "source_ids": [
+        "raft_transfer_defererr_buffer",
+        "raft_leadership_transfer_drain",
+        "raft_timeoutnow_handler"
+      ],
+      "executions": {
+        "991fd67c1e3d4760b83fd8a724444ff0": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "refuted",
+      "rationale": "Retained execution (check 991fd67c1e3d4760b83fd8a724444ff0, exit 0, tests_passed, 12 parsed events, 0 parse errors) plus the source reading that the run's outcome matches. The probe did exercise the intended state: in every interrupted trial the target's last index at transfer time was 2 against the leader's 202, so the drain loop had real replication work after the target was isolated, and each transfer future resolved with 'leadership transfer timeout' rather than completing, i.e. the transfer was still in flight when the starting leader was cut off and its replication goroutine exited. Against the hypothesis's prediction, in all ten interrupted trials transfer_in_progress_after was false, no goroutine was found stranded in the leadershipTransfer/triggerDeferErrorCh path, and in the three trials where another node became leader first the interrupted node was re-elected and its Apply and GetConfiguration both succeeded with no error; the two uninterrupted controls completed with an empty transfer error, the starting node ending as Follower with the flag false. The source reason, which is the primary basis for refutation: followerReplication.triggerDeferErrorCh is created with capacity 1 (raft.go 603), and leadershipTransfer only reaches its next send (raft.go 1003) after receiving the response for the previous deferError, which by construction means the replicator consumed that item, so the buffer is empty at each send and a buffered send succeeds without any reader. A send cannot therefore be stranded by the replicator exiting, and the outer goroutine's wait on doneCh is always satisfied, so the deferred setLeadershipTransferInProgress(false) runs - which is what every trial shows. The alternative interleaving-theoretical reading is also excluded empirically across two scheduling regimes: the ten retained trials on the host's default parallelism plus six additional local trials with GOMAXPROCS=1, which should favour the single-threaded ordering the hypothesis needed, all cleared the flag with no stranded goroutine; the GOMAXPROCS run is native feedback and is not offered as retained evidence.",
+      "counterevidence": [
+        "The refutation is about reachability through this trigger, not about the flag's design: setLeadershipTransferInProgress(false) really is only reached from the outer transfer goroutine's deferred call, so any exit path of the inner goroutine that skips doneCh would still leave the flag set. The probe's trials exercised the drain-in-flight interruption, the timeout and the leadership-loss paths, but not a state where the transport call itself never returns.",
+        "The stranded-goroutine search is a sampled goroutine dump at one instant per trial; it would miss a goroutine that had already exited, but the primary basis does not depend on the dump - the buffered send cannot block regardless of sampling."
+      ],
+      "limitations": [
+        "Timings are the captured in-memory ones (50ms heartbeat, election and lease), and the transfer therefore timed out before the target could win; different timing would change which branch resolves the transfer, though not the buffered-send argument.",
+        "Three of ten interrupted trials reached the re-election check; the other seven had no other leader within the 3s wait, so the client-endpoint check was exercised three times, not ten."
+      ]
+    },
+    {
+      "investigation_id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+      "source_ids": [
+        "raft_leadership_transfer_drain",
+        "raft_timeoutnow_handler",
+        "commands_timeoutnow_request"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Answered from source and from the transfer receipts rather than by new injection. The handler does validate nothing: raft.timeoutNow (raft.go 2232-2237) ignores the request's origin and any term, because TimeoutNowRequest carries only the RPC header (commands.go 206-208), and it immediately clears the leader, moves the node to Candidate and marks the candidacy as transfer-driven, which makes its RequestVote waive the known-leader rejection on other servers. What the question turned on, however, is whether a TimeoutNow that no longer reflects the current leader can be produced inside the library. The producer is the leadership-transfer path, and it reaches trans.TimeoutNow (raft.go 1026) only after its drain loop exits, which requires the target to be caught up; the loop's exit and the send are adjacent statements with no blocking point between them, and every earlier exit point of the loop is guarded by the transfer's stop channel (raft.go 1000-1020), which the transfer case closes when leadership is lost or the transfer times out. The interrupted-transfer receipt shows the same shape from the behaviour side: with real replication work pending, the transfer either times out with the flag cleared or is abandoned on leadership loss, and no message was produced after leadership was gone. External injection of a TimeoutNow is not evidence of a target defect here, because peer authentication is the transport's and application's responsibility rather than a guarantee of this library. So the suspicion is refuted for internal producers, and what remains is a hardening observation: the handler would be more defensive if the request carried the sender's term, or if the receiver checked that the sender is its current leader.",
+      "counterevidence": [
+        "The window between the drain loop's exit and the TimeoutNow call is adjacent code rather than a proven impossibility: a preemption exactly there, or a future change that inserts work between them, would reopen it. Nothing in the source prevents that window from existing, only from being wide or reachable in the tested flows.",
+        "The vote bypass that the transfer flag enables is intentional and is what makes a transfer target electable while peers still know the old leader; the refutation is about the absence of a stale internal producer, not about the bypass being wrong."
+      ],
+      "limitations": [
+        "This answer rests on source reading of the producer path plus the interrupted-transfer executions; no execution produced a transfer message after leadership was lost, so the refutation is a reachability argument with corroborating runs, not a proof about every scheduler.",
+        "A cluster whose transport reports delayed or replayed RPCs is outside what these runs cover; the question was scoped to producers inside this snapshot."
+      ]
+    }
+  ]
+}

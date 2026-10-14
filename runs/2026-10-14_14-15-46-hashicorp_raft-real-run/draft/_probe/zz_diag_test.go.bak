@@ -1,0 +1,58 @@
+package raft
+
+import (
+	"fmt"
+	"math"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	hclog "github.com/hashicorp/go-hclog"
+)
+
+func TestZZDiagReplay(t *testing.T) {
+	conf := inmemConfig(t)
+	conf.Logger = hclog.NewNullLogger()
+	conf.RestoreCommittedLogs = true
+	conf.SnapshotThreshold = math.MaxUint64
+	conf.SnapshotInterval = time.Hour
+	c := MakeClusterCustom(t, &MakeClusterOpts{Peers: 1, Bootstrap: true, Conf: conf, CommitTrackingLogs: true})
+	leader := c.Leader()
+	var last Future
+	for i := 0; i < 12000; i++ {
+		last = leader.Apply([]byte(fmt.Sprintf("t%d", i)), 0)
+	}
+	if err := last.Error(); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	logs, stable, snaps, fsm, addr := leader.logs, leader.stable, leader.snapshots, leader.fsm, leader.trans.LocalAddr()
+	if err := leader.Shutdown().Error(); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	cfg := *conf
+	cfg.Logger = hclog.NewNullLogger()
+	done := make(chan error, 1)
+	go func() {
+		_, tr := NewInmemTransport(addr)
+		_, err := NewRaft(&cfg, fsm, logs, stable, snaps, tr)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Logf("returned: %v", err)
+	case <-time.After(6 * time.Second):
+		buf := make([]byte, 1<<22)
+		n := runtime.Stack(buf, true)
+		dump := string(buf[:n])
+		fmt.Println("=== DUMP START ===")
+		blocks := strings.Split(dump, "\n\n")
+		for _, b := range blocks {
+			if strings.Contains(b, "raft.") || strings.Contains(b, "chan send") {
+				fmt.Println(b)
+				fmt.Println("---")
+			}
+		}
+		fmt.Println("=== DUMP END ===")
+	}
+}

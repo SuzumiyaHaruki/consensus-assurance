@@ -2,9 +2,10 @@ import json
 import shutil
 import pytest
 from types import SimpleNamespace
-from audit_support import engine_for, combined, opinion, stop
+from audit_support import engine_for, combined, experiment, opinion, stop
 from consensus_assurance.core.types import CheckRun, ExecutionStatus
 from consensus_assurance.workflow.research import execution_cost, costs
+from consensus_assurance.workflow.experiments import assessment
 from consensus_assurance.reporting.report import render_report
 
 
@@ -91,6 +92,10 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     assert 'Compare the actual return' in text
     assert 'confirmed' not in text and 'declared predicate does not hold' in text
     check=next(c for c in s.checks if c.experiment_id)
+    citations=assessment(s,e.root,s.experiments[0],check)['interpretation_citations']
+    assert citations['historical_count']==1
+    assert [i['id'] for i in citations['current']]==([s.interpretations[-1].id] if claim is not None else [])
+    assert ('Other current question interpretations explicitly citing this receipt' in execution)==(claim is not None)
     observation=f'logs/{check.id}/observations.json'
     for section,cited in ((current,claim is not None),(history,True)):
         assert '[code](state.json)' in section and '[doc](state.json)' in section
@@ -109,3 +114,43 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     assert str(original) not in moved and str(e.root) not in moved
     import re
     for link in re.findall(r'\]\(([^)]+)\)',moved):assert (clone/link).is_file(),link
+
+
+@pytest.mark.parametrize('superseded',[False,True])
+def test_other_experiment_receipt_citations_do_not_change_direct_assessment(tmp_path,superseded):
+    before={}
+    def start(state):
+        value,files=combined(state)
+        value['gaps']=[dict(investigation_id='@q',question='Was the producer history legal?')]
+        return value,files
+    def downstream(state):
+        fixed=e.state.experiments[0]
+        check=next(c for c in e.state.checks if c.experiment_id==fixed.id)
+        before.update(assessment(e.state,e.root,fixed,check))
+        request,files=experiment('@other')
+        return {'rationale':'Inspect a related local consequence',
+            'investigations':[dict(ref='@other',question='What does this separate local call establish?',source_ids=['code'])],
+            'experiment':request},files
+    def cite(state):
+        return opinion(state,executions={c['id']:[1] for c in state['checks'] if c.get('experiment_id')},
+            joint_history='These are independent calls to the same stateless function, not one distributed history')
+    def revise(state):
+        return opinion(state,experiment_id=None,executions={},conclusion='explained',
+            rationale='A narrower source-only account supersedes the measured account')
+    e,repo=engine_for(tmp_path,[start,downstream,cite,*([revise] if superseded else []),stop])
+    s=e.start(repo)
+    fixed=s.experiments[0]
+    check=next(c for c in s.checks if c.experiment_id==fixed.id)
+    after=assessment(s,e.root,fixed,check)
+    assert after['interpretation_id'] is None
+    assert after['gap_ids'] and 'no interpretation directly attributed' in str(after['blockers'])
+    assert {k:v for k,v in after.items() if k!='interpretation_citations'}=={
+        k:v for k,v in before.items() if k!='interpretation_citations'}
+    citations=after['interpretation_citations']
+    assert citations['historical_count']==int(superseded)
+    assert citations['current']==([] if superseded else [dict(id=s.interpretations[0].id,
+        investigation_id=s.investigations[1].id,experiment_id=s.experiments[1].id,event_indices=[1])])
+    text=render_report(s,e.root).read_text().split('### '+s.investigations[1].question)[0]
+    assert ('Other current question interpretations explicitly citing this receipt' in text)==(not superseded)
+    assert ('Historical interpretations explicitly citing this receipt: 1' in text)==superseded
+    assert 'No current explicit defect assertion' in text

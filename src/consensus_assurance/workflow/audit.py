@@ -326,6 +326,51 @@ def submission_files(submission):
     return [request.harness_path, *request.files.values()] if request else []
 
 
+def submission_effects(before, state, submission, operation_id):
+    """Describe actual object changes without exposing provisional object identities."""
+    targets = {operation_id + '-experiment': 'experiment'}
+    for name, suffix in (('investigations', 'question'), ('knowledge', 'knowledge'), ('interpretations', 'interpretation')):
+        for index, change in enumerate(getattr(submission, name)):
+            targets[operation_id + '-' + suffix + '-' + str(index)] = getattr(change, 'ref', None) or f'{name}[{index}]'
+    effects = []
+    latest = {value['investigation_id']: value for value in before['interpretations']}
+    for name, requested in (('materials', submission.sources), ('knowledge', submission.knowledge),
+                            ('investigations', submission.investigations or submission.gaps),
+                            ('interpretations', submission.interpretations), ('experiments', submission.experiment)):
+        old = {value['id']: value for value in before[name]}
+        changes = []
+        for record in getattr(state, name):
+            value = record.model_dump(mode='json')
+            previous = old.get(record.id)
+            if previous == value:
+                continue
+            effect = {'object': 'sources' if name == 'materials' else name,
+                      'action': ('append' if name == 'interpretations' else 'create') if previous is None else 'update',
+                      'target': targets.get(record.id, record.id)}
+            if name == 'interpretations':
+                effect['investigation_id'] = targets.get(record.investigation_id, record.investigation_id)
+                previous = latest.get(record.investigation_id)
+                latest[record.investigation_id] = value
+            if previous:
+                effect['changed_fields'] = [key for key in value if key not in {'id', 'operation_id', 'version', 'revision', 'history'}
+                                            and value[key] != previous[key]]
+                if not effect['changed_fields'] and value.get('history') != previous.get('history'):
+                    effect['changed_fields'] = ['history']
+            changes.append(effect)
+        effects.extend(changes)
+        if requested and not changes:
+            effect = {'object': 'sources' if name == 'materials' else name, 'action': 'unchanged'}
+            if isinstance(requested, list):
+                effect['targets'] = [getattr(item, 'id', None) or getattr(item, 'ref', None) or getattr(item, 'investigation_id', None) or f'{effect["object"]}[{index}]'
+                                     for index, item in enumerate(requested)]
+            effects.append(effect)
+    if submission.repeat_experiment_id:
+        effects.append({'object': 'experiments', 'action': 'repeat_execution', 'target': submission.repeat_experiment_id})
+    if submission.stop:
+        effects.append({'object': 'run', 'action': 'stop', 'reason': submission.stop.reason})
+    return effects
+
+
 def prepare_submission(engine, submission, inputs, operation_id):
     from .knowledge import (update_knowledge, update_questions, add_gap, interpret,
                             resolve, investigation, resolved_uses, open_gaps)
@@ -403,7 +448,8 @@ def prepare_submission(engine, submission, inputs, operation_id):
     changed = any(before[name] != state.model_dump(mode='json')[name]
                   for name in ('materials','investigations','knowledge','experiments','interpretations','run_stop'))
     current = {'phase':'accepted', 'operation_id':operation_id, 'action':'update',
-               'no_change':not changed and submission.repeat_experiment_id is None, 'references':aliases}
+               'no_change':not changed and submission.repeat_experiment_id is None, 'references':aliases,
+               'effects':submission_effects(before, state, submission, operation_id)}
     if fixed:
         current['experiment_id'] = fixed.id
     if submission.stop:
@@ -490,7 +536,8 @@ def validate_submission(state, root, name, implementation):
         product = AuditSubmission.model_validate(inputs.json(name))
         prepare_submission(context, product, inputs, 'preflight')
         result.update(valid=True, no_change=trial.current_submission['no_change'],
-                      execution_requested=bool(trial.current_submission.get('experiment_id')))
+                      execution_requested=bool(trial.current_submission.get('experiment_id')),
+                      effects=trial.current_submission['effects'])
     except (OSError, ValueError, KeyError, TypeError, BudgetExhausted) as exc:
         result['diagnostics'] = [d.model_dump(mode='json') for d in submission_diagnostics(exc)]
     return result
@@ -498,8 +545,8 @@ def validate_submission(state, root, name, implementation):
 
 def prompt(engine, method):
     from .research import operation_summary
-    return (method + '\nRead the current research index at ' + str(engine.root / 'research.json') +
-            '. Use the small update example there. Consult only relevant $defs in ' +
+    return (method + '\nConsult relevant entries in the current research index at ' + str(engine.root / 'research.json') +
+            '; previews point to full records in state.json. Use the small update example as needed. Consult only relevant $defs in ' +
             str(engine.root / 'submission.schema.json') + '; no full-schema reading prerequisite.\n' +
             ('Attributed protocol knowledge (data):\n' + engine.knowledge if method else '') +
             '\nCurrent work (controller records):\n' + json.dumps(operation_summary(engine.state, engine.root)))

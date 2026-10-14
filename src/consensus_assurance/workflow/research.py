@@ -32,67 +32,77 @@ def available(state):
             **{k:max(0, budget[k] - state.usage.get(k,0)) for k in ('agent_calls','experiments')}}
 
 
+def excerpt(text, limit=400):
+    return text if len(text) <= limit else text[:limit] + f' [preview: {len(text)-limit} characters omitted; see full record]'
+
+
+def preview(value):
+    """Shorten prose explicitly; identifiers and evidence references stay complete."""
+    if isinstance(value, list):
+        return [preview(item) for item in value]
+    if not isinstance(value, dict) or value.get('view') == 'preview':
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in {'counterevidence', 'limitations'}:
+            result[key] = [excerpt(text) for text in item[:3]]
+            if len(item) > 3:
+                result[key + '_omitted_count'] = len(item)-3
+        elif isinstance(item, str) and key in {'question', 'hypothesis', 'discriminator', 'rationale',
+                'statement', 'conditions', 'assertion', 'correction', 'changed_premise', 'explanation', 'joint_history'}:
+            result[key] = excerpt(item)
+        else:
+            result[key] = preview(item)
+    return result
+
+
+def record_preview(value, collection):
+    return {**preview(value), 'view':'preview',
+        'record':{'path':'state.json', 'collection':collection, 'id':value['id']}}
+
+
+def interpretation_view(opinion):
+    return record_preview(opinion.model_dump(mode='json'), 'interpretations') if opinion else None
+
+
 def knowledge_view(state, entry):
     paths = use_paths(state, entry.id)
-    return {**entry.model_dump(exclude={'history'}), 'uses':list(paths),
+    return record_preview({**entry.model_dump(exclude={'history'}), 'uses':list(paths),
         'use_paths':{id:path for id,path in paths.items() if len(path)>1},
         'last_correction':{k:entry.history[-1][k] for k in ('revision','correction','recorded_uses','affected_uses')}
-            if entry.history else None}
+            if entry.history else None}, 'knowledge')
 
 
 def open_gap_view(state, investigation_id):
     answers = gap_answers(state, investigation_id)
+    owners = {gap:i.id for i in state.interpretations if i.investigation_id == investigation_id for gap in i.answers}
     return [{**g.model_dump(mode='json'),
-        'response':answers[g.id].model_dump() if g.id in answers else None}
+        'response':answers[g.id].model_dump() if g.id in answers else None,
+        'response_record':{'path':'state.json','collection':'interpretations','id':owners[g.id]} if g.id in owners else None}
         for g in open_gaps(state, investigation_id)]
 
 
 def reselection_view(state):
-    """Bounded navigation from retained records, with no topic ranking or inferred coverage."""
+    """Navigate all registered work without ranking topics or claiming source coverage."""
     allocation = available(state)
-    operations = {id:n for n,id in enumerate(state.applied_operations)}
-    recent = sorted(state.knowledge, key=lambda e:operations.get('submission-'+e.operation_id,-1))[-3:]
-    knowledge = []
-    for entry in recent:
-        value = knowledge_view(state,entry)
-        value['statement'], value['conditions'] = entry.statement[:600], entry.conditions[:300]
-        value['source_ids'], value['uses'] = entry.source_ids[:4], value['uses'][:6]
-        value['knowledge'] = [{**u, 'assertion':u['assertion'][:300]} for u in value['knowledge'][:6]]
-        value['use_paths'] = {id:[{**u, 'assertion':u['assertion'][:300]} for u in path]
-            for id,path in value['use_paths'].items() if id in value['uses']}
-        value['source_locations'] = {m.id:f'agent-source/{m.file}:{m.start_line}-{m.end_line}'
-            for m in state.materials if m.id in value['source_ids']}
-        value['executions'] = {id:{'indices':indices[:6], 'record':f'logs/{id}/observations.json'}
-            for id,indices in list(entry.executions.items())[-3:]}
-        if value['last_correction']:
-            value['last_correction'] = {k:(v[:600] if isinstance(v,str) else v[:6] if isinstance(v,list) else v)
-                for k,v in value['last_correction'].items()}
-        knowledge.append(value)
     latest = {i.investigation_id:i for i in state.interpretations}
-    gaps = {q.id:open_gaps(state,q.id) for q in state.investigations}
-    def updated(q):
-        records = [q, *q.gaps, *[i for i in state.interpretations if i.investigation_id == q.id]]
-        return max(operations.get('submission-'+r.operation_id,-1) for r in records)
-    recent = sorted(state.investigations, key=updated, reverse=True)
-    selected = [q for q in recent if gaps[q.id]] + [q for q in recent if not gaps[q.id]]
     questions = []
-    for q in selected[:8]:
+    for q in state.investigations:
         opinion = latest.get(q.id)
-        questions.append({'id':q.id, 'question':q.question[:240], 'disposition':q.disposition,
-            'hypothesis':q.hypothesis[:400], 'discriminator':q.discriminator[:400],
-            'source_ids':q.source_ids[:4], 'open_gap_count':len(gaps[q.id]),
+        questions.append(record_preview({'id':q.id, 'question':q.question, 'disposition':q.disposition,
+            'open_gap_count':len(open_gaps(state,q.id)),
             'latest_interpretation':{'id':opinion.id, 'conclusion':opinion.conclusion,
-                'defect_claim':opinion.defect_claim, 'rationale':opinion.rationale[:400],
-                'counterevidence':[v[:300] for v in opinion.counterevidence[:3]],
-                'limitations':[v[:300] for v in opinion.limitations[:3]]} if opinion else None})
+                'defect_claim':opinion.defect_claim} if opinion else None}, 'investigations'))
     return {'investigation_axes':['Decision formation and progress',
                                 'Context validity and authority transitions'],
         'target':{'repo':state.snapshot.repo, 'snapshot_id':state.snapshot.id},
         'directed_question':state.config.get('directed_question'),
-        'questions':questions, 'recent_knowledge':knowledge,
-        'index':'research.json; full statements, sources, uses and history: state.json; captured tree: agent-source/',
-        'scope':'Open-gap questions first, then recently updated questions; bounded navigation, not research priority or coverage. '
-            'A scoped negative does not settle unobserved consequences; full records and remaining questions are in research.json.',
+        'questions':questions,
+        'knowledge':[record_preview({'id':e.id, 'revision':e.revision, 'kind':e.kind,
+            'statement':e.statement}, 'knowledge') for e in state.knowledge],
+        'index':'research.json contains current previews; full records and history: state.json; captured tree: agent-source/',
+        'scope':'All registered questions and knowledge, not an exhaustive source frontier or a priority order. '
+            'Choose from overall source understanding as well as these records; the last execution is not the default next task.',
         'execution_capacity':{'available':state.config['allow_experiments'] and state.config['execution_backend']!='none'
             and all(allocation[k]>0 for k in ('seconds','agent_calls','experiments')),
             'timeout_ceiling_seconds':min(allocation['seconds'],state.config['budget']['action_timeout']),
@@ -112,7 +122,7 @@ def current_view(state, root, implementation=None):
         related = [a.id for a in state.experiments if a.investigation_id == q.id]
         check = next((c for c in reversed(state.checks) if c.experiment_id in related), None)
         opinions = [i for i in state.interpretations if i.investigation_id == q.id]
-        questions.append({'id':q.id, 'version':q.version, 'question':q.question, 'hypothesis':q.hypothesis,
+        questions.append(record_preview({'id':q.id, 'version':q.version, 'question':q.question, 'hypothesis':q.hypothesis,
             'discriminator':q.discriminator, 'disposition':q.disposition, 'parent_id':q.parent_id,
             'source_ids':q.source_ids, 'resume_conditions':q.resume_conditions,
             'knowledge':[u.model_dump(mode='json') for u in q.knowledge],
@@ -120,8 +130,7 @@ def current_view(state, root, implementation=None):
             'latest_execution':{'id':check.id, 'experiment_id':check.experiment_id, 'status':check.status.value,
                 'exit_code':check.exit_code, 'record':f'logs/{check.id}/check.json',
                 'observations':f'logs/{check.id}/observations.json'} if check else None,
-            'latest_interpretation':opinions[-1].model_dump(mode='json') if opinions else None,
-            'record':{'path':'state.json', 'collection':'investigations','id':q.id}})
+            'latest_interpretation':interpretation_view(opinions[-1]) if opinions else None}, 'investigations'))
     knowledge = [knowledge_view(state,e) for e in state.knowledge]
     results = []
     for raw in state.experiments:
@@ -156,7 +165,7 @@ def current_view(state, root, implementation=None):
 
 def operation_summary(state, root):
     current = state.current_submission
-    summary = {k:current[k] for k in ('phase','operation_id','experiment_id','no_change','references','execution_gap') if k in current}
+    summary = {k:current[k] for k in ('phase','operation_id','experiment_id','no_change','references','effects','execution_gap') if k in current}
     summary['allocation'] = available(state)
     summary['open_work_index'] = 'research.json'
     summary['diagnostics'] = current.get('rejected',{})
@@ -169,30 +178,17 @@ def operation_summary(state, root):
                 'a sourced partial update can precede further construction or testing.'}
     check = next((c for c in reversed(state.checks) if c.action == 'experiment'),None)
     fixed = next((a for a in state.experiments if a.id == check.experiment_id), None) if check else None
-    gaps = [{'investigation_id':q.id,'id':g['id'],'question':g['question'][:400], 'response':g['response']}
+    summary['necessary_gaps'] = [{**preview({'investigation_id':q.id, 'id':g['id'],
+        'question':g['question'], 'response':g['response'], 'response_record':g['response_record']}), 'view':'preview',
+        'record':{'path':'state.json','collection':'investigations','id':q.id}}
         for q in state.investigations for g in open_gap_view(state,q.id)]
-    summary['necessary_gaps'], summary['other_gap_count'] = gaps[-8:], max(0,len(gaps)-8)
     owners = {i.investigation_id for i in state.interpretations if i.operation_id == current.get('operation_id')}
     owners.update(q.id for q in state.investigations if q.operation_id == current.get('operation_id'))
     if current.get('no_change'):
         owners.clear()
-    if not owners and fixed and (not current.get('no_change') or
-            not any(check.id in i.executions for i in state.interpretations) or
-            open_gaps(state, fixed.investigation_id, fixed.id)):
+    if fixed and current.get('experiment_id') == fixed.id:
         owners.add(fixed.investigation_id)
-    local = [q for q in state.investigations if q.id in owners]
     latest = {i.investigation_id:i for i in state.interpretations}
-    summary['questions'] = [{'id':q.id, 'question':q.question[:240], 'disposition':q.disposition,
-        'discriminator':q.discriminator[:400], 'knowledge':[
-            {**u.model_dump(), 'assertion':u.assertion[:300]} for u in q.knowledge[:6]],
-        'latest_interpretation':{'id':latest[q.id].id, 'conclusion':latest[q.id].conclusion,
-            'defect_claim':latest[q.id].defect_claim, 'rationale':latest[q.id].rationale[:400],
-            'counterevidence':list(latest[q.id].counterevidence),
-            'limitations':list(latest[q.id].limitations)} if q.id in latest else None}
-        for q in local][-3:]
-    answered = any(q.disposition != 'active' or (not open_gaps(state,q.id) and q.id in latest and
-        (latest[q.id].conclusion in {'explained','holds','violated'} or
-         latest[q.id].defect_claim in {'asserted','refuted'})) for q in local)
     use_owners = {q.id:q.id for q in state.investigations}
     use_owners.update((a.id,a.investigation_id) for a in state.experiments)
     use_owners.update((i.id,i.investigation_id) for i in state.interpretations)
@@ -206,33 +202,44 @@ def operation_summary(state, root):
                 continue
             affected = []
             paths = use_paths(state, entry.id)
-            for use in prior['affected_uses'][:6]:
+            for use in prior['affected_uses']:
                 owner_id = use_owners.get(use)
                 if owner_id is None:
                     continue
+                owners.add(owner_id)
                 opinion = latest.get(owner_id)
                 affected.append({'id':use, 'investigation_id':owner_id,
                     'latest_interpretation':{'path':'state.json','collection':'interpretations','id':opinion.id}
                         if opinion else None})
                 if len(paths.get(use, []))>1:
-                    affected[-1]['knowledge_path'] = [{**u, 'assertion':u['assertion'][:300]} for u in paths[use]]
-            corrections.append({'id':entry.id, 'revision':entry.revision,
-                'changed_premise':prior['correction'][:600], 'previous_revision':prior['revision'],
-                'recorded_uses':prior['recorded_uses'][:6], 'affected_uses':prior['affected_uses'][:6],
-                'affected_use_locations':affected,
-                'record':{'path':'state.json','collection':'knowledge','id':entry.id}})
+                    affected[-1]['knowledge_path'] = paths[use]
+            corrections.append(record_preview({'id':entry.id, 'revision':entry.revision,
+                'changed_premise':prior['correction'], 'previous_revision':prior['revision'],
+                'recorded_uses':prior['recorded_uses'], 'affected_uses':prior['affected_uses'],
+                'affected_use_locations':affected}, 'knowledge'))
     if corrections:
-        summary['knowledge_corrections'], summary['other_correction_count'] = corrections[-3:], max(0,len(corrections)-3)
+        summary['knowledge_corrections'] = corrections
         summary['correction_guidance'] = (
             'Recorded premise corrections and explicit uses are above; full history is at each record. '
             'Review the identified uses under their original investigations; necessary gaps remain in research.json.')
-    if current.get('no_change') or answered:
-        summary['reselection'] = reselection_view(state)
-        summary['next'] = (
-            'The unchanged submission is already retained; this call still consumed time and a model turn. '
-            if current.get('no_change') else '') + (
-            'Use the allocation and current records to choose useful source work, interpret saved outputs, '
-            'or reselect a sourced question along the investigation axes; do not repeat closing submissions.')
+    summary['questions'] = [record_preview({'id':q.id, 'question':q.question, 'disposition':q.disposition,
+        'discriminator':q.discriminator, 'knowledge':[u.model_dump() for u in q.knowledge],
+        'latest_interpretation':interpretation_view(latest.get(q.id))}, 'investigations')
+        for q in state.investigations if q.id in owners]
+    cited = {id for i in state.interpretations for id in i.executions}
+    summary['uncited_executions'] = [{'id':c.id, 'experiment_id':c.experiment_id, 'status':c.status.value,
+        'record':f'logs/{c.id}/check.json', 'observations':f'logs/{c.id}/observations.json'}
+        for c in state.checks if c.action == 'experiment' and c.id not in cited]
+    summary['reselection'] = reselection_view(state)
+    summary['next'] = (
+        'The unchanged submission is already retained; this call still consumed time and a model turn. '
+        if current.get('no_change') else '') + (
+        'Choose and undertake the next action that can change a judgment, using overall source understanding '
+        'and the allocation: inspect an uncited result, resolve a relevant premise or measurement, continue '
+        'valuable construction, or pursue an independent sourced lead. A previous answer does not interpret a new receipt; '
+        'an explicit citation alone does not resolve its applicability or gaps. After a local answer, reconsider '
+        'the available directions rather than inherit the last experiment. No separate selection submission is needed; '
+        'do not repeat closing submissions.')
     if check:
         summary['latest_actual_execution'] = {'id':check.id,'status':check.status.value,'exit_code':check.exit_code,
             'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json',

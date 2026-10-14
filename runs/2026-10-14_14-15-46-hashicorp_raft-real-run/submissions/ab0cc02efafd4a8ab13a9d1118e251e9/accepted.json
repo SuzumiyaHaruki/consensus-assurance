@@ -1,0 +1,57 @@
+{
+  "rationale": "The run's questions are all answered, and one sourced lead remains untested, so it is registered rather than left in the transcript: the leader's main loop delivers committed entries to the FSM by a blocking send on a fixed-capacity channel, and the FSM contract asks only that Apply be deterministic, not that it return promptly. A slow FSM therefore fills that channel and blocks the main loop, which is the same blocking send that the startup-replay finding turns into a constructor deadlock, but in the running case the consumer exists. Whether that becomes a defect, and under what bound, is what the discriminator would decide, so it is recorded as paused work with the anchors and the experiment it would need.",
+  "sources": [
+    {
+      "id": "fsm_apply_contract",
+      "file": "fsm.go",
+      "start_line": 18,
+      "end_line": 30,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@fsm_backpressure_stall",
+      "question": "When a cluster's commits flow faster than the FSM applies them, does the leader's main loop block on the FSM mutation channel long enough to stop processing RPCs and its own lease check, and is the resulting non-progress bounded by anything the caller or the FSM can influence?",
+      "source_ids": [
+        "raft_applybatch_send",
+        "api_channel",
+        "fsm_consumer",
+        "fsm_apply_contract"
+      ],
+      "hypothesis": "processLogs delivers batches of committed entries with a blocking select-send on fsmMutateCh (capacity 128), and runFSM is its only reader, so once the FSM's Apply is slower than the incoming commit rate the channel fills and the main loop blocks inside processLogs. While it is blocked the leader cannot process RPCs, cannot answer client requests and cannot run checkLeaderLease, so its own lease check and any step-down are delayed even though the replication goroutines keep heartbeating. The FSM contract requires only determinism, so nothing in it bounds Apply's latency, and the caller's only lever is to keep Apply fast or bound the commit rate.",
+      "discriminator": "Run a real cluster whose FSM sleeps inside Apply for a fixed interval shorter than the heartbeat timeout, drive applies faster than the FSM drains, and record whether the leader's main loop stops answering an independent RPC probe and stops advancing its lease check while the FSM lags; then repeat with an FSM whose Apply is fast and with a bounded apply rate to see whether the stall disappears. The prediction is a stall proportional to how far the FSM lags rather than an immediate failure, and the question to settle is whether any internal repair (a bounded channel, a timeout, a rejection path) exists or whether the only response is the caller's own backpressure.",
+      "disposition": "paused",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": [
+        "A run has time to build a slow-FSM harness and interpret its receipt; the observation needs a real cluster with commit traffic, an FSM that blocks in Apply, and an independent probe of the main loop rather than a source-only reading."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@fsm_latency_is_caller_side",
+      "kind": "behavior",
+      "statement": "The library's FSM contract asks that Apply be deterministic and that a returned snapshot be cheap to obtain, and it says nothing that bounds how long Apply may block. The leader's delivery of committed entries is a blocking send on fsmMutateCh, so the library transfers the latency of the application's FSM directly into the main loop rather than rejecting or deferring work once the channel is full.",
+      "conditions": "RestoreCommittedLogs is not involved; this is the running path, where processLogs is called from the leader's main loop with futures for the committed entries and runFSM drains fsmMutateCh.",
+      "source_ids": [
+        "raft_applybatch_send",
+        "api_channel",
+        "fsm_consumer",
+        "fsm_apply_contract"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

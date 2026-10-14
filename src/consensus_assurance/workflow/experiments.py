@@ -169,6 +169,9 @@ def assessment(state, root, fixed, check):
     value = observed(fixed, check, root)
     interpretations = [i for i in state.interpretations if i.experiment_id == fixed.id and check.id in i.executions]
     opinion = interpretations[-1] if interpretations else None
+    latest = {i.investigation_id: i.id for i in state.interpretations}
+    citations = [i for i in state.interpretations if check.id in i.executions]
+    current_citations = [i for i in citations if latest[i.investigation_id] == i.id]
     blockers = []
     if not fixed.basis.requirement:
         blockers.append('Exploratory basis has no fixed requirement. Retained observations still support '
@@ -176,7 +179,7 @@ def assessment(state, root, fixed, check):
     if not fixed.basis.comparisons:
         blockers.append('No fixed comparisons')
     if opinion is None:
-        blockers.append('Execution has no attributed interpretation')
+        blockers.append('Execution has no interpretation directly attributed to this fixed experiment')
     elif opinion.conclusion not in {'violated', 'holds'}:
         blockers.append('Current interpretation remains conditional, disputed or unresolved')
     gaps = open_gaps(state, fixed.investigation_id, fixed.id)
@@ -222,4 +225,9 @@ def assessment(state, root, fixed, check):
             'outcome': 'violated' if any(r['outcome'] == 'violated' for r in value['comparisons']) else
                        'holds' if complete else 'unknown',
             'blockers': list(dict.fromkeys(blockers)), 'gap_ids': [g.id for g in gaps],
-            'interpretation_id': opinion.id if opinion else None}
+            'interpretation_id': opinion.id if opinion else None,
+            'interpretation_citations': {
+                'current': [{'id': i.id, 'investigation_id': i.investigation_id,
+                             'experiment_id': i.experiment_id, 'event_indices': i.executions[check.id]}
+                            for i in current_citations],
+                'historical_count': len(citations) - len(current_citations), 'path': 'state.json'}}

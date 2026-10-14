@@ -172,7 +172,7 @@ for operation, value in [('case',3),('control',2)]:
     labels={'holds':'declared predicate holds','violated':'declared predicate does not hold','unknown':'comparison undetermined'}
     assert labels[outcome] in case_text
     assert labels[control_outcome] in control_text
-    assert 'Attributed interpretation for this execution' in report and state.interpretations[0].rationale in report
+    assert 'Directly attributed interpretation for this execution' in report and state.interpretations[0].rationale in report
     claim=state.interpretations[0].defect_claim
     labels={None:'no explicit defect claim submitted','asserted':'defect asserted (subject to independent verification)','unresolved':'unresolved'}
     assert f'Current model defect claim: {labels[claim]}' in report
@@ -226,7 +226,10 @@ def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path
     assert state.experiments[0].model_dump(mode='json')==saved['fixed']
     assert all((e.root/path).read_bytes()==raw for path,raw in saved['files'].items())
     result=assessment(state,e.root,state.experiments[0],checks[0])
-    assert result==saved['assessment'] and result['events'][1]['value']==0
+    assert {k:v for k,v in result.items() if k!='interpretation_citations'}=={
+        k:v for k,v in saved['assessment'].items() if k!='interpretation_citations'}
+    assert result['events'][1]['value']==0
+    assert result['interpretation_citations']['current'][0]['id']==state.interpretations[-1].id
     assert result['outcome']=='violated' and result['comparisons'][0]['valid_witness_indices']==[1]
     assert len(result['blockers'])==1
     limitation=result['blockers'][0]
@@ -350,7 +353,7 @@ for mode, reset, ticks in [('short',True,4),('long',True,6),('control',False,6)]
     assert gap.question in assessment(challenged,e.root,state.experiments[2],next(c for c in state.checks if c.experiment_id==state.experiments[2].id))['blockers']
     from consensus_assurance.reporting.report import render_report
     report=render_report(state,e.root).read_text()
-    assert 'local question answered' in report and 'Attributed interpretation for this execution' in report and 'valid violating event indices' in report
+    assert 'local question answered' in report and 'Directly attributed interpretation for this execution' in report and 'valid violating event indices' in report
 
 
 def test_separate_receipt_requires_association_and_successor_cannot_borrow_it(tmp_path):
@@ -392,7 +395,8 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
         assert state['current_submission']['no_change']
         from consensus_assurance.workflow.research import operation_summary
         summary=operation_summary(engine.state,engine.root)
-        assert summary['questions'][0]['id']==state['investigations'][0]['id']
+        assert not summary['questions']
+        assert summary['uncited_executions'][0]['experiment_id']==state['experiments'][0]['id']
         assert summary['latest_actual_execution']['id'] not in {id for i in state['interpretations'] for id in i['executions']}
         sub, files = duplicate(state)
         sub['experiment']['prefix'] += ' A changed assumption.'
@@ -413,7 +417,7 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
 
 
 def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_path):
-    from consensus_assurance.workflow.research import operation_summary
+    from consensus_assurance.workflow.research import operation_summary, excerpt
     counterevidence = [f'The documented caller condition {n} bounds the sampled input' for n in range(5)]
     limitations = [f'No observation establishes asynchronous completion for caller {n}' for n in range(5)]
     counterevidence[1] += '; the actual operand comes from the admitted caller' * 8
@@ -446,7 +450,12 @@ def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_pat
         assert local['id'] == state['investigations'][0]['id']
         opinion = local['latest_interpretation']
         assert opinion['id'] == state['interpretations'][-1]['id']
-        assert opinion['counterevidence'] == counterevidence and opinion['limitations'] == limitations
+        assert opinion['counterevidence'] == [excerpt(v) for v in counterevidence[:3]]
+        assert opinion['limitations'] == limitations[:3]
+        assert opinion['counterevidence_omitted_count'] == opinion['limitations_omitted_count'] == 2
+        locator = opinion['record']
+        full = next(v for v in state[locator['collection']] if v['id'] == locator['id'])
+        assert full['counterevidence'] == counterevidence and full['limitations'] == limitations
         assert opinion['defect_claim'] == 'refuted' and opinion['conclusion'] == 'explained'
         return {'rationale':'Inspect another sourced condition', 'investigations':[dict(
             question='Which recovery caller uses this return?', source_ids=['code'])]}, {}
@@ -457,17 +466,19 @@ def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_pat
         assert summary['questions'][0]['id'] == state['investigations'][-1]['id']
         assert summary['questions'][0]['latest_interpretation'] is None
         assert len(state['interpretations']) == 2 and state['interpretations'][0] == saved['initial']
-        view = json.loads((engine.root/'research.json').read_text())['reselection']
+        index = json.loads((engine.root/'research.json').read_text())
+        view = index['reselection']
         questions = {q['id']:q for q in view['questions']}
         old, pending = state['investigations'][:2]
-        assert len(questions) == 8 and view['questions'][0]['id'] == pending['id']
+        assert list(questions) == [q['id'] for q in state['investigations']]
         assert questions[pending['id']]['open_gap_count'] == 1
         assert state['investigations'][-1]['id'] in questions
-        answer = questions[old['id']]
+        answer = next(q for q in index['investigations'] if q['id'] == old['id'])
         assert answer['discriminator'] == old['discriminator'] and answer['hypothesis'] == old['hypothesis']
         assert answer['latest_interpretation']['id'] == state['interpretations'][-1]['id']
-        assert answer['latest_interpretation']['limitations'] == [v[:300] for v in limitations[:3]]
-        assert answer['latest_interpretation']['counterevidence'] == [v[:300] for v in counterevidence[:3]]
+        assert answer['latest_interpretation']['limitations'] == limitations[:3]
+        assert answer['latest_interpretation']['counterevidence'] == [excerpt(v) for v in counterevidence[:3]]
+        assert answer['latest_interpretation']['counterevidence_omitted_count'] == 2
         assert all(q['disposition'] == 'active' for q in state['investigations']) and not state['experiments']
         return stop(state)
 
@@ -505,13 +516,18 @@ marker.write_text('observed one invocation')
         repeated.append(state['current_submission']['no_change'])
         return repeat_existing(state)
     def explain(state):
+        from consensus_assurance.workflow.research import operation_summary
         checks=[c for c in state['checks'] if c.get('experiment_id')]
+        summary=operation_summary(engine.state,engine.root)
+        assert summary['questions'][0]['latest_interpretation']['executions']=={checks[0]['id']:[1]}
+        assert {c['id'] for c in summary['uncited_executions']}=={c['id'] for c in checks[1:]}
+        assert summary['effects']==state['current_submission']['effects']
         sub,_=opinion(state)
         value=sub['interpretations'][0]
         sub['interpretations']=[{**value,'executions':{c['id']:[1]},
-            'rationale':'Interpret only the observed return in receipt '+c['id']} for c in checks]
+            'rationale':'Interpret only the observed return in receipt '+c['id']} for c in checks[1:]]
         return sub,{}
-    engine,repo=engine_for(tmp_path,[start,duplicate,repeat,repeat,explain,stop])
+    engine,repo=engine_for(tmp_path,[start,opinion,duplicate,repeat,repeat,explain,stop])
     state=engine.start(repo)
     checks=[c for c in state.checks if c.experiment_id]
     assert repeated==[True,False] and state.usage['experiments']==3

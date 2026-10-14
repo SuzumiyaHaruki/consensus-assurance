@@ -1,0 +1,148 @@
+{
+  "rationale": "The first retained execution of the startup-replay probe completed (exit 0, tests_passed) but every CA_EVENT payload was recorded as invalid_observation because the JSON object had no event name field, so the run yields no parsed decisive result. This submission records that parse loss against its own receipt without claiming a comparison, and submits a corrected successor harness (previous_id) that names both events, emits the pre-restart state as an admission event, declares the within/over-capacity comparisons, and adds two boundary cases that straddle the 128-batch limit of the FSM channel.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+      "experiment_id": "c4168d1deb72421a8935ea2ddc7d9b7c-experiment",
+      "source_ids": [
+        "api_startup_order",
+        "api_restore_committed",
+        "api_channel",
+        "raft_applybatch_send",
+        "raft_batch_loop",
+        "fsm_consumer",
+        "config_restore_committed_doc"
+      ],
+      "executions": {
+        "abb2ff0a1f0f449f87fb9b382c8a3fee": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ]
+      },
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Account of receipt abb2ff0a1f0f449f87fb9b382c8a3fee only: the run completed with exit 0 and tests_passed, and stdout carried five CA_EVENT payloads, but the extractor recorded all five (parsed indices 0-4) as invalid_observation with reason 'Event must be an object with an event name'. The failure is in the harness payload, not in the target: the payloads were valid JSON objects describing each case but carried no event field. Consequences for this account: no comparison can be evaluated from this receipt, and the observed outcomes it records cannot be cited as parsed decisive indices - only as retained, unparsed output. What the retained bytes do contain (parsing_errors[0..4].raw) is: small_window_default_batch window 4001 / 63 batches / returned; mid_window_default_batch window 1000 / 16 batches / returned; mid_window_small_batch (MaxAppendEntries 4) window 1001 / 250 batches / not returned within 8s with a blocked stack; large_window_default_batch window 12000 / 188 batches / not returned with a blocked stack; large_window_after_snapshot window 0 / 0 batches / returned. Because those payloads were never admitted as events, none of them is used here as evidence for the defect claim: the claim remains the source derivation from the previous interpretation (blocking send in the startup replay on the 128-slot fsmMutateCh before runFSM starts, batches of MaxAppendEntries, no internal repair and no reachable shutdown), and it stays conditional on a retained execution that actually parses. The corrected successor harness is submitted with this update; its receipt, not this one, will be the basis for the next interpretation.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The receipt itself is a completed, passing run (tests_passed, exit 0), which could be misread as establishing the target behavior; it does not, because the decisive payloads failed extraction and no comparison was evaluated.",
+        "Nothing in this receipt distinguishes 'NewRaft did not return' from a harness that stopped waiting: the raw payload is the harness's own derivation, and the 8s wait it recorded is a harness parameter, not a target interval. Only a parsed rerun with the corrected events, plus the blocked stack, can carry that difference."
+      ],
+      "limitations": [
+        "No parsed event from this receipt establishes any compared field; the five raw payloads are retained in the observations file and are described here only as unparsed output.",
+        "This interpretation covers the receipt and does not re-answer the source-derived mechanism, which was previously recorded and is unchanged."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "api_startup_order",
+      "api_restore_committed",
+      "api_channel",
+      "raft_applybatch_send",
+      "raft_batch_loop",
+      "fsm_consumer",
+      "config_restore_committed_doc",
+      "config_defaults"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Seven restart-only cases over the real hashicorp/raft single-voter node (in-memory transport, real commit-tracking log store): produce a committed log with the actual leader, stop the node, then call NewRaft again over the unchanged stores with a fresh transport on the same address, and record whether NewRaft returns. Cases vary the size of the committed-but-unapplied startup replay window (applies before the restart, plus an optional manual snapshot before shutdown) and MaxAppendEntries, which together decide how many FSM batches the replay must place in the 128-slot fsmMutateCh.",
+      "assumptions": [
+        "RestoreCommittedLogs=true with a CommitTrackingLogStore, the documented opt-in configuration for this feature.",
+        "Automatic snapshotting is disabled (SnapshotThreshold=math.MaxUint64, SnapshotInterval=1h) so the replay window is set explicitly instead of by timer; this models a node whose newest snapshot lags its commit index, which the default 120s SnapshotInterval plus 8192 SnapshotThreshold also produce when more than 8192 entries are committed between snapshot checks.",
+        "Restarted instances are constructed with a null logger so no logging occurs after the test completes; logging is not part of the observed mechanism.",
+        "A returning restart is expected in the millisecond range, and the 5s wait is a ceiling for recording non-return, not the evidence for it: the non-return cases are additionally recorded with the stack of the goroutine left in the startup replay path.",
+        "The census of FSM-bound entries applies the Raft.prepareLog rule to the stored entries (LogCommand, LogBarrier, and LogConfiguration above protocol version 2), so the batch count is computed from observed log contents."
+      ],
+      "excluded": [
+        "Multi-voter clusters, network faults and on-disk (bolt) log stores are excluded; the mechanism under test is in the startup replay path, not in replication.",
+        "The FSM's own semantics are excluded: MockFSM only records applied logs, and no FSM behavior is asserted.",
+        "No production code is modified and no full-package test suite is run; only the TestAssurance-prefixed test in this harness is selected."
+      ],
+      "parameters": {
+        "cases": "small_window_default_batch(applied=4000), mid_window_default_batch(applied=1000), mid_window_small_batch(applied=1000,MaxAppendEntries=4), boundary_within_default_batch(applied=8190), boundary_over_default_batch(applied=8197), large_window_default_batch(applied=12000), large_window_after_snapshot(applied=12000,snapshot before shutdown)",
+        "restart_wait_seconds": 5,
+        "events": "startup_replay_prefix (pre-restart state: applied, max_append_entries, fsm_mutate_ch_capacity read from the running instance, persisted_commit_index, last_log_index, snapshot_present, snapshot_index, last_applied_before_restart, replay_window, fsm_bound_entries_in_window, estimated_replay_batches) and startup_replay_restart (same operands plus replay_batches_within_capacity, restart_returned, restart_elapsed_ms, restart_error, restart_stack_frames)",
+        "predicted_boundary": "ceil(fsm_bound_entries_in_window / max_append_entries) <= fsm_mutate_ch_capacity (128) returns; one batch more does not return"
+      }
+    },
+    "prefix": "Each case builds one real single-voter cluster with opts{Peers:1, Bootstrap:true, CommitTrackingLogs:true} so the log store, stable store, snapshot store and FSM are produced by the target itself: the leader dispatches and commits the applied commands through the normal leaderLoop/dispatchLogs path, which stages the commit index via StageCommitIndex and stores the entries. Before shutdown the harness reads the store's persisted commit index, the last log index, cap(fsmMutateCh), the configured MaxAppendEntries, and censuses the entry types in the replay window with GetLog using the same rule as Raft.prepareLog, then emits the startup_replay_prefix event. For the snapshot case it takes a user snapshot before shutdown and uses that snapshot's index as the restart's last-applied point. It then calls leader.Shutdown(), creates a fresh NewInmemTransport on the same address, and calls NewRaft over the unchanged logs/stable/snapshots instances as the target's own restart tests do, in a goroutine that reports completion through a channel; the harness waits up to 5s, and if nothing arrived it samples all goroutine stacks and keeps the one on the startup replay path. It then emits the startup_replay_restart event carrying the same operands plus replay_batches_within_capacity and the outcome. All events are printed as CA_EVENT JSON objects with an event name so they are extracted as observations rather than parse errors.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "replay_prefix",
+        "event": "startup_replay_prefix",
+        "conditions": []
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "startup_replay_restart",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "replay_prefix",
+        "assertion": {
+          "field": "restart_returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "replay_batches_within_capacity",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "When the admitted startup replay window needs at most fsm_mutate_ch_capacity batches, the restart returns."
+      },
+      {
+        "event": "startup_replay_restart",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "replay_prefix",
+        "assertion": {
+          "field": "restart_returned",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "replay_batches_within_capacity",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "When the admitted startup replay window needs more than fsm_mutate_ch_capacity batches, NewRaft does not return within the bounded wait and a goroutine is left in the startup replay path."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": "c4168d1deb72421a8935ea2ddc7d9b7c-experiment",
+    "revision_reason": "The predecessor harness emitted CA_EVENT payloads without an event name, so the retained run was recorded entirely as invalid_observation (parse loss, indices 0-4) and no comparison could be evaluated. This revision names the events, splits them into a pre-restart admission event and a restart result event so the restart outcome is admitted by an independently observed prefix, declares the two comparisons the hypothesis predicts, and adds two boundary cases that straddle 128 batches with otherwise identical setup."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

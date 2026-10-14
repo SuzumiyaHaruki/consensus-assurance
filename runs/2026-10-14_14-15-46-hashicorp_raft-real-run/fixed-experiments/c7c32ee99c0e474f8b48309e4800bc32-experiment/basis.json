@@ -1,0 +1,139 @@
+{
+  "id": "c7c32ee99c0e474f8b48309e4800bc32-experiment",
+  "investigation_id": "c7c32ee99c0e474f8b48309e4800bc32-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright (c) 2026. Assurance harness artifact (draft, not part of the target source).\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nfunc caEmit(t *testing.T, payload interface{}) {\n\tt.Helper()\n\tblob, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// caWaitFuture reports whether a future resolved within the bound and its error.\nfunc caWaitFuture(f Future, wait time.Duration) (bool, string) {\n\tch := make(chan error, 1)\n\tgo func() { ch <- f.Error() }()\n\tselect {\n\tcase err := <-ch:\n\t\treturn true, caErrString(err)\n\tcase <-time.After(wait):\n\t\treturn false, \"future did not resolve within the bound\"\n\t}\n}\n\nfunc caQuorum(cfg Configuration) (voters int) {\n\tfor _, s := range cfg.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters\n}\n\n// TestAssurance_AddVoterUnreachableServer observes what adding a server that is\n// not running does to a cluster's ability to make progress, and whether the\n// cluster can undo it through the API.\n//\n// The AddVoter documentation in the captured snapshot says the given server is\n// added as a staging server that the leader promotes once it is ready. This\n// probe adds an address no transport answers, on a single-voter cluster and on\n// a three-voter cluster, records the resulting configuration and quorum,\n// whether a subsequent apply can complete, whether the cluster can still elect,\n// and whether the added server can be removed again through the API.\nfunc TestAssurance_AddVoterUnreachableServer(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.NewNullLogger()\n\n\tcaRunAddDeadVoter(t, conf, 0, 1)\n\tcaRunAddDeadVoter(t, conf, 1, 3)\n}\n\nfunc caRunAddDeadVoter(t *testing.T, conf *Config, trial, peers int) {\n\tt.Helper()\n\n\tc := MakeCluster(peers, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\n\t// A server that exists only as an address: no transport answers it.\n\tdeadAddr, deadTrans := NewInmemTransport(\"\")\n\tdeadID := ServerID(\"dead-\" + string(deadAddr))\n\t_ = deadTrans\n\n\t// Baseline: the cluster can commit before the new server is added.\n\tbaseCompleted, baseErr := caWaitFuture(leader.Apply([]byte(\"before-add\"), 0), 2*time.Second)\n\tbaseCfg := leader.GetConfiguration().Configuration()\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":             \"add_dead_voter_baseline\",\n\t\t\"trial\":             trial,\n\t\t\"configured_voters\": peers,\n\t\t\"voters_in_config\":  caQuorum(baseCfg),\n\t\t\"apply_completed\":   baseCompleted,\n\t\t\"apply_error\":       baseErr,\n\t\t\"leader_state\":      leader.getState().String(),\n\t})\n\n\t// Add the unreachable server through the documented API.\n\taddCompleted, addErr := caWaitFuture(leader.AddVoter(deadID, deadAddr, 0, 0), 3*time.Second)\n\tcfgAfterAdd := leader.GetConfiguration().Configuration()\n\tdeadSuffrage := \"absent\"\n\tlivingVoters := 0\n\tfor _, s := range cfgAfterAdd.Servers {\n\t\tif s.ID == deadID {\n\t\t\tdeadSuffrage = s.Suffrage.String()\n\t\t} else if s.Suffrage == Voter {\n\t\t\tlivingVoters++\n\t\t}\n\t}\n\tvotersAfterAdd := caQuorum(cfgAfterAdd)\n\tquorumSizeAfterAdd := votersAfterAdd/2 + 1\n\tquorumNeedsDead := quorumSizeAfterAdd > livingVoters\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"add_dead_voter_config\",\n\t\t\"trial\":                        trial,\n\t\t\"added_server_id\":              string(deadID),\n\t\t\"add_completed\":                addCompleted,\n\t\t\"add_error\":                    addErr,\n\t\t\"dead_server_suffrage\":         deadSuffrage,\n\t\t\"voters_in_config\":             votersAfterAdd,\n\t\t\"living_voters_in_config\":      livingVoters,\n\t\t\"quorum_size\":                  quorumSizeAfterAdd,\n\t\t\"quorum_requires_dead_server\":  quorumNeedsDead,\n\t\t\"leader_state\":                 leader.getState().String(),\n\t})\n\n\t// Can the cluster still make progress, and can it elect a leader?\n\ttime.Sleep(150 * time.Millisecond)\n\tstateAfter := leader.getState().String()\n\tapplyCompleted, applyErr := caWaitFuture(leader.Apply([]byte(\"after-add\"), 0), 1500*time.Millisecond)\n\tleaders := 0\n\tfor _, r := range c.rafts {\n\t\tif r.getState() == Leader {\n\t\t\tleaders++\n\t\t}\n\t}\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                      \"add_dead_voter_apply\",\n\t\t\"trial\":                      trial,\n\t\t\"voters_in_config\":           votersAfterAdd,\n\t\t\"living_voters_in_config\":    livingVoters,\n\t\t\"quorum_size\":                quorumSizeAfterAdd,\n\t\t\"quorum_requires_dead_server\": quorumNeedsDead,\n\t\t\"apply_completed\":            applyCompleted,\n\t\t\"apply_succeeded\":            applyCompleted && applyErr == \"\",\n\t\t\"apply_error\":                applyErr,\n\t\t\"leader_state\":               stateAfter,\n\t\t\"leaders_in_cluster\":         leaders,\n\t})\n\n\t// Can the operator undo it through the same API?\n\tremoveCompleted, removeErr := caWaitFuture(leader.RemoveServer(deadID, 0, 0), 2*time.Second)\n\tcfgAfterRemove := leader.GetConfiguration().Configuration()\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                       \"add_dead_voter_remove\",\n\t\t\"trial\":                       trial,\n\t\t\"quorum_requires_dead_server\": quorumNeedsDead,\n\t\t\"remove_completed\":            removeCompleted,\n\t\t\"remove_succeeded\":            removeCompleted && removeErr == \"\",\n\t\t\"remove_error\":                removeErr,\n\t\t\"voters_in_config_after\":      caQuorum(cfgAfterRemove),\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "pre",
+          "event": "add_dead_voter_config",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "api_addvoter_contract",
+      "configuration_addvoter_voter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two cases over real clusters with the in-memory transport: a single-voter cluster and a three-voter cluster, each healthy and committing before the change. In each case the harness records a baseline apply, adds a server address that no transport answers through the exported AddVoter API, records the resulting configuration (voters, the added server's suffrage, the quorum and whether the quorum exceeds the living voters), then attempts an apply and reports whether it succeeded, which state the node is in and how many leaders the cluster has, and finally attempts RemoveServer for the added server and reports whether that succeeded and what the configuration lists afterwards.",
+      "assumptions": [
+        "The added server is represented by a freshly created in-memory transport address that is never connected to the cluster, so no peer can answer it; this is the state of a server that has not been started yet.",
+        "The documented workflow under test is the one AddVoter's comment describes - add the server, then bring it up - so the probe follows the documentation rather than inventing a use the API does not describe.",
+        "Captured in-memory timeouts are used, so the lease and election timers are the ones the target's own tests run with, and each future is waited for with a bound and reported as resolved or not rather than assumed."
+      ],
+      "excluded": [
+        "No on-disk store, no network transport and no multi-process execution; the added server is never started, which is the premise of the case rather than an omission.",
+        "The probe does not test the promotion path the documentation describes, because no such path exists in the captured code to test."
+      ],
+      "parameters": {
+        "cases": "trial 0 single-voter cluster plus one unreachable voter; trial 1 three-voter cluster plus one unreachable voter",
+        "recorded_operands": "voters_in_config, living_voters_in_config, quorum_size, dead_server_suffrage, add_completed, add_error, quorum_requires_dead_server, apply_completed, apply_succeeded, apply_error, leader_state, leaders_in_cluster, remove_completed, remove_succeeded, remove_error, voters_in_config_after"
+      }
+    },
+    "prefix": "Each case builds a real cluster with MakeCluster and the captured in-memory timeouts, takes the elected leader, and creates a fresh in-memory transport address that is never connected to the cluster to stand for a server that has not been started. It confirms the cluster commits a command before the change, then calls the exported AddVoter with that address, waits for the returned future with a bound, and reads back the configuration to report the added server's suffrage, the number of voters, how many of them are living, and whether the quorum exceeds the living voters. After letting the lease timer run, it attempts an apply with a bounded wait and reports whether the future resolved, whether it succeeded, the error, the node's state and how many leaders the cluster has. Finally it attempts RemoveServer for the added server with a bounded wait and reports whether that succeeded and what the configuration lists afterwards. Only the TestAssurance-prefixed test in this harness is selected and no production file is modified.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "add_dead_voter_apply",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "apply_succeeded",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "quorum_requires_dead_server",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "When the quorum after the change exceeds the living voters, a subsequent apply does not succeed."
+      },
+      {
+        "event": "add_dead_voter_apply",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "apply_succeeded",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "quorum_requires_dead_server",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: when the living voters still satisfy the quorum the same change leaves applies working."
+      },
+      {
+        "event": "add_dead_voter_remove",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "remove_succeeded",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "quorum_requires_dead_server",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "When the quorum needs the unreachable server, the change cannot be undone through RemoveServer either, so there is no in-band repair."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a9b23cffeb2849bb8cf827344104972c",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "c7c32ee99c0e474f8b48309e4800bc32",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

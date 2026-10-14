@@ -1,0 +1,127 @@
+{
+  "rationale": "The corrected harness ran in the fixed clean copy and produced parsed events: both declared comparisons hold, the boundary between fitting and not fitting the 128-slot FSM channel is pinned (128 batches return, 129 do not), the MaxAppendEntries=4 case isolates the batch-size factor on an otherwise identical window, the post-snapshot case isolates the window-size factor on an otherwise identical store, and every non-return case leaves a goroutine in the startup replay path. This update appends the execution-grounded interpretation for that receipt, keeps the two knowledge entries with their exact revisions and relied-on assertions, marks the mechanism question answered, and registers the one applicability question the finding still depends on: whether a node with the captured default snapshot settings can present a window above the bound at restart, rather than only a node whose snapshots are disabled as in the probe. It also records a second, independently sourced lead as a paused child question about the TimeoutNow authority path, so the next work item is explicit rather than inherited from this execution.",
+  "sources": [
+    {
+      "id": "raft_timeoutnow_handler",
+      "file": "raft.go",
+      "start_line": 2232,
+      "end_line": 2237,
+      "kind": "code_observation"
+    },
+    {
+      "id": "commands_timeoutnow_request",
+      "file": "commands.go",
+      "start_line": 200,
+      "end_line": 213,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    },
+    {
+      "id": null,
+      "ref": "@timeoutnow_authority",
+      "question": "Can a TimeoutNow message that no longer reflects the current leader start an election that displaces a live leader, given that the handler clears the receiver's known leader, moves it to Candidate, sets candidateFromLeadershipTransfer, and the resulting RequestVote waives the 'we have a leader' rejection on other servers?",
+      "source_ids": [
+        "raft_timeoutnow_handler",
+        "commands_timeoutnow_request"
+      ],
+      "hypothesis": "TimeoutNowRequest carries only the RPC header and no term, and raft.timeoutNow performs no term comparison, no check that the sender is the current leader and no membership check: it clears the leader, sets Candidate and marks the candidacy as coming from a leadership transfer, and requestVote on other servers then grants the vote even though the voter knows a live leader and is not in a transfer of its own. Election safety (term, one vote per term, log freshness) is preserved, so the question is scoped to authority/liveness: whether a TimeoutNow that a leader produced before losing leadership can still be delivered and displace a healthy current-term leader.",
+      "discriminator": "Trace the real producer path (initiateLeadershipTransfer -> leadershipTransfer -> trans.TimeoutNow) and the consumer path (processRPC -> timeoutNow -> runCandidate with candidateFromLeadershipTransfer, then requestVote's LeadershipTransfer bypass) and identify which permitted event in the captured snapshot can deliver the request after the receiving node learned a newer leader. A real interrupted transfer in a small cluster should then show the receiver entering candidacy and peers granting votes despite a live leader, while a control where the transfer completes before the leadership change should not.",
+      "disposition": "paused",
+      "parent_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+      "knowledge": null,
+      "resume_conditions": [
+        "A concrete internal producer prefix for a late or repeated TimeoutNow is established from source or from a transport behavior available in the captured snapshot, so the input is produced by the target rather than injected by the harness.",
+        "The safety side is settled from source (term handling, one vote per term, log freshness) so any claim can be scoped to authority/liveness rather than to election safety."
+      ]
+    }
+  ],
+  "knowledge": [],
+  "gaps": [
+    {
+      "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+      "question": "Under the captured default snapshot settings (SnapshotInterval 120s, SnapshotThreshold 8192) with automatic snapshotting left enabled, can a node reach a restart whose committed-but-unapplied replay window exceeds 128*MaxAppendEntries entries, or does the periodic snapshot keep the window below that bound during normal operation?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+      "experiment_id": "28496be07c87443ea089331e8a4dbc77-experiment",
+      "source_ids": [
+        "api_startup_order",
+        "api_restore_committed",
+        "api_channel",
+        "raft_applybatch_send",
+        "raft_batch_loop",
+        "fsm_consumer",
+        "config_restore_committed_doc",
+        "config_defaults"
+      ],
+      "executions": {
+        "ec81425b7ebc4941ba70f77e78b109fb": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "Retained execution (check ec81425b7ebc4941ba70f77e78b109fb, exit 0, tests_passed, 14 parsed events, 0 parse errors). Comparison 0 (within-capacity restart returns) evaluated indices 1, 3, 7, 13 and holds with no missing or contradictory observations: every admitted prefix was correlated by identity (case) to its result (0->1, 2->3, 6->7, 12->13), comparison_complete true. Comparison 1 (over-capacity restart does not return) evaluated indices 5, 9, 11 and holds, correlated with prefixes 4, 8, 10. Observed operands: window 4001 with 4000 FSM-bound entries -> 63 batches, returned in 4ms; window 1000/999 -> 16 batches, returned in 0ms; window 8190/8189 -> exactly 128 batches, returned in 4ms; window 8197/8196 -> 129 batches, did not return within 5s; window 12000/11999 -> 188 batches, did not return; window 1001/1000 with MaxAppendEntries=4 -> 250 batches, did not return. The last two pairs are the discriminators that exclude the rival explanations: the MaxAppendEntries=4 case has essentially the same ~1000-entry window as the case that returned in 0ms with 64-entry batches, so what decides the outcome is batches against channel capacity, not window size alone; and the after-snapshot case applies the same 12000 commands against the same stores yet returns in 7ms because the manual snapshot moves last_applied to 12002 and leaves a window of 0. Each non-return case sampled a goroutine that had not returned out of the replay path, with frames at raft.go:1305 (the select-send of a batch inside processLogs' applyBatch), raft.go:1346 (the batched applyBatch call), api.go:753 (restoreFromCommittedLogs' processLogs call) and api.go:606 (NewRaft), i.e. exactly the source-derived send that has no consumer until api.go:637 starts runFSM. The 5s wait is a harness ceiling and is not load-bearing for the claim: the stack shows the goroutine is inside the replay send, and the source shows the only reader of that channel is started later in the same constructor and that the caller cannot call Shutdown because no *Raft has been returned. Together with the source account this makes the non-return a deadlock of the constructor under the stated configuration, so the account is no longer merely conditional; the previous receipt abb2ff0a1f0f449f87fb9b382c8a3fee is superseded on the evidence side by this parsed run, and its parse loss remains recorded.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+          "revision": 1,
+          "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists; the blocked stacks in this run end at raft.go:1305 inside processLogs' applyBatch, called from raft.go:1346, from api.go:753 (restoreFromCommittedLogs) and api.go:606 (NewRaft)."
+        },
+        {
+          "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+          "revision": 1,
+          "assertion": "Non-return tracks ceil(FSM-bound window entries / MaxAppendEntries) against the 128-slot channel: 63 and 16 batches returned in 0-4ms, 128 batches returned, 129 batches, 188 batches and 250 batches (MaxAppendEntries=4) did not return."
+        }
+      ],
+      "counterevidence": [
+        "The feature is opt-in: RestoreCommittedLogs defaults to false (config.go 243-254, DefaultConfig), so a cluster that never enables it cannot reach this path; the defect is scoped to that configuration plus a commit-tracking log store.",
+        "The blocked send is inside a select with a shutdownCh arm, so it is not unconditional: Shutdown releases it - but only a caller holding the *Raft can call Shutdown, and in the affected path NewRaft has not returned yet, while NewRaft starts no internal routine before this call, so no participant exists that could take that arm during the window.",
+        "The probe constructs the large windows by disabling automatic snapshotting; a deployment that snapshots often keeps the window small, so the observed non-returns are not evidence that ordinary clusters of this kind restart broken - only that the constructor cannot complete when the window is large.",
+        "For the within-capacity cases the returns were immediate (0-7ms), but a returning restart is only bounded by the harness wait; nothing here claims a bound on restart duration for other configurations."
+      ],
+      "limitations": [
+        "Configuration space is sampled, not exhausted: MaxAppendEntries was exercised at 4 and 64 while ValidateConfig allows up to 1024, and the relation tested is the batch count against capacity, so untested settings are covered by the relation rather than by direct observation.",
+        "The probe runs a single-voter cluster with an in-memory transport, an in-memory commit-tracking log store and MockFSM, so disk latency, network behaviour and slow FSM application are excluded; a slow FSM would fill the same channel sooner, which limits the observed non-returns as a lower bound rather than an upper one.",
+        "The probe does not measure the memory held by the queued batches (up to 128 batches of up to MaxAppendEntries commit tuples), nor whether an operator can recover a node blocked in NewRaft, and no claim is made about either.",
+        "The window-to-FSM-bound offset varied by one entry between runs (the persisted commit index is staged with the last StoreLogs), so the exact counts 8189/8196 are specific to these runs; the tested predicate is the batch count against the 128-slot capacity.",
+        "Restart outcome is recorded as returned / not returned within 5s with a sampled stack; no attempt is made to force completion or to establish that no future internal or external event could ever release the send beyond the source argument that none is enabled."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

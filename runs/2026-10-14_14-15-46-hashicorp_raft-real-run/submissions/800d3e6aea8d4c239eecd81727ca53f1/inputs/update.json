@@ -1,0 +1,114 @@
+{
+  "rationale": "The retained finding's one recorded counterevidence is that the probe constructed its large replay windows by disabling automatic snapshotting, which leaves open whether the captured default snapshot cadence (SnapshotThreshold 8192, SnapshotInterval 120s) would have kept the window below the 128-batch bound. This submission revises the fixed experiment on exactly that point: the snapshot settings stay untouched at their configured values and are reported as operands, the newest snapshot is placed with a real user snapshot so the accumulation after it is deterministic, and one case has no snapshot at all, which is the state of a node that has not yet reached its first periodic check. Source anchors for the interval-driven check (snapshot.go) are added for the account that will interpret the receipt. No interpretation is appended here because the answer to the registered gap must come from the retained execution of this revision, not from a prediction.",
+  "sources": [
+    {
+      "id": "snapshot_interval_check",
+      "file": "snapshot.go",
+      "start_line": 73,
+      "end_line": 100,
+      "kind": "code_observation"
+    },
+    {
+      "id": "snapshot_should_snapshot",
+      "file": "snapshot.go",
+      "start_line": 107,
+      "end_line": 126,
+      "kind": "code_observation"
+    },
+    {
+      "id": "snapshot_take_snapshot",
+      "file": "snapshot.go",
+      "start_line": 126,
+      "end_line": 178,
+      "kind": "code_observation"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "previous_id": "28496be07c87443ea089331e8a4dbc77-experiment",
+    "revision_reason": "Changed basis to address the recorded counterevidence: the predecessor disabled automatic snapshotting (SnapshotThreshold=MaxUint64, SnapshotInterval=1h) and varied MaxAppendEntries and applied counts; this revision leaves SnapshotThreshold, SnapshotInterval and MaxAppendEntries at their configured values, reports them as observed operands, places the newest snapshot with a real user snapshot at a chosen point, and includes a case with no snapshot at all. The comparisons are the same predicates over the same admission prefix shape, so the receipt answers whether the configured snapshot cadence keeps the window below the bound.",
+    "source_ids": [
+      "api_startup_order",
+      "api_restore_committed",
+      "api_channel",
+      "raft_applybatch_send",
+      "raft_batch_loop",
+      "fsm_consumer",
+      "config_restore_committed_doc",
+      "config_defaults",
+      "snapshot_interval_check",
+      "snapshot_should_snapshot"
+    ],
+    "scope": {
+      "description": "Three restart-only cases over the real hashicorp/raft single-voter node with the captured snapshot settings left in place (in-memory transport, real commit-tracking log store): commit with the actual leader, optionally place the newest snapshot with a real user snapshot at a chosen index, commit more entries, stop the node, then call NewRaft again over the unchanged stores with a fresh transport on the same address and record whether it returns.",
+      "assumptions": [
+        "RestoreCommittedLogs=true with a CommitTrackingLogStore; the documented opt-in configuration for the feature under test.",
+        "SnapshotThreshold, SnapshotInterval and MaxAppendEntries are not modified by the harness; their configured values are reported in the admission event so the reader can check that the defaults were in force.",
+        "The test runs for seconds, well inside the configured 120s snapshot interval, so the periodic check does not fire during the case; that is the situation in which the window is whatever accumulated since the newest snapshot, and the case without a snapshot is the situation of a node before its first periodic check.",
+        "A returning restart is expected in the millisecond range; the 5s wait is a ceiling for recording non-return, and non-return cases additionally carry the stack of the goroutine left in the startup replay path.",
+        "Restarted instances use a null logger so no logging occurs after the test completes; logging is not part of the observed mechanism."
+      ],
+      "excluded": [
+        "Real-time accumulation over a full 120s interval is not observed; the accumulation is produced deterministically by the target's own apply path instead, and the rate at which the same accumulation would occur in time is left as arithmetic on the configured interval.",
+        "Multi-voter clusters, network faults, on-disk log stores and FSM slowness are excluded.",
+        "No production code is modified and no full-package suite is run; only the TestAssurance-prefixed test in this harness is selected."
+      ],
+      "parameters": {
+        "cases": "defaults_no_snapshot_window_10000(applied=10000, no snapshot), defaults_snapshot_then_10000_more(applied=14000, user snapshot after 4000), defaults_snapshot_then_2000_more(applied=6000, user snapshot after 4000)",
+        "restart_wait_seconds": 5,
+        "events": "startup_replay_prefix (applied, snapshot_after, max_append_entries, snapshot_threshold, snapshot_interval_ms, fsm_mutate_ch_capacity read from the running instance, persisted_commit_index, last_log_index, snapshot_present, snapshot_index, last_applied_before_restart, replay_window, fsm_bound_entries_in_window, estimated_replay_batches) and startup_replay_restart (the same operands plus replay_batches_within_capacity, restart_returned, restart_elapsed_ms, restart_error, restart_stack_frames)",
+        "predicted_window": "persisted_commit_index minus the newest snapshot index, counted in FSM-bound entries, with the captured SnapshotThreshold of 8192 and a 120s interval in force"
+      }
+    },
+    "prerequisites": [
+      {
+        "alias": "replay_prefix",
+        "event": "startup_replay_prefix"
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "startup_replay_restart",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "replay_prefix",
+        "applicability_conditions": [
+          {
+            "field": "replay_batches_within_capacity",
+            "op": "eq",
+            "value": true
+          }
+        ],
+        "assertion": {
+          "field": "restart_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "With the configured snapshot settings in force, a restart whose committed-but-unapplied window needs at most fsm_mutate_ch_capacity batches returns."
+      },
+      {
+        "event": "startup_replay_restart",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "replay_prefix",
+        "applicability_conditions": [
+          {
+            "field": "replay_batches_within_capacity",
+            "op": "eq",
+            "value": false
+          }
+        ],
+        "assertion": {
+          "field": "restart_returned",
+          "op": "eq",
+          "value": false
+        },
+        "description": "With the configured snapshot settings in force but a window above the configured SnapshotThreshold accumulated since the newest snapshot, NewRaft does not return within the bounded wait and a goroutine is left in the startup replay path."
+      }
+    ],
+    "prefix": "Each case builds one real single-voter cluster with opts{Peers:1, Bootstrap:true, CommitTrackingLogs:true} and RestoreCommittedLogs enabled, leaving SnapshotThreshold=8192, SnapshotInterval=120s and MaxAppendEntries=64 as configured. Commands are applied through the leader's normal path, with a real user snapshot (leader.Snapshot()) inserted after the chosen number of applies when a case asks for one, so the newest snapshot in the store and the entries above it are produced by the target itself. Before shutdown the harness reads the store's persisted commit index, the last log index, the newest snapshot from the store list, cap(fsmMutateCh), the configured MaxAppendEntries, SnapshotThreshold and SnapshotInterval, and censuses the entry types in the replay window with GetLog using the same rule as Raft.prepareLog, then emits the startup_replay_prefix event. It then shuts the node down, creates a fresh NewInmemTransport on the same address and calls NewRaft over the unchanged logs/stable/snapshots instances as the target's own restart tests do, in a goroutine that reports completion through a channel; it waits up to 5s, and if nothing arrived it samples all goroutine stacks and keeps the one on the startup replay path. It finally emits the startup_replay_restart event carrying the same operands plus replay_batches_within_capacity and the outcome."
+  }
+}

@@ -1,0 +1,1371 @@
+{
+  "input": {
+    "rationale": "The retained execution of the interrupted-transfer probe answered the stranding question, and re-reading the send path shows why: the deferError send is on a channel created with capacity 1 (raft.go 603) and the transfer goroutine only reaches a send after receiving the response to the previous deferError, which requires the replicator to have consumed it, so the buffer is empty at every send and the send never needs a reader. With that premise defeated at the mechanism level, the hypothesis is refuted rather than merely unwitnessed. The same reading answers the parent TimeoutNow question: the producer reaches trans.TimeoutNow only while it is still the leader inside the transfer path, and the drain loop's exit and the send are adjacent statements with no blocking point, so no internal producer supplies a transfer message that no longer reflects the current leader; the handler's missing term and sender validation is a hardening gap with no reachable internal trigger. This update records both refutations with their sources, the executions the first one rests on, and the exact observations that agree with the source account, and it marks both questions answered so the remaining budget goes to a fresh relationship rather than to this thread.",
+    "sources": [
+      {
+        "id": "raft_transfer_defererr_buffer",
+        "file": "raft.go",
+        "start_line": 596,
+        "end_line": 612,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_leadership_transfer_drain",
+        "file": "raft.go",
+        "start_line": 991,
+        "end_line": 1030,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_verifyleader_votes",
+        "file": "raft.go",
+        "start_line": 966,
+        "end_line": 995,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_quorumsize_voters",
+        "file": "raft.go",
+        "start_line": 1087,
+        "end_line": 1098,
+        "kind": "code_observation"
+      },
+      {
+        "id": "replication_notifyall",
+        "file": "replication.go",
+        "start_line": 100,
+        "end_line": 112,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+        "ref": null,
+        "question": null,
+        "source_ids": null,
+        "hypothesis": null,
+        "discriminator": null,
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      },
+      {
+        "id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "ref": null,
+        "question": null,
+        "source_ids": null,
+        "hypothesis": null,
+        "discriminator": null,
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": []
+      },
+      {
+        "id": null,
+        "ref": "@verifyleader_nonvoter_acks",
+        "question": "Does VerifyLeader confirm leadership using acknowledgements that do not count toward the voter quorum, so that a leader separated from every other voter but still able to reach a nonvoter reports itself verified?",
+        "source_ids": [
+          "raft_verifyleader_votes",
+          "raft_quorumsize_voters",
+          "replication_notifyall"
+        ],
+        "hypothesis": "verifyLeader seeds votes with the leader's own vote and registers the verify future with every followerReplication in leaderState.replState, which startStopReplication creates for every server in the latest configuration including nonvoters; each successful AppendEntries response then calls notifyAll, which casts a vote for every registered future. Since quorumSize counts only voters, acknowledgements from nonvoters can complete the voter quorum, so a leader whose only reachable peers are nonvoters returns a successful VerifyLeader while it cannot contact a majority of voters - and while another leader may already have been elected among the voters it cannot reach.",
+        "discriminator": "Run a real cluster of three voters plus one nonvoter, elect the leader, confirm it can verify normally, then partition the leader together with the nonvoter away from the other two voters and call VerifyLeader on the leader before the new term reaches the nonvoter. Predict: the future returns nil with votes counting only the leader's own vote plus the nonvoter's acknowledgement, while the leader's configurations.latest contains three voters, so the confirmation is made against a quorum of voters it cannot reach; a control in which the nonvoter is also cut off must fail the verification instead.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+        "experiment_id": "9a28fea90bc64596b790f2372fc4c716-experiment",
+        "source_ids": [
+          "raft_transfer_defererr_buffer",
+          "raft_leadership_transfer_drain",
+          "raft_timeoutnow_handler"
+        ],
+        "executions": {
+          "991fd67c1e3d4760b83fd8a724444ff0": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "refuted",
+        "rationale": "Retained execution (check 991fd67c1e3d4760b83fd8a724444ff0, exit 0, tests_passed, 12 parsed events, 0 parse errors) plus the source reading that the run's outcome matches. The probe did exercise the intended state: in every interrupted trial the target's last index at transfer time was 2 against the leader's 202, so the drain loop had real replication work after the target was isolated, and each transfer future resolved with 'leadership transfer timeout' rather than completing, i.e. the transfer was still in flight when the starting leader was cut off and its replication goroutine exited. Against the hypothesis's prediction, in all ten interrupted trials transfer_in_progress_after was false, no goroutine was found stranded in the leadershipTransfer/triggerDeferErrorCh path, and in the three trials where another node became leader first the interrupted node was re-elected and its Apply and GetConfiguration both succeeded with no error; the two uninterrupted controls completed with an empty transfer error, the starting node ending as Follower with the flag false. The source reason, which is the primary basis for refutation: followerReplication.triggerDeferErrorCh is created with capacity 1 (raft.go 603), and leadershipTransfer only reaches its next send (raft.go 1003) after receiving the response for the previous deferError, which by construction means the replicator consumed that item, so the buffer is empty at each send and a buffered send succeeds without any reader. A send cannot therefore be stranded by the replicator exiting, and the outer goroutine's wait on doneCh is always satisfied, so the deferred setLeadershipTransferInProgress(false) runs - which is what every trial shows. The alternative interleaving-theoretical reading is also excluded empirically across two scheduling regimes: the ten retained trials on the host's default parallelism plus six additional local trials with GOMAXPROCS=1, which should favour the single-threaded ordering the hypothesis needed, all cleared the flag with no stranded goroutine; the GOMAXPROCS run is native feedback and is not offered as retained evidence.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The refutation is about reachability through this trigger, not about the flag's design: setLeadershipTransferInProgress(false) really is only reached from the outer transfer goroutine's deferred call, so any exit path of the inner goroutine that skips doneCh would still leave the flag set. The probe's trials exercised the drain-in-flight interruption, the timeout and the leadership-loss paths, but not a state where the transport call itself never returns.",
+          "The stranded-goroutine search is a sampled goroutine dump at one instant per trial; it would miss a goroutine that had already exited, but the primary basis does not depend on the dump - the buffered send cannot block regardless of sampling."
+        ],
+        "limitations": [
+          "Timings are the captured in-memory ones (50ms heartbeat, election and lease), and the transfer therefore timed out before the target could win; different timing would change which branch resolves the transfer, though not the buffered-send argument.",
+          "Three of ten interrupted trials reached the re-election check; the other seven had no other leader within the 3s wait, so the client-endpoint check was exercised three times, not ten."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      },
+      {
+        "investigation_id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_leadership_transfer_drain",
+          "raft_timeoutnow_handler",
+          "commands_timeoutnow_request"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Answered from source and from the transfer receipts rather than by new injection. The handler does validate nothing: raft.timeoutNow (raft.go 2232-2237) ignores the request's origin and any term, because TimeoutNowRequest carries only the RPC header (commands.go 206-208), and it immediately clears the leader, moves the node to Candidate and marks the candidacy as transfer-driven, which makes its RequestVote waive the known-leader rejection on other servers. What the question turned on, however, is whether a TimeoutNow that no longer reflects the current leader can be produced inside the library. The producer is the leadership-transfer path, and it reaches trans.TimeoutNow (raft.go 1026) only after its drain loop exits, which requires the target to be caught up; the loop's exit and the send are adjacent statements with no blocking point between them, and every earlier exit point of the loop is guarded by the transfer's stop channel (raft.go 1000-1020), which the transfer case closes when leadership is lost or the transfer times out. The interrupted-transfer receipt shows the same shape from the behaviour side: with real replication work pending, the transfer either times out with the flag cleared or is abandoned on leadership loss, and no message was produced after leadership was gone. External injection of a TimeoutNow is not evidence of a target defect here, because peer authentication is the transport's and application's responsibility rather than a guarantee of this library. So the suspicion is refuted for internal producers, and what remains is a hardening observation: the handler would be more defensive if the request carried the sender's term, or if the receiver checked that the sender is its current leader.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The window between the drain loop's exit and the TimeoutNow call is adjacent code rather than a proven impossibility: a preemption exactly there, or a future change that inserts work between them, would reopen it. Nothing in the source prevents that window from existing, only from being wide or reachable in the tested flows.",
+          "The vote bypass that the transfer flag enables is intentional and is what makes a transfer target electable while peers still know the old leader; the refutation is about the absence of a stale internal producer, not about the bypass being wrong."
+        ],
+        "limitations": [
+          "This answer rests on source reading of the producer path plus the interrupted-transfer executions; no execution produced a transfer message after leadership was lost, so the refutation is a reachability argument with corroborating runs, not a proof about every scheduler.",
+          "A cluster whose transport reports delayed or replayed RPCs is outside what these runs cover; the question was scoped to producers inside this snapshot."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "version": 2,
+        "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "log_commit_tracking_iface"
+        ],
+        "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+        "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+          }
+        ],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "0d83a8cdded948c3b78d936f719d97d7-gap-0",
+            "question": "Under the captured default snapshot settings (SnapshotInterval 120s, SnapshotThreshold 8192) with automatic snapshotting left enabled, can a node reach a restart whose committed-but-unapplied replay window exceeds 128*MaxAppendEntries entries, or does the periodic snapshot keep the window below that bound during normal operation?",
+            "experiment_id": null,
+            "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+          }
+        ],
+        "history": [
+          {
+            "id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+            "version": 1,
+            "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+            "source_ids": [
+              "api_startup_order",
+              "api_restore_committed",
+              "api_channel",
+              "raft_applybatch_send",
+              "raft_batch_loop",
+              "fsm_consumer",
+              "config_restore_committed_doc",
+              "log_commit_tracking_iface"
+            ],
+            "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+            "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [
+              {
+                "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+                "revision": 1,
+                "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+              },
+              {
+                "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+                "revision": 1,
+                "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+              }
+            ],
+            "resume_conditions": [],
+            "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+          }
+        ],
+        "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+      },
+      {
+        "id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "version": 1,
+        "question": "Can a TimeoutNow message that no longer reflects the current leader start an election that displaces a live leader, given that the handler clears the receiver's known leader, moves it to Candidate, sets candidateFromLeadershipTransfer, and the resulting RequestVote waives the 'we have a leader' rejection on other servers?",
+        "source_ids": [
+          "raft_timeoutnow_handler",
+          "commands_timeoutnow_request"
+        ],
+        "hypothesis": "TimeoutNowRequest carries only the RPC header and no term, and raft.timeoutNow performs no term comparison, no check that the sender is the current leader and no membership check: it clears the leader, sets Candidate and marks the candidacy as coming from a leadership transfer, and requestVote on other servers then grants the vote even though the voter knows a live leader and is not in a transfer of its own. Election safety (term, one vote per term, log freshness) is preserved, so the question is scoped to authority/liveness: whether a TimeoutNow that a leader produced before losing leadership can still be delivered and displace a healthy current-term leader.",
+        "discriminator": "Trace the real producer path (initiateLeadershipTransfer -> leadershipTransfer -> trans.TimeoutNow) and the consumer path (processRPC -> timeoutNow -> runCandidate with candidateFromLeadershipTransfer, then requestVote's LeadershipTransfer bypass) and identify which permitted event in the captured snapshot can deliver the request after the receiving node learned a newer leader. A real interrupted transfer in a small cluster should then show the receiver entering candidacy and peers granting votes despite a live leader, while a control where the transfer completes before the leadership change should not.",
+        "disposition": "paused",
+        "parent_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "knowledge": [],
+        "resume_conditions": [
+          "A concrete internal producer prefix for a late or repeated TimeoutNow is established from source or from a transport behavior available in the captured snapshot, so the input is produced by the target rather than injected by the harness.",
+          "The safety side is settled from source (term handling, one vote per term, log freshness) so any claim can be scoped to authority/liveness rather than to election safety."
+        ],
+        "gaps": [],
+        "history": [],
+        "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+      },
+      {
+        "id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+        "version": 1,
+        "question": "If a leadership transfer is interrupted while its drain loop still has replication work, can the transfer goroutine be stranded on the followerReplication triggerDeferErrorCh send so that the deferred setLeadershipTransferInProgress(false) never runs, leaving a node that later becomes leader permanently rejecting client operations with ErrLeadershipTransferInProgress?",
+        "source_ids": [
+          "raft_timeoutnow_handler",
+          "commands_timeoutnow_request"
+        ],
+        "hypothesis": "The drain loop sends a deferError on repl.triggerDeferErrorCh outside any arm on the transfer's stop channel, and the only reader of that channel is the peer's replication goroutine, which exits when the leader steps down (runLeader's defer closes its stopCh) or when the peer is removed. If the leader loses leadership between the goroutine's wake-up and that send, the send has no reader and blocks forever; the outer transfer goroutine then blocks on doneCh before its deferred setLeadershipTransferInProgress(false), so the flag stays set for the lifetime of the Raft instance, including after a later election of that instance.",
+        "discriminator": "Run a real three-voter cluster, isolate the transfer target, commit a backlog that the target never receives, start a transfer to that target, then cut the starting leader off so it steps down while the transfer is draining. Predict: the transfer future resolves with an error, the drained goroutine is left in the triggerDeferErrorCh send, getLeadershipTransferInProgress stays true, and after the old leader is made leader again through a normal transfer its Apply and GetConfiguration return ErrLeadershipTransferInProgress. A control trial without the interruption must show the flag cleared and client calls unaffected; if every interrupted trial clears the flag with no stranded goroutine, the hypothesis is defeated for this trigger.",
+        "disposition": "active",
+        "parent_id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "9a28fea90bc64596b790f2372fc4c716"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults",
+          "log_commit_tracking_iface"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Source-only account: RestoreCommittedLogs is documented to replay all known-committed logs on disk before NewRaft completes (config.go 243-254), and restoreFromCommittedLogs does exactly that by calling processLogs before runFSM is started (api.go 606 vs 637). processLogs' applyBatch performs a blocking send on fsmMutateCh (raft.go 1306) whose capacity is 128 (api.go 560) while batching entries at MaxAppendEntries (raft.go 1318, 1345-1348), and runFSM (fsm.go 241) is the only reader of that channel anywhere in the package. Therefore the startup replay can only fit 128*MaxAppendEntries FSM-bound entries; past that the constructor cannot complete, and the escape in applyBatch (the shutdownCh arm) is unreachable because the caller has no *Raft to shut down before NewRaft returns. The sizing is inside the documented use case: DefaultConfig pairs MaxAppendEntries=64 with SnapshotThreshold=8192 and a 120s SnapshotInterval, so a node committing more than 8192 entries between snapshot checks - exactly the follower/restart situation the option targets - comes back with a replay window above the bound. The submitted experiment records the retained-execution state of this account (return vs non-return, window census, batch estimate, blocked stack) for five restart-only cases; the account above is a source derivation, not a reading of that run.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "Startup replay blocking-sends FSM batches before runFSM is started."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return once FSM-bound window entries exceed 128*MaxAppendEntries."
+          }
+        ],
+        "counterevidence": [
+          "The option is off by default (config.go 243-254, RestoreCommittedLogs false in DefaultConfig), so a cluster that does not opt into it cannot reach this path; the defect is scoped to that opt-in configuration.",
+          "raft.go 1305-1307 also arms a shutdownCh arm, so the blocked send is not unconditionally permanent: it can be released by Shutdown - but only by a caller that already holds the *Raft, which NewRaft has not yet returned, and by nothing internal (NewRaft starts no routines before this call).",
+          "An implementation that used an unbounded or larger FSM channel, or started runFSM first, would not show this; the account is specific to this snapshot's ordering and capacity."
+        ],
+        "limitations": [
+          "The precise batch/window boundary (window in FSM-bound entries vs 128*MaxAppendEntries) is derived from source; the submitted probe brackets it with observed windows rather than pinning the exact entry count at which the last fitting send is reached.",
+          "The startup replay also holds up to 128 batches (each up to MaxAppendEntries commit tuples) in the channel, so memory use grows with MaxAppendEntries; this submission does not measure that.",
+          "Whether a node that blocks here can be recovered by an operator (for example via configuration change) is not investigated; the claim is limited to NewRaft not returning and no internal repair being enabled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+      },
+      {
+        "id": "28496be07c87443ea089331e8a4dbc77-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": "c4168d1deb72421a8935ea2ddc7d9b7c-experiment",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc"
+        ],
+        "executions": {
+          "abb2ff0a1f0f449f87fb9b382c8a3fee": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Account of receipt abb2ff0a1f0f449f87fb9b382c8a3fee only: the run completed with exit 0 and tests_passed, and stdout carried five CA_EVENT payloads, but the extractor recorded all five (parsed indices 0-4) as invalid_observation with reason 'Event must be an object with an event name'. The failure is in the harness payload, not in the target: the payloads were valid JSON objects describing each case but carried no event field. Consequences for this account: no comparison can be evaluated from this receipt, and the observed outcomes it records cannot be cited as parsed decisive indices - only as retained, unparsed output. What the retained bytes do contain (parsing_errors[0..4].raw) is: small_window_default_batch window 4001 / 63 batches / returned; mid_window_default_batch window 1000 / 16 batches / returned; mid_window_small_batch (MaxAppendEntries 4) window 1001 / 250 batches / not returned within 8s with a blocked stack; large_window_default_batch window 12000 / 188 batches / not returned with a blocked stack; large_window_after_snapshot window 0 / 0 batches / returned. Because those payloads were never admitted as events, none of them is used here as evidence for the defect claim: the claim remains the source derivation from the previous interpretation (blocking send in the startup replay on the 128-slot fsmMutateCh before runFSM starts, batches of MaxAppendEntries, no internal repair and no reachable shutdown), and it stays conditional on a retained execution that actually parses. The corrected successor harness is submitted with this update; its receipt, not this one, will be the basis for the next interpretation.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The receipt itself is a completed, passing run (tests_passed, exit 0), which could be misread as establishing the target behavior; it does not, because the decisive payloads failed extraction and no comparison was evaluated.",
+          "Nothing in this receipt distinguishes 'NewRaft did not return' from a harness that stopped waiting: the raw payload is the harness's own derivation, and the 8s wait it recorded is a harness parameter, not a target interval. Only a parsed rerun with the corrected events, plus the blocked stack, can carry that difference."
+        ],
+        "limitations": [
+          "No parsed event from this receipt establishes any compared field; the five raw payloads are retained in the observations file and are described here only as unparsed output.",
+          "This interpretation covers the receipt and does not re-answer the source-derived mechanism, which was previously recorded and is unchanged."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "28496be07c87443ea089331e8a4dbc77"
+      },
+      {
+        "id": "0d83a8cdded948c3b78d936f719d97d7-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": "28496be07c87443ea089331e8a4dbc77-experiment",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults"
+        ],
+        "executions": {
+          "ec81425b7ebc4941ba70f77e78b109fb": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "Retained execution (check ec81425b7ebc4941ba70f77e78b109fb, exit 0, tests_passed, 14 parsed events, 0 parse errors). Comparison 0 (within-capacity restart returns) evaluated indices 1, 3, 7, 13 and holds with no missing or contradictory observations: every admitted prefix was correlated by identity (case) to its result (0->1, 2->3, 6->7, 12->13), comparison_complete true. Comparison 1 (over-capacity restart does not return) evaluated indices 5, 9, 11 and holds, correlated with prefixes 4, 8, 10. Observed operands: window 4001 with 4000 FSM-bound entries -> 63 batches, returned in 4ms; window 1000/999 -> 16 batches, returned in 0ms; window 8190/8189 -> exactly 128 batches, returned in 4ms; window 8197/8196 -> 129 batches, did not return within 5s; window 12000/11999 -> 188 batches, did not return; window 1001/1000 with MaxAppendEntries=4 -> 250 batches, did not return. The last two pairs are the discriminators that exclude the rival explanations: the MaxAppendEntries=4 case has essentially the same ~1000-entry window as the case that returned in 0ms with 64-entry batches, so what decides the outcome is batches against channel capacity, not window size alone; and the after-snapshot case applies the same 12000 commands against the same stores yet returns in 7ms because the manual snapshot moves last_applied to 12002 and leaves a window of 0. Each non-return case sampled a goroutine that had not returned out of the replay path, with frames at raft.go:1305 (the select-send of a batch inside processLogs' applyBatch), raft.go:1346 (the batched applyBatch call), api.go:753 (restoreFromCommittedLogs' processLogs call) and api.go:606 (NewRaft), i.e. exactly the source-derived send that has no consumer until api.go:637 starts runFSM. The 5s wait is a harness ceiling and is not load-bearing for the claim: the stack shows the goroutine is inside the replay send, and the source shows the only reader of that channel is started later in the same constructor and that the caller cannot call Shutdown because no *Raft has been returned. Together with the source account this makes the non-return a deadlock of the constructor under the stated configuration, so the account is no longer merely conditional; the previous receipt abb2ff0a1f0f449f87fb9b382c8a3fee is superseded on the evidence side by this parsed run, and its parse loss remains recorded.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists; the blocked stacks in this run end at raft.go:1305 inside processLogs' applyBatch, called from raft.go:1346, from api.go:753 (restoreFromCommittedLogs) and api.go:606 (NewRaft)."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return tracks ceil(FSM-bound window entries / MaxAppendEntries) against the 128-slot channel: 63 and 16 batches returned in 0-4ms, 128 batches returned, 129 batches, 188 batches and 250 batches (MaxAppendEntries=4) did not return."
+          }
+        ],
+        "counterevidence": [
+          "The feature is opt-in: RestoreCommittedLogs defaults to false (config.go 243-254, DefaultConfig), so a cluster that never enables it cannot reach this path; the defect is scoped to that configuration plus a commit-tracking log store.",
+          "The blocked send is inside a select with a shutdownCh arm, so it is not unconditional: Shutdown releases it - but only a caller holding the *Raft can call Shutdown, and in the affected path NewRaft has not returned yet, while NewRaft starts no internal routine before this call, so no participant exists that could take that arm during the window.",
+          "The probe constructs the large windows by disabling automatic snapshotting; a deployment that snapshots often keeps the window small, so the observed non-returns are not evidence that ordinary clusters of this kind restart broken - only that the constructor cannot complete when the window is large.",
+          "For the within-capacity cases the returns were immediate (0-7ms), but a returning restart is only bounded by the harness wait; nothing here claims a bound on restart duration for other configurations."
+        ],
+        "limitations": [
+          "Configuration space is sampled, not exhausted: MaxAppendEntries was exercised at 4 and 64 while ValidateConfig allows up to 1024, and the relation tested is the batch count against capacity, so untested settings are covered by the relation rather than by direct observation.",
+          "The probe runs a single-voter cluster with an in-memory transport, an in-memory commit-tracking log store and MockFSM, so disk latency, network behaviour and slow FSM application are excluded; a slow FSM would fill the same channel sooner, which limits the observed non-returns as a lower bound rather than an upper one.",
+          "The probe does not measure the memory held by the queued batches (up to 128 batches of up to MaxAppendEntries commit tuples), nor whether an operator can recover a node blocked in NewRaft, and no claim is made about either.",
+          "The window-to-FSM-bound offset varied by one entry between runs (the persisted commit index is staged with the last StoreLogs), so the exact counts 8189/8196 are specific to these runs; the tested predicate is the batch count against the 128-slot capacity.",
+          "Restart outcome is recorded as returned / not returned within 5s with a sampled stack; no attempt is made to force completion or to establish that no future internal or external event could ever release the send beyond the source argument that none is enabled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+      },
+      {
+        "id": "91debf466df04e14a60f2bc847535594-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": "800d3e6aea8d4c239eecd81727ca53f1-experiment",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults",
+          "snapshot_interval_check",
+          "snapshot_should_snapshot",
+          "snapshot_take_snapshot"
+        ],
+        "executions": {
+          "4ad6471fdd1547f28bc88a8f911e0319": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "Retained execution (check 4ad6471fdd1547f28bc88a8f911e0319, exit 0, tests_passed, 6 parsed events, 0 parse errors, snapshot settings reported per case as SnapshotThreshold 8192, SnapshotInterval 120000ms, MaxAppendEntries 64). Comparison 0 (within-capacity restart returns) evaluated result index 5, correlated to admission index 4, and holds; comparison 1 (over-capacity restart does not return) evaluated result indices 1 and 3, correlated to admission indices 0 and 2, and holds. Both are comparison_complete with no missing or contradictory observations, and neither result was filtered on the measured field: applicability came from replay_batches_within_capacity, which is decided by the pre-restart operands carried in the admission event. Observed state: with no snapshot at all, persisted commit index 10001 above last-applied 0 gives a window of 10001 entries (10000 FSM-bound, 157 batches) and NewRaft had not returned after 5s; with a real user snapshot at index 4002 followed by 9998 more commits, the window is 9998 (157 batches) and NewRaft had not returned; with the same snapshot followed by only 1999 commits, the window is 1999 (32 batches) and NewRaft returned in 7ms. Each non-return sampled a goroutine still inside the replay path (raft.go:1305 inside the batch select-send, raft.go:1346, api.go:753 restoreFromCommittedLogs, api.go:606 NewRaft). The applicability question is therefore answered from the target's own behaviour: the periodic snapshot does not cap the window below the 128-batch bound. The mechanism is that runSnapshots consults shouldSnapshot only on the SnapshotInterval timer (snapshot.go 73-100), shouldSnapshot compares the log-store last index against the last snapshot index (snapshot.go 107-120), and the startup replay window is measured from the newest snapshot to the persisted commit index, so between checks the window is simply however many committed entries accumulated, and before the first check it is the whole committed log. With the captured defaults that accumulation exceeds 8192 FSM-bound entries whenever more than about 8192 commits occur per 120s interval, i.e. above roughly 68 commits/s sustained, at which point the window at an arbitrary restart exceeds the 128*64 = 8192 bound and NewRaft cannot complete. The third counterevidence recorded in the previous revision (windows only constructed by disabling automatic snapshotting) is answered by this receipt and no longer stands; the remaining counterevidence is listed below.",
+        "answers": {
+          "0d83a8cdded948c3b78d936f719d97d7-gap-0": {
+            "explanation": "Answered from the retained execution: with the captured snapshot settings in force (threshold 8192, interval 120s, both reported in the admission events) a node reaches a restart whose window exceeds the bound - 10001 entries / 157 batches with no snapshot yet taken, and 9998 / 157 after a real snapshot at 4002 plus 9998 more commits - and both restarts fail to return, while the 1999-entry control returns in 7ms. Source reading explains why the periodic check cannot prevent this: the check runs only on the SnapshotInterval timer (snapshot.go 73-100), its condition is a last-index minus last-snapshot delta against SnapshotThreshold (snapshot.go 107-120), and the replay window is measured from the newest snapshot to the persisted commit index, so the window is whatever accumulated since the newest snapshot. The residual condition is a rate premise rather than a target property: with the defaults the window exceeds 8192 FSM-bound entries when more than about 8192 commits occur per 120s interval (about 68/s sustained), and a sufficiently small SnapshotInterval relative to the write rate keeps the window below the bound.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "In this run too the non-returning goroutine's frames are raft.go:1305 (batch select-send in processLogs' applyBatch), raft.go:1346, api.go:753 (restoreFromCommittedLogs) and api.go:606 (NewRaft), with the only reader of fsmMutateCh started later at api.go:637."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "With the configured snapshot settings in force, windows of 10001 and 9998 FSM-bound entries (157 batches each) did not return, while 1999 entries (32 batches) returned in 7ms."
+          }
+        ],
+        "counterevidence": [
+          "The feature remains opt-in: RestoreCommittedLogs defaults to false and requires a CommitTrackingLogStore, so a cluster that does not enable it cannot reach this path.",
+          "The blocked send has a shutdownCh arm, so it is releasable by Shutdown - but the affected caller holds no *Raft because NewRaft has not returned, and NewRaft starts no routine before the replay, so nothing can take that arm during the window.",
+          "Scope-narrowing premise: the deadlock needs the window above the bound at the restart, which with the captured defaults requires a sustained commit rate of roughly 68 commits/s or more between snapshot checks (or a configuration that raises SnapshotThreshold, lengthens SnapshotInterval, or prevents snapshots from being taken); below that rate the periodic snapshot keeps the window small and the constructor returns."
+        ],
+        "limitations": [
+          "No full 120s interval elapsed in the probe: the accumulation is produced by the target's own apply path rather than by wall-clock passage, so the rate at which the same accumulation occurs in time is arithmetic on the configured interval, not an observation.",
+          "The newest snapshot in the two snapshot cases is placed by a user snapshot at a chosen index; with automatic snapshots the placement is at an interval tick, which changes the phase of the accumulation but not its bound, and that equivalence is a source argument rather than an observation.",
+          "The probe still runs a single-voter cluster with an in-memory transport, an in-memory commit-tracking store and MockFSM, so disk latency, network behaviour and slow FSM application are excluded; MaxAppendEntries is the configured default here and was varied only in the predecessor experiment.",
+          "Unchanged from earlier: the memory held by queued batches is not measured, and whether an operator can recover a node blocked inside NewRaft is not investigated."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "91debf466df04e14a60f2bc847535594"
+      }
+    ],
+    "materials": [
+      {
+        "id": "api_channel",
+        "file": "api.go",
+        "start_line": 558,
+        "end_line": 562,
+        "kind": "code_observation",
+        "text": "\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),\n\t\tfsmSnapshotCh:         make(chan *reqSnapshotFuture),\n\t\tleaderCh:              make(chan bool, 1),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_startup_order",
+        "file": "api.go",
+        "start_line": 600,
+        "end_line": 640,
+        "kind": "code_observation",
+        "text": "\n\t// Attempt to restore a snapshot if there are any.\n\tif err := r.restoreSnapshot(); err != nil {\n\t\treturn nil, err\n\t}\n\n\tif err := r.restoreFromCommittedLogs(); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Scan through the log for any configuration change entries.\n\tsnapshotIndex, _ := r.getLastSnapshot()\n\tlastappliedIndex := r.getLastApplied()\n\tfor index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {\n\t\tvar entry Log\n\t\tif err := r.logs.GetLog(index, &entry); err != nil {\n\t\t\tr.logger.Error(\"failed to get log\", \"index\", index, \"error\", err)\n\t\t\tpanic(err)\n\t\t}\n\t\tif err := r.processConfigurationLogEntry(&entry); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n\tr.logger.Info(\"initial configuration\",\n\t\t\"index\", r.configurations.latestIndex,\n\t\t\"servers\", hclog.Fmt(\"%+v\", r.configurations.latest.Servers))\n\n\t// Setup a heartbeat fast-path to avoid head-of-line\n\t// blocking where possible. It MUST be safe for this\n\t// to be called concurrently with a blocking RPC.\n\ttrans.SetHeartbeatHandler(r.processHeartbeat)\n\n\tif conf.skipStartup {\n\t\treturn r, nil\n\t}\n\t// Start the background work.\n\tr.goFunc(r.run)\n\tr.goFunc(r.runFSM)\n\tr.goFunc(r.runSnapshots)\n\treturn r, nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_committed",
+        "file": "api.go",
+        "start_line": 724,
+        "end_line": 754,
+        "kind": "code_observation",
+        "text": "func (r *Raft) restoreFromCommittedLogs() error {\n\tif !r.RestoreCommittedLogs {\n\t\treturn nil\n\t}\n\n\t// If the store implements CommitTrackingLogStore, we can read the commit index from the store.\n\t// This is useful when the store is able to track the commit index and we can avoid replaying logs.\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tr.logger.Warn(\"restore committed logs enabled but log store does not support it\", \"log_store\", fmt.Sprintf(\"%T\", r.logs))\n\t\treturn ErrIncompatibleLogStore\n\t}\n\n\tcommitIndex, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get commit index from store\", \"error\", err)\n\t\treturn err\n\t}\n\n\tlastIndex, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index from store\", \"error\", err)\n\t\treturn err\n\t}\n\tif commitIndex > lastIndex {\n\t\tcommitIndex = lastIndex\n\t}\n\n\tr.setCommitIndex(commitIndex)\n\tr.processLogs(commitIndex, nil)\n\treturn nil",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "raft_applybatch_send",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1313,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_batch_loop",
+        "file": "raft.go",
+        "start_line": 1314,
+        "end_line": 1360,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Store maxAppendEntries for this call in case it ever becomes reloadable. We\n\t// need to use the same value for all lines here to get the expected result.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\n\tbatch := make([]*commitTuple, 0, maxAppendEntries)\n\n\t// Apply all the preceding logs\n\tfor idx := lastApplied + 1; idx <= index; idx++ {\n\t\tvar preparedLog *commitTuple\n\t\t// Get the log, either from the future or from our log store\n\t\tfuture, futureOk := futures[idx]\n\t\tif futureOk {\n\t\t\tpreparedLog = r.prepareLog(&future.log, future)\n\t\t} else {\n\t\t\tl := new(Log)\n\t\t\tif err := r.logs.GetLog(idx, l); err != nil {\n\t\t\t\tr.logger.Error(\"failed to get log\", \"index\", idx, \"error\", err)\n\t\t\t\tpanic(err)\n\t\t\t}\n\t\t\tpreparedLog = r.prepareLog(l, nil)\n\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "fsm_consumer",
+        "file": "fsm.go",
+        "start_line": 236,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "\n\tfor {\n\t\tsaturation.sleeping()\n\n\t\tselect {\n\t\tcase ptr := <-r.fsmMutateCh:\n\t\t\tsaturation.working()\n\n\t\t\tswitch req := ptr.(type) {\n\t\t\tcase []*commitTuple:\n\t\t\t\tapplyBatch(req)",
+        "content_digest": "87043c532565c2027473e38fbe2089a0dcebba6f58d1b05262eb13a14e179df3"
+      },
+      {
+        "id": "config_restore_committed_doc",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "document_statement",
+        "text": "\t// RestoreCommittedLogs controls if the Raft server should use the restore committed logs\n\t// mechanism. Restore committed logs requires a LogStore implementation that\n\t// support commit tracking. When such a store is used and this config\n\t// enabled, raft nodes will replay all known-committed logs on disk\n\t// before completing `NewRaft` on startup. This is mainly useful where\n\t// the application allows relaxed-consistency reads from followers as it\n\t// will reduce how far behind the follower's FSM is when it starts. If all reads\n\t// are forwarded to the leader then there won't be observable benefit from this feature.\n\t//\n\t// Notice: If this is enabled, the log store MUST implement the CommitTrackingLogStore\n\t// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.\n\tRestoreCommittedLogs bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "config_defaults",
+        "file": "config.go",
+        "start_line": 329,
+        "end_line": 343,
+        "kind": "code_observation",
+        "text": "func DefaultConfig() *Config {\n\treturn &Config{\n\t\tProtocolVersion:    ProtocolVersionMax,\n\t\tHeartbeatTimeout:   1000 * time.Millisecond,\n\t\tElectionTimeout:    1000 * time.Millisecond,\n\t\tCommitTimeout:      50 * time.Millisecond,\n\t\tMaxAppendEntries:   64,\n\t\tShutdownOnRemove:   true,\n\t\tTrailingLogs:       10240,\n\t\tSnapshotInterval:   120 * time.Second,\n\t\tSnapshotThreshold:  8192,\n\t\tLeaderLeaseTimeout: 500 * time.Millisecond,\n\t\tLogLevel:           \"DEBUG\",\n\t}\n}",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "log_commit_tracking_iface",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 221,
+        "kind": "interface_statement",
+        "text": "type CommitTrackingLogStore interface {\n\tLogStore\n\n\t// StageCommitIndex stages a new commit index to be persisted.\n\t// The staged commit index MUST only be persisted in a manner that is atomic\n\t// with the following StoreLogs call in the face of a crash.\n\t// This allows the Raft implementation to optimize commit index updates\n\t// without risking inconsistency between the commit index and the log entries.\n\t//\n\t// The implementation MUST NOT persist this value separately from the log entries.\n\t// Instead, it should stage the value to be written atomically with the next\n\t// StoreLogs call.\n\t//\n\t// GetCommitIndex MUST never return a value higher than the last index in the log,\n\t// even if a higher value has been staged with this method.\n\t//\n\t// idx is the new commit index to stage.\n\tStageCommitIndex(idx uint64) error\n\n\t// GetCommitIndex returns the latest persisted commit index from the latest log entry\n\t// in the store at startup.\n\t//\n\t// GetCommitIndex should not return a value higher than the last index in the log.\n\t// If that happens, the last index in the log will be used.\n\t//\n\t// When no commit index is found in the log store, return (0, nil).\n\tGetCommitIndex() (uint64, error)\n}",
+        "content_digest": "7a890bd749cd6863faef212b586320b8c6d9574bb7158f56c4e022408abff0b4"
+      },
+      {
+        "id": "raft_timeoutnow_handler",
+        "file": "raft.go",
+        "start_line": 2232,
+        "end_line": 2237,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "commands_timeoutnow_request",
+        "file": "commands.go",
+        "start_line": 200,
+        "end_line": 213,
+        "kind": "code_observation",
+        "text": "func (r *InstallSnapshotResponse) GetRPCHeader() RPCHeader {\n\treturn r.RPCHeader\n}\n\n// TimeoutNowRequest is the command used by a leader to signal another server to\n// start an election.\ntype TimeoutNowRequest struct {\n\tRPCHeader\n}\n\n// GetRPCHeader - See WithRPCHeader.\nfunc (r *TimeoutNowRequest) GetRPCHeader() RPCHeader {\n\treturn r.RPCHeader\n}",
+        "content_digest": "e79714e646bbb43a79aca5c112168dff1b37a58396f509a4734baf242e570853"
+      },
+      {
+        "id": "snapshot_interval_check",
+        "file": "snapshot.go",
+        "start_line": 73,
+        "end_line": 100,
+        "kind": "code_observation",
+        "text": "func (r *Raft) runSnapshots() {\n\tfor {\n\t\tselect {\n\t\tcase <-randomTimeout(r.config().SnapshotInterval):\n\t\t\t// Check if we should snapshot\n\t\t\tif !r.shouldSnapshot() {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Trigger a snapshot\n\t\t\tif _, err := r.takeSnapshot(); err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {\n\t\t\t\tr.logger.Error(\"failed to take snapshot\", \"error\", err)\n\t\t\t}\n\n\t\tcase future := <-r.userSnapshotCh:\n\t\t\t// User-triggered, run immediately\n\t\t\tid, err := r.takeSnapshot()\n\t\t\tif err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {\n\t\t\t\tr.logger.Error(\"failed to take snapshot\", \"error\", err)\n\t\t\t} else if err == nil {\n\t\t\t\tfuture.opener = func() (*SnapshotMeta, io.ReadCloser, error) {\n\t\t\t\t\treturn r.snapshots.Open(id)\n\t\t\t\t}\n\t\t\t}\n\t\t\tfuture.respond(err)\n\n\t\tcase <-r.shutdownCh:\n\t\t\treturn",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      },
+      {
+        "id": "snapshot_should_snapshot",
+        "file": "snapshot.go",
+        "start_line": 107,
+        "end_line": 126,
+        "kind": "code_observation",
+        "text": "func (r *Raft) shouldSnapshot() bool {\n\t// Check the last snapshot index\n\tlastSnap, _ := r.getLastSnapshot()\n\n\t// Check the last log index\n\tlastIdx, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index\", \"error\", err)\n\t\treturn false\n\t}\n\n\t// Compare the delta to the threshold\n\tdelta := lastIdx - lastSnap\n\treturn delta >= r.config().SnapshotThreshold\n}\n\n// takeSnapshot is used to take a new snapshot. This must only be called from\n// the snapshot thread, never the main thread. This returns the ID of the new\n// snapshot, along with an error.\nfunc (r *Raft) takeSnapshot() (string, error) {",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      },
+      {
+        "id": "snapshot_take_snapshot",
+        "file": "snapshot.go",
+        "start_line": 126,
+        "end_line": 178,
+        "kind": "code_observation",
+        "text": "func (r *Raft) takeSnapshot() (string, error) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"snapshot\", \"takeSnapshot\"}, time.Now())\n\n\t// Create a request for the FSM to perform a snapshot.\n\tsnapReq := &reqSnapshotFuture{}\n\tsnapReq.init()\n\n\t// Wait for dispatch or shutdown.\n\tselect {\n\tcase r.fsmSnapshotCh <- snapReq:\n\tcase <-r.shutdownCh:\n\t\treturn \"\", ErrRaftShutdown\n\t}\n\n\t// Wait until we get a response\n\tif err := snapReq.Error(); err != nil {\n\t\tif err != ErrNothingNewToSnapshot {\n\t\t\terr = fmt.Errorf(\"failed to start snapshot: %v\", err)\n\t\t}\n\t\treturn \"\", err\n\t}\n\tdefer snapReq.snapshot.Release()\n\n\t// Make a request for the configurations and extract the committed info.\n\t// We have to use the future here to safely get this information since\n\t// it is owned by the main thread.\n\tconfigReq := &configurationsFuture{}\n\tconfigReq.ShutdownCh = r.shutdownCh\n\tconfigReq.init()\n\tselect {\n\tcase r.configurationsCh <- configReq:\n\tcase <-r.shutdownCh:\n\t\treturn \"\", ErrRaftShutdown\n\t}\n\tif err := configReq.Error(); err != nil {\n\t\treturn \"\", err\n\t}\n\tcommitted := configReq.configurations.committed\n\tcommittedIndex := configReq.configurations.committedIndex\n\n\t// We don't support snapshots while there's a config change outstanding\n\t// since the snapshot doesn't have a means to represent this state. This\n\t// is a little weird because we need the FSM to apply an index that's\n\t// past the configuration change, even though the FSM itself doesn't see\n\t// the configuration changes. It should be ok in practice with normal\n\t// application traffic flowing through the FSM. If there's none of that\n\t// then it's not crucial that we snapshot, since there's not much going\n\t// on Raft-wise.\n\tif snapReq.index < committedIndex {\n\t\treturn \"\", fmt.Errorf(\"cannot take snapshot now, wait until the configuration entry at %v has been applied (have applied %v)\",\n\t\t\tcommittedIndex, snapReq.index)\n\t}\n",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "9af1f08cbbbb45298f90a629cefc3686",
+      "result": {
+        "submission": "update.json",
+        "summary": "Both transfer-thread suspicions are now refuted with a receipt and a mechanism-level argument, and I have recorded the next lead. The retained interrupted-transfer run did exercise the intended state — target last index 2 against the leader's 202, so the drain loop had real work, and every transfer resolved with 'leadership transfer timeout' rather than completing — yet the in-progress flag was false in all ten interrupted trials, no goroutine was stranded in the transfer path, and in the trials where another node became leader first the interrupted node was re-elected with Apply and GetConfiguration both succeeding; the controls completed cleanly. The decisive reason is source-level: triggerDeferErrorCh is created with capacity 1, and the transfer goroutine only reaches a send after receiving the response to the previous deferError, which means the replicator consumed it, so the buffer is empty at every send and a buffered send never needs a reader — the stranding premise is wrong, not merely unobserved. The parent TimeoutNow suspicion is refuted the same way: the handler validates nothing, but the only internal producer reaches the trans.TimeoutNow call immediately after its drain loop exits, with that loop's exit points all guarded by the transfer stop channel, so no internal path supplies a transfer message that no longer reflects the leader; what remains is a hardening observation (the request carries no term and the receiver checks no sender) rather than a defect. I disclosed the local single-threaded GOMAXPROCS=1 follow-up as native feedback rather than evidence, since the buffer argument does not depend on it. Looking for the next judgment-changing relationship I found a promising one on the same authority axis and recorded it with anchors: verifyLeader seeds votes with the leader's own vote and registers the verify future with every followerReplication — including nonvoters — while quorumSize counts only voters, so a leader partitioned from all other voters but still able to reach a nonvoter can satisfy the voter quorum with an acknowledgement that cannot vote; the discriminator is a three-voter plus one-nonvoter cluster where the leader and the nonvoter are partitioned together, with a control that cuts the nonvoter off as well."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-c4168d1deb72421a8935ea2ddc7d9b7c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-c4168d1deb72421a8935ea2ddc7d9b7c.json"
+      },
+      "submission-28496be07c87443ea089331e8a4dbc77": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-28496be07c87443ea089331e8a4dbc77.json"
+      },
+      "submission-0d83a8cdded948c3b78d936f719d97d7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-0d83a8cdded948c3b78d936f719d97d7.json"
+      },
+      "submission-800d3e6aea8d4c239eecd81727ca53f1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-800d3e6aea8d4c239eecd81727ca53f1.json"
+      },
+      "submission-91debf466df04e14a60f2bc847535594": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-91debf466df04e14a60f2bc847535594.json"
+      },
+      "submission-9a28fea90bc64596b790f2372fc4c716": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-9a28fea90bc64596b790f2372fc4c716.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "version": 2,
+        "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "log_commit_tracking_iface"
+        ],
+        "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+        "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+          }
+        ],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "0d83a8cdded948c3b78d936f719d97d7-gap-0",
+            "question": "Under the captured default snapshot settings (SnapshotInterval 120s, SnapshotThreshold 8192) with automatic snapshotting left enabled, can a node reach a restart whose committed-but-unapplied replay window exceeds 128*MaxAppendEntries entries, or does the periodic snapshot keep the window below that bound during normal operation?",
+            "experiment_id": null,
+            "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+          }
+        ],
+        "history": [
+          {
+            "id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+            "version": 1,
+            "question": "Does NewRaft complete when RestoreCommittedLogs replays a large committed-but-unapplied window, and if not, which mechanism prevents completion?",
+            "source_ids": [
+              "api_startup_order",
+              "api_restore_committed",
+              "api_channel",
+              "raft_applybatch_send",
+              "raft_batch_loop",
+              "fsm_consumer",
+              "config_restore_committed_doc",
+              "log_commit_tracking_iface"
+            ],
+            "hypothesis": "NewRaft blocks permanently inside the startup replay once the replay window contains more than 128*MaxAppendEntries FSM-bound entries: processLogs sends FSM batches on the 128-slot fsmMutateCh, and the only consumer, runFSM, is started later in the same NewRaft call, so no goroutine can ever drain the buffer and the caller has no Raft handle with which to trigger shutdown.",
+            "discriminator": "Restart the same real single-voter node over unchanged stores and vary only the size of the replay window (committed entries above the last snapshot) and MaxAppendEntries. The hypothesis predicts non-return exactly when the window's FSM-bound entries exceed 128*MaxAppendEntries (blocked stack ending in the replay send), and return for windows below that, with the window and batch counts reported as observed operands.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [
+              {
+                "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+                "revision": 1,
+                "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists."
+              },
+              {
+                "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+                "revision": 1,
+                "assertion": "Non-return follows from FSM-bound window entries exceeding 128*MaxAppendEntries."
+              }
+            ],
+            "resume_conditions": [],
+            "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+          }
+        ],
+        "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+      },
+      {
+        "id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "version": 2,
+        "question": "Can a TimeoutNow message that no longer reflects the current leader start an election that displaces a live leader, given that the handler clears the receiver's known leader, moves it to Candidate, sets candidateFromLeadershipTransfer, and the resulting RequestVote waives the 'we have a leader' rejection on other servers?",
+        "source_ids": [
+          "raft_timeoutnow_handler",
+          "commands_timeoutnow_request"
+        ],
+        "hypothesis": "TimeoutNowRequest carries only the RPC header and no term, and raft.timeoutNow performs no term comparison, no check that the sender is the current leader and no membership check: it clears the leader, sets Candidate and marks the candidacy as coming from a leadership transfer, and requestVote on other servers then grants the vote even though the voter knows a live leader and is not in a transfer of its own. Election safety (term, one vote per term, log freshness) is preserved, so the question is scoped to authority/liveness: whether a TimeoutNow that a leader produced before losing leadership can still be delivered and displace a healthy current-term leader.",
+        "discriminator": "Trace the real producer path (initiateLeadershipTransfer -> leadershipTransfer -> trans.TimeoutNow) and the consumer path (processRPC -> timeoutNow -> runCandidate with candidateFromLeadershipTransfer, then requestVote's LeadershipTransfer bypass) and identify which permitted event in the captured snapshot can deliver the request after the receiving node learned a newer leader. A real interrupted transfer in a small cluster should then show the receiver entering candidacy and peers granting votes despite a live leader, while a control where the transfer completes before the leadership change should not.",
+        "disposition": "explained",
+        "parent_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+            "version": 1,
+            "question": "Can a TimeoutNow message that no longer reflects the current leader start an election that displaces a live leader, given that the handler clears the receiver's known leader, moves it to Candidate, sets candidateFromLeadershipTransfer, and the resulting RequestVote waives the 'we have a leader' rejection on other servers?",
+            "source_ids": [
+              "raft_timeoutnow_handler",
+              "commands_timeoutnow_request"
+            ],
+            "hypothesis": "TimeoutNowRequest carries only the RPC header and no term, and raft.timeoutNow performs no term comparison, no check that the sender is the current leader and no membership check: it clears the leader, sets Candidate and marks the candidacy as coming from a leadership transfer, and requestVote on other servers then grants the vote even though the voter knows a live leader and is not in a transfer of its own. Election safety (term, one vote per term, log freshness) is preserved, so the question is scoped to authority/liveness: whether a TimeoutNow that a leader produced before losing leadership can still be delivered and displace a healthy current-term leader.",
+            "discriminator": "Trace the real producer path (initiateLeadershipTransfer -> leadershipTransfer -> trans.TimeoutNow) and the consumer path (processRPC -> timeoutNow -> runCandidate with candidateFromLeadershipTransfer, then requestVote's LeadershipTransfer bypass) and identify which permitted event in the captured snapshot can deliver the request after the receiving node learned a newer leader. A real interrupted transfer in a small cluster should then show the receiver entering candidacy and peers granting votes despite a live leader, while a control where the transfer completes before the leadership change should not.",
+            "disposition": "paused",
+            "parent_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+            "knowledge": [],
+            "resume_conditions": [
+              "A concrete internal producer prefix for a late or repeated TimeoutNow is established from source or from a transport behavior available in the captured snapshot, so the input is produced by the target rather than injected by the harness.",
+              "The safety side is settled from source (term handling, one vote per term, log freshness) so any claim can be scoped to authority/liveness rather than to election safety."
+            ],
+            "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+          }
+        ],
+        "operation_id": "9af1f08cbbbb45298f90a629cefc3686"
+      },
+      {
+        "id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+        "version": 2,
+        "question": "If a leadership transfer is interrupted while its drain loop still has replication work, can the transfer goroutine be stranded on the followerReplication triggerDeferErrorCh send so that the deferred setLeadershipTransferInProgress(false) never runs, leaving a node that later becomes leader permanently rejecting client operations with ErrLeadershipTransferInProgress?",
+        "source_ids": [
+          "raft_timeoutnow_handler",
+          "commands_timeoutnow_request"
+        ],
+        "hypothesis": "The drain loop sends a deferError on repl.triggerDeferErrorCh outside any arm on the transfer's stop channel, and the only reader of that channel is the peer's replication goroutine, which exits when the leader steps down (runLeader's defer closes its stopCh) or when the peer is removed. If the leader loses leadership between the goroutine's wake-up and that send, the send has no reader and blocks forever; the outer transfer goroutine then blocks on doneCh before its deferred setLeadershipTransferInProgress(false), so the flag stays set for the lifetime of the Raft instance, including after a later election of that instance.",
+        "discriminator": "Run a real three-voter cluster, isolate the transfer target, commit a backlog that the target never receives, start a transfer to that target, then cut the starting leader off so it steps down while the transfer is draining. Predict: the transfer future resolves with an error, the drained goroutine is left in the triggerDeferErrorCh send, getLeadershipTransferInProgress stays true, and after the old leader is made leader again through a normal transfer its Apply and GetConfiguration return ErrLeadershipTransferInProgress. A control trial without the interruption must show the flag cleared and client calls unaffected; if every interrupted trial clears the flag with no stranded goroutine, the hypothesis is defeated for this trigger.",
+        "disposition": "explained",
+        "parent_id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+            "version": 1,
+            "question": "If a leadership transfer is interrupted while its drain loop still has replication work, can the transfer goroutine be stranded on the followerReplication triggerDeferErrorCh send so that the deferred setLeadershipTransferInProgress(false) never runs, leaving a node that later becomes leader permanently rejecting client operations with ErrLeadershipTransferInProgress?",
+            "source_ids": [
+              "raft_timeoutnow_handler",
+              "commands_timeoutnow_request"
+            ],
+            "hypothesis": "The drain loop sends a deferError on repl.triggerDeferErrorCh outside any arm on the transfer's stop channel, and the only reader of that channel is the peer's replication goroutine, which exits when the leader steps down (runLeader's defer closes its stopCh) or when the peer is removed. If the leader loses leadership between the goroutine's wake-up and that send, the send has no reader and blocks forever; the outer transfer goroutine then blocks on doneCh before its deferred setLeadershipTransferInProgress(false), so the flag stays set for the lifetime of the Raft instance, including after a later election of that instance.",
+            "discriminator": "Run a real three-voter cluster, isolate the transfer target, commit a backlog that the target never receives, start a transfer to that target, then cut the starting leader off so it steps down while the transfer is draining. Predict: the transfer future resolves with an error, the drained goroutine is left in the triggerDeferErrorCh send, getLeadershipTransferInProgress stays true, and after the old leader is made leader again through a normal transfer its Apply and GetConfiguration return ErrLeadershipTransferInProgress. A control trial without the interruption must show the flag cleared and client calls unaffected; if every interrupted trial clears the flag with no stranded goroutine, the hypothesis is defeated for this trigger.",
+            "disposition": "active",
+            "parent_id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "9a28fea90bc64596b790f2372fc4c716"
+          }
+        ],
+        "operation_id": "9af1f08cbbbb45298f90a629cefc3686"
+      },
+      {
+        "id": "9af1f08cbbbb45298f90a629cefc3686-question-2",
+        "version": 1,
+        "question": "Does VerifyLeader confirm leadership using acknowledgements that do not count toward the voter quorum, so that a leader separated from every other voter but still able to reach a nonvoter reports itself verified?",
+        "source_ids": [
+          "raft_verifyleader_votes",
+          "raft_quorumsize_voters",
+          "replication_notifyall"
+        ],
+        "hypothesis": "verifyLeader seeds votes with the leader's own vote and registers the verify future with every followerReplication in leaderState.replState, which startStopReplication creates for every server in the latest configuration including nonvoters; each successful AppendEntries response then calls notifyAll, which casts a vote for every registered future. Since quorumSize counts only voters, acknowledgements from nonvoters can complete the voter quorum, so a leader whose only reachable peers are nonvoters returns a successful VerifyLeader while it cannot contact a majority of voters - and while another leader may already have been elected among the voters it cannot reach.",
+        "discriminator": "Run a real cluster of three voters plus one nonvoter, elect the leader, confirm it can verify normally, then partition the leader together with the nonvoter away from the other two voters and call VerifyLeader on the leader before the new term reaches the nonvoter. Predict: the future returns nil with votes counting only the leader's own vote plus the nonvoter's acknowledgement, while the leader's configurations.latest contains three voters, so the confirmation is made against a quorum of voters it cannot reach; a control in which the nonvoter is also cut off must fail the verification instead.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "9af1f08cbbbb45298f90a629cefc3686"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "c4168d1deb72421a8935ea2ddc7d9b7c-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults",
+          "log_commit_tracking_iface"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Source-only account: RestoreCommittedLogs is documented to replay all known-committed logs on disk before NewRaft completes (config.go 243-254), and restoreFromCommittedLogs does exactly that by calling processLogs before runFSM is started (api.go 606 vs 637). processLogs' applyBatch performs a blocking send on fsmMutateCh (raft.go 1306) whose capacity is 128 (api.go 560) while batching entries at MaxAppendEntries (raft.go 1318, 1345-1348), and runFSM (fsm.go 241) is the only reader of that channel anywhere in the package. Therefore the startup replay can only fit 128*MaxAppendEntries FSM-bound entries; past that the constructor cannot complete, and the escape in applyBatch (the shutdownCh arm) is unreachable because the caller has no *Raft to shut down before NewRaft returns. The sizing is inside the documented use case: DefaultConfig pairs MaxAppendEntries=64 with SnapshotThreshold=8192 and a 120s SnapshotInterval, so a node committing more than 8192 entries between snapshot checks - exactly the follower/restart situation the option targets - comes back with a replay window above the bound. The submitted experiment records the retained-execution state of this account (return vs non-return, window census, batch estimate, blocked stack) for five restart-only cases; the account above is a source derivation, not a reading of that run.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "Startup replay blocking-sends FSM batches before runFSM is started."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return once FSM-bound window entries exceed 128*MaxAppendEntries."
+          }
+        ],
+        "counterevidence": [
+          "The option is off by default (config.go 243-254, RestoreCommittedLogs false in DefaultConfig), so a cluster that does not opt into it cannot reach this path; the defect is scoped to that opt-in configuration.",
+          "raft.go 1305-1307 also arms a shutdownCh arm, so the blocked send is not unconditionally permanent: it can be released by Shutdown - but only by a caller that already holds the *Raft, which NewRaft has not yet returned, and by nothing internal (NewRaft starts no routines before this call).",
+          "An implementation that used an unbounded or larger FSM channel, or started runFSM first, would not show this; the account is specific to this snapshot's ordering and capacity."
+        ],
+        "limitations": [
+          "The precise batch/window boundary (window in FSM-bound entries vs 128*MaxAppendEntries) is derived from source; the submitted probe brackets it with observed windows rather than pinning the exact entry count at which the last fitting send is reached.",
+          "The startup replay also holds up to 128 batches (each up to MaxAppendEntries commit tuples) in the channel, so memory use grows with MaxAppendEntries; this submission does not measure that.",
+          "Whether a node that blocks here can be recovered by an operator (for example via configuration change) is not investigated; the claim is limited to NewRaft not returning and no internal repair being enabled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c4168d1deb72421a8935ea2ddc7d9b7c"
+      },
+      {
+        "id": "28496be07c87443ea089331e8a4dbc77-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": "c4168d1deb72421a8935ea2ddc7d9b7c-experiment",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc"
+        ],
+        "executions": {
+          "abb2ff0a1f0f449f87fb9b382c8a3fee": [
+            0,
+            1,
+            2,
+            3,
+            4
+          ]
+        },
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Account of receipt abb2ff0a1f0f449f87fb9b382c8a3fee only: the run completed with exit 0 and tests_passed, and stdout carried five CA_EVENT payloads, but the extractor recorded all five (parsed indices 0-4) as invalid_observation with reason 'Event must be an object with an event name'. The failure is in the harness payload, not in the target: the payloads were valid JSON objects describing each case but carried no event field. Consequences for this account: no comparison can be evaluated from this receipt, and the observed outcomes it records cannot be cited as parsed decisive indices - only as retained, unparsed output. What the retained bytes do contain (parsing_errors[0..4].raw) is: small_window_default_batch window 4001 / 63 batches / returned; mid_window_default_batch window 1000 / 16 batches / returned; mid_window_small_batch (MaxAppendEntries 4) window 1001 / 250 batches / not returned within 8s with a blocked stack; large_window_default_batch window 12000 / 188 batches / not returned with a blocked stack; large_window_after_snapshot window 0 / 0 batches / returned. Because those payloads were never admitted as events, none of them is used here as evidence for the defect claim: the claim remains the source derivation from the previous interpretation (blocking send in the startup replay on the 128-slot fsmMutateCh before runFSM starts, batches of MaxAppendEntries, no internal repair and no reachable shutdown), and it stays conditional on a retained execution that actually parses. The corrected successor harness is submitted with this update; its receipt, not this one, will be the basis for the next interpretation.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The receipt itself is a completed, passing run (tests_passed, exit 0), which could be misread as establishing the target behavior; it does not, because the decisive payloads failed extraction and no comparison was evaluated.",
+          "Nothing in this receipt distinguishes 'NewRaft did not return' from a harness that stopped waiting: the raw payload is the harness's own derivation, and the 8s wait it recorded is a harness parameter, not a target interval. Only a parsed rerun with the corrected events, plus the blocked stack, can carry that difference."
+        ],
+        "limitations": [
+          "No parsed event from this receipt establishes any compared field; the five raw payloads are retained in the observations file and are described here only as unparsed output.",
+          "This interpretation covers the receipt and does not re-answer the source-derived mechanism, which was previously recorded and is unchanged."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "28496be07c87443ea089331e8a4dbc77"
+      },
+      {
+        "id": "0d83a8cdded948c3b78d936f719d97d7-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": "28496be07c87443ea089331e8a4dbc77-experiment",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults"
+        ],
+        "executions": {
+          "ec81425b7ebc4941ba70f77e78b109fb": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "Retained execution (check ec81425b7ebc4941ba70f77e78b109fb, exit 0, tests_passed, 14 parsed events, 0 parse errors). Comparison 0 (within-capacity restart returns) evaluated indices 1, 3, 7, 13 and holds with no missing or contradictory observations: every admitted prefix was correlated by identity (case) to its result (0->1, 2->3, 6->7, 12->13), comparison_complete true. Comparison 1 (over-capacity restart does not return) evaluated indices 5, 9, 11 and holds, correlated with prefixes 4, 8, 10. Observed operands: window 4001 with 4000 FSM-bound entries -> 63 batches, returned in 4ms; window 1000/999 -> 16 batches, returned in 0ms; window 8190/8189 -> exactly 128 batches, returned in 4ms; window 8197/8196 -> 129 batches, did not return within 5s; window 12000/11999 -> 188 batches, did not return; window 1001/1000 with MaxAppendEntries=4 -> 250 batches, did not return. The last two pairs are the discriminators that exclude the rival explanations: the MaxAppendEntries=4 case has essentially the same ~1000-entry window as the case that returned in 0ms with 64-entry batches, so what decides the outcome is batches against channel capacity, not window size alone; and the after-snapshot case applies the same 12000 commands against the same stores yet returns in 7ms because the manual snapshot moves last_applied to 12002 and leaves a window of 0. Each non-return case sampled a goroutine that had not returned out of the replay path, with frames at raft.go:1305 (the select-send of a batch inside processLogs' applyBatch), raft.go:1346 (the batched applyBatch call), api.go:753 (restoreFromCommittedLogs' processLogs call) and api.go:606 (NewRaft), i.e. exactly the source-derived send that has no consumer until api.go:637 starts runFSM. The 5s wait is a harness ceiling and is not load-bearing for the claim: the stack shows the goroutine is inside the replay send, and the source shows the only reader of that channel is started later in the same constructor and that the caller cannot call Shutdown because no *Raft has been returned. Together with the source account this makes the non-return a deadlock of the constructor under the stated configuration, so the account is no longer merely conditional; the previous receipt abb2ff0a1f0f449f87fb9b382c8a3fee is superseded on the evidence side by this parsed run, and its parse loss remains recorded.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "The startup replay delivers FSM batches by blocking send on fsmMutateCh before runFSM exists; the blocked stacks in this run end at raft.go:1305 inside processLogs' applyBatch, called from raft.go:1346, from api.go:753 (restoreFromCommittedLogs) and api.go:606 (NewRaft)."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-return tracks ceil(FSM-bound window entries / MaxAppendEntries) against the 128-slot channel: 63 and 16 batches returned in 0-4ms, 128 batches returned, 129 batches, 188 batches and 250 batches (MaxAppendEntries=4) did not return."
+          }
+        ],
+        "counterevidence": [
+          "The feature is opt-in: RestoreCommittedLogs defaults to false (config.go 243-254, DefaultConfig), so a cluster that never enables it cannot reach this path; the defect is scoped to that configuration plus a commit-tracking log store.",
+          "The blocked send is inside a select with a shutdownCh arm, so it is not unconditional: Shutdown releases it - but only a caller holding the *Raft can call Shutdown, and in the affected path NewRaft has not returned yet, while NewRaft starts no internal routine before this call, so no participant exists that could take that arm during the window.",
+          "The probe constructs the large windows by disabling automatic snapshotting; a deployment that snapshots often keeps the window small, so the observed non-returns are not evidence that ordinary clusters of this kind restart broken - only that the constructor cannot complete when the window is large.",
+          "For the within-capacity cases the returns were immediate (0-7ms), but a returning restart is only bounded by the harness wait; nothing here claims a bound on restart duration for other configurations."
+        ],
+        "limitations": [
+          "Configuration space is sampled, not exhausted: MaxAppendEntries was exercised at 4 and 64 while ValidateConfig allows up to 1024, and the relation tested is the batch count against capacity, so untested settings are covered by the relation rather than by direct observation.",
+          "The probe runs a single-voter cluster with an in-memory transport, an in-memory commit-tracking log store and MockFSM, so disk latency, network behaviour and slow FSM application are excluded; a slow FSM would fill the same channel sooner, which limits the observed non-returns as a lower bound rather than an upper one.",
+          "The probe does not measure the memory held by the queued batches (up to 128 batches of up to MaxAppendEntries commit tuples), nor whether an operator can recover a node blocked in NewRaft, and no claim is made about either.",
+          "The window-to-FSM-bound offset varied by one entry between runs (the persisted commit index is staged with the last StoreLogs), so the exact counts 8189/8196 are specific to these runs; the tested predicate is the batch count against the 128-slot capacity.",
+          "Restart outcome is recorded as returned / not returned within 5s with a sampled stack; no attempt is made to force completion or to establish that no future internal or external event could ever release the send beyond the source argument that none is enabled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "0d83a8cdded948c3b78d936f719d97d7"
+      },
+      {
+        "id": "91debf466df04e14a60f2bc847535594-interpretation-0",
+        "investigation_id": "c4168d1deb72421a8935ea2ddc7d9b7c-question-0",
+        "experiment_id": "800d3e6aea8d4c239eecd81727ca53f1-experiment",
+        "source_ids": [
+          "api_startup_order",
+          "api_restore_committed",
+          "api_channel",
+          "raft_applybatch_send",
+          "raft_batch_loop",
+          "fsm_consumer",
+          "config_restore_committed_doc",
+          "config_defaults",
+          "snapshot_interval_check",
+          "snapshot_should_snapshot",
+          "snapshot_take_snapshot"
+        ],
+        "executions": {
+          "4ad6471fdd1547f28bc88a8f911e0319": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "asserted",
+        "rationale": "Retained execution (check 4ad6471fdd1547f28bc88a8f911e0319, exit 0, tests_passed, 6 parsed events, 0 parse errors, snapshot settings reported per case as SnapshotThreshold 8192, SnapshotInterval 120000ms, MaxAppendEntries 64). Comparison 0 (within-capacity restart returns) evaluated result index 5, correlated to admission index 4, and holds; comparison 1 (over-capacity restart does not return) evaluated result indices 1 and 3, correlated to admission indices 0 and 2, and holds. Both are comparison_complete with no missing or contradictory observations, and neither result was filtered on the measured field: applicability came from replay_batches_within_capacity, which is decided by the pre-restart operands carried in the admission event. Observed state: with no snapshot at all, persisted commit index 10001 above last-applied 0 gives a window of 10001 entries (10000 FSM-bound, 157 batches) and NewRaft had not returned after 5s; with a real user snapshot at index 4002 followed by 9998 more commits, the window is 9998 (157 batches) and NewRaft had not returned; with the same snapshot followed by only 1999 commits, the window is 1999 (32 batches) and NewRaft returned in 7ms. Each non-return sampled a goroutine still inside the replay path (raft.go:1305 inside the batch select-send, raft.go:1346, api.go:753 restoreFromCommittedLogs, api.go:606 NewRaft). The applicability question is therefore answered from the target's own behaviour: the periodic snapshot does not cap the window below the 128-batch bound. The mechanism is that runSnapshots consults shouldSnapshot only on the SnapshotInterval timer (snapshot.go 73-100), shouldSnapshot compares the log-store last index against the last snapshot index (snapshot.go 107-120), and the startup replay window is measured from the newest snapshot to the persisted commit index, so between checks the window is simply however many committed entries accumulated, and before the first check it is the whole committed log. With the captured defaults that accumulation exceeds 8192 FSM-bound entries whenever more than about 8192 commits occur per 120s interval, i.e. above roughly 68 commits/s sustained, at which point the window at an arbitrary restart exceeds the 128*64 = 8192 bound and NewRaft cannot complete. The third counterevidence recorded in the previous revision (windows only constructed by disabling automatic snapshotting) is answered by this receipt and no longer stands; the remaining counterevidence is listed below.",
+        "answers": {
+          "0d83a8cdded948c3b78d936f719d97d7-gap-0": {
+            "explanation": "Answered from the retained execution: with the captured snapshot settings in force (threshold 8192, interval 120s, both reported in the admission events) a node reaches a restart whose window exceeds the bound - 10001 entries / 157 batches with no snapshot yet taken, and 9998 / 157 after a real snapshot at 4002 plus 9998 more commits - and both restarts fail to return, while the 1999-entry control returns in 7ms. Source reading explains why the periodic check cannot prevent this: the check runs only on the SnapshotInterval timer (snapshot.go 73-100), its condition is a last-index minus last-snapshot delta against SnapshotThreshold (snapshot.go 107-120), and the replay window is measured from the newest snapshot to the persisted commit index, so the window is whatever accumulated since the newest snapshot. The residual condition is a rate premise rather than a target property: with the defaults the window exceeds 8192 FSM-bound entries when more than about 8192 commits occur per 120s interval (about 68/s sustained), and a sufficiently small SnapshotInterval relative to the write rate keeps the window below the bound.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-0",
+            "revision": 1,
+            "assertion": "In this run too the non-returning goroutine's frames are raft.go:1305 (batch select-send in processLogs' applyBatch), raft.go:1346, api.go:753 (restoreFromCommittedLogs) and api.go:606 (NewRaft), with the only reader of fsmMutateCh started later at api.go:637."
+          },
+          {
+            "entry_id": "c4168d1deb72421a8935ea2ddc7d9b7c-knowledge-1",
+            "revision": 1,
+            "assertion": "With the configured snapshot settings in force, windows of 10001 and 9998 FSM-bound entries (157 batches each) did not return, while 1999 entries (32 batches) returned in 7ms."
+          }
+        ],
+        "counterevidence": [
+          "The feature remains opt-in: RestoreCommittedLogs defaults to false and requires a CommitTrackingLogStore, so a cluster that does not enable it cannot reach this path.",
+          "The blocked send has a shutdownCh arm, so it is releasable by Shutdown - but the affected caller holds no *Raft because NewRaft has not returned, and NewRaft starts no routine before the replay, so nothing can take that arm during the window.",
+          "Scope-narrowing premise: the deadlock needs the window above the bound at the restart, which with the captured defaults requires a sustained commit rate of roughly 68 commits/s or more between snapshot checks (or a configuration that raises SnapshotThreshold, lengthens SnapshotInterval, or prevents snapshots from being taken); below that rate the periodic snapshot keeps the window small and the constructor returns."
+        ],
+        "limitations": [
+          "No full 120s interval elapsed in the probe: the accumulation is produced by the target's own apply path rather than by wall-clock passage, so the rate at which the same accumulation occurs in time is arithmetic on the configured interval, not an observation.",
+          "The newest snapshot in the two snapshot cases is placed by a user snapshot at a chosen index; with automatic snapshots the placement is at an interval tick, which changes the phase of the accumulation but not its bound, and that equivalence is a source argument rather than an observation.",
+          "The probe still runs a single-voter cluster with an in-memory transport, an in-memory commit-tracking store and MockFSM, so disk latency, network behaviour and slow FSM application are excluded; MaxAppendEntries is the configured default here and was varied only in the predecessor experiment.",
+          "Unchanged from earlier: the memory held by queued batches is not measured, and whether an operator can recover a node blocked inside NewRaft is not investigated."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "91debf466df04e14a60f2bc847535594"
+      },
+      {
+        "id": "9af1f08cbbbb45298f90a629cefc3686-interpretation-0",
+        "investigation_id": "9a28fea90bc64596b790f2372fc4c716-question-0",
+        "experiment_id": "9a28fea90bc64596b790f2372fc4c716-experiment",
+        "source_ids": [
+          "raft_transfer_defererr_buffer",
+          "raft_leadership_transfer_drain",
+          "raft_timeoutnow_handler"
+        ],
+        "executions": {
+          "991fd67c1e3d4760b83fd8a724444ff0": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "refuted",
+        "rationale": "Retained execution (check 991fd67c1e3d4760b83fd8a724444ff0, exit 0, tests_passed, 12 parsed events, 0 parse errors) plus the source reading that the run's outcome matches. The probe did exercise the intended state: in every interrupted trial the target's last index at transfer time was 2 against the leader's 202, so the drain loop had real replication work after the target was isolated, and each transfer future resolved with 'leadership transfer timeout' rather than completing, i.e. the transfer was still in flight when the starting leader was cut off and its replication goroutine exited. Against the hypothesis's prediction, in all ten interrupted trials transfer_in_progress_after was false, no goroutine was found stranded in the leadershipTransfer/triggerDeferErrorCh path, and in the three trials where another node became leader first the interrupted node was re-elected and its Apply and GetConfiguration both succeeded with no error; the two uninterrupted controls completed with an empty transfer error, the starting node ending as Follower with the flag false. The source reason, which is the primary basis for refutation: followerReplication.triggerDeferErrorCh is created with capacity 1 (raft.go 603), and leadershipTransfer only reaches its next send (raft.go 1003) after receiving the response for the previous deferError, which by construction means the replicator consumed that item, so the buffer is empty at each send and a buffered send succeeds without any reader. A send cannot therefore be stranded by the replicator exiting, and the outer goroutine's wait on doneCh is always satisfied, so the deferred setLeadershipTransferInProgress(false) runs - which is what every trial shows. The alternative interleaving-theoretical reading is also excluded empirically across two scheduling regimes: the ten retained trials on the host's default parallelism plus six additional local trials with GOMAXPROCS=1, which should favour the single-threaded ordering the hypothesis needed, all cleared the flag with no stranded goroutine; the GOMAXPROCS run is native feedback and is not offered as retained evidence.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The refutation is about reachability through this trigger, not about the flag's design: setLeadershipTransferInProgress(false) really is only reached from the outer transfer goroutine's deferred call, so any exit path of the inner goroutine that skips doneCh would still leave the flag set. The probe's trials exercised the drain-in-flight interruption, the timeout and the leadership-loss paths, but not a state where the transport call itself never returns.",
+          "The stranded-goroutine search is a sampled goroutine dump at one instant per trial; it would miss a goroutine that had already exited, but the primary basis does not depend on the dump - the buffered send cannot block regardless of sampling."
+        ],
+        "limitations": [
+          "Timings are the captured in-memory ones (50ms heartbeat, election and lease), and the transfer therefore timed out before the target could win; different timing would change which branch resolves the transfer, though not the buffered-send argument.",
+          "Three of ten interrupted trials reached the re-election check; the other seven had no other leader within the 3s wait, so the client-endpoint check was exercised three times, not ten."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9af1f08cbbbb45298f90a629cefc3686"
+      },
+      {
+        "id": "9af1f08cbbbb45298f90a629cefc3686-interpretation-1",
+        "investigation_id": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_leadership_transfer_drain",
+          "raft_timeoutnow_handler",
+          "commands_timeoutnow_request"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Answered from source and from the transfer receipts rather than by new injection. The handler does validate nothing: raft.timeoutNow (raft.go 2232-2237) ignores the request's origin and any term, because TimeoutNowRequest carries only the RPC header (commands.go 206-208), and it immediately clears the leader, moves the node to Candidate and marks the candidacy as transfer-driven, which makes its RequestVote waive the known-leader rejection on other servers. What the question turned on, however, is whether a TimeoutNow that no longer reflects the current leader can be produced inside the library. The producer is the leadership-transfer path, and it reaches trans.TimeoutNow (raft.go 1026) only after its drain loop exits, which requires the target to be caught up; the loop's exit and the send are adjacent statements with no blocking point between them, and every earlier exit point of the loop is guarded by the transfer's stop channel (raft.go 1000-1020), which the transfer case closes when leadership is lost or the transfer times out. The interrupted-transfer receipt shows the same shape from the behaviour side: with real replication work pending, the transfer either times out with the flag cleared or is abandoned on leadership loss, and no message was produced after leadership was gone. External injection of a TimeoutNow is not evidence of a target defect here, because peer authentication is the transport's and application's responsibility rather than a guarantee of this library. So the suspicion is refuted for internal producers, and what remains is a hardening observation: the handler would be more defensive if the request carried the sender's term, or if the receiver checked that the sender is its current leader.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The window between the drain loop's exit and the TimeoutNow call is adjacent code rather than a proven impossibility: a preemption exactly there, or a future change that inserts work between them, would reopen it. Nothing in the source prevents that window from existing, only from being wide or reachable in the tested flows.",
+          "The vote bypass that the transfer flag enables is intentional and is what makes a transfer target electable while peers still know the old leader; the refutation is about the absence of a stale internal producer, not about the bypass being wrong."
+        ],
+        "limitations": [
+          "This answer rests on source reading of the producer path plus the interrupted-transfer executions; no execution produced a transfer message after leadership was lost, so the refutation is a reachability argument with corroborating runs, not a proof about every scheduler.",
+          "A cluster whose transport reports delayed or replayed RPCs is outside what these runs cover; the question was scoped to producers inside this snapshot."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9af1f08cbbbb45298f90a629cefc3686"
+      }
+    ],
+    "materials": [
+      {
+        "id": "api_channel",
+        "file": "api.go",
+        "start_line": 558,
+        "end_line": 562,
+        "kind": "code_observation",
+        "text": "\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),\n\t\tfsmSnapshotCh:         make(chan *reqSnapshotFuture),\n\t\tleaderCh:              make(chan bool, 1),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_startup_order",
+        "file": "api.go",
+        "start_line": 600,
+        "end_line": 640,
+        "kind": "code_observation",
+        "text": "\n\t// Attempt to restore a snapshot if there are any.\n\tif err := r.restoreSnapshot(); err != nil {\n\t\treturn nil, err\n\t}\n\n\tif err := r.restoreFromCommittedLogs(); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Scan through the log for any configuration change entries.\n\tsnapshotIndex, _ := r.getLastSnapshot()\n\tlastappliedIndex := r.getLastApplied()\n\tfor index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {\n\t\tvar entry Log\n\t\tif err := r.logs.GetLog(index, &entry); err != nil {\n\t\t\tr.logger.Error(\"failed to get log\", \"index\", index, \"error\", err)\n\t\t\tpanic(err)\n\t\t}\n\t\tif err := r.processConfigurationLogEntry(&entry); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n\tr.logger.Info(\"initial configuration\",\n\t\t\"index\", r.configurations.latestIndex,\n\t\t\"servers\", hclog.Fmt(\"%+v\", r.configurations.latest.Servers))\n\n\t// Setup a heartbeat fast-path to avoid head-of-line\n\t// blocking where possible. It MUST be safe for this\n\t// to be called concurrently with a blocking RPC.\n\ttrans.SetHeartbeatHandler(r.processHeartbeat)\n\n\tif conf.skipStartup {\n\t\treturn r, nil\n\t}\n\t// Start the background work.\n\tr.goFunc(r.run)\n\tr.goFunc(r.runFSM)\n\tr.goFunc(r.runSnapshots)\n\treturn r, nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_committed",
+        "file": "api.go",
+        "start_line": 724,
+        "end_line": 754,
+        "kind": "code_observation",
+        "text": "func (r *Raft) restoreFromCommittedLogs() error {\n\tif !r.RestoreCommittedLogs {\n\t\treturn nil\n\t}\n\n\t// If the store implements CommitTrackingLogStore, we can read the commit index from the store.\n\t// This is useful when the store is able to track the commit index and we can avoid replaying logs.\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tr.logger.Warn(\"restore committed logs enabled but log store does not support it\", \"log_store\", fmt.Sprintf(\"%T\", r.logs))\n\t\treturn ErrIncompatibleLogStore\n\t}\n\n\tcommitIndex, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get commit index from store\", \"error\", err)\n\t\treturn err\n\t}\n\n\tlastIndex, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index from store\", \"error\", err)\n\t\treturn err\n\t}\n\tif commitIndex > lastIndex {\n\t\tcommitIndex = lastIndex\n\t}\n\n\tr.setCommitIndex(commitIndex)\n\tr.processLogs(commitIndex, nil)\n\treturn nil",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "raft_applybatch_send",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1313,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_batch_loop",
+        "file": "raft.go",
+        "start_line": 1314,
+        "end_line": 1360,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Store maxAppendEntries for this call in case it ever becomes reloadable. We\n\t// need to use the same value for all lines here to get the expected result.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\n\tbatch := make([]*commitTuple, 0, maxAppendEntries)\n\n\t// Apply all the preceding logs\n\tfor idx := lastApplied + 1; idx <= index; idx++ {\n\t\tvar preparedLog *commitTuple\n\t\t// Get the log, either from the future or from our log store\n\t\tfuture, futureOk := futures[idx]\n\t\tif futureOk {\n\t\t\tpreparedLog = r.prepareLog(&future.log, future)\n\t\t} else {\n\t\t\tl := new(Log)\n\t\t\tif err := r.logs.GetLog(idx, l); err != nil {\n\t\t\t\tr.logger.Error(\"failed to get log\", \"index\", idx, \"error\", err)\n\t\t\t\tpanic(err)\n\t\t\t}\n\t\t\tpreparedLog = r.prepareLog(l, nil)\n\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "fsm_consumer",
+        "file": "fsm.go",
+        "start_line": 236,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "\n\tfor {\n\t\tsaturation.sleeping()\n\n\t\tselect {\n\t\tcase ptr := <-r.fsmMutateCh:\n\t\t\tsaturation.working()\n\n\t\t\tswitch req := ptr.(type) {\n\t\t\tcase []*commitTuple:\n\t\t\t\tapplyBatch(req)",
+        "content_digest": "87043c532565c2027473e38fbe2089a0dcebba6f58d1b05262eb13a14e179df3"
+      },
+      {
+        "id": "config_restore_committed_doc",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "document_statement",
+        "text": "\t// RestoreCommittedLogs controls if the Raft server should use the restore committed logs\n\t// mechanism. Restore committed logs requires a LogStore implementation that\n\t// support commit tracking. When such a store is used and this config\n\t// enabled, raft nodes will replay all known-committed logs on disk\n\t// before completing `NewRaft` on startup. This is mainly useful where\n\t// the application allows relaxed-consistency reads from followers as it\n\t// will reduce how far behind the follower's FSM is when it starts. If all reads\n\t// are forwarded to the leader then there won't be observable benefit from this feature.\n\t//\n\t// Notice: If this is enabled, the log store MUST implement the CommitTrackingLogStore\n\t// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.\n\tRestoreCommittedLogs bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "config_defaults",
+        "file": "config.go",
+        "start_line": 329,
+        "end_line": 343,
+        "kind": "code_observation",
+        "text": "func DefaultConfig() *Config {\n\treturn &Config{\n\t\tProtocolVersion:    ProtocolVersionMax,\n\t\tHeartbeatTimeout:   1000 * time.Millisecond,\n\t\tElectionTimeout:    1000 * time.Millisecond,\n\t\tCommitTimeout:      50 * time.Millisecond,\n\t\tMaxAppendEntries:   64,\n\t\tShutdownOnRemove:   true,\n\t\tTrailingLogs:       10240,\n\t\tSnapshotInterval:   120 * time.Second,\n\t\tSnapshotThreshold:  8192,\n\t\tLeaderLeaseTimeout: 500 * time.Millisecond,\n\t\tLogLevel:           \"DEBUG\",\n\t}\n}",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "log_commit_tracking_iface",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 221,
+        "kind": "interface_statement",
+        "text": "type CommitTrackingLogStore interface {\n\tLogStore\n\n\t// StageCommitIndex stages a new commit index to be persisted.\n\t// The staged commit index MUST only be persisted in a manner that is atomic\n\t// with the following StoreLogs call in the face of a crash.\n\t// This allows the Raft implementation to optimize commit index updates\n\t// without risking inconsistency between the commit index and the log entries.\n\t//\n\t// The implementation MUST NOT persist this value separately from the log entries.\n\t// Instead, it should stage the value to be written atomically with the next\n\t// StoreLogs call.\n\t//\n\t// GetCommitIndex MUST never return a value higher than the last index in the log,\n\t// even if a higher value has been staged with this method.\n\t//\n\t// idx is the new commit index to stage.\n\tStageCommitIndex(idx uint64) error\n\n\t// GetCommitIndex returns the latest persisted commit index from the latest log entry\n\t// in the store at startup.\n\t//\n\t// GetCommitIndex should not return a value higher than the last index in the log.\n\t// If that happens, the last index in the log will be used.\n\t//\n\t// When no commit index is found in the log store, return (0, nil).\n\tGetCommitIndex() (uint64, error)\n}",
+        "content_digest": "7a890bd749cd6863faef212b586320b8c6d9574bb7158f56c4e022408abff0b4"
+      },
+      {
+        "id": "raft_timeoutnow_handler",
+        "file": "raft.go",
+        "start_line": 2232,
+        "end_line": 2237,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "commands_timeoutnow_request",
+        "file": "commands.go",
+        "start_line": 200,
+        "end_line": 213,
+        "kind": "code_observation",
+        "text": "func (r *InstallSnapshotResponse) GetRPCHeader() RPCHeader {\n\treturn r.RPCHeader\n}\n\n// TimeoutNowRequest is the command used by a leader to signal another server to\n// start an election.\ntype TimeoutNowRequest struct {\n\tRPCHeader\n}\n\n// GetRPCHeader - See WithRPCHeader.\nfunc (r *TimeoutNowRequest) GetRPCHeader() RPCHeader {\n\treturn r.RPCHeader\n}",
+        "content_digest": "e79714e646bbb43a79aca5c112168dff1b37a58396f509a4734baf242e570853"
+      },
+      {
+        "id": "snapshot_interval_check",
+        "file": "snapshot.go",
+        "start_line": 73,
+        "end_line": 100,
+        "kind": "code_observation",
+        "text": "func (r *Raft) runSnapshots() {\n\tfor {\n\t\tselect {\n\t\tcase <-randomTimeout(r.config().SnapshotInterval):\n\t\t\t// Check if we should snapshot\n\t\t\tif !r.shouldSnapshot() {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Trigger a snapshot\n\t\t\tif _, err := r.takeSnapshot(); err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {\n\t\t\t\tr.logger.Error(\"failed to take snapshot\", \"error\", err)\n\t\t\t}\n\n\t\tcase future := <-r.userSnapshotCh:\n\t\t\t// User-triggered, run immediately\n\t\t\tid, err := r.takeSnapshot()\n\t\t\tif err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {\n\t\t\t\tr.logger.Error(\"failed to take snapshot\", \"error\", err)\n\t\t\t} else if err == nil {\n\t\t\t\tfuture.opener = func() (*SnapshotMeta, io.ReadCloser, error) {\n\t\t\t\t\treturn r.snapshots.Open(id)\n\t\t\t\t}\n\t\t\t}\n\t\t\tfuture.respond(err)\n\n\t\tcase <-r.shutdownCh:\n\t\t\treturn",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      },
+      {
+        "id": "snapshot_should_snapshot",
+        "file": "snapshot.go",
+        "start_line": 107,
+        "end_line": 126,
+        "kind": "code_observation",
+        "text": "func (r *Raft) shouldSnapshot() bool {\n\t// Check the last snapshot index\n\tlastSnap, _ := r.getLastSnapshot()\n\n\t// Check the last log index\n\tlastIdx, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index\", \"error\", err)\n\t\treturn false\n\t}\n\n\t// Compare the delta to the threshold\n\tdelta := lastIdx - lastSnap\n\treturn delta >= r.config().SnapshotThreshold\n}\n\n// takeSnapshot is used to take a new snapshot. This must only be called from\n// the snapshot thread, never the main thread. This returns the ID of the new\n// snapshot, along with an error.\nfunc (r *Raft) takeSnapshot() (string, error) {",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      },
+      {
+        "id": "snapshot_take_snapshot",
+        "file": "snapshot.go",
+        "start_line": 126,
+        "end_line": 178,
+        "kind": "code_observation",
+        "text": "func (r *Raft) takeSnapshot() (string, error) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"snapshot\", \"takeSnapshot\"}, time.Now())\n\n\t// Create a request for the FSM to perform a snapshot.\n\tsnapReq := &reqSnapshotFuture{}\n\tsnapReq.init()\n\n\t// Wait for dispatch or shutdown.\n\tselect {\n\tcase r.fsmSnapshotCh <- snapReq:\n\tcase <-r.shutdownCh:\n\t\treturn \"\", ErrRaftShutdown\n\t}\n\n\t// Wait until we get a response\n\tif err := snapReq.Error(); err != nil {\n\t\tif err != ErrNothingNewToSnapshot {\n\t\t\terr = fmt.Errorf(\"failed to start snapshot: %v\", err)\n\t\t}\n\t\treturn \"\", err\n\t}\n\tdefer snapReq.snapshot.Release()\n\n\t// Make a request for the configurations and extract the committed info.\n\t// We have to use the future here to safely get this information since\n\t// it is owned by the main thread.\n\tconfigReq := &configurationsFuture{}\n\tconfigReq.ShutdownCh = r.shutdownCh\n\tconfigReq.init()\n\tselect {\n\tcase r.configurationsCh <- configReq:\n\tcase <-r.shutdownCh:\n\t\treturn \"\", ErrRaftShutdown\n\t}\n\tif err := configReq.Error(); err != nil {\n\t\treturn \"\", err\n\t}\n\tcommitted := configReq.configurations.committed\n\tcommittedIndex := configReq.configurations.committedIndex\n\n\t// We don't support snapshots while there's a config change outstanding\n\t// since the snapshot doesn't have a means to represent this state. This\n\t// is a little weird because we need the FSM to apply an index that's\n\t// past the configuration change, even though the FSM itself doesn't see\n\t// the configuration changes. It should be ok in practice with normal\n\t// application traffic flowing through the FSM. If there's none of that\n\t// then it's not crucial that we snapshot, since there's not much going\n\t// on Raft-wise.\n\tif snapReq.index < committedIndex {\n\t\treturn \"\", fmt.Errorf(\"cannot take snapshot now, wait until the configuration entry at %v has been applied (have applied %v)\",\n\t\t\tcommittedIndex, snapReq.index)\n\t}\n",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      },
+      {
+        "id": "raft_transfer_defererr_buffer",
+        "file": "raft.go",
+        "start_line": 596,
+        "end_line": 612,
+        "kind": "code_observation",
+        "text": "\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_leadership_transfer_drain",
+        "file": "raft.go",
+        "start_line": 991,
+        "end_line": 1030,
+        "kind": "code_observation",
+        "text": "func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {\n\t// make sure we are not already stopped\n\tselect {\n\tcase <-stopCh:\n\t\tdoneCh <- nil\n\t\treturn\n\tdefault:\n\t}\n\n\tfor atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex() {\n\t\terr := &deferError{}\n\t\terr.init()\n\t\trepl.triggerDeferErrorCh <- err\n\t\tselect {\n\t\tcase err := <-err.errCh:\n\t\t\tif err != nil {\n\t\t\t\tdoneCh <- err\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-stopCh:\n\t\t\tdoneCh <- nil\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.\n\n\t// Step 3: send TimeoutNow message to target server.\n\terr := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})\n\tif err != nil {\n\t\terr = fmt.Errorf(\"failed to make TimeoutNow RPC to %v: %v\", id, err)\n\t}\n\tdoneCh <- err",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_verifyleader_votes",
+        "file": "raft.go",
+        "start_line": 966,
+        "end_line": 995,
+        "kind": "code_observation",
+        "text": "func (r *Raft) verifyLeader(v *verifyFuture) {\n\t// Current leader always votes for self\n\tv.votes = 1\n\n\t// Set the quorum size, hot-path for single node\n\tv.quorumSize = r.quorumSize()\n\tif v.quorumSize == 1 {\n\t\tv.respond(nil)\n\t\treturn\n\t}\n\n\t// Track this request\n\tv.notifyCh = r.verifyCh\n\tr.leaderState.notify[v] = struct{}{}\n\n\t// Trigger immediate heartbeats\n\tfor _, repl := range r.leaderState.replState {\n\t\trepl.notifyLock.Lock()\n\t\trepl.notify[v] = struct{}{}\n\t\trepl.notifyLock.Unlock()\n\t\tasyncNotifyCh(repl.notifyCh)\n\t}\n}\n\n// leadershipTransfer is doing the heavy lifting for the leadership transfer.\nfunc (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {\n\t// make sure we are not already stopped\n\tselect {\n\tcase <-stopCh:\n\t\tdoneCh <- nil",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_quorumsize_voters",
+        "file": "raft.go",
+        "start_line": 1087,
+        "end_line": 1098,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}\n\n// restoreUserSnapshot is used to manually consume an external snapshot, such\n// as if restoring from a backup. We will use the current Raft configuration,",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "replication_notifyall",
+        "file": "replication.go",
+        "start_line": 100,
+        "end_line": 112,
+        "kind": "code_observation",
+        "text": "func (s *followerReplication) notifyAll(leader bool) {\n\t// Clear the waiting notifies minimizing lock time\n\ts.notifyLock.Lock()\n\tn := s.notify\n\ts.notify = make(map[*verifyFuture]struct{})\n\ts.notifyLock.Unlock()\n\n\t// Submit our votes\n\tfor v := range n {\n\t\tv.vote(leader)\n\t}\n}\n",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "9af1f08cbbbb45298f90a629cefc3686",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@verifyleader_nonvoter_acks": "9af1f08cbbbb45298f90a629cefc3686-question-2"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_transfer_defererr_buffer"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_leadership_transfer_drain"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_verifyleader_votes"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_quorumsize_voters"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "replication_notifyall"
+        },
+        {
+          "object": "investigations",
+          "action": "update",
+          "target": "0d83a8cdded948c3b78d936f719d97d7-question-1",
+          "changed_fields": [
+            "disposition",
+            "resume_conditions"
+          ]
+        },
+        {
+          "object": "investigations",
+          "action": "update",
+          "target": "9a28fea90bc64596b790f2372fc4c716-question-0",
+          "changed_fields": [
+            "disposition"
+          ]
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@verifyleader_nonvoter_acks"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "9a28fea90bc64596b790f2372fc4c716-question-0"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[1]",
+          "investigation_id": "0d83a8cdded948c3b78d936f719d97d7-question-1"
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-c4168d1deb72421a8935ea2ddc7d9b7c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-c4168d1deb72421a8935ea2ddc7d9b7c.json"
+      },
+      "submission-28496be07c87443ea089331e8a4dbc77": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-28496be07c87443ea089331e8a4dbc77.json"
+      },
+      "submission-0d83a8cdded948c3b78d936f719d97d7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-0d83a8cdded948c3b78d936f719d97d7.json"
+      },
+      "submission-800d3e6aea8d4c239eecd81727ca53f1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-800d3e6aea8d4c239eecd81727ca53f1.json"
+      },
+      "submission-91debf466df04e14a60f2bc847535594": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-91debf466df04e14a60f2bc847535594.json"
+      },
+      "submission-9a28fea90bc64596b790f2372fc4c716": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-9a28fea90bc64596b790f2372fc4c716.json"
+      },
+      "submission-9af1f08cbbbb45298f90a629cefc3686": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_14-15-46-hashicorp_raft-real-run/semantic-commits/submission-9af1f08cbbbb45298f90a629cefc3686.json"
+      }
+    }
+  }
+}

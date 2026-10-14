@@ -1,0 +1,124 @@
+{
+  "id": "b10fd79890d24698b7a94433b7c4c89f-experiment",
+  "investigation_id": "92e710d02abc4842a2f6c79e3aae70e4-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright (c) 2026. Assurance harness artifact (draft, not part of the target source).\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nfunc caEmit(t *testing.T, payload interface{}) {\n\tt.Helper()\n\tblob, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\nfunc caVerify(leader *Raft, wait time.Duration) (verified bool, errText string, votes, quorum int, returned bool) {\n\tdone := make(chan struct{})\n\tvf := &verifyFuture{}\n\tvf.init()\n\tgo func() {\n\t\tdefer close(done)\n\t\tleader.verifyCh <- vf\n\t}()\n\t<-done\n\tquorum = leader.quorumSize()\n\twaitCh := make(chan error, 1)\n\tgo func() { waitCh <- vf.Error() }()\n\tselect {\n\tcase err := <-waitCh:\n\t\tif err != nil {\n\t\t\treturn false, err.Error(), vf.votes, quorum, true\n\t\t}\n\t\treturn true, \"\", vf.votes, quorum, true\n\tcase <-time.After(wait):\n\t\treturn false, \"verification did not resolve\", vf.votes, quorum, false\n\t}\n}\n\n// caManualCluster builds a cluster whose nodes may carry different timer\n// settings, which MakeCluster does not allow. Every node is bootstrapped with\n// the same configuration, as the target's own multi-node tests do.\nfunc caManualCluster(t *testing.T, confs []*Config) ([]*Raft, []*InmemTransport, []ServerAddress, Configuration) {\n\tt.Helper()\n\tn := len(confs)\n\tvar trans []*InmemTransport\n\tvar addrs []ServerAddress\n\tvar configuration Configuration\n\tfor i := 0; i < n; i++ {\n\t\taddr, tr := NewInmemTransport(\"\")\n\t\taddrs = append(addrs, addr)\n\t\ttrans = append(trans, tr)\n\t\tconfiguration.Servers = append(configuration.Servers, Server{\n\t\t\tSuffrage: Voter,\n\t\t\tID:       ServerID(fmt.Sprintf(\"node-%d-%s\", i, addr)),\n\t\t\tAddress:  addr,\n\t\t})\n\t}\n\tfor i := 0; i < n; i++ {\n\t\tfor j := 0; j < n; j++ {\n\t\t\tif i != j {\n\t\t\t\ttrans[i].Connect(addrs[j], trans[j])\n\t\t\t}\n\t\t}\n\t}\n\n\tvar rafts []*Raft\n\tfor i := 0; i < n; i++ {\n\t\tconf := confs[i]\n\t\tconf.LocalID = configuration.Servers[i].ID\n\t\tconf.Logger = hclog.NewNullLogger()\n\t\tstore := NewInmemStore()\n\t\tsnap := NewInmemSnapshotStore()\n\t\tif err := BootstrapCluster(conf, store, store, snap, trans[i], configuration); err != nil {\n\t\t\tt.Fatalf(\"bootstrap node %d: %v\", i, err)\n\t\t}\n\t\tr, err := NewRaft(conf, &MockFSM{}, store, store, snap, trans[i])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"NewRaft node %d: %v\", i, err)\n\t\t}\n\t\trafts = append(rafts, r)\n\t}\n\treturn rafts, trans, addrs, configuration\n}\n\n// TestAssurance_VerifyLeaderMixedTimers tests whether the separation between a\n// cut-off leader's confirmation window and a competing leader survives when the\n// cluster's nodes do not share timer settings.\n//\n// ValidateConfig enforces LeaderLeaseTimeout <= HeartbeatTimeout <=\n// ElectionTimeout per node, not across the cluster, so a member may be\n// configured to campaign sooner than the leader's lease expires. In the mixed\n// case the leader carries the slow settings and the two other voters the fast\n// ones; the uniform case keeps every node on the leader's settings. The leader\n// is always the slow node, forced by a normal leadership transfer, and a\n// nonvoter stays with it so that its verifications have an acknowledgement to\n// count.\nfunc TestAssurance_VerifyLeaderMixedTimers(t *testing.T) {\n\tcaRunMixedTimerTrial(t, 0, true)\n\tcaRunMixedTimerTrial(t, 1, false)\n}\n\nfunc caRunMixedTimerTrial(t *testing.T, trial int, mixed bool) {\n\tt.Helper()\n\n\tslow := DefaultConfig()\n\tslow.HeartbeatTimeout = 50 * time.Millisecond\n\tslow.ElectionTimeout = 50 * time.Millisecond\n\tslow.LeaderLeaseTimeout = 50 * time.Millisecond\n\tslow.CommitTimeout = 5 * time.Millisecond\n\n\tfast := DefaultConfig()\n\tfast.HeartbeatTimeout = 10 * time.Millisecond\n\tfast.ElectionTimeout = 20 * time.Millisecond\n\tfast.LeaderLeaseTimeout = 5 * time.Millisecond\n\tfast.CommitTimeout = 5 * time.Millisecond\n\n\tconfs := []*Config{slow, slow, slow, slow}\n\tif mixed {\n\t\tconfs = []*Config{slow, fast, fast, fast}\n\t}\n\n\trafts, trans, addrs, configuration := caManualCluster(t, confs)\n\tdefer func() {\n\t\tfor _, r := range rafts {\n\t\t\t_ = r.Shutdown().Error()\n\t\t}\n\t}()\n\n\t// Wait for any leader, then force leadership onto the slow node 0.\n\tvar leader *Raft\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range rafts {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tleader = r\n\t\t\t}\n\t\t}\n\t\tif leader != nil {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tif leader == nil {\n\t\tt.Fatalf(\"trial %d: no leader elected\", trial)\n\t}\n\tif leader != rafts[0] {\n\t\tif err := leader.LeadershipTransferToServer(rafts[0].localID, rafts[0].localAddr).Error(); err != nil {\n\t\t\tt.Fatalf(\"trial %d: transfer to slow node: %v\", trial, err)\n\t\t}\n\t\tdeadline = time.Now().Add(5 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tif rafts[0].getState() == Leader {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(5 * time.Millisecond)\n\t\t}\n\t}\n\tleader = rafts[0]\n\tif leader.getState() != Leader {\n\t\tt.Fatalf(\"trial %d: slow node is %s, not leader\", trial, leader.getState())\n\t}\n\n\t// Node 3 becomes a nonvoter so the cut-off leader has a peer to count.\n\tnonvoter := rafts[3]\n\tif err := leader.DemoteVoter(nonvoter.localID, 0, 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: demote: %v\", trial, err)\n\t}\n\ttime.Sleep(100 * time.Millisecond)\n\n\tbaseVerified, baseErr, baseVotes, baseQuorum, baseReturned := caVerify(leader, 2*time.Second)\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                             \"verify_baseline\",\n\t\t\"trial\":                             trial,\n\t\t\"mixed_timers\":                      mixed,\n\t\t\"leader_lease_ms\":                   leader.config().LeaderLeaseTimeout.Milliseconds(),\n\t\t\"leader_election_ms\":                leader.config().ElectionTimeout.Milliseconds(),\n\t\t\"voter_election_ms\":                 rafts[1].config().ElectionTimeout.Milliseconds(),\n\t\t\"voter_election_shorter_than_lease\": rafts[1].config().ElectionTimeout < leader.config().LeaderLeaseTimeout,\n\t\t\"verified\":                          baseVerified,\n\t\t\"error\":                             baseErr,\n\t\t\"votes\":                             baseVotes,\n\t\t\"quorum_size\":                       baseQuorum,\n\t\t\"returned\":                          baseReturned,\n\t})\n\n\tif err := leader.Apply([]byte(\"pre-partition\"), 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: apply: %v\", trial, err)\n\t}\n\n\t// Isolate the leader and the nonvoter from the two remaining voters in both\n\t// directions.\n\tisolate := [][2]int{{0, 1}, {0, 2}, {3, 1}, {3, 2}, {1, 0}, {2, 0}, {1, 3}, {2, 3}}\n\tfor _, pair := range isolate {\n\t\ttrans[pair[0]].Disconnect(addrs[pair[1]])\n\t}\n\tpartitionedAt := time.Now()\n\n\tvar polls, confirmed, confirmedAfterLeader int\n\tvar lastConfirmedMs int64 = -1\n\tvar firstPeerLeaderMs int64 = -1\n\tvar leaderSteppedDown bool\n\tfor i := 0; i < 400; i++ {\n\t\tif leader.getState() != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\t\tpeerLeader := rafts[1].getState() == Leader || rafts[2].getState() == Leader\n\t\telapsed := time.Since(partitionedAt).Milliseconds()\n\t\tif peerLeader && firstPeerLeaderMs < 0 {\n\t\t\tfirstPeerLeaderMs = elapsed\n\t\t}\n\t\tverified, _, _, _, returned := caVerify(leader, 500*time.Millisecond)\n\t\telapsed = time.Since(partitionedAt).Milliseconds()\n\t\tpolls++\n\t\tif returned && verified {\n\t\t\tconfirmed++\n\t\t\tlastConfirmedMs = elapsed\n\t\t\tif peerLeader {\n\t\t\t\tconfirmedAfterLeader++\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(2 * time.Millisecond)\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                             \"verify_exposure\",\n\t\t\"trial\":                             trial,\n\t\t\"mixed_timers\":                      mixed,\n\t\t\"leader_lease_ms\":                   leader.config().LeaderLeaseTimeout.Milliseconds(),\n\t\t\"voter_election_ms\":                 rafts[1].config().ElectionTimeout.Milliseconds(),\n\t\t\"voter_election_shorter_than_lease\": rafts[1].config().ElectionTimeout < leader.config().LeaderLeaseTimeout,\n\t\t\"polls\":                             polls,\n\t\t\"confirmations\":                     confirmed,\n\t\t\"last_confirmation_ms\":              lastConfirmedMs,\n\t\t\"first_peer_leader_ms\":              firstPeerLeaderMs,\n\t\t\"confirmations_after_peer_leader\":   confirmedAfterLeader,\n\t\t\"confirmation_after_peer_leader\":    confirmedAfterLeader > 0,\n\t\t\"leader_stepped_down\":               leaderSteppedDown,\n\t\t\"leader_term\":                       leader.getCurrentTerm(),\n\t\t\"peer_term\":                         rafts[1].getCurrentTerm(),\n\t\t\"leader_applied_index\":              leader.getLastApplied(),\n\t})\n\t_ = configuration\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "pre",
+          "event": "verify_baseline",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "raft_verifyleader_votes",
+      "raft_quorumsize_voters",
+      "replication_notifyall",
+      "config_validate_timer_relations",
+      "raft_follower_election_trigger",
+      "raft_lease_check_counts_voters"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two trials on hand-built four-node clusters in one process, because the cluster helper cannot give nodes different settings. In the mixed trial the leader-to-be carries the slow settings (50ms heartbeat, election and lease) while the other three nodes carry fast ones (10ms heartbeat, 20ms election, 5ms lease); in the control every node carries the slow settings. In both trials the slow node is made leader through a normal leadership transfer, one node is demoted to nonvoter with DemoteVoter so the cut-off leader has a peer whose acknowledgement can be counted, the leader and the nonvoter are then isolated from the two remaining voters in both directions, and the leader is verified repeatedly while the harness watches for a competing leader among those voters.",
+      "assumptions": [
+        "Per-node configurations are legal: ValidateConfig is applied per node, and nothing in the captured snapshot requires the cluster to share timer values. The mixed trial therefore represents a cluster whose nodes drifted apart or were rolled out with different settings, not a configuration the library rejects.",
+        "Each node is bootstrapped with the same configuration, which is how the target's own multi-node tests create clusters.",
+        "The leader is forced onto the slow node by a normal LeadershipTransferToServer so that the lease under test belongs to the leader rather than to a node that happened to win the first election.",
+        "Verification is driven through the same channel the exported API uses, and a competing leader is detected by reading the two isolated nodes' states.",
+        "The dry run is native feedback only; the retained execution is what will be interpreted."
+      ],
+      "excluded": [
+        "No application read is served, so the overlap is a fact about the confirmation and a competing leader's existence, not about a value returned to a client.",
+        "No on-disk store, no network transport and no multi-process execution.",
+        "The probe does not search over timer combinations; it contrasts the two configurations named above."
+      ],
+      "parameters": {
+        "trials": "trial 0 mixed timers (leader 50ms lease, voters 20ms election), trial 1 uniform timers (all nodes 50ms)",
+        "poll_interval_ms": 2,
+        "recorded_operands": "leader_lease_ms, voter_election_ms, voter_election_shorter_than_lease, polls, confirmations, last_confirmation_ms, first_peer_leader_ms, confirmations_after_peer_leader, confirmation_after_peer_leader, leader_stepped_down, leader_term, peer_term, leader_applied_index"
+      }
+    },
+    "prefix": "Each trial builds four nodes by hand: an in-memory transport per node, all pairs connected, one in-memory store serving as both log and stable store per node, an in-memory snapshot store and a MockFSM, each node bootstrapped with the same configuration and then started with its own Config. The harness waits for any leader, transfers leadership to the slow node through the exported API and waits until that node reports Leader, demotes the fourth node to nonvoter with DemoteVoter and waits for the change to settle, records a healthy baseline verification, applies one command, and then disconnects the leader and the nonvoter from the two remaining voters in both directions using the transports' Disconnect. From that moment it polls the verification path every 2ms while the leader still reports Leader, recording each outcome, while separately reading whether either isolated node reports Leader; it stops when the leader is no longer Leader and emits one summary event carrying the counts, the last confirmation's elapsed time, the first competing leader's elapsed time, how many confirmations followed a competing leader, the terms of the leader and of an isolated node, and the configured lease and election values that classify the trial. Only the TestAssurance-prefixed test in this harness is selected and no production file is modified.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "verify_exposure",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "confirmation_after_peer_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "voter_election_shorter_than_lease",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "When a voter can campaign before the leader's lease expires, the cut-off leader still obtains confirmations after a competing leader exists."
+      },
+      {
+        "event": "verify_exposure",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "confirmation_after_peer_leader",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "voter_election_shorter_than_lease",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: with every node on the same settings no competing leader exists while the cut-off leader still confirms."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a9b23cffeb2849bb8cf827344104972c",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "b10fd79890d24698b7a94433b7c4c89f",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

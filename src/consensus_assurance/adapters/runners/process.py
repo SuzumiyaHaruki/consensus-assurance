@@ -48,12 +48,12 @@ class ProcessRunner:
             stdin += '\n\nCurrent turn time allocation (controller record):\n'+json.dumps({
                 'action_id':run.pending_action_id, 'check_id':run.id,
                 'check_record':str(logs/'check.json'), 'generated_at':run.started_at,
-                'timeout_seconds':timeout, 'timeout_limit':limit,
+                'timeout_seconds':timeout,
+                **({'run_remaining_seconds':remaining} if self.deadline is not None else {}),
                 'estimated_deadline_utc':(datetime.fromisoformat(run.started_at)+timedelta(seconds=timeout)).isoformat(),
-                'meaning':'timeout_seconds is the interval allocated at generated_at, not a live countdown. '
-                    'timeout_limit names the limiting budget, not exhaustion; a positive total_seconds allocation '
-                    'still permits useful research within that interval. Expiry needs no closing submission. '
-                    'CheckRun start is not exact process spawn; UTC deadline is estimated and enforced with a monotonic clock. '
+                'meaning':'timeout_seconds is the granted turn interval; run_remaining_seconds, when present, '
+                    'is the remaining run time sampled at generated_at. These are not live countdowns. '
+                    'The turn deadline is estimated; enforcement uses a monotonic clock. '
                     'research.json capacity and preflight elapsed_seconds are saved run checkpoints, not live timers.'})
         process = None
         try:

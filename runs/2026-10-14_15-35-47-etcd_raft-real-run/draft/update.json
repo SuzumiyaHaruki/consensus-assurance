@@ -1,0 +1,490 @@
+{
+  "rationale": "Decision formation for linearizable reads: stepLeader answers a local MsgReadIndex request directly from r.raftLog.committed whenever trk.IsSingleton() holds, skipping the in-term-commit guard and the whole ReadOnlySafe quorum exchange. IsSingleton only asserts that the incoming voter set has exactly one member and that the outgoing set is empty; it does not assert that the local node is that member. The same file keeps a removed leader in StateLeader by default (Config.StepDownOnRemoval is false and switchToConfig only steps down when it is set), so a leader whose own removal leaves a singleton configuration that excludes it can be asked for a linearizable read. Two paired scenarios in one harness separate this cause from its environment: the same removals leaving the singleton {2} (node 1 removed, not a member) versus leaving the non-singleton {2,4}. The discriminator is whether the read is answered locally with no message emitted and with an index below an already committed write (defect), or is left unconfirmed awaiting quorum acknowledgements (no defect).",
+  "sources": [
+    {
+      "id": "src_readindex_case",
+      "file": "raft.go",
+      "start_line": 1353,
+      "end_line": 1371,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_is_singleton",
+      "file": "tracker/tracker.go",
+      "start_line": 158,
+      "end_line": 161,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_removal_no_stepdown",
+      "file": "raft.go",
+      "start_line": 1993,
+      "end_line": 2005,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_stepdown_option",
+      "file": "raft.go",
+      "start_line": 282,
+      "end_line": 287,
+      "kind": "document_statement"
+    },
+    {
+      "id": "src_readonly_safe_guarantee",
+      "file": "raft.go",
+      "start_line": 60,
+      "end_line": 67,
+      "kind": "document_statement"
+    },
+    {
+      "id": "src_safe_readindex_flow",
+      "file": "raft.go",
+      "start_line": 2146,
+      "end_line": 2161,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_local_readindex_reply",
+      "file": "raft.go",
+      "start_line": 2073,
+      "end_line": 2087,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_node_readindex_contract",
+      "file": "node.go",
+      "start_line": 218,
+      "end_line": 224,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "src_ready_readstates_contract",
+      "file": "node.go",
+      "start_line": 68,
+      "end_line": 72,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "src_rawnode_readindex",
+      "file": "rawnode.go",
+      "start_line": 555,
+      "end_line": 557,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_readindex_singleton_premise",
+      "question": "Does the singleton short-circuit in stepLeader's MsgReadIndex case establish its own premise (that the local node is the config's single voter), or can it answer a local linearizable read with a stale r.raftLog.committed after the local node stopped being a member of a configuration that became a singleton?",
+      "source_ids": [
+        "src_readindex_case",
+        "src_is_singleton",
+        "src_removal_no_stepdown",
+        "src_stepdown_option",
+        "src_readonly_safe_guarantee",
+        "src_safe_readindex_flow",
+        "src_local_readindex_reply",
+        "src_node_readindex_contract",
+        "src_ready_readstates_contract",
+        "src_rawnode_readindex"
+      ],
+      "hypothesis": "The branch conditions on trk.IsSingleton() alone and then delivers a local ReadState built from the local commit index, without any heartbeat/ack exchange and without the committedEntryInCurrentTerm guard. A leader removed from the group (default StepDownOnRemoval=false) that stays in StateLeader and whose remaining configuration collapses to a singleton not containing it therefore answers reads from its own stale commit index, defeating the ReadOnlySafe guarantee that reads are confirmed by communicating with the quorum.",
+      "discriminator": "Three-node cluster: elect 1, then remove 3 and remove 1 (both simple conf changes proposed by 1). With the default configuration 1 stays StateLeader while the config is the singleton {2} and 1 has no progress entry. Let 2 win an election for {2} and commit a write. A local ReadIndex at node 1 (no From field, the RawNode.ReadIndex shape) either returns ReadState{Index=r1.committed} with zero messages emitted while r2.committed is higher (defect), or leaves the request unconfirmed because the ReadOnlySafe acks never arrive (no defect). Control: the same removals in a four-node cluster leave {2,4}, still excluding node 1 but not a singleton.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_singleton_readindex_path",
+      "kind": "behavior",
+      "statement": "In StateLeader, a MsgReadIndex received while trk.IsSingleton() is true is answered locally: responseToReadIndexReq appends ReadState{Index: r.raftLog.committed, RequestCtx: entries[0].data} to r.readStates and returns a blank message, the handler returns before committedEntryInCurrentTerm() and before sendMsgReadIndexResponse, so no request is added to readOnly and no MsgHeartbeat is broadcast. IsSingleton is len(Voters[0]) == 1 && len(Voters[1]) == 0, which is a property of the configuration only; the branch is taken whether or not the local node is that single voter.",
+      "conditions": "Local raft instance is StateLeader; trk.Voters has exactly one member in the incoming set and an empty outgoing set; the request arrives as a local message (From unset, as produced by RawNode.ReadIndex/Node.ReadIndex, or From == r.id). ReadOnlyOption does not affect this path.",
+      "source_ids": [
+        "src_readindex_case",
+        "src_is_singleton",
+        "src_local_readindex_reply",
+        "src_rawnode_readindex"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q_readindex_singleton_premise",
+    "harness_path": "assurance_generated_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "src_readindex_case",
+      "src_is_singleton",
+      "src_removal_no_stepdown",
+      "src_stepdown_option",
+      "src_readonly_safe_guarantee",
+      "src_safe_readindex_flow",
+      "src_local_readindex_reply",
+      "src_node_readindex_contract",
+      "src_ready_readstates_contract",
+      "src_rawnode_readindex"
+    ],
+    "scope": {
+      "description": "Two paired scenarios in one execution. Scenario A: three nodes 1,2,3 with the captured package's default Config (ReadOnlySafe, CheckQuorum=false, PreVote=false, StepDownOnRemoval=false); elect 1, commit one write, remove 3, then remove 1 (simple conf changes proposed by the leader); node 2 then campaigns for the remaining singleton {2} and commits another write; node 1 receives a local read index request. Scenario B is the control: nodes 1,2,3,4, the same two removals leaving the non-singleton {2,4} which also excludes node 1, node 2 again campaigns (needing node 4) and commits, and node 1 again receives a local read index request.",
+      "assumptions": [
+        "Config.StepDownOnRemoval keeps its default value false, so switchToConfig leaves the removed leader in StateLeader.",
+        "Config.ReadOnlyOption keeps its default ReadOnlySafe; CheckQuorum and PreVote are false as in newTestConfig.",
+        "All instances run in one process and are driven by an application loop that persists unstable entries, releases the messages raft queued behind persistence (stepping self addressed ones back in), applies committed entries together with the configuration changes they carry, and then advances.",
+        "The link is lossless and delivers in order; scenario A therefore does not rely on any message drop, only on the fact that a lower-term MsgHeartbeat is ignored when CheckQuorum and PreVote are both false.",
+        "Configuration changes are committed under the configuration in force when they were proposed, and node 2 can only win {2} after node 1 has been removed from every node's configuration."
+      ],
+      "excluded": [
+        "Byzantine peers, storage faults, partial persistence and clock drift.",
+        "AsyncStorageWrites (the harness uses the synchronous Ready/Advance loop semantics).",
+        "Snapshots and compaction (no snapshot is taken in either scenario).",
+        "ReadOnlyLeaseBased."
+      ],
+      "parameters": {
+        "election_tick": 10,
+        "heartbeat_tick": 1,
+        "scenario_a_voters_after_removals": "2",
+        "scenario_b_voters_after_removals": "2 4"
+      }
+    },
+    "prefix": "For each scenario the harness builds every instance with NewMemoryStorage (dummy entry at index 0) whose snapshot ConfState.Voters is set to the initial voter set, and newRaft with ID, ElectionTick=10, HeartbeatTick=1, MaxSizePerMsg=noLimit, MaxInflightMsgs=256. Producers are then invoked in this order: MsgHup to the node that should campaign (the RawNode.Campaign equivalent), a MsgProp carrying one entry, then one MsgProp per configuration change built with confChangeToMsg over &pb.ConfChangeV2{Changes: ConfChangesFromString(\"r3\")} and {Changes: ConfChangesFromString(\"r1\")} (transition Auto, one change each, so the change is simple and takes effect when its entry is applied). Each delivered message is followed by one application iteration on the receiving node: resetEntries via ms.Append(raftLog.nextUnstableEnts()), raftLog.stableTo(lastEntryID), stepping of r.msgsAfterAppend (self addressed entries are stepped back into raft), application of raftLog.nextCommittedEnts(true) with applyConfChange for EntryConfChange/EntryConfChangeV2 entries, then r.appliedTo(lastIndex, entsSize(entries)). Node 2 campaigns only after both configuration changes have been applied by every node. The read request is injected exactly as RawNode.ReadIndex does it: Step(&pb.Message{Type: MsgReadIndex, Entries: []*pb.Entry{{Data: []byte(\"read-after-removal\")}}}) with no From field.",
+    "responsibility": "The raft library itself (stepLeader's MsgReadIndex case together with ProgressTracker.IsSingleton) decides whether a local read index request may be answered from the local commit index without a quorum exchange; the documented duty is Node.ReadIndex and Ready.ReadStates (linearizable reads issued before the request can be served safely once the application passed the returned index) together with the Config.ReadOnlyOption note that ReadOnlySafe guarantees linearizability by communicating with the quorum.",
+    "prerequisites": [
+      {
+        "alias": "p_leader_initial",
+        "event": "leader_before_conf_change",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "singleton_config_excluding_leader"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "StateLeader"
+          },
+          {
+            "field": "own_progress",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "read_only_safe",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "alias": "p_removal_singleton",
+        "event": "leader_after_own_removal",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "singleton_config_excluding_leader"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "StateLeader"
+          },
+          {
+            "field": "own_progress",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "is_singleton",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "step_down_on_removal",
+            "op": "eq",
+            "value": false
+          }
+        ]
+      },
+      {
+        "alias": "p_write_singleton",
+        "event": "node_committed_write",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "singleton_config_excluding_leader"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 2
+          },
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "StateLeader"
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "value": 2
+          },
+          {
+            "field": "node1_last_index",
+            "op": "eq",
+            "value": 4
+          },
+          {
+            "field": "write_index",
+            "op": "eq",
+            "value": 6
+          }
+        ]
+      },
+      {
+        "alias": "p_removal_multi",
+        "event": "leader_after_own_removal",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "multi_voter_config_excluding_leader"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "StateLeader"
+          },
+          {
+            "field": "own_progress",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "is_singleton",
+            "op": "eq",
+            "value": false
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "leader_after_own_removal",
+        "identity_fields": [
+          "case",
+          "node"
+        ],
+        "admission_alias": "p_leader_initial",
+        "assertion": {
+          "field": "last_index",
+          "op": "eq",
+          "value": 4
+        },
+        "description": "Scenario A: after the leader itself is removed, node 1 is still StateLeader of the singleton {2} with no progress entry of its own (own_progress=false), and its log ends at the removed-leader conf change."
+      },
+      {
+        "event": "node_committed_write",
+        "identity_fields": [
+          "case",
+          "node"
+        ],
+        "admission_alias": "p_removal_singleton",
+        "assertion": {
+          "field": "write_index",
+          "op": "eq",
+          "value": 6
+        },
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 2
+          },
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "StateLeader"
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "value": 2
+          }
+        ],
+        "description": "Necessary history for the read comparison: node 2 has become leader at term 2 for {2} and committed a write at a higher index than node 1's log (node1_last_index=4), so the write is complete before node 1 is asked to read."
+      },
+      {
+        "event": "read_index_request",
+        "identity_fields": [
+          "case",
+          "node",
+          "request_ctx"
+        ],
+        "admission_alias": "p_removal_singleton",
+        "assertion": {
+          "field": "read_answered",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "write_index",
+            "op": "eq",
+            "reference": "p_write_singleton.write_index"
+          }
+        ],
+        "description": "Scenario A: node 1 answers the local read index request even though it is not a member of the configuration it holds."
+      },
+      {
+        "event": "read_index_request",
+        "identity_fields": [
+          "case",
+          "node",
+          "request_ctx"
+        ],
+        "admission_alias": "p_removal_singleton",
+        "assertion": {
+          "field": "messages_sent",
+          "op": "eq",
+          "value": 0
+        },
+        "applicability_conditions": [
+          {
+            "field": "write_index",
+            "op": "eq",
+            "reference": "p_write_singleton.write_index"
+          }
+        ],
+        "description": "Scenario A: the answer is produced without sending any message, so no quorum acknowledgement was obtained (the protection that ReadOnlySafe is documented to provide)."
+      },
+      {
+        "event": "read_index_request",
+        "identity_fields": [
+          "case",
+          "node",
+          "request_ctx"
+        ],
+        "admission_alias": "p_removal_singleton",
+        "assertion": {
+          "field": "read_index_behind_committed_write",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "read_index",
+            "op": "eq",
+            "value": 4
+          },
+          {
+            "field": "write_index",
+            "op": "eq",
+            "value": 6
+          },
+          {
+            "field": "write_index",
+            "op": "eq",
+            "reference": "p_write_singleton.write_index"
+          }
+        ],
+        "description": "Scenario A: the delivered read index (4) is below the index of the write (6) that node 2 had already committed, so serving the read at the returned index cannot observe it; both operands are in this event."
+      },
+      {
+        "event": "read_index_after_heartbeat_tick",
+        "identity_fields": [
+          "case",
+          "node",
+          "request_ctx"
+        ],
+        "admission_alias": "p_removal_singleton",
+        "assertion": {
+          "field": "same_stale_index",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "write_index",
+            "op": "eq",
+            "reference": "p_write_singleton.write_index"
+          }
+        ],
+        "description": "Scenario A: after a heartbeat tick whose heartbeat reaches node 2 (now at a higher term), a repeated read still returns the same stale index with node 1 still StateLeader, so the condition is not repaired in this run."
+      },
+      {
+        "event": "read_index_request",
+        "identity_fields": [
+          "case",
+          "node",
+          "request_ctx"
+        ],
+        "admission_alias": "p_removal_multi",
+        "assertion": {
+          "field": "read_answered",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Control B: with the same removal of the leader but a non-singleton configuration {2,4}, node 1 does not answer the read, because the request goes through readOnly and waits for acknowledgements that never arrive."
+      },
+      {
+        "event": "read_index_request",
+        "identity_fields": [
+          "case",
+          "node",
+          "request_ctx"
+        ],
+        "admission_alias": "p_removal_multi",
+        "assertion": {
+          "field": "pending_reads",
+          "op": "eq",
+          "value": 1
+        },
+        "description": "Control B: the request is retained as an unconfirmed read (pending_reads=1) and two heartbeat messages are sent, in contrast to the zero-message answer in scenario A."
+      }
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "@q_readindex_singleton_premise",
+      "source_ids": [
+        "src_readindex_case",
+        "src_is_singleton",
+        "src_removal_no_stepdown",
+        "src_stepdown_option",
+        "src_readonly_safe_guarantee",
+        "src_safe_readindex_flow",
+        "src_local_readindex_reply",
+        "src_node_readindex_contract"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Source account: stepLeader's MsgReadIndex case returns before committedEntryInCurrentTerm and before sendMsgReadIndexResponse whenever trk.IsSingleton() holds, and responseToReadIndexReq turns a local request into ReadState{Index: r.raftLog.committed} without emitting anything. IsSingleton checks only the shape of the configuration, while switchToConfig keeps a removed leader in StateLeader unless Config.StepDownOnRemoval is set (default false). Combining the two means the local node can answer a linearizable read from its own commit index while the configuration it holds is a singleton whose voter is a different node and while that other node is already committing new entries - so the ReadState handed to the application is stale and no quorum acknowledgement was obtained, contradicting the documented ReadOnlySafe guarantee and the ReadIndex contract. The paired scenarios requested in this submission are the discriminator: A (singleton {2} excluding the removed leader) should answer with an index below the already committed write and zero messages sent, B (non-singleton {2,4} also excluding the removed leader) should leave the same request unconfirmed.",
+      "counterevidence": [
+        "Config.StepDownOnRemoval exists and, when enabled, switchToConfig makes the removed leader call becomeFollower, which removes the trigger: a follower drops MsgReadIndex when it has no leader. The claim therefore applies to the default configuration, not to configurations that set this option.",
+        "The Config comment states the step-down behaviour will become unconditional in the future and refers to an open upstream issue, so upstream treats removal-time behaviour as incomplete rather than as intended-by-design; this narrows the practical weight of the finding but does not remove the observable contract violation for a default-configured instance."
+      ],
+      "limitations": [
+        "The account currently rests on source reading; the retained execution of the paired harness is requested in this submission, and no execution receipt is cited yet.",
+        "The scenario needs the configuration to collapse to a singleton that excludes the removed leader; a configuration that still has two or more voters does not satisfy the branch condition.",
+        "Node 2's write is committed by a singleton quorum (its own log), which is legal under the configuration in force on node 2, but only reachable after every node has applied the removal of node 1.",
+        "The observation that the stale answer repeats after a heartbeat tick is scoped to CheckQuorum=false and PreVote=false (the defaults); with CheckQuorum enabled a lower-term MsgHeartbeat would be answered with the higher term and the removed leader would step down."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,118 @@
+{
+  "rationale": "The VerifyLeader finding stands on the mechanism, but its practical impact rests on an unmeasured timing relation that I recorded as a limitation: does a leader cut off from every other voter keep obtaining confirmations while a competing leader exists, or does its own lease close the window first? A local dry run of the probe submitted here suggests the latter, which would narrow the consequence rather than the mechanism, so the measurement is worth a retained execution before any account is corrected. The probe polls the exported verification path on the cut-off leader for as long as it is confirmable, then keeps watching until the detached voters elect their own leader, and reports both moments on one timeline with the competing leader's commit and the cut-off leader's applied index; the control repeats this with the nonvoter also cut off.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@verify_confirmation_window",
+      "question": "On a leader that has lost contact with every other voter but can still reach a nonvoter, for how long do verifications keep succeeding relative to the moment the detached voters elect their own leader and commit entries - does the confirmation window overlap a competing leader, or does the leader's own lease end it first?",
+      "source_ids": [
+        "raft_verifyleader_votes",
+        "raft_quorumsize_voters",
+        "replication_notifyall"
+      ],
+      "hypothesis": "Because checkLeaderLease counts only voters, the cut-off leader keeps confirming only until its lease check steps it down, which is one LeaderLeaseTimeout after its last successful contact with a voter; the detached voters' election starts from their own heartbeat timeouts. With the captured relations between those timers the confirmation window may close before a competing leader appears, in which case the defect is confined to the confirmation primitive - an unsound confirmation while no competing leader yet exists - rather than to an observed stale read.",
+      "discriminator": "Partition the leader together with the nonvoter on a real three-voter plus one-nonvoter cluster, poll the exported verification path while it is confirmable, record the last successful confirmation's elapsed time, then watch until the detached voters report a leader and record when that happens and whether it precedes or follows the last confirmation. Overlap (a competing leader before the last confirmation) would support a stale-read consequence; a clean separation would narrow it. The control, with the nonvoter cut off too, must produce no confirmations at all.",
+      "disposition": "active",
+      "parent_id": "9af1f08cbbbb45298f90a629cefc3686-question-2",
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@verify_confirmation_window",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "raft_verifyleader_votes",
+      "raft_quorumsize_voters",
+      "replication_notifyall"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two trials on real four-voter clusters with one voter demoted to nonvoter through DemoteVoter: the interrupted trial partitions the leader together with the nonvoter and the control partitions the leader alone. Each trial verifies the healthy leader, applies the partition, polls the exported verification path while the leader is still confirmable, keeps watching until the detached voters report their own leader, and reports the last confirmation's and the competing leader's elapsed times on the same clock together with the competing leader's commit index and the cut-off leader's applied index.",
+      "assumptions": [
+        "Captured in-memory timeouts are used, so the lease and election relations are the ones the target's own tests run with; the leader lease is shorter than the election timeout in this configuration, which is a property of the configuration and is reported through the timeline rather than assumed.",
+        "The verification is driven through the same channel the exported VerifyLeader API uses, with a bounded wait per poll; polls stop as soon as the leader is no longer confirmable.",
+        "The competing leader is identified by which raft instance reports Leader among the two voters that were detached from the interrupted leader, and the observation window for it is 3s, which is longer than this cluster's election time."
+      ],
+      "excluded": [
+        "No application-level read is served in this harness; the measurement is about the confirmation and the competing leader's existence, not about what an application would return.",
+        "No on-disk store, no network transport and no synthetic request injection."
+      ],
+      "parameters": {
+        "trials": "trial 0 leader partitioned with the nonvoter; trial 1 leader partitioned alone",
+        "poll_interval_ms": 5,
+        "recorded_operands": "polls, confirmations, confirmations_after_peer_leader, last_confirmation_ms, first_peer_leader_ms, confirmation_precedes_peer_leader, leader_stepped_down, leader_term, nonvoter_term, leader_applied_index, peer_write_index, peer_commit_index"
+      }
+    },
+    "prefix": "Each trial builds a real four-voter cluster with the captured in-memory timeouts, demotes one follower to nonvoter with DemoteVoter and waits until the configuration shows it without a vote, verifies the healthy leader once, applies one command, and then applies the partition (leader with the nonvoter, or leader alone for the control). It polls the verification path every 5ms while the leader reports Leader, recording each outcome, and stops when the leader is no longer confirmable or steps down. It then keeps watching for up to 3s until one of the two detached voters reports Leader, recording when that happened on the same clock, has it commit one entry, and finally emits one summary event carrying the poll counts, the last confirmation's elapsed time, the competing leader's elapsed time, whether the confirmation preceded that leader, and the competing leader's commit index against the cut-off leader's applied index. Only the TestAssurance-prefixed test in this harness is selected and no production file is modified.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "pre",
+        "event": "verify_baseline",
+        "conditions": []
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "verify_exposure",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "confirmation_precedes_peer_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable_only",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "With the captured timers, the last successful confirmation on the cut-off leader comes before the detached voters' leader appears, so the confirmation window does not overlap a competing leader in this configuration."
+      },
+      {
+        "event": "verify_exposure",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "confirmations",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable_only",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: with the nonvoter also cut off the leader obtains no confirmation at all before stepping down."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

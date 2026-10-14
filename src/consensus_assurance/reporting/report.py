@@ -111,12 +111,22 @@ def render_report(state, root):
                 rows.append(comparison_summary(result))
                 current = next((i for i in opinions if i.id == result['interpretation_id']), None)
                 if current:
-                    rows.append(f'Attributed interpretation for this execution: `{current.id}` ({current.conclusion}; {"current question interpretation" if current.id == latest[q.id].id else "historical interpretation; the question has a later account"}).')
+                    rows.append(f'Directly attributed interpretation for this execution: `{current.id}` ({current.conclusion}; {"current question interpretation" if current.id == latest[q.id].id else "historical interpretation; the question has a later account"}).')
                     if current.conclusion in {'holds','violated'}:
                         if result['outcome'] == 'unknown':
                             rows.append(f'Model interpretation: `{current.conclusion}`; the mechanical comparison is undetermined, not an opposing conclusion.')
                         elif current.conclusion != result['outcome']:
                             rows.append(f'Interpretation differs from the mechanical result: model `{current.conclusion}`, mechanical `{result["outcome"]}`.')
+                citations = result['interpretation_citations']
+                other_current = [i for i in citations['current'] if i['id'] != result['interpretation_id']]
+                if other_current:
+                    rows.append('Other current question interpretations explicitly citing this receipt: ' + '; '.join(
+                        f"[{i['id']}]({citations['path']}) (question `{i['investigation_id']}`, "
+                        f"fixed-experiment attribution: {i['experiment_id'] or 'none'}; event indices {i['event_indices']})"
+                        for i in other_current) + '.')
+                if citations['historical_count']:
+                    rows.append(f"Historical interpretations explicitly citing this receipt: {citations['historical_count']} "
+                                f"([full records]({citations['path']})); these are not current question accounts.")
                 if result['blockers']:
                     rows.append('Evidence limitations: ' + '; '.join(result['blockers']))
                 for comparison in result['comparisons']:

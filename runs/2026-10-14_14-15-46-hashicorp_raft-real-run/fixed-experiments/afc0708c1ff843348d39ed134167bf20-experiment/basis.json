@@ -1,0 +1,289 @@
+{
+  "id": "afc0708c1ff843348d39ed134167bf20-experiment",
+  "investigation_id": "92e710d02abc4842a2f6c79e3aae70e4-question-0",
+  "version": 2,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright (c) 2026. Assurance harness artifact (draft, not part of the target source).\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nfunc caEmit(t *testing.T, payload interface{}) {\n\tt.Helper()\n\tblob, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// caVerify issues one verification through the same channel the exported\n// VerifyLeader API uses and reports whether it was confirmed, its error, and\n// the tally and quorum the future ended with.\nfunc caVerify(leader *Raft, wait time.Duration) (verified bool, errText string, votes, quorum int, returned bool) {\n\tdone := make(chan struct{})\n\tvf := &verifyFuture{}\n\tvf.init()\n\tgo func() {\n\t\tdefer close(done)\n\t\tleader.verifyCh <- vf\n\t}()\n\t<-done\n\tquorum = leader.quorumSize()\n\twaitCh := make(chan error, 1)\n\tgo func() { waitCh <- vf.Error() }()\n\tselect {\n\tcase err := <-waitCh:\n\t\treturn err == nil, caErrString(err), vf.votes, quorum, true\n\tcase <-time.After(wait):\n\t\treturn false, \"verification did not resolve\", vf.votes, quorum, false\n\t}\n}\n\nfunc caPeerLeader(c *cluster, leader, nonvoter *Raft) *Raft {\n\tfor _, r := range c.rafts {\n\t\tif r == leader || r == nonvoter {\n\t\t\tcontinue\n\t\t}\n\t\tif r.getState() == Leader {\n\t\t\treturn r\n\t\t}\n\t}\n\treturn nil\n}\n\n// TestAssurance_VerifyLeaderConfirmationWindow measures how long a leader that\n// has lost contact with every other voter but can still reach a nonvoter keeps\n// obtaining successful verifications, and whether those confirmations continue\n// after the voters it cannot reach have elected their own leader.\n//\n// The cluster is four voters with one demoted to nonvoter, so three voters and\n// a voter quorum of two. In the interrupted trial the leader is partitioned\n// together with the nonvoter; in the control the leader is partitioned alone.\n// After the partition the leader is verified repeatedly until it stops being\n// confirmed or the bounded loop ends, and each poll records whether a peer\n// leader existed at that moment.\nfunc TestAssurance_VerifyLeaderConfirmationWindow(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.NewNullLogger()\n\n\t// The partition lands at whatever phase the peers' randomized election\n\t// timers happen to be in, so the relation between the last confirmation and\n\t// the competing leader is measured over repeated trials rather than once.\n\tfor i := 0; i < 12; i++ {\n\t\tcaRunWindowTrial(t, conf, i, true)\n\t}\n\tfor i := 12; i < 14; i++ {\n\t\tcaRunWindowTrial(t, conf, i, false)\n\t}\n}\n\nfunc caRunWindowTrial(t *testing.T, conf *Config, trial int, withNonvoter bool) {\n\tt.Helper()\n\n\tc := MakeCluster(4, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfollowers := c.Followers()\n\tnonvoter := followers[0]\n\n\tif err := leader.DemoteVoter(nonvoter.localID, 0, 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: demote: %v\", trial, err)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif !hasVote(leader.GetConfiguration().Configuration(), nonvoter.localID) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif hasVote(leader.GetConfiguration().Configuration(), nonvoter.localID) {\n\t\tt.Fatalf(\"trial %d: nonvoter still has a vote\", trial)\n\t}\n\n\tbaseVerified, baseErr, baseVotes, baseQuorum, baseReturned := caVerify(leader, 2*time.Second)\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"verify_baseline\",\n\t\t\"trial\":                    trial,\n\t\t\"nonvoter_reachable_only\":  withNonvoter,\n\t\t\"verified\":                 baseVerified,\n\t\t\"error\":                    baseErr,\n\t\t\"votes\":                    baseVotes,\n\t\t\"quorum_size\":              baseQuorum,\n\t\t\"returned\":                 baseReturned,\n\t\t\"leader_term\":              leader.getCurrentTerm(),\n\t\t\"nonvoter_term\":            nonvoter.getCurrentTerm(),\n\t})\n\n\tif err := leader.Apply([]byte(\"pre-partition\"), 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: pre-partition apply: %v\", trial, err)\n\t}\n\n\tif withNonvoter {\n\t\tc.Partition([]ServerAddress{leader.localAddr, nonvoter.localAddr})\n\t} else {\n\t\tc.Partition([]ServerAddress{leader.localAddr})\n\t}\n\tpartitionedAt := time.Now()\n\n\tvar polls, confirmed, confirmedAfterLeader int\n\tvar maxConfirmedAfterLeaderMs int64\n\tvar firstPeerLeaderMs int64 = -1\n\tvar lastConfirmedMs int64 = -1\n\tvar peerLeaderSeen, leaderSteppedDown bool\n\tvar peerWriteIndex, peerCommitIndex uint64\n\n\tfor i := 0; i < 500; i++ {\n\t\tstateBefore := leader.getState()\n\t\tpeerLeader := caPeerLeader(c, leader, nonvoter)\n\t\tif peerLeader != nil {\n\t\t\tif !peerLeaderSeen {\n\t\t\t\tfirstPeerLeaderMs = time.Since(partitionedAt).Milliseconds()\n\t\t\t}\n\t\t\tpeerLeaderSeen = true\n\t\t}\n\t\tif stateBefore != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\n\t\tverified, _, _, _, returned := caVerify(leader, 500*time.Millisecond)\n\t\telapsed := time.Since(partitionedAt).Milliseconds()\n\t\tpolls++\n\t\tif returned && verified {\n\t\t\tconfirmed++\n\t\t\tlastConfirmedMs = elapsed\n\t\t\tif peerLeaderSeen {\n\t\t\t\tconfirmedAfterLeader++\n\t\t\t\tif elapsed > maxConfirmedAfterLeaderMs {\n\t\t\t\t\tmaxConfirmedAfterLeaderMs = elapsed\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif leader.getState() != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\t\tif peerLeaderSeen && confirmedAfterLeader == 0 && elapsed > firstPeerLeaderMs+500 {\n\t\t\t// Enough time after the peer leader appeared with no confirmation.\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\t// Keep watching after the confirmed leader stopped being confirmable, so the\n\t// relation between the last confirmation and the appearance of a competing\n\t// leader is observed rather than left unmeasured.\n\twatchDeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(watchDeadline) {\n\t\tif peerLeader := caPeerLeader(c, leader, nonvoter); peerLeader != nil {\n\t\t\tif firstPeerLeaderMs < 0 {\n\t\t\t\tfirstPeerLeaderMs = time.Since(partitionedAt).Milliseconds()\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\t// What the detached majority did, for context on the timeline above.\n\tif peerLeader := caPeerLeader(c, leader, nonvoter); peerLeader != nil {\n\t\tfuture := peerLeader.Apply([]byte(\"committed-after-partition\"), 0)\n\t\tif err := future.Error(); err == nil {\n\t\t\tpeerWriteIndex = future.Index()\n\t\t}\n\t\tpeerCommitIndex = peerLeader.getCommitIndex()\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"verify_exposure\",\n\t\t\"trial\":                        trial,\n\t\t\"nonvoter_reachable_only\":      withNonvoter,\n\t\t\"polls\":                        polls,\n\t\t\"confirmations\":                confirmed,\n\t\t\"confirmations_after_peer_leader\": confirmedAfterLeader,\n\t\t\"max_confirmation_after_peer_leader_ms\": maxConfirmedAfterLeaderMs,\n\t\t\"first_peer_leader_ms\":         firstPeerLeaderMs,\n\t\t\"last_confirmation_ms\":         lastConfirmedMs,\n\t\t\"confirmation_precedes_peer_leader\": lastConfirmedMs >= 0 && (firstPeerLeaderMs < 0 || lastConfirmedMs < firstPeerLeaderMs),\n\t\t\"leader_stepped_down\":          leaderSteppedDown,\n\t\t\"leader_term\":                  leader.getCurrentTerm(),\n\t\t\"nonvoter_term\":                nonvoter.getCurrentTerm(),\n\t\t\"leader_applied_index\":         leader.getLastApplied(),\n\t\t\"peer_write_index\":             peerWriteIndex,\n\t\t\"peer_commit_index\":            peerCommitIndex,\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "pre",
+          "event": "verify_baseline",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "raft_verifyleader_votes",
+      "raft_quorumsize_voters",
+      "replication_notifyall"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Fourteen trials in total on real four-voter clusters with one voter demoted to nonvoter: twelve interrupted trials in which the leader is partitioned together with the nonvoter, and two controls in which the leader is partitioned alone. Each trial polls the exported verification path while the cut-off leader is confirmable, then watches until the detached voters report their own leader, and reports both moments on one clock with the competing leader's commit index and the cut-off leader's applied index.",
+      "assumptions": [
+        "Each trial starts from a stable cluster with an elected leader and freshly heartbeated followers, so the trial-to-trial variation comes from the randomized election timers and scheduling rather than from a disturbed cluster.",
+        "Captured in-memory timeouts are used; the enforced relation LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout is a property of the configuration and is reported through the timeline.",
+        "Verification is driven through the same channel the exported API uses and stops as soon as the leader is no longer confirmable."
+      ],
+      "excluded": [
+        "No partition during an already-running election attempt is exercised, so the adverse phase is not covered by this basis.",
+        "No application-level read, no on-disk store, no network transport and no synthetic request injection."
+      ],
+      "parameters": {
+        "trials": "12 interrupted (trial ids 0-11), 2 controls (trial ids 12-13)",
+        "poll_interval_ms": 5,
+        "recorded_operands": "polls, confirmations, confirmations_after_peer_leader, last_confirmation_ms, first_peer_leader_ms, confirmation_precedes_peer_leader, leader_stepped_down, leader_term, nonvoter_term, leader_applied_index, peer_write_index, peer_commit_index"
+      }
+    },
+    "prefix": "Unchanged from the predecessor harness apart from repetition: each trial builds a fresh real four-voter cluster, demotes one follower to nonvoter with DemoteVoter and waits for the configuration to show it without a vote, verifies the healthy leader once, applies one command, applies the partition, polls the verification path every 5ms while the leader reports Leader, stops when it is no longer confirmable or steps down, then watches for up to 3s until one of the two detached voters reports Leader, has it commit one entry, and emits one summary event per trial. Only the TestAssurance-prefixed test is selected and no production file is modified.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "verify_exposure",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "confirmation_precedes_peer_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable_only",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Across the interrupted trials the last successful confirmation precedes the detached voters' leader; a violation would be a witness that the confirmation window overlapped a competing leader."
+      },
+      {
+        "event": "verify_exposure",
+        "identity_fields": [
+          "trial"
+        ],
+        "admission_alias": "pre",
+        "assertion": {
+          "field": "confirmations",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable_only",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Both controls obtain no confirmation before stepping down."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a9b23cffeb2849bb8cf827344104972c",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "afc0708c1ff843348d39ed134167bf20",
+  "previous_id": "92e710d02abc4842a2f6c79e3aae70e4-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "// Copyright (c) 2026. Assurance harness artifact (draft, not part of the target source).\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nfunc caEmit(t *testing.T, payload interface{}) {\n\tt.Helper()\n\tblob, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// caVerify issues one verification through the same channel the exported\n// VerifyLeader API uses and reports whether it was confirmed, its error, and\n// the tally and quorum the future ended with.\nfunc caVerify(leader *Raft, wait time.Duration) (verified bool, errText string, votes, quorum int, returned bool) {\n\tdone := make(chan struct{})\n\tvf := &verifyFuture{}\n\tvf.init()\n\tgo func() {\n\t\tdefer close(done)\n\t\tleader.verifyCh <- vf\n\t}()\n\t<-done\n\tquorum = leader.quorumSize()\n\twaitCh := make(chan error, 1)\n\tgo func() { waitCh <- vf.Error() }()\n\tselect {\n\tcase err := <-waitCh:\n\t\treturn err == nil, caErrString(err), vf.votes, quorum, true\n\tcase <-time.After(wait):\n\t\treturn false, \"verification did not resolve\", vf.votes, quorum, false\n\t}\n}\n\nfunc caPeerLeader(c *cluster, leader, nonvoter *Raft) *Raft {\n\tfor _, r := range c.rafts {\n\t\tif r == leader || r == nonvoter {\n\t\t\tcontinue\n\t\t}\n\t\tif r.getState() == Leader {\n\t\t\treturn r\n\t\t}\n\t}\n\treturn nil\n}\n\n// TestAssurance_VerifyLeaderConfirmationWindow measures how long a leader that\n// has lost contact with every other voter but can still reach a nonvoter keeps\n// obtaining successful verifications, and whether those confirmations continue\n// after the voters it cannot reach have elected their own leader.\n//\n// The cluster is four voters with one demoted to nonvoter, so three voters and\n// a voter quorum of two. In the interrupted trial the leader is partitioned\n// together with the nonvoter; in the control the leader is partitioned alone.\n// After the partition the leader is verified repeatedly until it stops being\n// confirmed or the bounded loop ends, and each poll records whether a peer\n// leader existed at that moment.\nfunc TestAssurance_VerifyLeaderConfirmationWindow(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.NewNullLogger()\n\n\tcaRunWindowTrial(t, conf, 0, true)\n\tcaRunWindowTrial(t, conf, 1, false)\n}\n\nfunc caRunWindowTrial(t *testing.T, conf *Config, trial int, withNonvoter bool) {\n\tt.Helper()\n\n\tc := MakeCluster(4, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfollowers := c.Followers()\n\tnonvoter := followers[0]\n\n\tif err := leader.DemoteVoter(nonvoter.localID, 0, 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: demote: %v\", trial, err)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif !hasVote(leader.GetConfiguration().Configuration(), nonvoter.localID) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif hasVote(leader.GetConfiguration().Configuration(), nonvoter.localID) {\n\t\tt.Fatalf(\"trial %d: nonvoter still has a vote\", trial)\n\t}\n\n\tbaseVerified, baseErr, baseVotes, baseQuorum, baseReturned := caVerify(leader, 2*time.Second)\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"verify_baseline\",\n\t\t\"trial\":                    trial,\n\t\t\"nonvoter_reachable_only\":  withNonvoter,\n\t\t\"verified\":                 baseVerified,\n\t\t\"error\":                    baseErr,\n\t\t\"votes\":                    baseVotes,\n\t\t\"quorum_size\":              baseQuorum,\n\t\t\"returned\":                 baseReturned,\n\t\t\"leader_term\":              leader.getCurrentTerm(),\n\t\t\"nonvoter_term\":            nonvoter.getCurrentTerm(),\n\t})\n\n\tif err := leader.Apply([]byte(\"pre-partition\"), 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: pre-partition apply: %v\", trial, err)\n\t}\n\n\tif withNonvoter {\n\t\tc.Partition([]ServerAddress{leader.localAddr, nonvoter.localAddr})\n\t} else {\n\t\tc.Partition([]ServerAddress{leader.localAddr})\n\t}\n\tpartitionedAt := time.Now()\n\n\tvar polls, confirmed, confirmedAfterLeader int\n\tvar maxConfirmedAfterLeaderMs int64\n\tvar firstPeerLeaderMs int64 = -1\n\tvar lastConfirmedMs int64 = -1\n\tvar peerLeaderSeen, leaderSteppedDown bool\n\tvar peerWriteIndex, peerCommitIndex uint64\n\n\tfor i := 0; i < 500; i++ {\n\t\tstateBefore := leader.getState()\n\t\tpeerLeader := caPeerLeader(c, leader, nonvoter)\n\t\tif peerLeader != nil {\n\t\t\tif !peerLeaderSeen {\n\t\t\t\tfirstPeerLeaderMs = time.Since(partitionedAt).Milliseconds()\n\t\t\t}\n\t\t\tpeerLeaderSeen = true\n\t\t}\n\t\tif stateBefore != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\n\t\tverified, _, _, _, returned := caVerify(leader, 500*time.Millisecond)\n\t\telapsed := time.Since(partitionedAt).Milliseconds()\n\t\tpolls++\n\t\tif returned && verified {\n\t\t\tconfirmed++\n\t\t\tlastConfirmedMs = elapsed\n\t\t\tif peerLeaderSeen {\n\t\t\t\tconfirmedAfterLeader++\n\t\t\t\tif elapsed > maxConfirmedAfterLeaderMs {\n\t\t\t\t\tmaxConfirmedAfterLeaderMs = elapsed\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif leader.getState() != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\t\tif peerLeaderSeen && confirmedAfterLeader == 0 && elapsed > firstPeerLeaderMs+500 {\n\t\t\t// Enough time after the peer leader appeared with no confirmation.\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\t// Keep watching after the confirmed leader stopped being confirmable, so the\n\t// relation between the last confirmation and the appearance of a competing\n\t// leader is observed rather than left unmeasured.\n\twatchDeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(watchDeadline) {\n\t\tif peerLeader := caPeerLeader(c, leader, nonvoter); peerLeader != nil {\n\t\t\tif firstPeerLeaderMs < 0 {\n\t\t\t\tfirstPeerLeaderMs = time.Since(partitionedAt).Milliseconds()\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\t// What the detached majority did, for context on the timeline above.\n\tif peerLeader := caPeerLeader(c, leader, nonvoter); peerLeader != nil {\n\t\tfuture := peerLeader.Apply([]byte(\"committed-after-partition\"), 0)\n\t\tif err := future.Error(); err == nil {\n\t\t\tpeerWriteIndex = future.Index()\n\t\t}\n\t\tpeerCommitIndex = peerLeader.getCommitIndex()\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"verify_exposure\",\n\t\t\"trial\":                        trial,\n\t\t\"nonvoter_reachable_only\":      withNonvoter,\n\t\t\"polls\":                        polls,\n\t\t\"confirmations\":                confirmed,\n\t\t\"confirmations_after_peer_leader\": confirmedAfterLeader,\n\t\t\"max_confirmation_after_peer_leader_ms\": maxConfirmedAfterLeaderMs,\n\t\t\"first_peer_leader_ms\":         firstPeerLeaderMs,\n\t\t\"last_confirmation_ms\":         lastConfirmedMs,\n\t\t\"confirmation_precedes_peer_leader\": lastConfirmedMs >= 0 && (firstPeerLeaderMs < 0 || lastConfirmedMs < firstPeerLeaderMs),\n\t\t\"leader_stepped_down\":          leaderSteppedDown,\n\t\t\"leader_term\":                  leader.getCurrentTerm(),\n\t\t\"nonvoter_term\":                nonvoter.getCurrentTerm(),\n\t\t\"leader_applied_index\":         leader.getLastApplied(),\n\t\t\"peer_write_index\":             peerWriteIndex,\n\t\t\"peer_commit_index\":            peerCommitIndex,\n\t})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "pre",
+            "event": "verify_baseline",
+            "conditions": []
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "// Copyright (c) 2026. Assurance harness artifact (draft, not part of the target source).\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nfunc caEmit(t *testing.T, payload interface{}) {\n\tt.Helper()\n\tblob, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// caVerify issues one verification through the same channel the exported\n// VerifyLeader API uses and reports whether it was confirmed, its error, and\n// the tally and quorum the future ended with.\nfunc caVerify(leader *Raft, wait time.Duration) (verified bool, errText string, votes, quorum int, returned bool) {\n\tdone := make(chan struct{})\n\tvf := &verifyFuture{}\n\tvf.init()\n\tgo func() {\n\t\tdefer close(done)\n\t\tleader.verifyCh <- vf\n\t}()\n\t<-done\n\tquorum = leader.quorumSize()\n\twaitCh := make(chan error, 1)\n\tgo func() { waitCh <- vf.Error() }()\n\tselect {\n\tcase err := <-waitCh:\n\t\treturn err == nil, caErrString(err), vf.votes, quorum, true\n\tcase <-time.After(wait):\n\t\treturn false, \"verification did not resolve\", vf.votes, quorum, false\n\t}\n}\n\nfunc caPeerLeader(c *cluster, leader, nonvoter *Raft) *Raft {\n\tfor _, r := range c.rafts {\n\t\tif r == leader || r == nonvoter {\n\t\t\tcontinue\n\t\t}\n\t\tif r.getState() == Leader {\n\t\t\treturn r\n\t\t}\n\t}\n\treturn nil\n}\n\n// TestAssurance_VerifyLeaderConfirmationWindow measures how long a leader that\n// has lost contact with every other voter but can still reach a nonvoter keeps\n// obtaining successful verifications, and whether those confirmations continue\n// after the voters it cannot reach have elected their own leader.\n//\n// The cluster is four voters with one demoted to nonvoter, so three voters and\n// a voter quorum of two. In the interrupted trial the leader is partitioned\n// together with the nonvoter; in the control the leader is partitioned alone.\n// After the partition the leader is verified repeatedly until it stops being\n// confirmed or the bounded loop ends, and each poll records whether a peer\n// leader existed at that moment.\nfunc TestAssurance_VerifyLeaderConfirmationWindow(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.NewNullLogger()\n\n\t// The partition lands at whatever phase the peers' randomized election\n\t// timers happen to be in, so the relation between the last confirmation and\n\t// the competing leader is measured over repeated trials rather than once.\n\tfor i := 0; i < 12; i++ {\n\t\tcaRunWindowTrial(t, conf, i, true)\n\t}\n\tfor i := 12; i < 14; i++ {\n\t\tcaRunWindowTrial(t, conf, i, false)\n\t}\n}\n\nfunc caRunWindowTrial(t *testing.T, conf *Config, trial int, withNonvoter bool) {\n\tt.Helper()\n\n\tc := MakeCluster(4, t, conf)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfollowers := c.Followers()\n\tnonvoter := followers[0]\n\n\tif err := leader.DemoteVoter(nonvoter.localID, 0, 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: demote: %v\", trial, err)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif !hasVote(leader.GetConfiguration().Configuration(), nonvoter.localID) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif hasVote(leader.GetConfiguration().Configuration(), nonvoter.localID) {\n\t\tt.Fatalf(\"trial %d: nonvoter still has a vote\", trial)\n\t}\n\n\tbaseVerified, baseErr, baseVotes, baseQuorum, baseReturned := caVerify(leader, 2*time.Second)\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"verify_baseline\",\n\t\t\"trial\":                    trial,\n\t\t\"nonvoter_reachable_only\":  withNonvoter,\n\t\t\"verified\":                 baseVerified,\n\t\t\"error\":                    baseErr,\n\t\t\"votes\":                    baseVotes,\n\t\t\"quorum_size\":              baseQuorum,\n\t\t\"returned\":                 baseReturned,\n\t\t\"leader_term\":              leader.getCurrentTerm(),\n\t\t\"nonvoter_term\":            nonvoter.getCurrentTerm(),\n\t})\n\n\tif err := leader.Apply([]byte(\"pre-partition\"), 0).Error(); err != nil {\n\t\tt.Fatalf(\"trial %d: pre-partition apply: %v\", trial, err)\n\t}\n\n\tif withNonvoter {\n\t\tc.Partition([]ServerAddress{leader.localAddr, nonvoter.localAddr})\n\t} else {\n\t\tc.Partition([]ServerAddress{leader.localAddr})\n\t}\n\tpartitionedAt := time.Now()\n\n\tvar polls, confirmed, confirmedAfterLeader int\n\tvar maxConfirmedAfterLeaderMs int64\n\tvar firstPeerLeaderMs int64 = -1\n\tvar lastConfirmedMs int64 = -1\n\tvar peerLeaderSeen, leaderSteppedDown bool\n\tvar peerWriteIndex, peerCommitIndex uint64\n\n\tfor i := 0; i < 500; i++ {\n\t\tstateBefore := leader.getState()\n\t\tpeerLeader := caPeerLeader(c, leader, nonvoter)\n\t\tif peerLeader != nil {\n\t\t\tif !peerLeaderSeen {\n\t\t\t\tfirstPeerLeaderMs = time.Since(partitionedAt).Milliseconds()\n\t\t\t}\n\t\t\tpeerLeaderSeen = true\n\t\t}\n\t\tif stateBefore != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\n\t\tverified, _, _, _, returned := caVerify(leader, 500*time.Millisecond)\n\t\telapsed := time.Since(partitionedAt).Milliseconds()\n\t\tpolls++\n\t\tif returned && verified {\n\t\t\tconfirmed++\n\t\t\tlastConfirmedMs = elapsed\n\t\t\tif peerLeaderSeen {\n\t\t\t\tconfirmedAfterLeader++\n\t\t\t\tif elapsed > maxConfirmedAfterLeaderMs {\n\t\t\t\t\tmaxConfirmedAfterLeaderMs = elapsed\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif leader.getState() != Leader {\n\t\t\tleaderSteppedDown = true\n\t\t\tbreak\n\t\t}\n\t\tif peerLeaderSeen && confirmedAfterLeader == 0 && elapsed > firstPeerLeaderMs+500 {\n\t\t\t// Enough time after the peer leader appeared with no confirmation.\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\t// Keep watching after the confirmed leader stopped being confirmable, so the\n\t// relation between the last confirmation and the appearance of a competing\n\t// leader is observed rather than left unmeasured.\n\twatchDeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(watchDeadline) {\n\t\tif peerLeader := caPeerLeader(c, leader, nonvoter); peerLeader != nil {\n\t\t\tif firstPeerLeaderMs < 0 {\n\t\t\t\tfirstPeerLeaderMs = time.Since(partitionedAt).Milliseconds()\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\t// What the detached majority did, for context on the timeline above.\n\tif peerLeader := caPeerLeader(c, leader, nonvoter); peerLeader != nil {\n\t\tfuture := peerLeader.Apply([]byte(\"committed-after-partition\"), 0)\n\t\tif err := future.Error(); err == nil {\n\t\t\tpeerWriteIndex = future.Index()\n\t\t}\n\t\tpeerCommitIndex = peerLeader.getCommitIndex()\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"verify_exposure\",\n\t\t\"trial\":                        trial,\n\t\t\"nonvoter_reachable_only\":      withNonvoter,\n\t\t\"polls\":                        polls,\n\t\t\"confirmations\":                confirmed,\n\t\t\"confirmations_after_peer_leader\": confirmedAfterLeader,\n\t\t\"max_confirmation_after_peer_leader_ms\": maxConfirmedAfterLeaderMs,\n\t\t\"first_peer_leader_ms\":         firstPeerLeaderMs,\n\t\t\"last_confirmation_ms\":         lastConfirmedMs,\n\t\t\"confirmation_precedes_peer_leader\": lastConfirmedMs >= 0 && (firstPeerLeaderMs < 0 || lastConfirmedMs < firstPeerLeaderMs),\n\t\t\"leader_stepped_down\":          leaderSteppedDown,\n\t\t\"leader_term\":                  leader.getCurrentTerm(),\n\t\t\"nonvoter_term\":                nonvoter.getCurrentTerm(),\n\t\t\"leader_applied_index\":         leader.getLastApplied(),\n\t\t\"peer_write_index\":             peerWriteIndex,\n\t\t\"peer_commit_index\":            peerCommitIndex,\n\t})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "pre",
+            "event": "verify_baseline",
+            "conditions": []
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Two trials on real four-voter clusters with one voter demoted to nonvoter through DemoteVoter: the interrupted trial partitions the leader together with the nonvoter and the control partitions the leader alone. Each trial verifies the healthy leader, applies the partition, polls the exported verification path while the leader is still confirmable, keeps watching until the detached voters report their own leader, and reports the last confirmation's and the competing leader's elapsed times on the same clock together with the competing leader's commit index and the cut-off leader's applied index.",
+        "assumptions": [
+          "Captured in-memory timeouts are used, so the lease and election relations are the ones the target's own tests run with; the leader lease is shorter than the election timeout in this configuration, which is a property of the configuration and is reported through the timeline rather than assumed.",
+          "The verification is driven through the same channel the exported VerifyLeader API uses, with a bounded wait per poll; polls stop as soon as the leader is no longer confirmable.",
+          "The competing leader is identified by which raft instance reports Leader among the two voters that were detached from the interrupted leader, and the observation window for it is 3s, which is longer than this cluster's election time."
+        ],
+        "excluded": [
+          "No application-level read is served in this harness; the measurement is about the confirmation and the competing leader's existence, not about what an application would return.",
+          "No on-disk store, no network transport and no synthetic request injection."
+        ],
+        "parameters": {
+          "trials": "trial 0 leader partitioned with the nonvoter; trial 1 leader partitioned alone",
+          "poll_interval_ms": 5,
+          "recorded_operands": "polls, confirmations, confirmations_after_peer_leader, last_confirmation_ms, first_peer_leader_ms, confirmation_precedes_peer_leader, leader_stepped_down, leader_term, nonvoter_term, leader_applied_index, peer_write_index, peer_commit_index"
+        }
+      },
+      "after": {
+        "description": "Fourteen trials in total on real four-voter clusters with one voter demoted to nonvoter: twelve interrupted trials in which the leader is partitioned together with the nonvoter, and two controls in which the leader is partitioned alone. Each trial polls the exported verification path while the cut-off leader is confirmable, then watches until the detached voters report their own leader, and reports both moments on one clock with the competing leader's commit index and the cut-off leader's applied index.",
+        "assumptions": [
+          "Each trial starts from a stable cluster with an elected leader and freshly heartbeated followers, so the trial-to-trial variation comes from the randomized election timers and scheduling rather than from a disturbed cluster.",
+          "Captured in-memory timeouts are used; the enforced relation LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout is a property of the configuration and is reported through the timeline.",
+          "Verification is driven through the same channel the exported API uses and stops as soon as the leader is no longer confirmable."
+        ],
+        "excluded": [
+          "No partition during an already-running election attempt is exercised, so the adverse phase is not covered by this basis.",
+          "No application-level read, no on-disk store, no network transport and no synthetic request injection."
+        ],
+        "parameters": {
+          "trials": "12 interrupted (trial ids 0-11), 2 controls (trial ids 12-13)",
+          "poll_interval_ms": 5,
+          "recorded_operands": "polls, confirmations, confirmations_after_peer_leader, last_confirmation_ms, first_peer_leader_ms, confirmation_precedes_peer_leader, leader_stepped_down, leader_term, nonvoter_term, leader_applied_index, peer_write_index, peer_commit_index"
+        }
+      }
+    },
+    "prefix": {
+      "before": "Each trial builds a real four-voter cluster with the captured in-memory timeouts, demotes one follower to nonvoter with DemoteVoter and waits until the configuration shows it without a vote, verifies the healthy leader once, applies one command, and then applies the partition (leader with the nonvoter, or leader alone for the control). It polls the verification path every 5ms while the leader reports Leader, recording each outcome, and stops when the leader is no longer confirmable or steps down. It then keeps watching for up to 3s until one of the two detached voters reports Leader, recording when that happened on the same clock, has it commit one entry, and finally emits one summary event carrying the poll counts, the last confirmation's elapsed time, the competing leader's elapsed time, whether the confirmation preceded that leader, and the competing leader's commit index against the cut-off leader's applied index. Only the TestAssurance-prefixed test in this harness is selected and no production file is modified.",
+      "after": "Unchanged from the predecessor harness apart from repetition: each trial builds a fresh real four-voter cluster, demotes one follower to nonvoter with DemoteVoter and waits for the configuration to show it without a vote, verifies the healthy leader once, applies one command, applies the partition, polls the verification path every 5ms while the leader reports Leader, stops when it is no longer confirmable or steps down, then watches for up to 3s until one of the two detached voters reports Leader, has it commit one entry, and emits one summary event per trial. Only the TestAssurance-prefixed test is selected and no production file is modified."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "verify_exposure",
+          "identity_fields": [
+            "trial"
+          ],
+          "admission_alias": "pre",
+          "assertion": {
+            "field": "confirmation_precedes_peer_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable_only",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "With the captured timers, the last successful confirmation on the cut-off leader comes before the detached voters' leader appears, so the confirmation window does not overlap a competing leader in this configuration."
+        },
+        {
+          "event": "verify_exposure",
+          "identity_fields": [
+            "trial"
+          ],
+          "admission_alias": "pre",
+          "assertion": {
+            "field": "confirmations",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable_only",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: with the nonvoter also cut off the leader obtains no confirmation at all before stepping down."
+        }
+      ],
+      "after": [
+        {
+          "event": "verify_exposure",
+          "identity_fields": [
+            "trial"
+          ],
+          "admission_alias": "pre",
+          "assertion": {
+            "field": "confirmation_precedes_peer_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable_only",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Across the interrupted trials the last successful confirmation precedes the detached voters' leader; a violation would be a witness that the confirmation window overlapped a competing leader."
+        },
+        {
+          "event": "verify_exposure",
+          "identity_fields": [
+            "trial"
+          ],
+          "admission_alias": "pre",
+          "assertion": {
+            "field": "confirmations",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable_only",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Both controls obtain no confirmation before stepping down."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Same question and same comparisons, changed basis: the predecessor ran one interrupted trial and one control, which cannot bound a relation that depends on the phase of the peers' randomized election timers. This revision repeats the interrupted case twelve times and the control twice, one fresh cluster per trial, keeping the same event shape, identity field and assertions so a violation is reported as a witness of an overlap rather than as an inconclusive result."
+}

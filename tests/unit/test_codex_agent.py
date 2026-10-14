@@ -181,9 +181,9 @@ def test_invalid_final_response_remains_a_repairable_format_error(tmp_path,final
     assert accept_received(engine) and len(state.investigations)==1
 
 
-@pytest.mark.parametrize('session_id',[None,'exact-session'])
+@pytest.mark.parametrize('session_id,run_seconds',[(None,2000),('exact-session',100),(None,None)])
 @pytest.mark.parametrize('custom',[False,True])
-def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path,monkeypatch,session_id,custom):
+def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path,monkeypatch,session_id,run_seconds,custom):
     from consensus_assurance.core.config import CodexProvider
     monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
     monkeypatch.setenv('PROVIDER_TICKET','canary-client-only')
@@ -204,13 +204,13 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
             assert context['action_id']=='operation' and context['check_id']==record['id']
             assert context['generated_at']==record['started_at']
             assert timeout==context['timeout_seconds']==record['parameters']['timeout_seconds']==(80 if session_id else 900)
-            assert context['timeout_limit']==('total_seconds' if session_id else 'agent_turn_timeout')
+            assert record['parameters']['timeout_limit']==('total_seconds' if session_id else 'agent_turn_timeout')
+            assert 'timeout_limit' not in context
+            if run_seconds is None:assert 'run_remaining_seconds' not in context
+            else:assert context['run_remaining_seconds']==run_seconds-20
             assert (datetime.fromisoformat(context['estimated_deadline_utc'])-datetime.fromisoformat(context['generated_at'])).total_seconds()==timeout
             meaning=context['meaning']
-            assert 'allocated at generated_at, not a live countdown' in meaning
-            assert 'timeout_limit names the limiting budget, not exhaustion' in meaning
-            assert 'positive total_seconds allocation still permits useful research within that interval' in meaning
-            assert 'Expiry needs no closing submission' in meaning
+            assert 'sampled at generated_at' in meaning and 'not live countdowns' in meaning
             assert 'saved run checkpoints' in meaning and 'estimate' in meaning and 'monotonic clock' in meaning
             events=[{'type':'thread.started','thread_id':'exact-session'},
                 {'type':'item.started','item':{'id':'tool-1','type':'command_execution'}},
@@ -224,7 +224,8 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
             return '\n'.join(json.dumps(e) for e in events),''
     monkeypatch.setattr('subprocess.Popen',Process)
     provider=CodexProvider(id='deepseek',base_url='https://api.deepseek.com',env_key='PROVIDER_TICKET') if custom else None
-    runner=ProcessRunner(tmp_path);runner.active_action_id='operation';runner.deadline=clock[0]+(100 if session_id else 2000)
+    runner=ProcessRunner(tmp_path);runner.active_action_id='operation'
+    runner.deadline=clock[0]+run_seconds if run_seconds is not None else None
     agent=CodexAgent('low','deepseek-flash' if custom else 'gpt-6-astra',provider);agent.available=True;agent.version='fixture-cli'
     agent.sandbox_command=lambda root:['codex']
     def permission(*args):
