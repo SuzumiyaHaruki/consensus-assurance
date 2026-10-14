@@ -1,0 +1,282 @@
+{
+  "rationale": "Trace how a restarted node re-establishes its configuration ('context validity') when the committed-log replay feature is enabled. NewRaft replays committed logs first (restoreFromCommittedLogs sets lastApplied to the persisted commit index) and then scans the log for configuration entries starting at max(lastSnapshot, lastApplied)+1. Because the scan is skipped over the committed prefix, configuration entries inside it are never applied to r.configurations when no snapshot carries them, even though they remain in the log. Focused probe: restart a single-voter node that was bootstrapped and applied commands but never snapshotted, with RestoreCommittedLogs on/off and with a covering snapshot as control.",
+  "sources": [
+    {
+      "id": "newraft_scan",
+      "file": "api.go",
+      "start_line": 601,
+      "end_line": 622,
+      "kind": "code_observation"
+    },
+    {
+      "id": "restore_committed",
+      "file": "api.go",
+      "start_line": 723,
+      "end_line": 755,
+      "kind": "code_observation"
+    },
+    {
+      "id": "newraft_doc",
+      "file": "api.go",
+      "start_line": 504,
+      "end_line": 507,
+      "kind": "document_statement"
+    },
+    {
+      "id": "snapshot_config",
+      "file": "api.go",
+      "start_line": 645,
+      "end_line": 689,
+      "kind": "code_observation"
+    },
+    {
+      "id": "process_config_entry",
+      "file": "raft.go",
+      "start_line": 1605,
+      "end_line": 1623,
+      "kind": "code_observation"
+    },
+    {
+      "id": "follower_abort",
+      "file": "raft.go",
+      "start_line": 230,
+      "end_line": 251,
+      "kind": "code_observation"
+    },
+    {
+      "id": "vote_config_checks",
+      "file": "raft.go",
+      "start_line": 1663,
+      "end_line": 1672,
+      "kind": "code_observation"
+    },
+    {
+      "id": "prevote_config_checks",
+      "file": "raft.go",
+      "start_line": 1780,
+      "end_line": 1784,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cfg_doc",
+      "file": "config.go",
+      "start_line": 243,
+      "end_line": 254,
+      "kind": "document_statement"
+    },
+    {
+      "id": "existing_test",
+      "file": "raft_test.go",
+      "start_line": 1183,
+      "end_line": 1280,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "append_config_entry",
+      "file": "raft.go",
+      "start_line": 1204,
+      "end_line": 1241,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cfg_change_gate",
+      "file": "raft.go",
+      "start_line": 654,
+      "end_line": 664,
+      "kind": "code_observation"
+    },
+    {
+      "id": "next_configuration",
+      "file": "configuration.go",
+      "start_line": 224,
+      "end_line": 302,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@restart_config",
+      "question": "Does a node restarted with RestoreCommittedLogs=true, whose newest configuration entry is inside the persisted commit index and has no covering snapshot, still know that configuration after NewRaft returns?",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "newraft_doc",
+        "cfg_doc",
+        "snapshot_config",
+        "process_config_entry",
+        "follower_abort"
+      ],
+      "hypothesis": "No. restoreFromCommittedLogs sets lastApplied to the persisted commit index, so the configuration scan starts after the committed prefix and never calls processConfigurationLogEntry for the configuration entry that only exists in the log. r.configurations.latest stays empty (or stays at the snapshot configuration), so the node loses its own membership context, cannot start elections, and skips the membership checks when granting votes.",
+      "discriminator": "Restart the same durable state twice: with RestoreCommittedLogs=true and with RestoreCommittedLogs=false. Predict servers_after=0 and no re-election with the feature on, versus servers_after=1 and a successful re-election with it off. A third run takes a snapshot before restart to show that a snapshot-carried configuration masks the loss (servers_after=1), separating the scanning bound from generic restart damage.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [
+    {
+      "investigation_id": "@restart_config",
+      "question": "When a snapshot exists but the newest configuration entry was committed after that snapshot (ConfigurationIndex older than the entry), does the same skipped committed prefix make the restarted node adopt the older configuration, permanently losing the newer membership (and its quorum size), and does that stale configuration later justify a different decision or duty completion?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+      "experiment_id": "8efd0d1e3da9484e926cab983024d9c3-experiment",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "newraft_doc",
+        "cfg_doc",
+        "snapshot_config",
+        "process_config_entry",
+        "follower_abort",
+        "vote_config_checks",
+        "prevote_config_checks"
+      ],
+      "executions": {
+        "430d7ba602ed4666bdfe63a96c71e2fc": [
+          1
+        ],
+        "d2d1cb0951b74a2984ec525710e4c740": [
+          1,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Observed in the retained execution: after restart with RestoreCommittedLogs=true and no snapshot, the node's configuration is empty (event index 1: mode=restore_on_no_snapshot, servers_before=1, servers_after=0, config_preserved=false, snapshot_count=0, staged_commit=6, log_last_index=7) and it never campaigns again (became_leader=false after a 3s opportunity, with the node logging 'no known peers, aborting election'), while the two controls keep the configuration and re-elect (index 3 restore_off_no_snapshot: servers_after=1, became_leader=true; index 5 restore_on_with_snapshot: servers_after=1, snapshot_count=1, became_leader=true). Source account of the mechanism: NewRaft documents that existing state such as logs and peers is restored (api.go 504-507) and RestoreCommittedLogs is documented only as replaying committed logs before startup (config.go 243-254); restoreFromCommittedLogs raises lastApplied to the persisted commit index (api.go 723-755) and the configuration scan then starts at max(lastSnapshot,lastApplied)+1 (api.go 611-613), so configuration entries inside the committed prefix are never turned into r.configurations by their only producer processConfigurationLogEntry (raft.go 1605-1623) unless a snapshot carries them (api.go 645-689). With Servers empty, runFollower refuses to start an election (raft.go 230-234) and both vote handlers skip their membership checks (raft.go 1663-1672, 1780-1784).",
+      "answers": {
+        "9c549c026d7341f2b1e328826eac6dc3-gap-0": {
+          "explanation": "Resolved by the retained receipt d2d1cb0951b74a2984ec525710e4c740: after a snapshot that carries configuration {A,B}@1, a committed AddVoter C at index 8 and four further commits (staged commit 11), the restarted node reports servers_after=2 while its continuously running peer reports 3 and its own log still contains the newest configuration entry at index 8 (comparison 0 violated, witness index 1). That stale base then changes a real decision: a later AddVoter E against the restarted node returned no error and the cluster converged on 3 members with contains_c_final=false on both nodes (comparison 2 violated, witness index 3), i.e. voter C was silently removed although no request removed it. The control run in the same receipt with RestoreCommittedLogs=false kept 3 members and ended with 4 members including C (observed at parsed index 5, whose comparison the controller recorded as unknown because both modes emit the same result event name).",
+          "resolved": true
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The control mode inside the same receipt (parsed index 5) kept servers_after=3 and the later change produced 4 members including C, so the stale base is specific to the replayed committed prefix rather than to snapshots or configuration changes in general.",
+        "The restarted node still held every committed entry on disk (log_last_index=12), so this is lost configuration context, not lost data; the entry would be re-read only from a snapshot install."
+      ],
+      "limitations": [
+        "The control mod in the same receipt was scored 'unknown' by the controller because both modes emit the same result event name; its observed values at index 5 are cited as observations, and the dedicated control experiment requested in this update is meant to produce an independently scored control.",
+        "Voter C never runs in this probe, so the probe does not show whether C itself would notice the removal; the finding is about the configuration each running node decides with.",
+        "Executed scope is two in-memory voters at protocol version 3 with 50ms timeouts and one committed single-server change; joint consensus and multi-step changes are not exercised."
+      ],
+      "joint_history": "Both receipts belong to the same question and harness family (single-voter restart probe, then two-voter snapshot/configuration-change probe) executed from the same snapshot; the second probe was built after the first receipt confirmed the empty-configuration case, to test whether a snapshot-carried configuration makes the loss stale rather than empty, and whether that stale base changes a later decision.",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "snapshot_config",
+        "append_config_entry",
+        "next_configuration",
+        "cfg_change_gate"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Registered gap answered by source trace plus a construction-time run of this probe. Source: a restarted node adopts the snapshot's configuration whenever the newest configuration entry lies inside the skipped committed prefix (api.go 611-613 with 723-755, snapshot path api.go 645-689), and appendConfigurationEntry then computes the next configuration from that stale r.configurations.latest (raft.go 1204-1241) once configurationChangeChIfStable admits the change because latest and committed indexes look equal (raft.go 654-664); nextConfiguration derives the new membership from that same base (configuration.go 328-406). Observed at construction time (native run, pending retained receipt): with RestoreCommittedLogs=true the restarted node reports 2 servers while its peer still reports 3 and its own log's newest configuration entry (index 8) is below the persisted commit index (11); the next AddVoter then committed successfully (err=nil) with the cluster converging on 3 servers without C, so voter C was legitimately added and then silently removed without any request removing it. The control case with RestoreCommittedLogs=false kept 3 servers and the later change produced 4 members including C.",
+      "answers": {
+        "9c549c026d7341f2b1e328826eac6dc3-gap-0": {
+          "explanation": "Yes for both parts, subject to the retained receipt for this probe: the stale configuration is adopted when the snapshot predates the committed configuration entry, and it does justify a different decision - a configuration change based on the stale membership drops voter C for the whole cluster (observed change_err=nil, both nodes ending with 3 members and contains_c=false), instead of the intended 4-member configuration. Source dependency chain recorded in the rationale; construction-time run reproduced all three predictions, retained execution pending.",
+          "resolved": false
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The control case with RestoreCommittedLogs=false on identical stores preserved all three members and added E without dropping C, so the stale base is specific to the skipped committed prefix rather than to config changes in general."
+      ],
+      "limitations": [
+        "This is a construction-time native reproduction; the formal receipt for this harness is requested in this update and the claim is retained as explained/unresolved-for-receipt until it exists.",
+        "C never runs, so the probe cannot show whether C would itself notice or resist its removal; that is about C's own state, not about the decision the restarted node made.",
+        "The removal happens through a successful public AddVoter, so the consequence is reachable through the ordinary configuration API, but only while the restarted node is leader and its stale latest/committed indexes look equal."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+    "harness_path": "assurance_control_probe_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "newraft_scan",
+      "restore_committed",
+      "newraft_doc",
+      "follower_abort"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Isolated control for the committed-log-replay finding: bootstrap a single voter, become leader, commit five commands, never snapshot (SnapshotThreshold huge, SnapshotInterval 10m), shut down and restart on the same InmemCommitTrackingStore/InmemStore/InmemSnapshotStore with RestoreCommittedLogs left at its default false. Emits only the control setup event and the control result event, so the control is scored independently of the failing mode.",
+      "assumptions": [
+        "RestoreCommittedLogs defaults to false (config.go), so this is the ordinary restart path with identical durable state and identical missing snapshot.",
+        "The stores and the bootstrap/commit sequence are the same as in the failing probe, so the only difference is the replay of committed logs at startup."
+      ],
+      "excluded": [
+        "No multi-voter cluster, no configuration change, no partitions."
+      ],
+      "parameters": {
+        "protocol_version": 3,
+        "heartbeat_timeout_ms": 50,
+        "election_timeout_ms": 50,
+        "trailing_logs": 10
+      }
+    },
+    "prefix": "Real bootstrap, real election, real applies, real shutdown and restart on the same durable stores with a fresh transport; no fabricated log entries or configuration state.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "admit_control_restart",
+        "event": "control_start",
+        "conditions": [
+          {
+            "field": "restore_committed",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "snapshot_count",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "restore_committed"
+        ],
+        "admission_alias": "admit_control_restart",
+        "assertion": {
+          "field": "servers_after",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control expectation: without replaying committed logs, the restarted node keeps its bootstrapped configuration, isolating the replay as the cause of the loss observed with RestoreCommittedLogs enabled."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

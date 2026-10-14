@@ -1,0 +1,128 @@
+{
+  "rationale": "Correcting a mechanism premise in my own knowledge before it propagates further. The recorded entry said the invocation sends on a nil channel when the gate is disarmed. Re-reading the source: stepWithWaitOption sends on n.propc, the always non-nil channel field (node.go:525), while the nil-ness lives in the run loop's local gate variable (node.go:344, assigned at 374/377/426 and used as the receive case at 386). The caller therefore blocks because the run loop is not receiving from that channel, not because the channel itself is nil. This matters for the resumption condition: the pending invocation is admitted as soon as the gate is re-armed by an observed leader change, so the non-completion lasts exactly as long as no leader change is observed (or until the caller's context or node stop), which is narrower and more precise than the recorded wording, and the interpretations that repeated the nil-channel phrasing need the corrected premise.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-1",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "node.Propose and node.ProposeConfChange hand a MsgProp to the run loop through stepWithWaitOption, which sends the request on the node's proposal channel n.propc (an unbuffered channel field that is always non-nil) and, when the call waits for a result, blocks until the run loop accepts the request or the caller's context or the node stop ends the wait. The run loop only receives from that channel while its own local gate variable is armed (set when an observed leader exists, cleared when the local member is removed and when no leader is observed), so while the gate is disarmed the caller's send is pending: it returns context.Canceled/DeadlineExceeded or ErrStopped only via those two exits, and it is admitted unmodified as soon as the gate is re-armed by an observed leader change.",
+      "conditions": "Async Node API run loop (node.go) with the local proposal gate disarmed, e.g. after the local member was removed by a committed conf change and before any observed leader change; caller either supplies a deadline or a context that never expires.",
+      "source_ids": [
+        "stepwait",
+        "propose_api",
+        "propc_uses",
+        "runloop",
+        "removal_gate"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "Previously recorded as 'when that channel is nil the send case cannot be selected'. The channel is not nil: the caller sends on n.propc (node.go:525) and blocks because the run loop's local gate variable is nil, so the receive case at node.go:386 cannot proceed until the gate is armed. Consequence for the claim: the pending invocation is admitted when the gate is re-armed (an observed leader change), so the non-completion window is bounded by the absence of an observed leader change rather than by the caller's context alone.",
+      "affected_uses": [
+        "3592ccaf01864f56aaf06d54a3f97423-interpretation-0",
+        "48ce57b251a644edaaf9d17731df0b25-interpretation-0",
+        "e3c629874a414978b22ef047cbd43bc1-interpretation-0",
+        "607acbc24a5d4e529930608fd01e382f-interpretation-0"
+      ]
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "3592ccaf01864f56aaf06d54a3f97423-question-0",
+      "experiment_id": "baee4030bf1e4f229c46ece8d0ddc365-experiment",
+      "source_ids": [
+        "runloop",
+        "removal_gate",
+        "propose_api",
+        "stepwait",
+        "leader_prop_gate",
+        "propc_uses",
+        "block_expectation"
+      ],
+      "executions": {
+        "87b38a551d554c2391427dda00c4e6e4": [
+          7,
+          8,
+          9,
+          11,
+          12,
+          14,
+          17,
+          19,
+          22,
+          25,
+          26
+        ],
+        "a9f71d7a07454d058d818148f7479e8f": [
+          7,
+          8,
+          9,
+          11,
+          12,
+          15,
+          16
+        ],
+        "43a04622beef40588679c6cf1c40d6ad": [
+          7,
+          8,
+          9,
+          11,
+          12,
+          15,
+          16
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "Three retained executions agree; the mechanism statement is corrected in this revision, the evidence is unchanged. In 87b38a551d554c2391427dda00c4e6e4: node 3 applied its own re-admission (index 4: change add, ok true, voter true, leader 1, term 1) and its configuration listed it as a voter with leader 1 (index 5); the admitted invocation (index 6) had not returned after 1200 ms (index 7: returned false, err empty, voter true, leader 1), released only when the caller's deadline expired (index 8: 'context deadline exceeded', 2501 ms), and left its payload absent from every node's committed entries (index 9: present false, observed_nodes null). During the same stable-leader period the never-removed member's invocation returned in 0 ms and committed on all three nodes (indices 11, 12). Two independent retry attempts on node 3 (distinct operation ids, 900 ms contexts, 800 ms windows) also never completed (indices 14 and 19: returned false at 800 ms and 801 ms, voter true, leader 1) and were not committed, while in each of those intervals a fresh proposal by node 2 returned in 0 ms and was committed on all three nodes (indices 17 and 22). After node 3 observed the leader change 1->2 at term 2 (index 23) the same call returned in 0 ms and committed on all three nodes (indices 25, 26). Source account, corrected: the run loop's gate variable is assigned only at node.go:374 (leader observed), 377 (no leader) and 426 (local member removed) and used as the receive case at node.go:386; a re-admission cannot match the removal guard because the local Progress entry is already gone (node.go:401-412), so the gate stays disarmed and the caller's send on n.propc (node.go:525) stays pending until the caller's context, the node stop, or an observed leader change re-arms the receive side. The snapshot's own expectation (node_test.go:352-385) scopes intended blocking to a node that does not know the current leader and expects acceptance once a leader is known, which is the condition node 3 satisfies while pending; the control and interval controls exclude cluster-wide stalls, and the post-leader-change call excludes a defect in node 3's own state machine. Net effect: a member's proposal duty is held pending, without any error signal, for as long as no leader change is observed, and is admitted unmodified once one is.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-0",
+          "revision": 1,
+          "assertion": "propc is armed only on observed leader change and is left nil after a re-admission"
+        },
+        {
+          "entry_id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-1",
+          "revision": 2,
+          "assertion": "the caller sends on n.propc and stays pending while the run loop's gate variable is disarmed; a later observed leader change admits the pending request"
+        },
+        {
+          "entry_id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-2",
+          "revision": 1,
+          "assertion": "the raft state machine returns ErrProposalDropped for a removed leader instead of blocking"
+        },
+        {
+          "entry_id": "e3c629874a414978b22ef047cbd43bc1-knowledge-0",
+          "revision": 1,
+          "assertion": "intended blocking is scoped to the unknown-leader case and acceptance is expected once a leader is known; re-addition is untested"
+        },
+        {
+          "entry_id": "607acbc24a5d4e529930608fd01e382f-knowledge-0",
+          "revision": 1,
+          "assertion": "three consecutive invocations on the re-added voter never completed while other members' proposals committed in the same intervals"
+        }
+      ],
+      "counterevidence": [
+        "node.go:407-411 acknowledges the gate as improvised ('propc is reset when the leader changes ... This isn't very sound and likely has bugs'); this explains the dependence on leader changes but is neither a calling restriction nor a protection, and no other re-arm path exists in the snapshot.",
+        "node_test.go:352-385 shows that not returning is intended for a node that does not know the current leader. That expectation does not cover the witnessed case, and the same test expects acceptance once a leader is known.",
+        "The pending invocation is not lost: it is admitted unmodified when the gate is re-armed (node.go:386 resumes receiving from n.propc), so the harmed interval is 'no observed leader change', not the entire lifetime of the node.",
+        "The same run contains successful paths (indices 12, 17, 22, 26), showing proposals are neither generally dropped nor generally blocked."
+      ],
+      "limitations": [
+        "Comparison outcomes for the earliest receipt were 'unknown' because that harness gave the three operations' result events the same names; its decisive events are complete and match the successor receipts, which have complete holds.",
+        "Scope is the async Node API path (node.run loop) in this snapshot; RawNode.Propose has no such gate. No ticks were delivered and delivery was reliable, so no timing or network-fault characterization is claimed.",
+        "Only the voter-removal form was executed; other transitions that delete the local Progress entry are variants of the same cause and were not executed separately. The same gate also covers Node.ProposeConfChange (node.go:496-502 via stepWithWaitOption), which was not executed.",
+        "Admission of a still-pending invocation by a later leader change is established from source (node.go:386 resumes receiving from n.propc) and was seen only in a native local dry run, not in a retained execution; whether such an admitted payload then commits is likewise not yet retained.",
+        "No retained execution issued an invocation with a context that never expires: all retained contexts have deadlines, so the retained evidence measures pending windows of up to 2501 ms, not the unbounded case."
+      ],
+      "joint_history": "All three receipts run the same fixed scenario lineage: 3592ccaf01864f56aaf06d54a3f97423-experiment (executed as 43a04622beef40588679c6cf1c40d6ad) and its successors 48ce57b251a644edaaf9d17731df0b25-experiment (a9f71d7a07454d058d818148f7479e8f) and baee4030bf1e4f229c46ece8d0ddc365-experiment (87b38a551d554c2391427dda00c4e6e4), each registered with previous_id and a revision_reason. All three build the same configuration {1,2,3} from the same storage ConfState, elect leader 1 at term 1, apply the same committed remove-3 and add-3 conf changes on node 3, use the same witness/control/repair operation ids, payloads, phases, deadlines and windows, and force the same campaign of node 2 into term 2; the successors change event naming and then add retry/progress cases without altering the earlier ones. Witnesses agree field for field at the corresponding indices (witness 7/8/9 in all three; control 11/12; repair 15/16 or 25/26), so the difference is a property of the fixed scenario rather than of one run.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

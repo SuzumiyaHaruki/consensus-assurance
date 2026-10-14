@@ -25,7 +25,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## 目标配置
 
-configs/targets 保留 etcd Raft、HashiCorp Raft、Dragonboat、OmniPaxos、SwiftPaxos 中 EPaxos 的五份目标模板，以及一份 DeepSeek 接入示例。目标模板默认关闭材料发送和执行授权；需要运行时生成本地 `*.run.yaml`，不提交。目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。tests/fixtures/toy_protocol 仅用于隔离回归，不是实验目标或默认选题答案。
+configs/targets 保留 etcd Raft、HashiCorp Raft、Dragonboat、OmniPaxos、SwiftPaxos 中 EPaxos 的五份目标模板，以及一份 DeepSeek 接入示例。目标模板默认关闭材料发送和执行授权；获权后使用本地 `*.run.yaml`，不提交。同一目标、模型及预算复用已有配置，不按实验轮次或方法版本复制；新配置以目标、模型和预算命名。实际方法版本由运行时记录，每次运行独立保存所用配置。目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。tests/fixtures/toy_protocol 仅用于隔离回归，不是实验目标或默认选题答案。
 
 ## 文档与记录
 

@@ -168,15 +168,7 @@ def operation_summary(state, root):
                 'Continue this session using retained drafts and logs and the current allocation; '
                 'a sourced partial update can precede further construction or testing.'}
     check = next((c for c in reversed(state.checks) if c.action == 'experiment'),None)
-    if check:
-        summary['latest_actual_execution'] = {'id':check.id,'status':check.status.value,'exit_code':check.exit_code,
-            'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json',
-            'stdout':check.stdout,'stderr':check.stderr}
-        fixed = next((a for a in state.experiments if a.id == check.experiment_id), None)
-        if fixed:
-            summary['latest_actual_execution'].update(experiment_id=fixed.id, investigation_id=fixed.investigation_id,
-                basis=f'fixed-experiments/{fixed.id}/basis.json',
-                harness=f'fixed-experiments/{fixed.id}/{fixed.harness_filename}')
+    fixed = next((a for a in state.experiments if a.id == check.experiment_id), None) if check else None
     gaps = [{'investigation_id':q.id,'id':g['id'],'question':g['question'][:400], 'response':g['response']}
         for q in state.investigations for g in open_gap_view(state,q.id)]
     summary['necessary_gaps'], summary['other_gap_count'] = gaps[-8:], max(0,len(gaps)-8)
@@ -184,9 +176,10 @@ def operation_summary(state, root):
     owners.update(q.id for q in state.investigations if q.operation_id == current.get('operation_id'))
     if current.get('no_change'):
         owners.clear()
-    if not owners and check and (not current.get('no_change') or
-            not any(check.id in i.executions for i in state.interpretations)):
-        owners.update(a.investigation_id for a in state.experiments if a.id == check.experiment_id)
+    if not owners and fixed and (not current.get('no_change') or
+            not any(check.id in i.executions for i in state.interpretations) or
+            open_gaps(state, fixed.investigation_id, fixed.id)):
+        owners.add(fixed.investigation_id)
     local = [q for q in state.investigations if q.id in owners]
     latest = {i.investigation_id:i for i in state.interpretations}
     summary['questions'] = [{'id':q.id, 'question':q.question[:240], 'disposition':q.disposition,
@@ -240,6 +233,14 @@ def operation_summary(state, root):
             if current.get('no_change') else '') + (
             'Use the allocation and current records to choose useful source work, interpret saved outputs, '
             'or reselect a sourced question along the investigation axes; do not repeat closing submissions.')
+    if check:
+        summary['latest_actual_execution'] = {'id':check.id,'status':check.status.value,'exit_code':check.exit_code,
+            'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json',
+            'stdout':check.stdout,'stderr':check.stderr}
+        if fixed:
+            summary['latest_actual_execution'].update(experiment_id=fixed.id, investigation_id=fixed.investigation_id,
+                basis=f'fixed-experiments/{fixed.id}/basis.json',
+                harness=f'fixed-experiments/{fixed.id}/{fixed.harness_filename}')
     return summary
 
 

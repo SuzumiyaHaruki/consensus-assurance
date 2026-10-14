@@ -489,7 +489,8 @@ def validate_submission(state, root, name, implementation):
         inputs = Inputs(root / 'draft')
         product = AuditSubmission.model_validate(inputs.json(name))
         prepare_submission(context, product, inputs, 'preflight')
-        result['valid'] = True
+        result.update(valid=True, no_change=trial.current_submission['no_change'],
+                      execution_requested=bool(trial.current_submission.get('experiment_id')))
     except (OSError, ValueError, KeyError, TypeError, BudgetExhausted) as exc:
         result['diagnostics'] = [d.model_dump(mode='json') for d in submission_diagnostics(exc)]
     return result

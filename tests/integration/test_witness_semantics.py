@@ -15,6 +15,21 @@ def inputs():
     return comparison,requirements,events
 
 
+@pytest.mark.parametrize('sample,expected,outcome',[
+    ({},False,'unknown'), ({'qualified':False},False,'holds'),
+    ({'qualified':None},False,'violated'), ({'qualified':None},None,'holds')])
+def test_missing_sample_is_unknown_but_null_remains_a_value(sample,expected,outcome):
+    comparison,requirements,events=inputs()
+    comparison.assertion.value=expected
+    events[1].pop('qualified')
+    events[1].update(sample or {'sampling_error':'No corresponding endpoint sample'})
+    result=compare_events(events,comparison,requirements)
+    assert result['outcome']==outcome
+    assert result['comparison_complete']==bool(sample)
+    if not sample:
+        assert result['diagnostics'][0]['identity']=={'operation':'one','generation':1}
+        assert not result['valid_witness_indices'] and 1 in result['missing_indices']
+
 
 @pytest.mark.parametrize('change,success,expected',[
     ('outside',True,'violated'),('outside_only',True,'unknown'),('formal_control',True,'violated'),

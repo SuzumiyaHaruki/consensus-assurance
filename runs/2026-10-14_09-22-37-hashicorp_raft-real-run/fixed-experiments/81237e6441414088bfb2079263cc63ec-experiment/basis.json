@@ -1,0 +1,128 @@
+{
+  "id": "81237e6441414088bfb2079263cc63ec-experiment",
+  "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc quorumEvent(t *testing.T, kind string, fields map[string]interface{}) {\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc waitLeaderAmong(rs []*Raft, d time.Duration) int {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor i, r := range rs {\n\t\t\tif r.State() == Leader {\n\t\t\t\treturn i\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn -1\n}\n\nfunc waitAllConfigured(rs []*Raft, want int, d time.Duration) bool {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tok := true\n\t\tfor _, r := range rs {\n\t\t\tf := r.GetConfiguration()\n\t\t\tif err := f.Error(); err != nil || len(f.Configuration().Servers) != want {\n\t\t\t\tok = false\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif ok {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn false\n}\n\nfunc fullConfigCount(rs []*Raft, want int) int {\n\tn := 0\n\tfor _, r := range rs {\n\t\tf := r.GetConfiguration()\n\t\tif err := f.Error(); err == nil && len(f.Configuration().Servers) == want {\n\t\t\tn++\n\t\t}\n\t}\n\treturn n\n}\n\nfunc configSizes(rs []*Raft) []int {\n\tout := make([]int, 0, len(rs))\n\tfor _, r := range rs {\n\t\tf := r.GetConfiguration()\n\t\tif err := f.Error(); err != nil {\n\t\t\tout = append(out, -1)\n\t\t\tcontinue\n\t\t}\n\t\tout = append(out, len(f.Configuration().Servers))\n\t}\n\treturn out\n}\n\n// TestAssurance_ClusterWideRestartWithoutSnapshot restarts every voter of a\n// three-voter cluster at once from durable state that has never been\n// snapshotted, with RestoreCommittedLogs enabled and (control) disabled, and\n// observes whether the cluster can elect a leader and whether each node still\n// knows the configuration.\nfunc TestAssurance_ClusterWideRestartWithoutSnapshot(t *testing.T) {\n\tfor _, mode := range []string{\"restore_on\", \"restore_off\"} {\n\t\trunClusterRestartCase(t, mode, mode == \"restore_on\")\n\t}\n}\n\nfunc runClusterRestartCase(t *testing.T, mode string, restore bool) {\n\tconf := inmemConfig(t)\n\tconf.RestoreCommittedLogs = restore\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 10\n\n\taddrs := []ServerAddress{\"A\", \"B\", \"C\"}\n\ttrans := make([]*InmemTransport, 3)\n\tconfs := make([]*Config, 3)\n\tlogs := make([]*InmemCommitTrackingStore, 3)\n\tstables := make([]*InmemStore, 3)\n\tsnaps := make([]*InmemSnapshotStore, 3)\n\tfor i, a := range addrs {\n\t\t_, trans[i] = NewInmemTransport(a)\n\t\tc := *conf\n\t\tc.LocalID = ServerID(a)\n\t\tconfs[i] = &c\n\t\tlogs[i] = NewInmemCommitTrackingStore()\n\t\tstables[i] = NewInmemStore()\n\t\tsnaps[i] = NewInmemSnapshotStore()\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tfor j := 0; j < 3; j++ {\n\t\t\tif i != j {\n\t\t\t\ttrans[i].Connect(addrs[j], trans[j])\n\t\t\t}\n\t\t}\n\t}\n\n\tcfg := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t\t{Suffrage: Voter, ID: \"C\", Address: \"C\"},\n\t}}\n\tif err := BootstrapCluster(confs[0], logs[0], stables[0], snaps[0], trans[0], cfg); err != nil {\n\t\tt.Fatalf(\"[%s] bootstrap: %v\", mode, err)\n\t}\n\n\trafts := make([]*Raft, 3)\n\tfor i := 0; i < 3; i++ {\n\t\tr, err := NewRaft(confs[i], new(MockFSM), logs[i], stables[i], snaps[i], trans[i])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"[%s] NewRaft %d: %v\", mode, i, err)\n\t\t}\n\t\trafts[i] = r\n\t}\n\n\tfirstLeader := waitLeaderAmong(rafts, 10*time.Second)\n\tif firstLeader < 0 {\n\t\tt.Fatalf(\"[%s] no initial leader\", mode)\n\t}\n\tif !waitAllConfigured(rafts, 3, 5*time.Second) {\n\t\tt.Fatalf(\"[%s] nodes did not converge on the configuration: %v\", mode, configSizes(rafts))\n\t}\n\tfor i := 0; i < 10; i++ {\n\t\tif err := rafts[firstLeader].Apply([]byte(fmt.Sprintf(\"cmd%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"[%s] apply %d: %v\", mode, i, err)\n\t\t}\n\t}\n\tstaged := make([]uint64, 3)\n\tfor i := 0; i < 3; i++ {\n\t\tstaged[i], _ = logs[i].GetCommitIndex()\n\t}\n\tquorumEvent(t, \"pre_restart_\"+mode, map[string]interface{}{\n\t\t\"mode\":              mode,\n\t\t\"servers_before\":    configSizes(rafts),\n\t\t\"staged_commit_idx\": fmt.Sprintf(\"%v\", staged),\n\t})\n\n\t// Restart every voter at once, as in a rolling cold restart of the cluster.\n\tfor i := 0; i < 3; i++ {\n\t\tif err := rafts[i].Shutdown().Error(); err != nil {\n\t\t\tt.Fatalf(\"[%s] shutdown %d: %v\", mode, i, err)\n\t\t}\n\t}\n\ttrans2 := make([]*InmemTransport, 3)\n\tfor i, a := range addrs {\n\t\t_, trans2[i] = NewInmemTransport(a)\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tfor j := 0; j < 3; j++ {\n\t\t\tif i != j {\n\t\t\t\ttrans2[i].Connect(addrs[j], trans2[j])\n\t\t\t}\n\t\t}\n\t}\n\trestarted := make([]*Raft, 3)\n\tfor i := 0; i < 3; i++ {\n\t\tr, err := NewRaft(confs[i], new(MockFSM), logs[i], stables[i], snaps[i], trans2[i])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"[%s] restart %d: %v\", mode, i, err)\n\t\t}\n\t\trestarted[i] = r\n\t}\n\n\t// Fair opportunity to campaign: many election timeouts (50ms configured).\n\tleaderAfter := waitLeaderAmong(restarted, 6*time.Second)\n\tquorumEvent(t, \"post_restart_\"+mode, map[string]interface{}{\n\t\t\"mode\":             mode,\n\t\t\"servers_after\":    configSizes(restarted),\n\t\t\"any_leader\":       leaderAfter >= 0,\n\t\t\"leader_index\":     leaderAfter,\n\t\t\"nodes_with_full_config\": fullConfigCount(restarted, 3),\n\t})\n\n\tfor i := 0; i < 3; i++ {\n\t\t_ = restarted[i].Shutdown().Error()\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_all_on",
+          "event": "pre_restart_restore_on",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "restore_on",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_all_off",
+          "event": "pre_restart_restore_off",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "restore_off",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "newraft_scan",
+      "restore_committed",
+      "follower_abort",
+      "heartbeat_timeout_election",
+      "cfg_doc"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three-voter in-memory cluster {A,B,C} bootstrapped on A, all three running and converged on the configuration, ten commands committed, no snapshot ever taken (SnapshotThreshold huge, SnapshotInterval 10m). All three voters are then shut down and restarted at once on their own durable stores with fresh transports: case restore_on with RestoreCommittedLogs=true, control restore_off with it false. Observations: each node's configuration size (GetConfiguration), the number of nodes still holding the full configuration, and whether any leader is elected within a six-second opportunity (configured election/heartbeat timeouts are 50ms, so dozens of election windows).",
+      "assumptions": [
+        "Every voter shares the same durable history because A bootstrapped and replicated it; all three stores report a persisted commit index at or above the configuration entry index before the restart (observed: [11 11 9] against the configuration entry at index 1).",
+        "No node snapshots before the restart, which is ordinary operation below SnapshotThreshold (8192 by default; the captured default SnapshotInterval is 120s).",
+        "Simultaneous restart of all voters is a legal operator action, not a fault injection: every node is stopped gracefully and started with its documented configuration."
+      ],
+      "excluded": [
+        "No partitions, no disk faults, no message loss; the only varying factor is RestoreCommittedLogs.",
+        "The election fan-out itself is not traced beyond the observable absence of a leader and the logged 'no known peers, aborting election' path that source-reading identifies."
+      ],
+      "parameters": {
+        "protocol_version": 3,
+        "peers": 3,
+        "heartbeat_timeout_ms": 50,
+        "election_timeout_ms": 50,
+        "trailing_logs": 10,
+        "opportunity_seconds": 6
+      }
+    },
+    "prefix": "Real bootstrap of all three voters on A's stores, real replication to B and C, real election, real applies, graceful shutdown of all three, then restart of all three on the same InmemCommitTrackingStore/InmemStore/InmemSnapshotStore instances with fresh in-memory transports. Nothing is fabricated: configuration, log and commit index all come from those operations; the control case repeats the identical procedure with RestoreCommittedLogs=false.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "post_restart_restore_on",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "admit_all_on",
+        "assertion": {
+          "field": "nodes_with_full_config",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "After a simultaneous restart with RestoreCommittedLogs enabled, all three voters must still know the configuration whose entry is present in their own committed logs."
+      },
+      {
+        "event": "post_restart_restore_off",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "admit_all_off",
+        "assertion": {
+          "field": "nodes_with_full_config",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: the same simultaneous restart without RestoreCommittedLogs keeps all three voters configured, isolating the committed-prefix replay as the cause."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "098207c91cca4275819eb43e8957164a",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "81237e6441414088bfb2079263cc63ec",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

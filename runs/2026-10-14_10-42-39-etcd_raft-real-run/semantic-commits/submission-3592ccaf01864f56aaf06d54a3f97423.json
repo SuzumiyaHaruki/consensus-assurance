@@ -1,0 +1,934 @@
+{
+  "input": {
+    "rationale": "Audit of Node-level proposal authority across an authority transition (member removal and re-admission) in the captured etcd-raft snapshot. The source trace shows that node.run() arms the proposal channel only when the observed leader changes, disarms it when the local node is removed, and never re-arms it on re-admission; a re-added voter with a stable leader therefore has no path that forwards or rejects a proposal. The submitted experiment drives a real three-node Node-API cluster through committed conf changes and compares the re-added voter's invocation with a never-removed member and with the same node after a leader change.",
+    "sources": [
+      {
+        "id": "runloop",
+        "file": "node.go",
+        "start_line": 343,
+        "end_line": 380,
+        "kind": "code_observation"
+      },
+      {
+        "id": "removal_gate",
+        "file": "node.go",
+        "start_line": 398,
+        "end_line": 431,
+        "kind": "code_observation"
+      },
+      {
+        "id": "propose_api",
+        "file": "node.go",
+        "start_line": 467,
+        "end_line": 473,
+        "kind": "code_observation"
+      },
+      {
+        "id": "stepwait",
+        "file": "node.go",
+        "start_line": 514,
+        "end_line": 552,
+        "kind": "code_observation"
+      },
+      {
+        "id": "leader_prop_gate",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1303,
+        "kind": "code_observation"
+      },
+      {
+        "id": "switch_config",
+        "file": "raft.go",
+        "start_line": 1979,
+        "end_line": 1996,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@readd",
+        "question": "After a voter is removed and then re-added by committed configuration changes, which code path lets a Node.Propose invocation on that re-added voter reach a decision (forward to the leader, be appended, or return an error), while the same leader stays in place?",
+        "source_ids": [
+          "runloop",
+          "removal_gate",
+          "propose_api",
+          "stepwait",
+          "leader_prop_gate"
+        ],
+        "hypothesis": "node.run() disarms the proposal channel when the local member is removed (propc = nil) and only re-arms it on an observed leader change, so a re-admitted voter with a stable leader accepts Propose calls into a nil channel that never fires: the invocation neither forwards the proposal nor returns an error until the caller's own context expires.",
+        "discriminator": "Drive a real three-node Node-API cluster (config {1,2,3}, leader 1) through committed remove-3 and add-3 conf changes, then invoke Propose on node 3 and on a never-removed member (node 2) with the same leader, and record whether each invocation returns, with which error, and whether its payload reaches any node's committed entries; finally force a leader change and repeat the invocation on node 3.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@gate",
+        "kind": "behavior",
+        "statement": "node.run() keeps a local proposal gate armed only as a side effect of observing a leader change: when r.lead changes and a leader exists it sets propc = n.propc, when no leader exists it sets propc = nil, and after applying a conf change that removes the local node from the configuration it sets propc = nil. Applying a conf change that adds the local node back does not change the gate (the removal branch is guarded by okBefore && !okAfter, which is false for a re-addition), so the gate stays nil until the next observed leader change.",
+        "conditions": "Async Node API (node.run loop) with a single goroutine consuming Ready and calling ApplyConfChange for every conf change entry in Ready.CommittedEntries; the local node is a voter that sees a leader, is removed by a committed conf change, and is then re-added by a later committed conf change, with the same leader in place throughout.",
+        "source_ids": [
+          "runloop",
+          "removal_gate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@block",
+        "kind": "behavior",
+        "statement": "node.Propose and node.ProposeConfChange send a MsgProp to the run loop through stepWithWaitOption. For MsgProp the channel used is n.propc; when that channel is nil the send case cannot be selected, so the call blocks until the caller's context is done or the node is stopped, and returns context.Canceled/DeadlineExceeded or ErrStopped instead of a proposal outcome.",
+        "conditions": "Same run loop as @gate with the proposal gate left nil; caller supplies a context whose deadline is reached while the node keeps running.",
+        "source_ids": [
+          "propose_api",
+          "stepwait"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@contrast",
+        "kind": "fact",
+        "statement": "The raft state machine itself does not block a proposal from a member that is no longer in its own configuration: stepLeader returns ErrProposalDropped when the leader has no progress entry for itself (a removed leader), so the blocking behavior of a re-added voter is produced by the node wrapper's gate rather than by the state machine's proposal rules.",
+        "conditions": "State-leader step function with r.trk.Progress[r.id] == nil (local node removed from the active configuration).",
+        "source_ids": [
+          "leader_prop_gate",
+          "removal_gate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [
+      {
+        "investigation_id": "@readd",
+        "question": "Besides an observed leader change, which source path re-arms the node.run() proposal gate for a member that is added back to the configuration, and which component is responsible for doing so?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [
+      {
+        "investigation_id": "@readd",
+        "experiment_id": null,
+        "source_ids": [
+          "runloop",
+          "removal_gate",
+          "propose_api",
+          "stepwait",
+          "leader_prop_gate"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "asserted",
+        "rationale": "Source account: node.run() arms propc only through the observed-leader-change branch (node.go:373-377) and disarms it after applying a removal conf change (node.go:412-427); the re-admission case never matches that guard because okBefore is false once the local Progress entry was dropped, so subsequent proposals are enqueued onto a nil channel inside stepWithWaitOption (node.go:514-552) and can only end by context expiry or node stop. The state machine would have accepted the proposal (stepFollower forwards to the leader) and the removed-leader case returns ErrProposalDropped instead of blocking (raft.go:1298-1302), so no rejection or loss is reported to the caller while the member is in fact a voter with a known leader. The submitted experiment is the discriminator for this account and its retained receipt is expected to witness the invocation interval; this entry is currently a source-only account and will be revised with that receipt (including the control on a never-removed member and the post-leader-change invocation).",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "@gate",
+            "revision": 1,
+            "assertion": "propc is armed only on observed leader change and is left nil after a re-admission"
+          },
+          {
+            "entry_id": "@block",
+            "revision": 1,
+            "assertion": "MsgProp on a nil propc blocks until context expiry or node stop"
+          },
+          {
+            "entry_id": "@contrast",
+            "revision": 1,
+            "assertion": "the raft state machine returns ErrProposalDropped for a removed leader instead of blocking"
+          }
+        ],
+        "counterevidence": [
+          "node.go:407-411 comments call the gate unsound ('propc is reset when the leader changes ... This isn't very sound and likely has bugs'), i.e. the mechanism is acknowledged as improvised; this explains but does not repair the concrete blocked invocation, and it imposes no restriction on the caller and no error contract.",
+          "A caller using a bounded context does eventually return (context deadline exceeded), so the defect is a bounded invocation interval under a stable leader, not an unbounded deadlock; the proposal itself is never delivered or rejected."
+        ],
+        "limitations": [
+          "The retained receipt for the submitted experiment does not exist yet in this turn; the source-only account above is the current basis.",
+          "The account is scoped to the async Node API path (node.run loop); RawNode.Propose has no such gate and is not claimed to be affected."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "@readd",
+      "harness_path": "harness/assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "source_ids": [
+        "runloop",
+        "removal_gate",
+        "propose_api",
+        "stepwait",
+        "leader_prop_gate"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "Three real raft nodes (ids 1,2,3) driven through the async Node API in one process: Ready handling with storage appends, conf-change application through Node.ApplyConfChange, and direct message delivery. Node 1 campaigns and becomes leader in the initial configuration {1,2,3} supplied by the storage ConfState; a remove-3 conf change and then an add-3 conf change are proposed on the leader and applied on every node. Then (a) Node.Propose is invoked on re-added node 3, (b) Node.Propose is invoked on never-removed node 2, and (c) after forcing a leader change (node 2 campaigns), Node.Propose is invoked again on node 3. Each invocation records whether it returned, the returned error, the elapsed time, the observed voter status and leader, and whether the payload reached any node's committed entries.",
+        "assumptions": [
+          "Reliable in-process message delivery and a shared logical clock via Tick are not used; no ticks are delivered, so the leader stays stable until the experiment forces the leader change.",
+          "Storage appends of Ready.Entries are durable before messages are delivered, which the driver does by appending entries before dispatching the Ready's messages.",
+          "The removal and re-addition are exactly the committed conf changes the driver applies; node 3 applies its own removal and re-addition through Node.ApplyConfChange."
+        ],
+        "excluded": [
+          "RawNode.Propose (no gate exists on that path)",
+          "AsyncStorageWrites mode",
+          "Network faults: delivery is reliable, so a non-delivered proposal cannot be attributed to message loss."
+        ],
+        "parameters": {}
+      },
+      "prefix": "Start nodes 1,2,3 with a MemoryStorage per node whose ConfState voters are {1,2,3} (captured test helper withPeers). Node 1 campaigns at term 1 and becomes leader; every node then reports leader 1 and node 1 has applied the initial entry. Propose a remove-3 ConfChange on node 1 and wait until node 3's applied entries contain it and node 3's own configuration excludes node 3. Propose an add-3 ConfChange on node 1 and wait until node 3's applied entries contain it and node 3's configuration includes node 3 again, with leader still 1. Then emit the observations for the three invocation cases.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "Client-facing obligation of the Node interface: a Propose invocation on a voting member whose leader is known must either reach a proposal outcome (appended/forwarded) or return an error to the caller; a caller cannot retry a proposal that never returns.",
+      "prerequisites": [
+        {
+          "alias": "ctx",
+          "event": "node_context",
+          "conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "voter",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "reapplied",
+          "event": "conf_change_applied",
+          "conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "change",
+              "op": "eq",
+              "value": "add",
+              "reference": null
+            },
+            {
+              "field": "ok",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit",
+          "event": "propose_invocation",
+          "conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "phase",
+              "op": "eq",
+              "value": "after_readmission",
+              "reference": null
+            },
+            {
+              "field": "operation_id",
+              "op": "eq",
+              "value": null,
+              "reference": "reapplied.operation_id"
+            },
+            {
+              "field": "leader",
+              "op": "eq",
+              "value": null,
+              "reference": "ctx.leader"
+            }
+          ]
+        },
+        {
+          "alias": "admit_control",
+          "event": "propose_invocation",
+          "conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            },
+            {
+              "field": "phase",
+              "op": "eq",
+              "value": "after_readmission",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "lchange",
+          "event": "leader_change",
+          "conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "from",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_repair",
+          "event": "propose_invocation",
+          "conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "phase",
+              "op": "eq",
+              "value": "after_leader_change",
+              "reference": null
+            },
+            {
+              "field": "leader",
+              "op": "eq",
+              "value": null,
+              "reference": "lchange.to"
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "propose_result",
+          "identity_fields": [
+            "operation_id"
+          ],
+          "admission_alias": "admit",
+          "assertion": {
+            "field": "returned",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "voter",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Invocation on the re-added voter did not return inside the observation window although the node is a voter and its leader is 1."
+        },
+        {
+          "event": "commit_observation",
+          "identity_fields": [
+            "operation_id"
+          ],
+          "admission_alias": "admit",
+          "assertion": {
+            "field": "present",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "The re-added voter's payload never reached any node's committed entries within the window."
+        },
+        {
+          "event": "propose_result",
+          "identity_fields": [
+            "operation_id"
+          ],
+          "admission_alias": "admit_control",
+          "assertion": {
+            "field": "returned",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: the never-removed member's invocation on the same leader returned immediately."
+        },
+        {
+          "event": "commit_observation",
+          "identity_fields": [
+            "operation_id"
+          ],
+          "admission_alias": "admit_control",
+          "assertion": {
+            "field": "present",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: the never-removed member's payload was committed, so the leader and the proposal path were healthy."
+        },
+        {
+          "event": "propose_result",
+          "identity_fields": [
+            "operation_id"
+          ],
+          "admission_alias": "admit_repair",
+          "assertion": {
+            "field": "returned",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "After the forced leader change, the same invocation on node 3 returned immediately."
+        }
+      ],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "interpretations": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "3592ccaf01864f56aaf06d54a3f97423",
+      "result": {
+        "submission": "update.json",
+        "summary": "Sourced and locally reproduced a proposal-authority defect in the captured etcd-raft snapshot: node.run() arms its proposal gate only on an observed leader change and leaves it nil after a member is re-added, so Node.Propose on a re-added voter with a stable leader never returns and its payload is never delivered (it unblocks only via the caller's context deadline; a never-removed member's identical call returns immediately, and the same call succeeds after a leader change). Submitted sources, investigation, three Behavior/Fact entries, a necessary gap, a source-only interpretation (defect asserted), and a three-node Node-API experiment with witness and control comparisons."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "3592ccaf01864f56aaf06d54a3f97423-question-0",
+        "version": 1,
+        "question": "After a voter is removed and then re-added by committed configuration changes, which code path lets a Node.Propose invocation on that re-added voter reach a decision (forward to the leader, be appended, or return an error), while the same leader stays in place?",
+        "source_ids": [
+          "runloop",
+          "removal_gate",
+          "propose_api",
+          "stepwait",
+          "leader_prop_gate"
+        ],
+        "hypothesis": "node.run() disarms the proposal channel when the local member is removed (propc = nil) and only re-arms it on an observed leader change, so a re-admitted voter with a stable leader accepts Propose calls into a nil channel that never fires: the invocation neither forwards the proposal nor returns an error until the caller's own context expires.",
+        "discriminator": "Drive a real three-node Node-API cluster (config {1,2,3}, leader 1) through committed remove-3 and add-3 conf changes, then invoke Propose on node 3 and on a never-removed member (node 2) with the same leader, and record whether each invocation returns, with which error, and whether its payload reaches any node's committed entries; finally force a leader change and repeat the invocation on node 3.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "3592ccaf01864f56aaf06d54a3f97423-gap-0",
+            "question": "Besides an observed leader change, which source path re-arms the node.run() proposal gate for a member that is added back to the configuration, and which component is responsible for doing so?",
+            "experiment_id": null,
+            "operation_id": "3592ccaf01864f56aaf06d54a3f97423"
+          }
+        ],
+        "history": [],
+        "operation_id": "3592ccaf01864f56aaf06d54a3f97423"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "node.run() keeps a local proposal gate armed only as a side effect of observing a leader change: when r.lead changes and a leader exists it sets propc = n.propc, when no leader exists it sets propc = nil, and after applying a conf change that removes the local node from the configuration it sets propc = nil. Applying a conf change that adds the local node back does not change the gate (the removal branch is guarded by okBefore && !okAfter, which is false for a re-addition), so the gate stays nil until the next observed leader change.",
+        "conditions": "Async Node API (node.run loop) with a single goroutine consuming Ready and calling ApplyConfChange for every conf change entry in Ready.CommittedEntries; the local node is a voter that sees a leader, is removed by a committed conf change, and is then re-added by a later committed conf change, with the same leader in place throughout.",
+        "source_ids": [
+          "runloop",
+          "removal_gate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3592ccaf01864f56aaf06d54a3f97423"
+      },
+      {
+        "id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "node.Propose and node.ProposeConfChange send a MsgProp to the run loop through stepWithWaitOption. For MsgProp the channel used is n.propc; when that channel is nil the send case cannot be selected, so the call blocks until the caller's context is done or the node is stopped, and returns context.Canceled/DeadlineExceeded or ErrStopped instead of a proposal outcome.",
+        "conditions": "Same run loop as @gate with the proposal gate left nil; caller supplies a context whose deadline is reached while the node keeps running.",
+        "source_ids": [
+          "propose_api",
+          "stepwait"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3592ccaf01864f56aaf06d54a3f97423"
+      },
+      {
+        "id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The raft state machine itself does not block a proposal from a member that is no longer in its own configuration: stepLeader returns ErrProposalDropped when the leader has no progress entry for itself (a removed leader), so the blocking behavior of a re-added voter is produced by the node wrapper's gate rather than by the state machine's proposal rules.",
+        "conditions": "State-leader step function with r.trk.Progress[r.id] == nil (local node removed from the active configuration).",
+        "source_ids": [
+          "leader_prop_gate",
+          "removal_gate"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3592ccaf01864f56aaf06d54a3f97423"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "3592ccaf01864f56aaf06d54a3f97423-experiment",
+        "investigation_id": "3592ccaf01864f56aaf06d54a3f97423-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n\n\t\"google.golang.org/protobuf/proto\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// emitAssurance writes one CA_EVENT line to the selected test's output stream.\nfunc emitAssurance(t *testing.T, event string, fields map[string]any) {\n\tt.Helper()\n\trec := map[string]any{\"event\": event}\n\tfor k, v := range fields {\n\t\trec[k] = v\n\t}\n\tb, err := json.Marshal(rec)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal CA_EVENT: %v\", err)\n\t}\n\tt.Logf(\"CA_EVENT %s\", string(b))\n}\n\ntype assuranceNode struct {\n\tid      uint64\n\tn       *node\n\tstorage *MemoryStorage\n}\n\n// assuranceCluster drives several real raft nodes (Node API, no async storage\n// writes) in one process: READY handling, storage appends, conf-change\n// application and message delivery.\ntype assuranceCluster struct {\n\tt       *testing.T\n\tmu      sync.Mutex\n\tnodes   map[uint64]*assuranceNode\n\tapplied map[uint64][]*pb.Entry\n}\n\nfunc newAssuranceCluster(t *testing.T, ids ...uint64) *assuranceCluster {\n\tc := &assuranceCluster{\n\t\tt:       t,\n\t\tnodes:   map[uint64]*assuranceNode{},\n\t\tapplied: map[uint64][]*pb.Entry{},\n\t}\n\tfor _, id := range ids {\n\t\ts := newTestMemoryStorage(withPeers(ids...))\n\t\trn := newTestRawNode(id, 10, 1, s)\n\t\tnd := newNode(rn)\n\t\tc.nodes[id] = &assuranceNode{id: id, n: &nd, storage: s}\n\t}\n\tfor _, cn := range c.nodes {\n\t\tgo cn.n.run()\n\t\tgo c.drive(cn)\n\t}\n\tt.Cleanup(c.stop)\n\treturn c\n}\n\nfunc (c *assuranceCluster) drive(cn *assuranceNode) {\n\tfor {\n\t\tselect {\n\t\tcase <-cn.n.done:\n\t\t\treturn\n\t\tcase rd := <-cn.n.Ready():\n\t\t\tif !IsEmptyHardState(rd.HardState) {\n\t\t\t\tcn.storage.SetHardState(rd.HardState)\n\t\t\t}\n\t\t\tif !IsEmptySnap(rd.Snapshot) {\n\t\t\t\tcn.storage.ApplySnapshot(rd.Snapshot)\n\t\t\t}\n\t\t\tcn.storage.Append(rd.Entries)\n\t\t\tc.mu.Lock()\n\t\t\tc.applied[cn.id] = append(c.applied[cn.id], rd.CommittedEntries...)\n\t\t\tc.mu.Unlock()\n\t\t\tfor _, e := range rd.CommittedEntries {\n\t\t\t\tc.applyConfChange(cn, e)\n\t\t\t}\n\t\t\tfor _, m := range rd.Messages {\n\t\t\t\tc.deliver(m)\n\t\t\t}\n\t\t\tcn.n.Advance()\n\t\t}\n\t}\n}\n\nfunc (c *assuranceCluster) applyConfChange(cn *assuranceNode, e *pb.Entry) {\n\tswitch e.GetType() {\n\tcase pb.EntryConfChange:\n\t\tcc := &pb.ConfChange{}\n\t\tif err := proto.Unmarshal(e.GetData(), cc); err != nil {\n\t\t\tc.t.Errorf(\"unmarshal ConfChange: %v\", err)\n\t\t\treturn\n\t\t}\n\t\tcn.n.ApplyConfChange(cc)\n\tcase pb.EntryConfChangeV2:\n\t\tcc := &pb.ConfChangeV2{}\n\t\tif err := proto.Unmarshal(e.GetData(), cc); err != nil {\n\t\t\tc.t.Errorf(\"unmarshal ConfChangeV2: %v\", err)\n\t\t\treturn\n\t\t}\n\t\tcn.n.ApplyConfChange(cc)\n\t}\n}\n\nfunc (c *assuranceCluster) deliver(m *pb.Message) {\n\tif IsLocalMsgTarget(m.GetTo()) {\n\t\treturn\n\t}\n\tc.mu.Lock()\n\ttarget := c.nodes[m.GetTo()]\n\tc.mu.Unlock()\n\tif target == nil {\n\t\treturn\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)\n\tdefer cancel()\n\t_ = target.n.Step(ctx, m)\n}\n\nfunc (c *assuranceCluster) stop() {\n\tfor _, cn := range c.nodes {\n\t\tcn.n.Stop()\n\t}\n}\n\nfunc (c *assuranceCluster) appliedEntries(id uint64) []*pb.Entry {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock()\n\treturn append([]*pb.Entry(nil), c.applied[id]...)\n}\n\nfunc (c *assuranceCluster) waitUntil(what string, pred func() bool) bool {\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif pred() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(2 * time.Millisecond)\n\t}\n\tc.t.Errorf(\"timed out waiting for %s\", what)\n\treturn false\n}\n\nfunc assuranceConfKind(t pb.ConfChangeType) string {\n\tswitch t {\n\tcase pb.ConfChangeAddNode:\n\t\treturn \"add\"\n\tcase pb.ConfChangeRemoveNode:\n\t\treturn \"remove\"\n\tcase pb.ConfChangeAddLearnerNode:\n\t\treturn \"add_learner\"\n\tcase pb.ConfChangeUpdateNode:\n\t\treturn \"update\"\n\t}\n\treturn fmt.Sprintf(\"unknown_%d\", int(t))\n}\n\n// confChangeIn reports the index of the first applied conf change matching kind\n// and target.\nfunc confChangeIn(ents []*pb.Entry, kind string, target uint64) (uint64, bool) {\n\tfor _, e := range ents {\n\t\tswitch e.GetType() {\n\t\tcase pb.EntryConfChange:\n\t\t\tcc := &pb.ConfChange{}\n\t\t\tif proto.Unmarshal(e.GetData(), cc) != nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif assuranceConfKind(cc.GetType()) == kind && cc.GetNodeId() == target {\n\t\t\t\treturn e.GetIndex(), true\n\t\t\t}\n\t\tcase pb.EntryConfChangeV2:\n\t\t\tcc := &pb.ConfChangeV2{}\n\t\t\tif proto.Unmarshal(e.GetData(), cc) != nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tfor _, ch := range cc.GetChanges() {\n\t\t\t\tif assuranceConfKind(ch.GetType()) == kind && ch.GetNodeId() == target {\n\t\t\t\t\treturn e.GetIndex(), true\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\treturn 0, false\n}\n\nfunc payloadPresent(ents []*pb.Entry, payload string) bool {\n\tfor _, e := range ents {\n\t\tif e.GetType() == pb.EntryNormal && string(e.GetData()) == payload {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc (c *assuranceCluster) nodesWithPayload(payload string) []uint64 {\n\tvar ids []uint64\n\tfor id := range c.nodes {\n\t\tif payloadPresent(c.appliedEntries(id), payload) {\n\t\t\tids = append(ids, id)\n\t\t}\n\t}\n\treturn ids\n}\n\nfunc assuranceVoter(nd *node, id uint64) bool {\n\tcfg := nd.Status().Config\n\tif _, ok := cfg.Voters[0][id]; ok {\n\t\treturn true\n\t}\n\t_, ok := cfg.Voters[1][id]\n\treturn ok\n}\n\nfunc assuranceErrf(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// TestAssuranceReaddedVoterPropose invokes Node.Propose on a voter that was\n// removed and then re-added by committed configuration changes, while the same\n// leader stays in place, and compares it with (a) a proposal by a member that\n// was never removed, and (b) the same node's proposal after a leader change.\nfunc TestAssuranceReaddedVoterPropose(t *testing.T) {\n\tconst (\n\t\topWitness = \"readd-propose-witness\"\n\t\topControl = \"member-propose-control\"\n\t\topRepair  = \"rearm-propose-after-leader-change\"\n\t)\n\twitnessPayload := \"witness-payload-readded-voter\"\n\tcontrolPayload := \"control-payload-member\"\n\trepairPayload := \"repair-payload-after-leader-change\"\n\tconst witnessWindowMs = 1200\n\tconst witnessDeadlineMs = 2500\n\n\tc := newAssuranceCluster(t, 1, 2, 3)\n\tbg := context.Background()\n\n\tif err := c.nodes[1].n.Campaign(bg); err != nil {\n\t\tt.Fatalf(\"campaign: %v\", err)\n\t}\n\tc.waitUntil(\"node 1 leader\", func() bool { return c.nodes[1].n.Status().SoftState.Lead == 1 })\n\tc.waitUntil(\"every node sees leader 1\", func() bool {\n\t\tfor id := range c.nodes {\n\t\t\tif c.nodes[id].n.Status().SoftState.Lead != 1 {\n\t\t\t\treturn false\n\t\t\t}\n\t\t}\n\t\treturn true\n\t})\n\tc.waitUntil(\"node 1 applied initial entry\", func() bool { return c.nodes[1].n.Status().Applied >= 1 })\n\temitAssurance(t, \"cluster_ready\", map[string]any{\n\t\t\"leader\": 1, \"term\": c.nodes[1].n.Status().GetTerm(),\n\t\t\"voters\": []uint64{1, 2, 3},\n\t})\n\n\t// Prefix: remove node 3, then re-add it, both through committed conf changes\n\t// proposed on the leader and applied on every node.\n\tremoveCC := &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(3))}\n\temitAssurance(t, \"conf_change_proposed\", map[string]any{\n\t\t\"operation_id\": \"remove-3\", \"node\": 1, \"change\": \"remove\", \"target\": 3,\n\t})\n\tif err := c.nodes[1].n.ProposeConfChange(bg, removeCC); err != nil {\n\t\tt.Fatalf(\"propose remove: %v\", err)\n\t}\n\tvar removeIndex uint64\n\tc.waitUntil(\"node 3 applied its own removal\", func() bool {\n\t\tidx, ok := confChangeIn(c.appliedEntries(3), \"remove\", 3)\n\t\tif ok {\n\t\t\tremoveIndex = idx\n\t\t}\n\t\treturn ok\n\t})\n\tc.waitUntil(\"node 3 config excludes itself\", func() bool { return !assuranceVoter(c.nodes[3].n, 3) })\n\temitAssurance(t, \"conf_change_applied\", map[string]any{\n\t\t\"operation_id\": \"remove-3\", \"node\": 3, \"change\": \"remove\", \"target\": 3, \"ok\": true,\n\t\t\"applied_index\": int(removeIndex), \"voter\": assuranceVoter(c.nodes[3].n, 3),\n\t\t\"leader\": c.nodes[3].n.Status().SoftState.Lead, \"term\": c.nodes[3].n.Status().GetTerm(),\n\t})\n\n\taddCC := &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(3))}\n\temitAssurance(t, \"conf_change_proposed\", map[string]any{\n\t\t\"operation_id\": \"readd-3\", \"node\": 1, \"change\": \"add\", \"target\": 3,\n\t})\n\tif err := c.nodes[1].n.ProposeConfChange(bg, addCC); err != nil {\n\t\tt.Fatalf(\"propose readd: %v\", err)\n\t}\n\tvar readdIndex uint64\n\tc.waitUntil(\"node 3 applied its own re-admission\", func() bool {\n\t\tidx, ok := confChangeIn(c.appliedEntries(3), \"add\", 3)\n\t\tif ok {\n\t\t\treaddIndex = idx\n\t\t}\n\t\treturn ok\n\t})\n\tc.waitUntil(\"node 3 config includes itself again\", func() bool { return assuranceVoter(c.nodes[3].n, 3) })\n\temitAssurance(t, \"conf_change_applied\", map[string]any{\n\t\t\"operation_id\": opWitness, \"change\": \"add\", \"target\": 3, \"node\": 3, \"ok\": true,\n\t\t\"applied_index\": int(readdIndex), \"voter\": assuranceVoter(c.nodes[3].n, 3),\n\t\t\"leader\": c.nodes[3].n.Status().SoftState.Lead, \"term\": c.nodes[3].n.Status().GetTerm(),\n\t})\n\temitAssurance(t, \"node_context\", map[string]any{\n\t\t\"operation_id\": opWitness, \"node\": 3,\n\t\t\"voter\":  assuranceVoter(c.nodes[3].n, 3),\n\t\t\"leader\": c.nodes[3].n.Status().SoftState.Lead,\n\t\t\"term\":   c.nodes[3].n.Status().GetTerm(),\n\t})\n\n\t// Case 1 (witness): propose on the re-added voter while the leader is stable.\n\temitAssurance(t, \"propose_invocation\", map[string]any{\n\t\t\"operation_id\": opWitness, \"node\": 3, \"phase\": \"after_readmission\",\n\t\t\"leader\": c.nodes[3].n.Status().SoftState.Lead, \"voter\": assuranceVoter(c.nodes[3].n, 3),\n\t\t\"deadline_ms\": witnessDeadlineMs, \"payload\": witnessPayload,\n\t})\n\tctxW, cancelW := context.WithTimeout(context.Background(), witnessDeadlineMs*time.Millisecond)\n\tdefer cancelW()\n\twErrCh := make(chan error, 1)\n\tstartW := time.Now()\n\tgo func() { wErrCh <- c.nodes[3].n.Propose(ctxW, []byte(witnessPayload)) }()\n\tvar wReturned bool\n\tvar wErr error\n\tselect {\n\tcase wErr = <-wErrCh:\n\t\twReturned = true\n\tcase <-time.After(witnessWindowMs * time.Millisecond):\n\t}\n\temitAssurance(t, \"propose_result\", map[string]any{\n\t\t\"operation_id\": opWitness, \"node\": 3, \"phase\": \"after_readmission\",\n\t\t\"returned\": wReturned, \"err\": assuranceErrf(wErr),\n\t\t\"elapsed_ms\": int(time.Since(startW).Milliseconds()), \"window_ms\": witnessWindowMs,\n\t\t\"deadline_ms\": witnessDeadlineMs, \"voter\": assuranceVoter(c.nodes[3].n, 3),\n\t\t\"leader\": c.nodes[3].n.Status().SoftState.Lead, \"payload\": witnessPayload,\n\t})\n\tif !wReturned {\n\t\tselect {\n\t\tcase wErr = <-wErrCh:\n\t\t\temitAssurance(t, \"propose_release\", map[string]any{\n\t\t\t\t\"operation_id\": opWitness, \"node\": 3, \"err\": assuranceErrf(wErr),\n\t\t\t\t\"elapsed_ms\": int(time.Since(startW).Milliseconds()),\n\t\t\t})\n\t\tcase <-time.After(3 * time.Second):\n\t\t\temitAssurance(t, \"propose_release\", map[string]any{\n\t\t\t\t\"operation_id\": opWitness, \"node\": 3, \"err\": \"still not returned\",\n\t\t\t\t\"elapsed_ms\": int(time.Since(startW).Milliseconds()),\n\t\t\t})\n\t\t}\n\t}\n\twitnessNodes := c.nodesWithPayload(witnessPayload)\n\temitAssurance(t, \"commit_observation\", map[string]any{\n\t\t\"operation_id\": opWitness, \"payload\": witnessPayload,\n\t\t\"present\": len(witnessNodes) > 0, \"observed_nodes\": witnessNodes,\n\t\t\"checked_after_ms\": witnessWindowMs,\n\t})\n\n\t// Case 2 (control): the same kind of invocation on a member that was never\n\t// removed, with the same leader, must complete and be committed.\n\temitAssurance(t, \"propose_invocation\", map[string]any{\n\t\t\"operation_id\": opControl, \"node\": 2, \"phase\": \"after_readmission\",\n\t\t\"leader\": c.nodes[2].n.Status().SoftState.Lead, \"voter\": assuranceVoter(c.nodes[2].n, 2),\n\t\t\"deadline_ms\": 5000, \"payload\": controlPayload,\n\t})\n\tctxC, cancelC := context.WithTimeout(context.Background(), 5*time.Second)\n\tdefer cancelC()\n\tstartC := time.Now()\n\tcErr := c.nodes[2].n.Propose(ctxC, []byte(controlPayload))\n\temitAssurance(t, \"propose_result\", map[string]any{\n\t\t\"operation_id\": opControl, \"node\": 2, \"phase\": \"after_readmission\",\n\t\t\"returned\": true, \"err\": assuranceErrf(cErr),\n\t\t\"elapsed_ms\": int(time.Since(startC).Milliseconds()), \"window_ms\": 5000,\n\t\t\"deadline_ms\": 5000, \"voter\": assuranceVoter(c.nodes[2].n, 2),\n\t\t\"leader\": c.nodes[2].n.Status().SoftState.Lead, \"payload\": controlPayload,\n\t})\n\tc.waitUntil(\"control payload committed\", func() bool {\n\t\treturn len(c.nodesWithPayload(controlPayload)) > 0\n\t})\n\tcontrolNodes := c.nodesWithPayload(controlPayload)\n\temitAssurance(t, \"commit_observation\", map[string]any{\n\t\t\"operation_id\": opControl, \"payload\": controlPayload,\n\t\t\"present\": len(controlNodes) > 0, \"observed_nodes\": controlNodes,\n\t})\n\n\t// Case 3 (repair): the source-reachable re-arm is a leader change; after it,\n\t// the same node's invocation completes and is committed.\n\tif err := c.nodes[2].n.Campaign(bg); err != nil {\n\t\tt.Fatalf(\"campaign 2: %v\", err)\n\t}\n\tc.waitUntil(\"node 3 sees a new leader\", func() bool {\n\t\tl := c.nodes[3].n.Status().SoftState.Lead\n\t\treturn l != 0 && l != 1\n\t})\n\tnewLeader := c.nodes[3].n.Status().SoftState.Lead\n\temitAssurance(t, \"leader_change\", map[string]any{\n\t\t\"operation_id\": opRepair, \"node\": 3, \"from\": 1, \"to\": newLeader,\n\t\t\"term\": c.nodes[3].n.Status().GetTerm(),\n\t})\n\temitAssurance(t, \"propose_invocation\", map[string]any{\n\t\t\"operation_id\": opRepair, \"node\": 3, \"phase\": \"after_leader_change\",\n\t\t\"leader\": newLeader, \"voter\": assuranceVoter(c.nodes[3].n, 3),\n\t\t\"deadline_ms\": 5000, \"payload\": repairPayload,\n\t})\n\tctxR, cancelR := context.WithTimeout(context.Background(), 5*time.Second)\n\tdefer cancelR()\n\trErrCh := make(chan error, 1)\n\tstartR := time.Now()\n\tgo func() { rErrCh <- c.nodes[3].n.Propose(ctxR, []byte(repairPayload)) }()\n\tvar rReturned bool\n\tvar rErr error\n\tselect {\n\tcase rErr = <-rErrCh:\n\t\trReturned = true\n\tcase <-time.After(2000 * time.Millisecond):\n\t}\n\temitAssurance(t, \"propose_result\", map[string]any{\n\t\t\"operation_id\": opRepair, \"node\": 3, \"phase\": \"after_leader_change\",\n\t\t\"returned\": rReturned, \"err\": assuranceErrf(rErr),\n\t\t\"elapsed_ms\": int(time.Since(startR).Milliseconds()), \"window_ms\": 2000,\n\t\t\"deadline_ms\": 5000, \"voter\": assuranceVoter(c.nodes[3].n, 3),\n\t\t\"leader\": c.nodes[3].n.Status().SoftState.Lead, \"payload\": repairPayload,\n\t})\n\tc.waitUntil(\"repair payload committed\", func() bool {\n\t\treturn len(c.nodesWithPayload(repairPayload)) > 0\n\t})\n\trepairNodes := c.nodesWithPayload(repairPayload)\n\temitAssurance(t, \"commit_observation\", map[string]any{\n\t\t\"operation_id\": opRepair, \"payload\": repairPayload,\n\t\t\"present\": len(repairNodes) > 0, \"observed_nodes\": repairNodes,\n\t})\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "ctx",
+                "event": "node_context",
+                "conditions": [
+                  {
+                    "field": "node",
+                    "op": "eq",
+                    "value": 3,
+                    "reference": null
+                  },
+                  {
+                    "field": "voter",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "reapplied",
+                "event": "conf_change_applied",
+                "conditions": [
+                  {
+                    "field": "node",
+                    "op": "eq",
+                    "value": 3,
+                    "reference": null
+                  },
+                  {
+                    "field": "change",
+                    "op": "eq",
+                    "value": "add",
+                    "reference": null
+                  },
+                  {
+                    "field": "ok",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "admit",
+                "event": "propose_invocation",
+                "conditions": [
+                  {
+                    "field": "node",
+                    "op": "eq",
+                    "value": 3,
+                    "reference": null
+                  },
+                  {
+                    "field": "phase",
+                    "op": "eq",
+                    "value": "after_readmission",
+                    "reference": null
+                  },
+                  {
+                    "field": "operation_id",
+                    "op": "eq",
+                    "value": null,
+                    "reference": "reapplied.operation_id"
+                  },
+                  {
+                    "field": "leader",
+                    "op": "eq",
+                    "value": null,
+                    "reference": "ctx.leader"
+                  }
+                ]
+              },
+              {
+                "alias": "admit_control",
+                "event": "propose_invocation",
+                "conditions": [
+                  {
+                    "field": "node",
+                    "op": "eq",
+                    "value": 2,
+                    "reference": null
+                  },
+                  {
+                    "field": "phase",
+                    "op": "eq",
+                    "value": "after_readmission",
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "lchange",
+                "event": "leader_change",
+                "conditions": [
+                  {
+                    "field": "node",
+                    "op": "eq",
+                    "value": 3,
+                    "reference": null
+                  },
+                  {
+                    "field": "from",
+                    "op": "eq",
+                    "value": 1,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "admit_repair",
+                "event": "propose_invocation",
+                "conditions": [
+                  {
+                    "field": "node",
+                    "op": "eq",
+                    "value": 3,
+                    "reference": null
+                  },
+                  {
+                    "field": "phase",
+                    "op": "eq",
+                    "value": "after_leader_change",
+                    "reference": null
+                  },
+                  {
+                    "field": "leader",
+                    "op": "eq",
+                    "value": null,
+                    "reference": "lchange.to"
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "runloop",
+            "removal_gate",
+            "propose_api",
+            "stepwait",
+            "leader_prop_gate"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Three real raft nodes (ids 1,2,3) driven through the async Node API in one process: Ready handling with storage appends, conf-change application through Node.ApplyConfChange, and direct message delivery. Node 1 campaigns and becomes leader in the initial configuration {1,2,3} supplied by the storage ConfState; a remove-3 conf change and then an add-3 conf change are proposed on the leader and applied on every node. Then (a) Node.Propose is invoked on re-added node 3, (b) Node.Propose is invoked on never-removed node 2, and (c) after forcing a leader change (node 2 campaigns), Node.Propose is invoked again on node 3. Each invocation records whether it returned, the returned error, the elapsed time, the observed voter status and leader, and whether the payload reached any node's committed entries.",
+            "assumptions": [
+              "Reliable in-process message delivery and a shared logical clock via Tick are not used; no ticks are delivered, so the leader stays stable until the experiment forces the leader change.",
+              "Storage appends of Ready.Entries are durable before messages are delivered, which the driver does by appending entries before dispatching the Ready's messages.",
+              "The removal and re-addition are exactly the committed conf changes the driver applies; node 3 applies its own removal and re-addition through Node.ApplyConfChange."
+            ],
+            "excluded": [
+              "RawNode.Propose (no gate exists on that path)",
+              "AsyncStorageWrites mode",
+              "Network faults: delivery is reliable, so a non-delivered proposal cannot be attributed to message loss."
+            ],
+            "parameters": {}
+          },
+          "prefix": "Start nodes 1,2,3 with a MemoryStorage per node whose ConfState voters are {1,2,3} (captured test helper withPeers). Node 1 campaigns at term 1 and becomes leader; every node then reports leader 1 and node 1 has applied the initial entry. Propose a remove-3 ConfChange on node 1 and wait until node 3's applied entries contain it and node 3's own configuration excludes node 3. Propose an add-3 ConfChange on node 1 and wait until node 3's applied entries contain it and node 3's configuration includes node 3 again, with leader still 1. Then emit the observations for the three invocation cases.",
+          "requirement": null,
+          "responsibility": "Client-facing obligation of the Node interface: a Propose invocation on a voting member whose leader is known must either reach a proposal outcome (appended/forwarded) or return an error to the caller; a caller cannot retry a proposal that never returns.",
+          "comparisons": [
+            {
+              "event": "propose_result",
+              "identity_fields": [
+                "operation_id"
+              ],
+              "admission_alias": "admit",
+              "assertion": {
+                "field": "returned",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "voter",
+                  "op": "eq",
+                  "value": true,
+                  "reference": null
+                }
+              ],
+              "description": "Invocation on the re-added voter did not return inside the observation window although the node is a voter and its leader is 1."
+            },
+            {
+              "event": "commit_observation",
+              "identity_fields": [
+                "operation_id"
+              ],
+              "admission_alias": "admit",
+              "assertion": {
+                "field": "present",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "The re-added voter's payload never reached any node's committed entries within the window."
+            },
+            {
+              "event": "propose_result",
+              "identity_fields": [
+                "operation_id"
+              ],
+              "admission_alias": "admit_control",
+              "assertion": {
+                "field": "returned",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "Control: the never-removed member's invocation on the same leader returned immediately."
+            },
+            {
+              "event": "commit_observation",
+              "identity_fields": [
+                "operation_id"
+              ],
+              "admission_alias": "admit_control",
+              "assertion": {
+                "field": "present",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "Control: the never-removed member's payload was committed, so the leader and the proposal path were healthy."
+            },
+            {
+              "event": "propose_result",
+              "identity_fields": [
+                "operation_id"
+              ],
+              "admission_alias": "admit_repair",
+              "assertion": {
+                "field": "returned",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "After the forced leader change, the same invocation on node 3 returned immediately."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "2c0cb5ee0eee4bbda3f51d25ba31ad2b",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "go.etcd.io/raft/v3",
+            "variant": "etcd_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "3592ccaf01864f56aaf06d54a3f97423",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "3592ccaf01864f56aaf06d54a3f97423-interpretation-0",
+        "investigation_id": "3592ccaf01864f56aaf06d54a3f97423-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "runloop",
+          "removal_gate",
+          "propose_api",
+          "stepwait",
+          "leader_prop_gate"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "asserted",
+        "rationale": "Source account: node.run() arms propc only through the observed-leader-change branch (node.go:373-377) and disarms it after applying a removal conf change (node.go:412-427); the re-admission case never matches that guard because okBefore is false once the local Progress entry was dropped, so subsequent proposals are enqueued onto a nil channel inside stepWithWaitOption (node.go:514-552) and can only end by context expiry or node stop. The state machine would have accepted the proposal (stepFollower forwards to the leader) and the removed-leader case returns ErrProposalDropped instead of blocking (raft.go:1298-1302), so no rejection or loss is reported to the caller while the member is in fact a voter with a known leader. The submitted experiment is the discriminator for this account and its retained receipt is expected to witness the invocation interval; this entry is currently a source-only account and will be revised with that receipt (including the control on a never-removed member and the post-leader-change invocation).",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-0",
+            "revision": 1,
+            "assertion": "propc is armed only on observed leader change and is left nil after a re-admission"
+          },
+          {
+            "entry_id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-1",
+            "revision": 1,
+            "assertion": "MsgProp on a nil propc blocks until context expiry or node stop"
+          },
+          {
+            "entry_id": "3592ccaf01864f56aaf06d54a3f97423-knowledge-2",
+            "revision": 1,
+            "assertion": "the raft state machine returns ErrProposalDropped for a removed leader instead of blocking"
+          }
+        ],
+        "counterevidence": [
+          "node.go:407-411 comments call the gate unsound ('propc is reset when the leader changes ... This isn't very sound and likely has bugs'), i.e. the mechanism is acknowledged as improvised; this explains but does not repair the concrete blocked invocation, and it imposes no restriction on the caller and no error contract.",
+          "A caller using a bounded context does eventually return (context deadline exceeded), so the defect is a bounded invocation interval under a stable leader, not an unbounded deadlock; the proposal itself is never delivered or rejected."
+        ],
+        "limitations": [
+          "The retained receipt for the submitted experiment does not exist yet in this turn; the source-only account above is the current basis.",
+          "The account is scoped to the async Node API path (node.run loop); RawNode.Propose has no such gate and is not claimed to be affected."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3592ccaf01864f56aaf06d54a3f97423"
+      }
+    ],
+    "materials": [
+      {
+        "id": "runloop",
+        "file": "node.go",
+        "start_line": 343,
+        "end_line": 380,
+        "kind": "code_observation",
+        "text": "func (n *node) run() {\n\tvar propc chan msgWithResult\n\tvar readyc chan Ready\n\tvar advancec chan struct{}\n\tvar rd Ready\n\n\tr := n.rn.raft\n\n\tlead := None\n\n\tfor {\n\t\tif advancec == nil && n.rn.HasReady() {\n\t\t\t// Populate a Ready. Note that this Ready is not guaranteed to\n\t\t\t// actually be handled. We will arm readyc, but there's no guarantee\n\t\t\t// that we will actually send on it. It's possible that we will\n\t\t\t// service another channel instead, loop around, and then populate\n\t\t\t// the Ready again. We could instead force the previous Ready to be\n\t\t\t// handled first, but it's generally good to emit larger Readys plus\n\t\t\t// it simplifies testing (by emitting less frequently and more\n\t\t\t// predictably).\n\t\t\trd = n.rn.readyWithoutAccept()\n\t\t\treadyc = n.readyc\n\t\t}\n\n\t\tif lead != r.lead {\n\t\t\tif r.hasLeader() {\n\t\t\t\tif lead == None {\n\t\t\t\t\tr.logger.Infof(\"raft.node: %x elected leader %x at term %d\", r.id, r.lead, r.Term)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Infof(\"raft.node: %x changed leader from %x to %x at term %d\", r.id, lead, r.lead, r.Term)\n\t\t\t\t}\n\t\t\t\tpropc = n.propc\n\t\t\t} else {\n\t\t\t\tr.logger.Infof(\"raft.node: %x lost leader %x at term %d\", r.id, lead, r.Term)\n\t\t\t\tpropc = nil\n\t\t\t}\n\t\t\tlead = r.lead\n\t\t}",
+        "content_digest": "311ece789019299836c97ca24908a52ca0e96ea11d3c81109444b41f625607a9"
+      },
+      {
+        "id": "removal_gate",
+        "file": "node.go",
+        "start_line": 398,
+        "end_line": 431,
+        "kind": "code_observation",
+        "text": "\t\t\t}\n\t\t\tr.Step(m)\n\t\tcase cc := <-n.confc:\n\t\t\t_, okBefore := r.trk.Progress[r.id]\n\t\t\tcs := r.applyConfChange(cc)\n\t\t\t// If the node was removed, block incoming proposals. Note that we\n\t\t\t// only do this if the node was in the config before. Nodes may be\n\t\t\t// a member of the group without knowing this (when they're catching\n\t\t\t// up on the log and don't have the latest config) and we don't want\n\t\t\t// to block the proposal channel in that case.\n\t\t\t//\n\t\t\t// NB: propc is reset when the leader changes, which, if we learn\n\t\t\t// about it, sort of implies that we got readded, maybe? This isn't\n\t\t\t// very sound and likely has bugs.\n\t\t\tif _, okAfter := r.trk.Progress[r.id]; okBefore && !okAfter {\n\t\t\t\tvar found bool\n\t\t\t\tfor _, sl := range [][]uint64{cs.Voters, cs.VotersOutgoing} {\n\t\t\t\t\tfor _, id := range sl {\n\t\t\t\t\t\tif id == r.id {\n\t\t\t\t\t\t\tfound = true\n\t\t\t\t\t\t\tbreak\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t\tif found {\n\t\t\t\t\t\tbreak\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tif !found {\n\t\t\t\t\tpropc = nil\n\t\t\t\t}\n\t\t\t}\n\t\t\tselect {\n\t\t\tcase n.confstatec <- cs:\n\t\t\tcase <-n.done:",
+        "content_digest": "311ece789019299836c97ca24908a52ca0e96ea11d3c81109444b41f625607a9"
+      },
+      {
+        "id": "propose_api",
+        "file": "node.go",
+        "start_line": 467,
+        "end_line": 473,
+        "kind": "code_observation",
+        "text": "func (n *node) Campaign(ctx context.Context) error {\n\treturn n.step(ctx, &pb.Message{Type: pb.MsgHup.Enum()})\n}\n\nfunc (n *node) Propose(ctx context.Context, data []byte) error {\n\treturn n.stepWait(ctx, &pb.Message{Type: pb.MsgProp.Enum(), Entries: []*pb.Entry{{Data: data}}})\n}",
+        "content_digest": "311ece789019299836c97ca24908a52ca0e96ea11d3c81109444b41f625607a9"
+      },
+      {
+        "id": "stepwait",
+        "file": "node.go",
+        "start_line": 514,
+        "end_line": 552,
+        "kind": "code_observation",
+        "text": "func (n *node) stepWithWaitOption(ctx context.Context, m *pb.Message, wait bool) error {\n\tif m.GetType() != pb.MsgProp {\n\t\tselect {\n\t\tcase n.recvc <- m:\n\t\t\treturn nil\n\t\tcase <-ctx.Done():\n\t\t\treturn ctx.Err()\n\t\tcase <-n.done:\n\t\t\treturn ErrStopped\n\t\t}\n\t}\n\tch := n.propc\n\tpm := msgWithResult{m: m}\n\tif wait {\n\t\tpm.result = make(chan error, 1)\n\t}\n\tselect {\n\tcase ch <- pm:\n\t\tif !wait {\n\t\t\treturn nil\n\t\t}\n\tcase <-ctx.Done():\n\t\treturn ctx.Err()\n\tcase <-n.done:\n\t\treturn ErrStopped\n\t}\n\tselect {\n\tcase err := <-pm.result:\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\tcase <-ctx.Done():\n\t\treturn ctx.Err()\n\tcase <-n.done:\n\t\treturn ErrStopped\n\t}\n\treturn nil\n}\n",
+        "content_digest": "311ece789019299836c97ca24908a52ca0e96ea11d3c81109444b41f625607a9"
+      },
+      {
+        "id": "leader_prop_gate",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1303,
+        "kind": "code_observation",
+        "text": "\t\t\tr.logger.Panicf(\"%x stepped empty MsgProp\", r.id)\n\t\t}\n\t\tif r.trk.Progress[r.id] == nil {\n\t\t\t// If we are not currently a member of the range (i.e. this node\n\t\t\t// was removed from the configuration while serving as leader),\n\t\t\t// drop any new proposals.\n\t\t\treturn ErrProposalDropped\n\t\t}",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      },
+      {
+        "id": "switch_config",
+        "file": "raft.go",
+        "start_line": 1979,
+        "end_line": 1996,
+        "kind": "code_observation",
+        "text": "func (r *raft) switchToConfig(cfg tracker.Config, trk tracker.ProgressMap) *pb.ConfState {\n\ttraceConfChangeEvent(cfg, r)\n\n\tr.trk.Config = cfg\n\tr.trk.Progress = trk\n\n\tr.logger.Infof(\"%x switched to configuration %s\", r.id, r.trk.Config)\n\tcs := r.trk.ConfState()\n\tpr, ok := r.trk.Progress[r.id]\n\n\t// Update whether the node itself is a learner, resetting to false when the\n\t// node is removed.\n\tr.isLearner = ok && pr.IsLearner\n\n\tif (!ok || r.isLearner) && r.state == StateLeader {\n\t\t// This node is leader and was removed or demoted, step down if requested.\n\t\t//\n\t\t// We prevent demotions at the time writing but hypothetically we handle",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "3592ccaf01864f56aaf06d54a3f97423",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@gate": "3592ccaf01864f56aaf06d54a3f97423-knowledge-0",
+        "@block": "3592ccaf01864f56aaf06d54a3f97423-knowledge-1",
+        "@contrast": "3592ccaf01864f56aaf06d54a3f97423-knowledge-2",
+        "@readd": "3592ccaf01864f56aaf06d54a3f97423-question-0"
+      },
+      "experiment_id": "3592ccaf01864f56aaf06d54a3f97423-experiment"
+    },
+    "applied_operations": {
+      "submission-3592ccaf01864f56aaf06d54a3f97423": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_10-42-39-etcd_raft-real-run/semantic-commits/submission-3592ccaf01864f56aaf06d54a3f97423.json"
+      }
+    }
+  }
+}

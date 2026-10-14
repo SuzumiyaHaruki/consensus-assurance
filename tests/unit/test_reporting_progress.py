@@ -57,12 +57,15 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
             counterevidence=['The documented input bound may exclude this caller'],limitations=['Only one call was observed'],
             answers={state['investigations'][0]['gaps'][0]['id']:dict(explanation='Initial contract reading',resolved=True)})
     def correction(state):
-        return opinion(state,experiment_id=None,conclusion='conditional',rationale='Caller history remains unestablished',
+        value,files=opinion(state,experiment_id=None,conclusion='conditional',rationale='Caller history remains unestablished',
             counterevidence=['The actual caller duty excludes the alleged general obligation'],
             limitations=['No broader consensus conclusion follows'],
             answers={state['investigations'][0]['gaps'][0]['id']:dict(resolved=claim!='refuted',
                 explanation='The earlier answer did not establish the actual caller condition' if claim=='refuted' else 'The cited local contract controls this call')},
             defect_claim=claim)
+        if claim is None:
+            value['interpretations'][0].pop('executions')
+        return value,files
     e,repo=engine_for(tmp_path,[start,initial,correction,stop]);s=e.start(repo)
     before=s.model_dump(mode='json')
     text=render_report(s,e.root).read_text()
@@ -89,10 +92,12 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     assert 'confirmed' not in text and 'declared predicate does not hold' in text
     check=next(c for c in s.checks if c.experiment_id)
     observation=f'logs/{check.id}/observations.json'
-    for section in (current,history):
-        assert f'logs/{check.id}/check.json' in section and observation in section
+    for section,cited in ((current,claim is not None),(history,True)):
         assert '[code](state.json)' in section and '[doc](state.json)' in section
-        assert 'event indices [1]' in section
+        assert (f'logs/{check.id}/check.json' in section)==cited
+        assert (observation in section)==cited
+        assert ('event indices [1]' in section)==cited
+        assert ('No execution receipt explicitly cited by this interpretation' in section)==(not cited)
     assert json.loads((e.root/observation).read_text())['events'][1]['value']==0
     assert s.model_dump(mode='json')==before
     clone=tmp_path/'moved';shutil.copytree(e.root,clone)

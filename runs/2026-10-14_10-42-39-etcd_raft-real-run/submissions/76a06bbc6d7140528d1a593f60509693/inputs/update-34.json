@@ -1,0 +1,45 @@
+{
+  "rationale": "One authority transition remained unexercised: the removal of the leader itself. This experiment enables StepDownOnRemoval, has a follower propose the removal of the current leader, and records whether the removed leader steps down, whether the remaining voters elect a new leader with the clock running, and whether the group keeps committing afterwards. It is a control on a documented option rather than a defect lead.",
+  "investigations": [
+    {
+      "ref": "@stepdown",
+      "question": "With StepDownOnRemoval enabled, does a leader removed by a committed configuration change step down, do the remaining voters elect a new leader, and does the group keep reaching decisions?",
+      "source_ids": ["runloop", "propose_api", "removal_gate", "tracker_committed"],
+      "hypothesis": "switchToConfig steps the removed leader down when the option is enabled, after which it is not promotable and the remaining voters campaign and elect one of themselves, so progress continues with the new configuration.",
+      "discriminator": "In the three-node Node-API cluster with StepDownOnRemoval true: elect node 1, have node 2 propose the removal of node 1, record node 1's state and membership after the change is applied, advance the clock until a leader other than node 1 emerges among the remaining voters, then propose a payload on the new leader and record whether it commits."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@stepdown",
+    "harness_path": "harness/assurance_generated_test.go",
+    "source_ids": ["runloop", "propose_api", "removal_gate", "tracker_committed"],
+    "scope": {
+      "description": "Three real raft nodes (ids 1,2,3) driven through the async Node API in one process, all configured with StepDownOnRemoval true. Node 1 is elected in configuration {1,2,3}; a follower proposes the removal of node 1; the harness waits until node 1 is no longer a leader and records its state, membership and leader view, then advances the clock in rounds with delivery between rounds until some node reports itself leader, and finally proposes a payload on that leader and checks whether it is committed.",
+      "assumptions": [
+        "Reliable, per-sender ordered in-process delivery.",
+        "The clock advance is needed because elections are tick driven; each round delivers one tick to every node with delivery in between.",
+        "The removal is a simple ConfChange proposed by a follower, which the leader appends and commits under the current configuration."
+      ],
+      "excluded": [
+        "StepDownOnRemoval disabled (covered implicitly by the other scenarios, where a removed leader keeps leading)",
+        "Message loss, partitions and simultaneous removal of further members"
+      ]
+    },
+    "prefix": "Start nodes 1,2,3 with a MemoryStorage per node whose ConfState voters are {1,2,3} and with StepDownOnRemoval enabled. Node 1 campaigns at term 1 and becomes leader; every node reports leader 1 and node 1 has applied the initial entry. Node 2 proposes a ConfChange removing node 1. The harness waits until node 1's state is no longer StateLeader and records its state, membership and leader. It then ticks every node in rounds of one tick with delivery between rounds until some node reports StateLeader, records which node that is together with all three states, and proposes a payload on that leader, waiting for the payload to appear in any node's applied entries.",
+    "responsibility": "Authority transition obligation of the documented StepDownOnRemoval option: a removed leader must give up leadership and the remaining voters must be able to continue deciding.",
+    "prerequisites": [
+      {"alias": "admit_stepdown", "event": "stepdown_removal_proposed", "conditions": [{"field": "node", "value": 2}, {"field": "change", "value": "remove"}, {"field": "target", "value": 1}]}
+    ],
+    "comparisons": [
+      {"event": "stepdown_observed", "identity_fields": ["operation_id"], "admission_alias": "admit_stepdown",
+       "assertion": {"field": "stepped_down", "value": true},
+       "description": "The removed leader left leadership instead of continuing to lead a configuration it is no longer part of."},
+      {"event": "stepdown_new_leader", "identity_fields": ["operation_id"], "admission_alias": "admit_stepdown",
+       "assertion": {"field": "new_leader", "op": "ne", "value": 0},
+       "description": "A new leader was elected among the remaining voters with the clock running."},
+      {"event": "stepdown_propose_result", "identity_fields": ["operation_id"], "admission_alias": "admit_stepdown",
+       "assertion": {"field": "present", "value": true},
+       "description": "A proposal made on the new leader was committed, so the group kept deciding after the transition."}
+    ]
+  }
+}

@@ -1,0 +1,174 @@
+{
+  "id": "8efd0d1e3da9484e926cab983024d9c3-experiment",
+  "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc gapEvent(t *testing.T, kind string, fields map[string]interface{}) {\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc serversOf(r *Raft) map[string]bool {\n\tout := map[string]bool{}\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn out\n\t}\n\tfor _, s := range f.Configuration().Servers {\n\t\tout[string(s.ID)] = true\n\t}\n\treturn out\n}\n\nfunc newestConfigEntryIdx(logs LogStore) uint64 {\n\tfirst, err := logs.FirstIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tlast, err := logs.LastIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tfor i := last; i >= first && i > 0; i-- {\n\t\tvar l Log\n\t\tif logs.GetLog(i, &l) == nil && l.Type == LogConfiguration {\n\t\t\treturn i\n\t\t}\n\t}\n\treturn 0\n}\n\nfunc waitAnyLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range rs {\n\t\t\tif r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn nil\n}\n\n// TestAssurance_StaleConfigurationAfterRestart creates a two-voter cluster,\n// snapshots it, then commits a configuration change that adds a third voter\n// (which never runs, since two acks are a quorum of three). It then restarts the\n// leader and observes whether the restarted node still knows the newest\n// committed configuration, and what configuration it bases a later change on.\nfunc TestAssurance_StaleConfigurationAfterRestart(t *testing.T) {\n\tfor _, mode := range []string{\"restore_on\", \"restore_off\"} {\n\t\trunStaleConfigCase(t, mode, mode == \"restore_on\")\n\t}\n}\n\nfunc runStaleConfigCase(t *testing.T, mode string, restore bool) {\n\tconf := inmemConfig(t)\n\tconf.RestoreCommittedLogs = restore\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 10\n\n\taddrA, transA := NewInmemTransport(ServerAddress(\"A\"))\n\tconfA := *conf\n\tconfA.LocalID = ServerID(addrA)\n\tlogsA := NewInmemCommitTrackingStore()\n\tstableA := NewInmemStore()\n\tsnapsA := NewInmemSnapshotStore()\n\n\tif err := BootstrapCluster(&confA, logsA, stableA, snapsA, transA, Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: ServerID(addrA), Address: addrA},\n\t\t{Suffrage: Voter, ID: ServerID(\"B\"), Address: ServerAddress(\"B\")},\n\t}}); err != nil {\n\t\tt.Fatalf(\"[%s] bootstrap: %v\", mode, err)\n\t}\n\n\trA, err := NewRaft(&confA, new(MockFSM), logsA, stableA, snapsA, transA)\n\tif err != nil {\n\t\tt.Fatalf(\"[%s] NewRaft A: %v\", mode, err)\n\t}\n\n\taddrB, transB := NewInmemTransport(ServerAddress(\"B\"))\n\ttransA.Connect(ServerAddress(\"B\"), transB)\n\ttransB.Connect(ServerAddress(\"A\"), transA)\n\tconfB := *conf\n\tconfB.LocalID = ServerID(addrB)\n\tlogsB := NewInmemCommitTrackingStore()\n\tstableB := NewInmemStore()\n\tsnapsB := NewInmemSnapshotStore()\n\trB, err := NewRaft(&confB, new(MockFSM), logsB, stableB, snapsB, transB)\n\tif err != nil {\n\t\tt.Fatalf(\"[%s] NewRaft B: %v\", mode, err)\n\t}\n\n\tleader := waitAnyLeader([]*Raft{rA, rB}, 8*time.Second)\n\tif leader == nil {\n\t\tt.Fatalf(\"[%s] no leader elected\", mode)\n\t}\n\tleaderIsA := leader == rA\n\n\tfor i := 0; i < 5; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"cmd%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"[%s] apply %d: %v\", mode, i, err)\n\t\t}\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"[%s] snapshot: %v\", mode, err)\n\t}\n\tsnapListA, err := snapsA.List()\n\tif err != nil {\n\t\tt.Fatalf(\"[%s] list snapshots A: %v\", mode, err)\n\t}\n\n\t// Add a third voter that never runs; two acks (A and B) are a quorum of three.\n\tif err := rA.AddVoter(ServerID(\"C\"), ServerAddress(\"C\"), 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"[%s] AddVoter C: %v\", mode, err)\n\t}\n\t// Commit further entries so the configuration change is no longer the\n\t// newest log entry: this is what puts it inside the persisted commit index.\n\tfor i := 0; i < 4; i++ {\n\t\tif err := rA.Apply([]byte(fmt.Sprintf(\"after%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"[%s] apply after %d: %v\", mode, i, err)\n\t\t}\n\t}\n\n\tbefore := serversOf(rA)\n\tstaged, err := logsA.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"[%s] GetCommitIndex A: %v\", mode, err)\n\t}\n\tlastIdx, _ := logsA.LastIndex()\n\n\tgapEvent(t, \"pre_restart\", map[string]interface{}{\n\t\t\"mode\":              mode,\n\t\t\"leader_is_A\":       leaderIsA,\n\t\t\"servers_before\":    len(before),\n\t\t\"contains_c_before\": before[\"C\"],\n\t\t\"snapshot_count_A\":  len(snapListA),\n\t\t\"log_last_index\":    lastIdx,\n\t\t\"staged_commit_idx\": staged,\n\t\t\"newest_config_idx\": newestConfigEntryIdx(logsA),\n\t})\n\n\tif err := rA.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"[%s] shutdown A: %v\", mode, err)\n\t}\n\n\t// Restart A on the same durable stores with a fresh transport.\n\t_, transA2 := NewInmemTransport(addrA)\n\ttransA2.Connect(ServerAddress(\"B\"), transB)\n\trA2, err := NewRaft(&confA, new(MockFSM), logsA, stableA, snapsA, transA2)\n\tif err != nil {\n\t\tt.Fatalf(\"[%s] second NewRaft A: %v\", mode, err)\n\t}\n\tafter := serversOf(rA2)\n\tviewB := serversOf(rB)\n\n\tgapEvent(t, \"post_restart\", map[string]interface{}{\n\t\t\"mode\":              mode,\n\t\t\"servers_after\":     len(after),\n\t\t\"contains_c_after\":  after[\"C\"],\n\t\t\"servers_view_B\":    len(viewB),\n\t\t\"last_applied_A\":    rA2.AppliedIndex(),\n\t\t\"commit_index_A\":    rA2.CommitIndex(),\n\t\t\"log_last_index\":    lastIdx,\n\t\t\"staged_commit\":     staged,\n\t\t\"snapshot_count_A\":  len(snapListA),\n\t\t\"newest_config_idx\": newestConfigEntryIdx(logsA),\n\t})\n\n\t// Optional continuation: if the restarted node can lead again, base a\n\t// configuration change on whatever configuration it believes it has.\n\tleader2 := waitAnyLeader([]*Raft{rA2, rB}, 8*time.Second)\n\tstableLeader := false\n\tdeadline := time.Now().Add(8 * time.Second)\n\tfor time.Now().Before(deadline) && leader2 == rA2 {\n\t\tif rA2.State() == Leader {\n\t\t\ttime.Sleep(300 * time.Millisecond)\n\t\t\tif rA2.State() == Leader {\n\t\t\t\tstableLeader = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\tgapEvent(t, \"post_restart_leader\", map[string]interface{}{\n\t\t\"mode\":            mode,\n\t\t\"leader_is_A\":     leader2 == rA2,\n\t\t\"stable_A_leader\": stableLeader,\n\t})\n\tif stableLeader {\n\t\terr := rA2.AddVoter(ServerID(\"E\"), ServerAddress(\"E\"), 0, 5*time.Second).Error()\n\t\tafterChange := serversOf(rA2)\n\t\tif err == nil {\n\t\t\t// Give B a moment to observe the entry as well.\n\t\t\tdeadline := time.Now().Add(2 * time.Second)\n\t\t\tfor time.Now().Before(deadline) {\n\t\t\t\tif serversOf(rB)[\"E\"] {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t\t}\n\t\t}\n\t\tgapEvent(t, \"after_config_change\", map[string]interface{}{\n\t\t\t\"mode\":                 mode,\n\t\t\t\"change_err\":           fmt.Sprintf(\"%v\", err),\n\t\t\t\"servers_after_change\": len(afterChange),\n\t\t\t\"contains_c_final\":     afterChange[\"C\"],\n\t\t\t\"contains_e_final\":     afterChange[\"E\"],\n\t\t\t\"view_B_contains_c\":    serversOf(rB)[\"C\"],\n\t\t\t\"view_B_contains_e\":    serversOf(rB)[\"E\"],\n\t\t})\n\t} else {\n\t\tgapEvent(t, \"after_config_change\", map[string]interface{}{\n\t\t\t\"mode\":       mode,\n\t\t\t\"skipped\":    true,\n\t\t\t\"leader_is_A\": leader2 == rA2,\n\t\t})\n\t}\n\n\t_ = rA2.Shutdown().Error()\n\t_ = rB.Shutdown().Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_gap_restore_on",
+          "event": "pre_restart",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "restore_on",
+              "reference": null
+            },
+            {
+              "field": "contains_c_before",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_gap_restore_off",
+          "event": "pre_restart",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "restore_off",
+              "reference": null
+            },
+            {
+              "field": "contains_c_before",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_gap_change_on",
+          "event": "post_restart_leader",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "restore_on",
+              "reference": null
+            },
+            {
+              "field": "stable_A_leader",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "newraft_scan",
+      "restore_committed",
+      "snapshot_config",
+      "append_config_entry",
+      "next_configuration",
+      "cfg_change_gate",
+      "vote_config_checks"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two-voter in-memory cluster {A,B}: A is bootstrapped with both voters and becomes leader, commands are committed, A takes a snapshot (configuration {A,B} at index 1), then AddVoter C commits a configuration entry at index 8 while A and B are the only running servers. Four further commands push the persisted commit index past index 8. A is shut down and restarted on the same stores with a fresh transport (case restore_on with RestoreCommittedLogs=true, control restore_off with it false). Observed: the restarted node's configuration membership versus the still-running peer's view and the newest configuration entry in its own log; then, while the restarted node is stably leader, one further AddVoter E and the resulting cluster configuration on both nodes.",
+      "assumptions": [
+        "AddVoter C commits with acks from A and B only, which is a legal quorum of three voters; C is never started, so nothing else can observe C's absence.",
+        "The snapshot predates the configuration change, so it carries configuration {A,B} at index 1 while the newest configuration entry (index 8) is in the log.",
+        "The extra commands after the change are ordinary applications; they only advance the persisted commit index past the configuration entry, which any later commit would do."
+      ],
+      "excluded": [
+        "Elections, partitions and failover among more than two servers are not exercised; the point is which configuration each node uses, not how leaders are chosen."
+      ],
+      "parameters": {
+        "protocol_version": 3,
+        "peers": 2,
+        "heartbeat_timeout_ms": 50,
+        "election_timeout_ms": 50,
+        "trailing_logs": 10
+      }
+    },
+    "prefix": "Real bootstrap of both voters on A, real election, real applies, real user snapshot on A, real AddVoter C through the cluster, real shutdown and restart of A on the same InmemCommitTrackingStore/InmemStore/InmemSnapshotStore. Nothing is fabricated: the log, snapshot metadata and staged commit index all come from those operations, and the control case runs the identical procedure with RestoreCommittedLogs=false.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "post_restart",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "admit_gap_restore_on",
+        "assertion": {
+          "field": "servers_after",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "After restart with RestoreCommittedLogs enabled, the node must still know the newest committed configuration {A,B,C} that is present in its own log."
+      },
+      {
+        "event": "post_restart",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "admit_gap_restore_off",
+        "assertion": {
+          "field": "servers_after",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: the same restart without RestoreCommittedLogs keeps all three members."
+      },
+      {
+        "event": "after_config_change",
+        "identity_fields": [
+          "mode"
+        ],
+        "admission_alias": "admit_gap_change_on",
+        "assertion": {
+          "field": "contains_c_final",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A configuration change issued by the restarted node must not remove voter C, which no request removed and which remains in the committed configuration."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "098207c91cca4275819eb43e8957164a",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "8efd0d1e3da9484e926cab983024d9c3",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

@@ -9,11 +9,15 @@ from consensus_assurance.workflow.knowledge import open_gaps
 from consensus_assurance.workflow.research import operation_summary
 
 
-def test_combined_local_start_and_interpretation_feedback(tmp_path):
+@pytest.mark.parametrize('gap',[False,True])
+def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
     seen = []
     def interpret(state):
         seen.append(json.loads((e.root/'research.json').read_text()))
-        return opinion(state)
+        sub,files=opinion(state)
+        if gap:sub['gaps']=[dict(investigation_id=state['investigations'][0]['id'],
+            experiment_id=state['experiments'][0]['id'],question='Does the producer establish the sampled input?')]
+        return sub,files
     def duplicate(state):
         assert operation_summary(e.state,e.root)['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
         return opinion(state)
@@ -22,7 +26,9 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path):
         assert index['investigations'][0]['latest_execution'] == seen[0]['investigations'][0]['latest_execution']
         assert index['investigations'][0]['latest_interpretation']['executions']
         summary=operation_summary(e.state,e.root)
-        assert summary['no_change'] and not summary['questions']
+        assert summary['no_change'] and bool(summary['questions'])==gap
+        assert bool(summary['necessary_gaps'])==gap
+        if gap:assert summary['questions'][0]['id']==state['investigations'][0]['id']
         assert summary['reselection']['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
         actual=summary['latest_actual_execution']
         fixed=state['experiments'][0]
@@ -44,6 +50,40 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path):
     assert result['outcome'] == 'violated' and 'Scripted or nonoriginal execution' in str(result['blockers'])
     assert result['comparisons'][0]['valid_witness_indices'] == [1]
     assert not any(name in type(state).model_fields for name in ('units','claims','bindings','relations','evidence','findings'))
+
+
+def test_preflight_reports_effect_without_acceptance_or_execution(tmp_path,monkeypatch):
+    from consensus_assurance.workflow.audit import validate_submission
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    def validate(sub,files,effects):
+        for name,content in {**files,'preflight.json':json.dumps(sub)}.items():
+            (e.root/'draft'/name).write_text(content)
+        before=e.state.model_dump(mode='json')
+        saved={p:p.read_bytes() for p in e.root.rglob('*') if p.is_file()}
+        with monkeypatch.context() as patch:
+            patch.setattr(ProcessRunner,'run',lambda *a,**kw:pytest.fail('Preflight cannot execute'))
+            result=validate_submission(e.state,e.root,'preflight.json',e.implementation)
+        assert result['valid']==(effects is not None)
+        if effects is None:
+            assert result['diagnostics'] and not {'no_change','execution_requested'} & result.keys()
+        else:assert (result['no_change'],result['execution_requested'])==effects
+        assert e.state.model_dump(mode='json')==before
+        assert {p:p.read_bytes() for p in e.root.rglob('*') if p.is_file()}==saved
+    def start(state):
+        sub,files=combined(state)
+        validate(sub,files,(False,True))
+        return sub,files
+    def inspect(state):
+        request,files=experiment(state['investigations'][0]['id'])
+        validate({'rationale':'Identical effective experiment','experiment':request},files,(True,False))
+        validate(*opinion(state),(False,False))
+        validate({'rationale':'Reproduce the fixed input','repeat_experiment_id':state['experiments'][0]['id']},{},(False,True))
+        validate({'rationale':'Unknown retained input','repeat_experiment_id':'absent'},{},None)
+        return stop(state)
+    e,repo=engine_for(tmp_path,[start,inspect])
+    state=e.start(repo)
+    assert len(state.experiments)==1 and not state.interpretations
+    assert state.usage=={'agent_calls':2,'experiments':1}
 
 
 def test_source_only_answer_and_exact_noop_keep_cost_without_revisions(tmp_path):

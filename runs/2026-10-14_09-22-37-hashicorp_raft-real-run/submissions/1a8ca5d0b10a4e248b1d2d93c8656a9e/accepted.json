@@ -1,0 +1,362 @@
+{
+  "rationale": "Trace how a restarted node re-establishes its configuration ('context validity') when the committed-log replay feature is enabled. NewRaft replays committed logs first (restoreFromCommittedLogs sets lastApplied to the persisted commit index) and then scans the log for configuration entries starting at max(lastSnapshot, lastApplied)+1. Because the scan is skipped over the committed prefix, configuration entries inside it are never applied to r.configurations when no snapshot carries them, even though they remain in the log. Focused probe: restart a single-voter node that was bootstrapped and applied commands but never snapshotted, with RestoreCommittedLogs on/off and with a covering snapshot as control. Reproducibility question: the dual-majority outcome depends on the ordering between the partitioned side's election and the stale leader's lease, so its successor experiment is repeated once from its retained inputs in a clean copy to see whether the concurrent-leader window and the truncation of the committed entry recur under schedule variation. Reproducibility question: the corrected resurrected-voter experiment is repeated once from its retained inputs in a clean copy, because the premature-commit observation depends on the stale leader winning its re-election after the restart and on the removed voter having caught up before the partition.",
+  "sources": [
+    {
+      "id": "newraft_scan",
+      "file": "api.go",
+      "start_line": 601,
+      "end_line": 622,
+      "kind": "code_observation"
+    },
+    {
+      "id": "restore_committed",
+      "file": "api.go",
+      "start_line": 723,
+      "end_line": 755,
+      "kind": "code_observation"
+    },
+    {
+      "id": "newraft_doc",
+      "file": "api.go",
+      "start_line": 504,
+      "end_line": 507,
+      "kind": "document_statement"
+    },
+    {
+      "id": "snapshot_config",
+      "file": "api.go",
+      "start_line": 645,
+      "end_line": 689,
+      "kind": "code_observation"
+    },
+    {
+      "id": "process_config_entry",
+      "file": "raft.go",
+      "start_line": 1605,
+      "end_line": 1623,
+      "kind": "code_observation"
+    },
+    {
+      "id": "follower_abort",
+      "file": "raft.go",
+      "start_line": 230,
+      "end_line": 251,
+      "kind": "code_observation"
+    },
+    {
+      "id": "vote_config_checks",
+      "file": "raft.go",
+      "start_line": 1663,
+      "end_line": 1672,
+      "kind": "code_observation"
+    },
+    {
+      "id": "prevote_config_checks",
+      "file": "raft.go",
+      "start_line": 1780,
+      "end_line": 1784,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cfg_doc",
+      "file": "config.go",
+      "start_line": 243,
+      "end_line": 254,
+      "kind": "document_statement"
+    },
+    {
+      "id": "existing_test",
+      "file": "raft_test.go",
+      "start_line": 1183,
+      "end_line": 1280,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "append_config_entry",
+      "file": "raft.go",
+      "start_line": 1204,
+      "end_line": 1241,
+      "kind": "code_observation"
+    },
+    {
+      "id": "cfg_change_gate",
+      "file": "raft.go",
+      "start_line": 654,
+      "end_line": 664,
+      "kind": "code_observation"
+    },
+    {
+      "id": "next_configuration",
+      "file": "configuration.go",
+      "start_line": 224,
+      "end_line": 302,
+      "kind": "code_observation"
+    },
+    {
+      "id": "heartbeat_timeout_election",
+      "file": "raft.go",
+      "start_line": 214,
+      "end_line": 251,
+      "kind": "code_observation"
+    },
+    {
+      "id": "truncate_conflict",
+      "file": "raft.go",
+      "start_line": 1522,
+      "end_line": 1553,
+      "kind": "code_observation"
+    },
+    {
+      "id": "commit_config_on_append",
+      "file": "raft.go",
+      "start_line": 1236,
+      "end_line": 1241,
+      "kind": "code_observation"
+    },
+    {
+      "id": "vote_prevote_checks",
+      "file": "raft.go",
+      "start_line": 1663,
+      "end_line": 1710,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@restart_config",
+      "question": "Does a node restarted with RestoreCommittedLogs=true, whose newest configuration entry is inside the persisted commit index and has no covering snapshot, still know that configuration after NewRaft returns?",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "newraft_doc",
+        "cfg_doc",
+        "snapshot_config",
+        "process_config_entry",
+        "follower_abort"
+      ],
+      "hypothesis": "No. restoreFromCommittedLogs sets lastApplied to the persisted commit index, so the configuration scan starts after the committed prefix and never calls processConfigurationLogEntry for the configuration entry that only exists in the log. r.configurations.latest stays empty (or stays at the snapshot configuration), so the node loses its own membership context, cannot start elections, and skips the membership checks when granting votes.",
+      "discriminator": "Restart the same durable state twice: with RestoreCommittedLogs=true and with RestoreCommittedLogs=false. Predict servers_after=0 and no re-election with the feature on, versus servers_after=1 and a successful re-election with it off. A third run takes a snapshot before restart to show that a snapshot-carried configuration masks the loss (servers_after=1), separating the scanning bound from generic restart damage.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    },
+    {
+      "id": null,
+      "ref": "@resurrect",
+      "question": "When RestoreCommittedLogs makes a restarted leader forget a committed removal, does the resurrected voter let that leader commit and report success for entries that the configuration committed in the log requires another member (B) to accept?",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "snapshot_config",
+        "commit_config_on_append",
+        "vote_prevote_checks",
+        "next_configuration"
+      ],
+      "hypothesis": "Yes: A's in-memory configuration still contains the removed voter C, so A's commitment quorum is computed over {A,B,C} and an entry acknowledged by A and C counts as committed even though the configuration committed in the log is {A,B}; A applies it and the client is told it succeeded although B, a member required for any quorum of the committed configuration, never received the entry.",
+      "discriminator": "Same cluster and stores with the flag on and off: shut down C, remove it, commit further entries, restart the leader, bring C back so it catches up, partition B, then apply one entry on the leader. Prediction with the flag: the Apply returns success, the leader's commit and applied indexes advance to the new entry, and the entry is absent from B (and from every quorum of {A,B}). Prediction without the flag: the leader's configuration is {A,B}, so the same partition makes the same Apply fail.",
+      "disposition": "active",
+      "parent_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": null,
+      "kind": "fact",
+      "statement": "NewRaft does not restore a configuration entry that lies inside the replayed committed log prefix: with RestoreCommittedLogs enabled the configuration comes only from the newest snapshot plus configuration entries above max(lastSnapshot, persistedCommitIndex), so a node restarted from a log whose newest configuration entry is at or below the persisted commit index adopts the snapshot configuration (empty when there is no snapshot) instead of the replicated one.",
+      "conditions": "RestoreCommittedLogs=true; LogStore implements CommitTrackingLogStore; node started on stores whose persisted commit index is at or above the newest configuration entry index; no snapshot whose ConfigurationIndex covers that entry.",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "snapshot_config",
+        "process_config_entry"
+      ],
+      "executions": {
+        "430d7ba602ed4666bdfe63a96c71e2fc": [
+          1
+        ],
+        "d2d1cb0951b74a2984ec525710e4c740": [
+          1
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "A stale in-memory configuration drives every membership decision of the node: configurationChangeChIfStable admits a configuration change once the stale latest and committed indexes look equal, appendConfigurationEntry derives the next membership from the stale base, commitment is installed from that new configuration on append, and both the election quorum and checkLeaderLease use the latest in-memory configuration. After a restart with RestoreCommittedLogs a node can therefore drop a voter that is only in its log, resurrect a voter whose removal is committed, and count a quorum of the stale membership: it commits and applies entries that a member required by the committed configuration has not accepted, and with a partitioned old voter it can truncate an entry it had committed.",
+      "conditions": "RestoreCommittedLogs=true with a CommitTrackingLogStore and a log whose newest configuration entry lies inside the replayed committed prefix without a covering snapshot; the affected node must lead (or be elected) for the commitment, lease and configuration-change consequences.",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "append_config_entry",
+        "next_configuration",
+        "commit_config_on_append",
+        "truncate_conflict",
+        "cfg_change_gate",
+        "vote_prevote_checks"
+      ],
+      "executions": {
+        "226f9762f0b444f69c154b35fe0788f3": [
+          1,
+          3
+        ],
+        "6f9feceeefb245c288a7fd1f4497b83c": [
+          2,
+          3,
+          4
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+      "question": "Can the silently-created two-server change ({A,B,C} -> {A,B,E}, committed with A plus a promoted caught-up nonvoter E while B is partitioned) let the old majority {B,C} elect a leader in a higher term that then truncates A's committed entry X when the partition heals, and can the two sides therefore hold leaders of different terms over the same log?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+      "experiment_id": "8efd0d1e3da9484e926cab983024d9c3-experiment",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "newraft_doc",
+        "cfg_doc",
+        "snapshot_config",
+        "process_config_entry",
+        "follower_abort",
+        "vote_config_checks",
+        "prevote_config_checks",
+        "truncate_conflict",
+        "commit_config_on_append"
+      ],
+      "executions": {
+        "430d7ba602ed4666bdfe63a96c71e2fc": [
+          1
+        ],
+        "d2d1cb0951b74a2984ec525710e4c740": [
+          1,
+          3
+        ],
+        "edfd3c204c654542a8bdb4263f290d4d": [
+          1
+        ],
+        "4f4a771f03b649c2a5703b0ff279ff3a": [
+          1
+        ],
+        "7afe8c0403874dbeb0a917a3ee9ed837": [
+          1
+        ],
+        "79d93a5aaad448888cc04214be8f2ad8": [
+          2,
+          3,
+          4
+        ],
+        "6f9feceeefb245c288a7fd1f4497b83c": [
+          2,
+          3,
+          4
+        ],
+        "11dea1fdcb6d4f089a373fe6c1d3a36e": [
+          2,
+          3,
+          4
+        ],
+        "e5ad9e5149fa4255b61e7826bf6b8064": [
+          3,
+          5
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Three independent receipts, all retained. (1) 430d7ba602ed4666bdfe63a96c71e2fc index 1: with RestoreCommittedLogs=true and no snapshot the restarting node returns with an empty configuration (servers_after=0 against servers_before=1), never campaigns again in a 3s opportunity, and logs 'no known peers, aborting election'; both the non-replay run (index 3) and the snapshot run (index 5) keep the configuration and re-elect. (2) d2d1cb0951b74a2984ec525710e4c740 index 1: with a snapshot carrying {A,B}@1 and a committed AddVoter C at index 8 with staged commit 11, the restarted node reports 2 servers while its continuously running peer reports 3 and its own log still holds the newest configuration entry; index 3: a later AddVoter E then returns no error and both nodes converge on 3 members without C (contains_c_final=false), i.e. a legitimately added voter is silently removed from the cluster by a change computed from the stale base. (3) edfd3c204c654542a8bdb4263f290d4d index 1: the isolated control with RestoreCommittedLogs=false scores holds (servers_after=1 against the same bootstrapped voter), so the replayed committed prefix, not restart itself, is the cause. (4) 4f4a771f03b649c2a5703b0ff279ff3a index 1: restarting all three voters at once with the flag leaves servers_after=[0,0,0] and nodes_with_full_config=0 with no leader in a six-second opportunity, while the same procedure without the flag scores holds at index 3 (nodes_with_full_config=3, leader elected) - a cluster-wide progress loss, not a single node's lost context. (5) 7afe8c0403874dbeb0a917a3ee9ed837: with only two of three voters restarted, the untouched configured voter leads with the configuration-less nodes' votes (index 0, servers_after=[0,0,3]); once that voter stops, the two remaining live, fully up-to-date voters cannot elect a leader in six seconds at 50ms timeouts (index 1, log last index 13 on both), while the control without the flag re-elects immediately (index 3). Source chain: restoreFromCommittedLogs raises lastApplied to the persisted commit index (api.go 723-755); the configuration scan then begins at max(lastSnapshot,lastApplied)+1 (api.go 611-613), so configuration entries inside the committed prefix are never fed to their only producer processConfigurationLogEntry (raft.go 1605-1623) unless a snapshot carries them (api.go 645-689). With Servers empty the follower refuses to campaign (raft.go 230-234 on every heartbeat timeout, raft.go 214-251) and both vote handlers skip their membership checks (raft.go 1663-1672, 1780-1784); with Servers stale, appendConfigurationEntry derives the next membership from that stale base (raft.go 1204-1241, configuration.go 224-302) once the admission gate sees latest==committed (raft.go 654-664). (6) 79d93a5aaad448888cc04214be8f2ad8: with A's configuration coming from a snapshot ({A,B}) while its log holds the newer {A,B,C} entry, AddVoter E returned no error and the silently created two-server change committed at index 11 with A's commit index at 11 and E holding the same LogConfiguration entry (parsed index 2), while B stayed at log index 10 with the old membership; the old majority {B,C} then elected B in term 4 while A was still leader in term 3 (parsed index 3, a_still_leader=true), and after the partition healed A's entry 11 was a LogNoop of term 4 rather than the committed configuration entry (parsed index 4, committed_entry_truncated=true). Receipt 6f9feceeefb245c288a7fd1f4497b83c from the corrected harness scored both comparisons: entry at index 11 truncated after heal (violated, witness index 4) and a_still_leader=true while the old side elected B in term 4 (violated, witness index 3), with the silent change itself at index 2 (change_err nil, committed=true, LogConfiguration on A and E, B at log index 10). The repeat receipt 11dea1fdcb6d4f089a373fe6c1d3a36e reproduced the same outcome under schedule variation (setup catch-up indices differed: C ended at log index 8 instead of 9): silent change committed at index 11 with entry type LogConfiguration on A and E (index 2), B elected in term 4 while A still led in term 3 (index 3, comparison violated), and the entry truncated after healing (index 4, comparison violated). Receipt e5ad9e5149fa4255b61e7826bf6b8064 (extended harness) scores both comparisons violated with witness index 5: the entry at the created index is truncated after healing, and after a client command returned success and was acknowledged and committed on the {A,B,E} leader (parsed index 3: write_applied=true, applied_a=12, fsm_a_logs=6) the FSM contents differ afterwards (fsm_a_logs=6 versus fsm_b_logs=5), so the client-visible effect survives only on the node whose log lost the entry.",
+      "answers": {
+        "9c549c026d7341f2b1e328826eac6dc3-gap-0": {
+          "explanation": "Resolved by retained receipt d2d1cb0951b74a2984ec525710e4c740: the restarted node adopts the snapshot-carried configuration when the newest configuration entry lies inside the replayed committed prefix (comparison 0 violated, witness index 1: servers_after=2 while the peer reports 3 and the newest configuration entry index 8 is below the staged commit index 11), and that stale base changes a real decision (comparison 2 violated, witness index 3: AddVoter E returned no error and both nodes ended with 3 members and contains_c_final=false, so voter C was silently removed). The same receipt's control mode kept 3 members and ended with 4 including C (observed at parsed index 5; that comparison was scored unknown because both modes shared a result event name, which the dedicated control experiment has now replaced with a scored holds).",
+          "resolved": true
+        },
+        "a8b8d696ac934beda1434a93b5d7758f-gap-1": {
+          "explanation": "Partly answered by source and receipt trace, not yet executed. The obvious route cannot work: a voter that never receives the silently-created {A,B,E} entry is strictly behind in the log, and the log up-to-date check in requestVote/requestPreVote (raft.go 1731-1746, 1812-1828) makes any voter that holds the entry refuse to vote for it, so the removed voter C cannot win alone or with a lagging peer. A disjoint-majority election therefore needs a majority of the OLD configuration whose members all lack the entry, which means the entry must commit without one of the old voters acking it. That is reachable because appendConfigurationEntry installs the new configuration into the commitment immediately on append (raft.go 1238-1240), so {A,B,E} commits with A plus a promoted, already-caught-up nonvoter E, without B. The remaining question is whether the partitioned old voter B can then be elected by the old majority {B,C} in a higher term and truncate A's committed entry X when the partition heals (appendEntries clears the conflicting suffix, raft.go 1541-1552), which would lose a committed entry. Requirements identified: a stale-config leader A that keeps leadership long enough, a caught-up nonvoter E (so the change commits without B), B partitioned for the change, and healing afterwards so the higher-term leader's appendEntries reaches A. The next experiment is designed to that discriminator.",
+          "resolved": false
+        },
+        "1ed9540f22fe4fa9bef3b3bda88e22e8-gap-2": {
+          "explanation": "Resolved by retained receipt 6f9feceeefb245c288a7fd1f4497b83c (scored): the silent two-server change {A,B,C} -> {A,B,E} committed on A plus the promoted caught-up nonvoter E (parsed index 2: change_err nil, x_index 11, committed=true, entry type LogConfiguration on A and on E, A commit index 11, B still at log index 10); the old majority {B,C} elected B in term 4 while A was still leader in term 3 (parsed index 3, comparison violated with witness 3), i.e. two concurrent leaders with disjoint support over the same log; and after healing, A's entry at index 11 became a LogNoop of term 4 (parsed index 4, comparison violated with witness 4), so the entry committed under the configuration recorded in the logs was truncated on the node that had committed it. The earlier receipt 79d93a5aaad448888cc04214be8f2ad8 reproduced the same observations but its comparisons were unscored because of my identity wiring; it is retained as the superseded revision of the same harness.",
+          "resolved": true
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The isolated control receipt edfd3c204c654542a8bdb4263f290d4d scores holds with the identical restart and no snapshot (servers_after=1), so the loss is caused by replaying the committed prefix, not by restart, snapshot absence, or the commit-tracking store.",
+        "The snapshot run inside the first receipt (index 5) keeps the configuration, so the defect requires the newest configuration entry to be inside the skipped prefix; a snapshot taken after the change masks it.",
+        "Voter C never runs in the two-voter probe, so nothing in the receipts shows C resisting or noticing its removal; the claim is about the configuration the running nodes decide with.",
+        "The cluster-wide receipt 4f4a771f03b649c2a5703b0ff279ff3a scores the control comparison holds (index 3, nodes_with_full_config=3) and the failing case violated (index 1, nodes_with_full_config=0), so the empty configuration after a simultaneous restart is specific to the replayed committed prefix.",
+        "Receipt 7afe8c0403874dbeb0a917a3ee9ed837 scores the control comparison holds (index 3: the two live voters re-elect a leader without the flag) and the failing case violated (index 1: after the configured voter stops, no leader among the two live voters although both hold every committed entry, log last index 13 on both), so the loss of electability is tied to the missing configuration rather than to the restart or the shutdown.",
+        "The dual-majority path needs a caught-up nonvoter E so the silent change can commit without the partitioned voter B; without such a node the change would need B's acknowledgement and B would then hold the new membership.",
+        "Two independent executions of the corrected dual-majority experiment (receipts 6f9feceeefb245c288a7fd1f4497b83c and 11dea1fdcb6d4f089a373fe6c1d3a36e) produced the same entry index, the same concurrent leadership and the same truncation, so the outcome is reproducible rather than a single-run timing artifact.",
+        "In that extended execution the stale leader had already stepped down when the old side's leader was sampled (index 4, a_still_leader=false), which is why leader concurrency is reported as an observed window from the two earlier executions rather than as a comparison in the current harness."
+      ],
+      "limitations": [
+        "All executions are in-process in-memory clusters at protocol version 3 with 50ms heartbeat/election timeouts and a single committed configuration change; joint-consensus or multi-step changes are not exercised.",
+        "The multi-node progress consequence (a live quorum of up-to-date voters unable to elect after the configured voter stops) is the subject of the partial-restart experiment requested in this update; the authority consequence that configuration-less nodes still grant votes is observed indirectly there (the configured voter wins their votes) and read from source (raft.go 1663-1672, 1780-1784).",
+        "The finding is specific to RestoreCommittedLogs=true with a CommitTrackingLogStore; with the flag disabled the same durable state recovers normally in every receipt.",
+        "The configuration-less nodes still act as voters in other respects (they granted the configured voter's election win in receipt 7afe8c0403874dbeb0a917a3ee9ed837, index 0), which is why the cluster survived until that voter stopped; this is read from the receipt and from the membership checks being skipped for an empty configuration (raft.go 1663-1672, 1780-1784).",
+        "In that probe the partitioned side elects its leader with 3s election timeouts (reloaded to keep the restarted leader from losing the first election), so the interval is seconds; the ordering it demonstrates does not depend on those particular values.",
+        "The dual-majority probe has no control variant: with the flag disabled the leader's configuration is current, so the same AddVoter is a single-server change and cannot create disjoint majorities (nextConfiguration over the current configuration, configuration.go 224-302).",
+        "Leader concurrency on the two sides was observed in the two scored executions (A still leader in term 3 while B led term 4) but a later construction-time run of the extended harness observed A already stepped down when the old side's leader was sampled, so that window is schedule-dependent; the reproducible consequences are the truncation of the committed entry and the resulting FSM divergence.",
+        "The child question is now established by retained receipt 226f9762f0b444f69c154b35fe0788f3 (resurrected membership and a write applied on the leader with B, required by the committed configuration, never receiving the entry; control refuses the same write), so the parents' consequence list includes premature commitment under a stale membership."
+      ],
+      "joint_history": "All receipts belong to this question and were executed from the same snapshot. 430d7ba6 (empty configuration), d2d1cb09 (stale configuration and the silently dropped voter), edfd3c20 (isolated control, holds), 4f4a771f (all voters restart, cluster-wide progress loss), 7afe8c04 (live quorum cannot elect) and 79d93a5a (silent two-server change, concurrent leaders, truncation of the committed entry) form one chain: each was built from the previous receipt's outcome, and each uses the same bootstrap/commit/snapshot/restart operations rather than fabricated state.",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "981f67969ef44bc1b4d8e296cbb610c4-question-1",
+      "experiment_id": "cff2222705354f669ca24cef6629804a-experiment",
+      "source_ids": [
+        "newraft_scan",
+        "restore_committed",
+        "snapshot_config",
+        "commit_config_on_append",
+        "vote_prevote_checks"
+      ],
+      "executions": {
+        "226f9762f0b444f69c154b35fe0788f3": [
+          1,
+          3
+        ],
+        "ee57ec0448704270bcbc1cf7ace9a045": [
+          1
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Two retained receipts. ee57ec0448704270bcbc1cf7ace9a045 established the membership half (restarted leader lists the removed voter C: three servers and two peers against B's two servers and one peer) but did not reach the write observation because B won the post-restart election. The corrected harness 226f9762f0b444f69c154b35fe0788f3 scores all four comparisons as predicted: the resurrected membership (violated, witness index 1), the control keeping two servers (holds, index 5), the premature commit (violated, witness index 3: write_applied=true, entry_index 10, A commit and applied index 10, B's log still at 9, entry_on_quorum=false), and the control refusing the same write under the committed membership (holds, index 7, 'leadership lost while committing log'). Source: with Servers still containing C, the commitment installed on append (raft.go 1236-1241) makes A+C a quorum of the stale {A,B,C}, while the configuration committed in the log is {A,B} (quorum 2, both members), and the leader applies what it believes committed.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The control mode shows the same cluster, partition and stores refusing the write ('leadership lost while committing log') when the leader's configuration is the committed one, so the premature commit is attributable to the stale membership and not to the partition alone."
+      ],
+      "limitations": [
+        "The partition is an explicit transport disconnection between A and B; the removed voter C is up and caught up, which is required for A to see a quorum in its stale view.",
+        "A repeat of this experiment is requested in this update because the observation depends on the stale leader winning its re-election and on C's catch-up completing before the partition."
+      ],
+      "joint_history": "Both receipts come from the same question and the same cluster construction (bootstrap {A,B,C} on A, snapshot, C offline for its removal, committed RemoveServer, further commits, restart of the leader on the same stores, C brought back on the same stores). ee57ec04 is the first revision of the harness; 226f9762 is its corrected successor, which differs only in keeping the stale leader in power, reporting whether it leads before the partition, and taking the compared index from the Apply future. The membership observation is common to both, so the earlier receipt remains a valid independent witness for it, while the write observation is taken only from the corrected revision where it was actually reached.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": "cff2222705354f669ca24cef6629804a-experiment",
+  "stop": null
+}

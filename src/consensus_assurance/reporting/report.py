@@ -26,7 +26,7 @@ def interpretation_rows(value, conclusions, label):
         heading += '; model defect claim: ' + DEFECT_LABELS[value.defect_claim]
     sources = ', '.join(f'[{id}](state.json)' for id in value.source_ids)
     executions = '; '.join(f'[{id}](logs/{id}/check.json) ([observations](logs/{id}/observations.json), event indices {indices})'
-        for id,indices in value.executions.items()) or 'none (source interpretation)'
+        for id,indices in value.executions.items()) or 'No execution receipt explicitly cited by this interpretation'
     rows = ['', heading + ': ' + value.rationale, '',
         f'Sources: {sources}; execution evidence: {executions}.']
     if value.counterevidence:

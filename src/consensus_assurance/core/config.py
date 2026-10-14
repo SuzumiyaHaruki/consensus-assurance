@@ -100,7 +100,7 @@ class Config(Record):
                 raise ValueError('Cargo seed cache must be outside run directories')
         if self.codex_provider and (self.agent_backend!='codex' or not (self.agent_model or '').strip()):
             raise ValueError('A custom provider requires agent_backend=codex and an explicit agent_model')
-        if self.codex_provider and (self.agent_model.startswith('-') or any(c.isspace() for c in self.agent_model)):
+        if self.codex_provider and (self.agent_model.startswith('-') or any(c.isspace() for c in self.agent_model)): # type: ignore
             raise ValueError('Custom provider agent_model must be a single model identifier')
         return self
 

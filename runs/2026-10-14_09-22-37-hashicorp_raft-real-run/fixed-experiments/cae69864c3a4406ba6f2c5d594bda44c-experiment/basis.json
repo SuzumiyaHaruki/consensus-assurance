@@ -1,0 +1,413 @@
+{
+  "id": "cae69864c3a4406ba6f2c5d594bda44c-experiment",
+  "investigation_id": "9c549c026d7341f2b1e328826eac6dc3-question-0",
+  "version": 4,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// Self-contained harness: only this file is copied into the captured package.\n\nfunc dualEvent(t *testing.T, kind string, fields map[string]interface{}) {\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc dualNewestConfigIdx(logs LogStore) uint64 {\n\tfirst, err := logs.FirstIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tlast, err := logs.LastIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tfor i := last; i >= first && i > 0; i-- {\n\t\tvar l Log\n\t\tif logs.GetLog(i, &l) == nil && l.Type == LogConfiguration {\n\t\t\treturn i\n\t\t}\n\t}\n\treturn 0\n}\n\nfunc dualEntry(logs LogStore, idx uint64) (string, uint64) {\n\tvar l Log\n\tif idx == 0 || logs.GetLog(idx, &l) != nil {\n\t\treturn \"missing\", 0\n\t}\n\treturn l.Type.String(), l.Term\n}\n\nfunc dualLeaderAmong(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range rs {\n\t\t\tif r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc dualServers(r *Raft) int {\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn -1\n\t}\n\treturn len(f.Configuration().Servers)\n}\n\nfunc dualWaitCatchUp(a *Raft, other *Raft, d time.Duration) bool {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tif other.LastIndex() >= a.LastIndex() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn other.LastIndex() >= a.LastIndex()\n}\n\n// TestAssurance_DualMajoritiesAfterSilentChange builds a three-voter cluster,\n// snapshots it, adds a caught-up nonvoter, then restarts the leader with\n// RestoreCommittedLogs so its in-memory configuration is the older {A,B}. That\n// stale base turns the next AddVoter into a two-server change ({A,B,C} ->\n// {A,B,E}). With the old voter B partitioned, the change commits on A plus the\n// promoted nonvoter E. The probe then observes whether the old majority {B,C}\n// can elect a leader that truncates A's committed entry once the partition is\n// healed.\nfunc TestAssurance_DualMajoritiesAfterSilentChange(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.HeartbeatTimeout = 300 * time.Millisecond\n\tconf.ElectionTimeout = 300 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 300 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 10\n\n\tids := []ServerID{\"A\", \"B\", \"C\", \"E\"}\n\ttrans := make([]*InmemTransport, len(ids))\n\tconfs := make([]*Config, len(ids))\n\tlogs := make([]*InmemCommitTrackingStore, len(ids))\n\tstables := make([]*InmemStore, len(ids))\n\tsnaps := make([]*InmemSnapshotStore, len(ids))\n\tfor i, id := range ids {\n\t\t_, trans[i] = NewInmemTransport(ServerAddress(id))\n\t\tc := *conf\n\t\tc.LocalID = id\n\t\t// Only the leader that is restarted replays committed logs.\n\t\tc.RestoreCommittedLogs = id == \"A\"\n\t\tconfs[i] = &c\n\t\tlogs[i] = NewInmemCommitTrackingStore()\n\t\tstables[i] = NewInmemStore()\n\t\tsnaps[i] = NewInmemSnapshotStore()\n\t}\n\tconnect := func(ts []*InmemTransport) {\n\t\tfor i := range ts {\n\t\t\tfor j := range ts {\n\t\t\t\tif i != j {\n\t\t\t\t\tts[i].Connect(ts[j].LocalAddr(), ts[j])\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\tconnect(trans)\n\n\tif err := BootstrapCluster(confs[0], logs[0], stables[0], snaps[0], trans[0], Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t}}); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\n\tfsms := make([]*MockFSM, len(ids))\n\tfor i := range ids {\n\t\tfsms[i] = new(MockFSM)\n\t}\n\tfsmA2 := new(MockFSM)\n\trafts := make([]*Raft, len(ids))\n\tfor i := range ids {\n\t\tr, err := NewRaft(confs[i], fsms[i], logs[i], stables[i], snaps[i], trans[i])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"NewRaft %s: %v\", ids[i], err)\n\t\t}\n\t\trafts[i] = r\n\t}\n\traftA, raftB, raftC, raftE := rafts[0], rafts[1], rafts[2], rafts[3]\n\n\tif dualLeaderAmong([]*Raft{raftA, raftB}, 10*time.Second) != raftA {\n\t\tt.Fatalf(\"A did not become leader\")\n\t}\n\t// The FSM needs something applied before it can snapshot.\n\tif err := raftA.Apply([]byte(\"pre0\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"pre-apply: %v\", err)\n\t}\n\tif err := raftA.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tif err := raftA.AddNonvoter(\"E\", \"E\", 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter E: %v\", err)\n\t}\n\tif !dualWaitCatchUp(raftA, raftE, 5*time.Second) {\n\t\tt.Fatalf(\"E did not catch up: E=%d A=%d\", raftE.LastIndex(), raftA.LastIndex())\n\t}\n\tif err := raftA.AddVoter(\"C\", \"C\", 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddVoter C: %v\", err)\n\t}\n\tif !dualWaitCatchUp(raftA, raftC, 5*time.Second) {\n\t\tt.Fatalf(\"C did not catch up: C=%d A=%d\", raftC.LastIndex(), raftA.LastIndex())\n\t}\n\tfor i := 0; i < 4; i++ {\n\t\tif err := raftA.Apply([]byte(fmt.Sprintf(\"cmd%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %d: %v\", i, err)\n\t\t}\n\t}\n\tconfigBeforeRestart := dualNewestConfigIdx(logs[0])\n\tdualEvent(t, \"setup\", map[string]interface{}{\n\t\t\"a_servers\":           dualServers(raftA),\n\t\t\"c_servers\":           dualServers(raftC),\n\t\t\"e_servers\":           dualServers(raftE),\n\t\t\"a_last\":              raftA.LastIndex(),\n\t\t\"a_commit\":            raftA.CommitIndex(),\n\t\t\"e_last\":              raftE.LastIndex(),\n\t\t\"c_last\":              raftC.LastIndex(),\n\t\t\"newest_config_index\": configBeforeRestart,\n\t})\n\n\t// Keep the other voters from campaigning while the restarted leader wins again.\n\tfor _, r := range []*Raft{raftB, raftC, raftE} {\n\t\trc := r.ReloadableConfig()\n\t\trc.HeartbeatTimeout = 3 * time.Second\n\t\trc.ElectionTimeout = 3 * time.Second\n\t\tif err := r.ReloadConfig(rc); err != nil {\n\t\t\tt.Fatalf(\"reload: %v\", err)\n\t\t}\n\t}\n\n\t// Restart A: its configuration now comes from the snapshot, not the log.\n\tif err := raftA.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown A: %v\", err)\n\t}\n\t_, transA2 := NewInmemTransport(\"A\")\n\ttransA2.Connect(\"B\", trans[1])\n\ttransA2.Connect(\"C\", trans[2])\n\ttransA2.Connect(\"E\", trans[3])\n\ttrans[1].Connect(\"A\", transA2)\n\ttrans[2].Connect(\"A\", transA2)\n\ttrans[3].Connect(\"A\", transA2)\n\traftA, err := NewRaft(confs[0], fsmA2, logs[0], stables[0], snaps[0], transA2)\n\tif err != nil {\n\t\tt.Fatalf(\"restart A: %v\", err)\n\t}\n\tif dualLeaderAmong([]*Raft{raftA}, 6*time.Second) != raftA {\n\t\tdualEvent(t, \"not_reached\", map[string]interface{}{\n\t\t\t\"reason\":       \"restarted A did not become leader\",\n\t\t\t\"a_servers\":    dualServers(raftA),\n\t\t\t\"a_state\":      raftA.State().String(),\n\t\t})\n\t\tfor _, r := range []*Raft{raftA, raftB, raftC, raftE} {\n\t\t\t_ = r.Shutdown()\n\t\t}\n\t\treturn\n\t}\n\tdualEvent(t, \"stale_leader\", map[string]interface{}{\n\t\t\"a_servers\":           dualServers(raftA),\n\t\t\"a_last\":              raftA.LastIndex(),\n\t\t\"a_commit\":            raftA.CommitIndex(),\n\t\t\"newest_config_index\": dualNewestConfigIdx(logs[0]),\n\t})\n\n\t// Partition B from A so the change cannot reach it; C was never A's peer\n\t// under the stale configuration.\n\ttrans[0] = transA2\n\ttransA2.Disconnect(\"B\")\n\ttrans[1].Disconnect(\"A\")\n\n\tchangeErr := raftA.AddVoter(\"E\", \"E\", 0, 2*time.Second).Error()\n\txIndex := dualNewestConfigIdx(logs[0])\n\tcommitted := xIndex > configBeforeRestart && raftA.CommitIndex() >= xIndex\n\tentryTypeAtX, entryTermAtX := dualEntry(logs[0], xIndex)\n\teTypeAtX, _ := dualEntry(logs[3], xIndex)\n\tdualEvent(t, \"silent_change\", map[string]interface{}{\n\t\t\"change_err\":           fmt.Sprintf(\"%v\", changeErr),\n\t\t\"x_index\":              xIndex,\n\t\t\"committed\":            committed,\n\t\t\"a_commit\":             raftA.CommitIndex(),\n\t\t\"entry_type_at_x\":      entryTypeAtX,\n\t\t\"entry_term_at_x\":      entryTermAtX,\n\t\t\"e_entry_type_at_x\":    eTypeAtX,\n\t\t\"a_servers\":            dualServers(raftA),\n\t\t\"b_log_last\":           raftB.LastIndex(),\n\t\t\"b_servers\":            dualServers(raftB),\n\t\t\"c_servers\":            dualServers(raftC),\n\t})\n\n\t// A client write on the {A,B,E} side: committed with A and E.\n\twriteErr := raftA.Apply([]byte(\"client-write\"), 2*time.Second).Error()\n\tdualEvent(t, \"client_write\", map[string]interface{}{\n\t\t\"x_index\":        xIndex,\n\t\t\"write_applied\":  writeErr == nil,\n\t\t\"write_err\":      fmt.Sprintf(\"%v\", writeErr),\n\t\t\"fsm_a_logs\":     len(fsmA2.Logs()),\n\t\t\"fsm_e_logs\":     len(fsms[3].Logs()),\n\t\t\"applied_a\":      raftA.AppliedIndex(),\n\t\t\"a_commit\":       raftA.CommitIndex(),\n\t})\n\n\t// Does leadership confirmation also follow the stale quorum?\n\taLeadsAtVerify := raftA.State() == Leader\n\tverifyErr := raftA.VerifyLeader().Error()\n\tdualEvent(t, \"stale_verify_pre\", map[string]interface{}{\n\t\t\"x_index\":      xIndex,\n\t\t\"a_is_leader\":  aLeadsAtVerify,\n\t\t\"verify_ok\":    verifyErr == nil,\n\t\t\"verify_err\":   fmt.Sprintf(\"%v\", verifyErr),\n\t})\n\n\t// The old majority {B,C} may now elect one of themselves.\n\toldSide := dualLeaderAmong([]*Raft{raftB, raftC}, 12*time.Second)\n\toldLeaderID := \"\"\n\tif oldSide != nil {\n\t\toldLeaderID = string(oldSide.localID)\n\t}\n\tdualEvent(t, \"old_side_elected\", map[string]interface{}{\n\t\t\"x_index\":         xIndex,\n\t\t\"old_leader\":      oldLeaderID,\n\t\t\"old_leader_term\": func() uint64 { if oldSide == nil { return 0 }; return oldSide.CurrentTerm() }(),\n\t\t\"b_log_last\":      raftB.LastIndex(),\n\t\t\"c_log_last\":      raftC.LastIndex(),\n\t\t\"a_still_leader\":  raftA.State() == Leader,\n\t\t\"a_servers\":       dualServers(raftA),\n\t})\n\n\tdualEvent(t, \"stale_verify\", map[string]interface{}{\n\t\t\"x_index\":     xIndex,\n\t\t\"verify_ok\":   verifyErr == nil,\n\t\t\"old_leader\":  oldLeaderID,\n\t\t\"verify_confirmed_while_other_leader\": verifyErr == nil && oldSide != nil,\n\t})\n\n\t// Heal the partition and let the higher-term side reach A.\n\ttransA2.Connect(\"B\", trans[1])\n\ttrans[1].Connect(\"A\", transA2)\n\ttime.Sleep(2500 * time.Millisecond)\n\n\tafterType, afterTerm := dualEntry(logs[0], xIndex)\n\tdualEvent(t, \"after_heal\", map[string]interface{}{\n\t\t\"x_index\":                  xIndex,\n\t\t\"entry_type_at_x\":          afterType,\n\t\t\"entry_term_at_x\":          afterTerm,\n\t\t\"committed_entry_truncated\": afterType != entryTypeAtX,\n\t\t\"a_last\":                   raftA.LastIndex(),\n\t\t\"a_servers\":                dualServers(raftA),\n\t\t\"a_state\":                  raftA.State().String(),\n\t\t\"fsm_a_logs\":               len(fsmA2.Logs()),\n\t\t\"fsm_b_logs\":               len(fsms[1].Logs()),\n\t\t\"fsm_logs_equal\":           len(fsmA2.Logs()) == len(fsms[1].Logs()),\n\t\t\"applied_a\":                raftA.AppliedIndex(),\n\t})\n\n\tfor _, r := range []*Raft{raftA, raftB, raftC, raftE} {\n\t\t_ = r.Shutdown()\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_dual_truncation2",
+          "event": "silent_change",
+          "conditions": [
+            {
+              "field": "committed",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "entry_type_at_x",
+              "op": "eq",
+              "value": "LogConfiguration",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_dual_fsm",
+          "event": "client_write",
+          "conditions": [
+            {
+              "field": "write_applied",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_dual_verify",
+          "event": "stale_verify_pre",
+          "conditions": [
+            {
+              "field": "a_is_leader",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "newraft_scan",
+      "restore_committed",
+      "snapshot_config",
+      "append_config_entry",
+      "next_configuration",
+      "commit_config_on_append",
+      "truncate_conflict",
+      "vote_prevote_checks"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Same four-node scenario as the executed revision (A/B bootstrapped, A snapshots, E added as a caught-up nonvoter, C added as a voter, A restarted with RestoreCommittedLogs so its configuration is the stale {A,B}, B partitioned, AddVoter E committing the two-server change {A,B,E} on A plus E, one client command applied on A), with one addition: while A still leads on the stale membership, the probe calls VerifyLeader on A and records the result, then observes whether the old majority {B,C} elects a leader in a higher term, and emits both together.",
+      "assumptions": [
+        "VerifyLeader is the documented protection clients use to avoid returning stale data from a peer that has lost leadership.",
+        "The stale leader's confirmation uses the acknowledgements available to it under its in-memory configuration {A,B,E}, which is exactly the configuration its own log does not contain.",
+        "The old majority's election is decided independently of the stale leader because B is partitioned from A."
+      ],
+      "excluded": [
+        "No control variant: with the flag disabled the configuration is current and the two-server change cannot arise.",
+        "Reads themselves are not issued; the observation is the confirmation call's result, not a data read."
+      ],
+      "parameters": {
+        "protocol_version": 3,
+        "nodes": 4,
+        "heartbeat_timeout_ms": 300,
+        "election_timeout_ms": 300,
+        "leader_lease_timeout_ms": 300
+      }
+    },
+    "prefix": "Identical to the executed revision: real bootstrap, real snapshot, real AddNonvoter catch-up, real AddVoter, real commits, graceful shutdown and restart of the leader on the same stores, real client Apply, real transport partition and real healing; the only addition is a VerifyLeader call on the stale leader between the client write and the old side's election.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "after_heal",
+        "identity_fields": [
+          "x_index"
+        ],
+        "admission_alias": "admit_dual_truncation2",
+        "assertion": {
+          "field": "committed_entry_truncated",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "An entry committed under the configuration recorded in the logs must not be replaced after the partition heals."
+      },
+      {
+        "event": "after_heal",
+        "identity_fields": [
+          "x_index"
+        ],
+        "admission_alias": "admit_dual_fsm",
+        "assertion": {
+          "field": "fsm_logs_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "After a client write returns success, every node following the same log must apply the same committed commands."
+      },
+      {
+        "event": "stale_verify",
+        "identity_fields": [
+          "x_index"
+        ],
+        "admission_alias": "admit_dual_verify",
+        "assertion": {
+          "field": "verify_confirmed_while_other_leader",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A node must not confirm leadership for a client while a different majority of the committed configuration has elected a leader in a higher term."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "098207c91cca4275819eb43e8957164a",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "cae69864c3a4406ba6f2c5d594bda44c",
+  "previous_id": "f79f8f8c97204c7d9c76b1a2b8ca07a0-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// Self-contained harness: only this file is copied into the captured package.\n\nfunc dualEvent(t *testing.T, kind string, fields map[string]interface{}) {\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc dualNewestConfigIdx(logs LogStore) uint64 {\n\tfirst, err := logs.FirstIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tlast, err := logs.LastIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tfor i := last; i >= first && i > 0; i-- {\n\t\tvar l Log\n\t\tif logs.GetLog(i, &l) == nil && l.Type == LogConfiguration {\n\t\t\treturn i\n\t\t}\n\t}\n\treturn 0\n}\n\nfunc dualEntry(logs LogStore, idx uint64) (string, uint64) {\n\tvar l Log\n\tif idx == 0 || logs.GetLog(idx, &l) != nil {\n\t\treturn \"missing\", 0\n\t}\n\treturn l.Type.String(), l.Term\n}\n\nfunc dualLeaderAmong(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range rs {\n\t\t\tif r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc dualServers(r *Raft) int {\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn -1\n\t}\n\treturn len(f.Configuration().Servers)\n}\n\nfunc dualWaitCatchUp(a *Raft, other *Raft, d time.Duration) bool {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tif other.LastIndex() >= a.LastIndex() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn other.LastIndex() >= a.LastIndex()\n}\n\n// TestAssurance_DualMajoritiesAfterSilentChange builds a three-voter cluster,\n// snapshots it, adds a caught-up nonvoter, then restarts the leader with\n// RestoreCommittedLogs so its in-memory configuration is the older {A,B}. That\n// stale base turns the next AddVoter into a two-server change ({A,B,C} ->\n// {A,B,E}). With the old voter B partitioned, the change commits on A plus the\n// promoted nonvoter E. The probe then observes whether the old majority {B,C}\n// can elect a leader that truncates A's committed entry once the partition is\n// healed.\nfunc TestAssurance_DualMajoritiesAfterSilentChange(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.HeartbeatTimeout = 300 * time.Millisecond\n\tconf.ElectionTimeout = 300 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 300 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 10\n\n\tids := []ServerID{\"A\", \"B\", \"C\", \"E\"}\n\ttrans := make([]*InmemTransport, len(ids))\n\tconfs := make([]*Config, len(ids))\n\tlogs := make([]*InmemCommitTrackingStore, len(ids))\n\tstables := make([]*InmemStore, len(ids))\n\tsnaps := make([]*InmemSnapshotStore, len(ids))\n\tfor i, id := range ids {\n\t\t_, trans[i] = NewInmemTransport(ServerAddress(id))\n\t\tc := *conf\n\t\tc.LocalID = id\n\t\t// Only the leader that is restarted replays committed logs.\n\t\tc.RestoreCommittedLogs = id == \"A\"\n\t\tconfs[i] = &c\n\t\tlogs[i] = NewInmemCommitTrackingStore()\n\t\tstables[i] = NewInmemStore()\n\t\tsnaps[i] = NewInmemSnapshotStore()\n\t}\n\tconnect := func(ts []*InmemTransport) {\n\t\tfor i := range ts {\n\t\t\tfor j := range ts {\n\t\t\t\tif i != j {\n\t\t\t\t\tts[i].Connect(ts[j].LocalAddr(), ts[j])\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\tconnect(trans)\n\n\tif err := BootstrapCluster(confs[0], logs[0], stables[0], snaps[0], trans[0], Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t}}); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\n\tfsms := make([]*MockFSM, len(ids))\n\tfor i := range ids {\n\t\tfsms[i] = new(MockFSM)\n\t}\n\tfsmA2 := new(MockFSM)\n\trafts := make([]*Raft, len(ids))\n\tfor i := range ids {\n\t\tr, err := NewRaft(confs[i], fsms[i], logs[i], stables[i], snaps[i], trans[i])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"NewRaft %s: %v\", ids[i], err)\n\t\t}\n\t\trafts[i] = r\n\t}\n\traftA, raftB, raftC, raftE := rafts[0], rafts[1], rafts[2], rafts[3]\n\n\tif dualLeaderAmong([]*Raft{raftA, raftB}, 10*time.Second) != raftA {\n\t\tt.Fatalf(\"A did not become leader\")\n\t}\n\t// The FSM needs something applied before it can snapshot.\n\tif err := raftA.Apply([]byte(\"pre0\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"pre-apply: %v\", err)\n\t}\n\tif err := raftA.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tif err := raftA.AddNonvoter(\"E\", \"E\", 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter E: %v\", err)\n\t}\n\tif !dualWaitCatchUp(raftA, raftE, 5*time.Second) {\n\t\tt.Fatalf(\"E did not catch up: E=%d A=%d\", raftE.LastIndex(), raftA.LastIndex())\n\t}\n\tif err := raftA.AddVoter(\"C\", \"C\", 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddVoter C: %v\", err)\n\t}\n\tif !dualWaitCatchUp(raftA, raftC, 5*time.Second) {\n\t\tt.Fatalf(\"C did not catch up: C=%d A=%d\", raftC.LastIndex(), raftA.LastIndex())\n\t}\n\tfor i := 0; i < 4; i++ {\n\t\tif err := raftA.Apply([]byte(fmt.Sprintf(\"cmd%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %d: %v\", i, err)\n\t\t}\n\t}\n\tconfigBeforeRestart := dualNewestConfigIdx(logs[0])\n\tdualEvent(t, \"setup\", map[string]interface{}{\n\t\t\"a_servers\":           dualServers(raftA),\n\t\t\"c_servers\":           dualServers(raftC),\n\t\t\"e_servers\":           dualServers(raftE),\n\t\t\"a_last\":              raftA.LastIndex(),\n\t\t\"a_commit\":            raftA.CommitIndex(),\n\t\t\"e_last\":              raftE.LastIndex(),\n\t\t\"c_last\":              raftC.LastIndex(),\n\t\t\"newest_config_index\": configBeforeRestart,\n\t})\n\n\t// Keep the other voters from campaigning while the restarted leader wins again.\n\tfor _, r := range []*Raft{raftB, raftC, raftE} {\n\t\trc := r.ReloadableConfig()\n\t\trc.HeartbeatTimeout = 3 * time.Second\n\t\trc.ElectionTimeout = 3 * time.Second\n\t\tif err := r.ReloadConfig(rc); err != nil {\n\t\t\tt.Fatalf(\"reload: %v\", err)\n\t\t}\n\t}\n\n\t// Restart A: its configuration now comes from the snapshot, not the log.\n\tif err := raftA.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown A: %v\", err)\n\t}\n\t_, transA2 := NewInmemTransport(\"A\")\n\ttransA2.Connect(\"B\", trans[1])\n\ttransA2.Connect(\"C\", trans[2])\n\ttransA2.Connect(\"E\", trans[3])\n\ttrans[1].Connect(\"A\", transA2)\n\ttrans[2].Connect(\"A\", transA2)\n\ttrans[3].Connect(\"A\", transA2)\n\traftA, err := NewRaft(confs[0], fsmA2, logs[0], stables[0], snaps[0], transA2)\n\tif err != nil {\n\t\tt.Fatalf(\"restart A: %v\", err)\n\t}\n\tif dualLeaderAmong([]*Raft{raftA}, 6*time.Second) != raftA {\n\t\tdualEvent(t, \"not_reached\", map[string]interface{}{\n\t\t\t\"reason\":       \"restarted A did not become leader\",\n\t\t\t\"a_servers\":    dualServers(raftA),\n\t\t\t\"a_state\":      raftA.State().String(),\n\t\t})\n\t\tfor _, r := range []*Raft{raftA, raftB, raftC, raftE} {\n\t\t\t_ = r.Shutdown()\n\t\t}\n\t\treturn\n\t}\n\tdualEvent(t, \"stale_leader\", map[string]interface{}{\n\t\t\"a_servers\":           dualServers(raftA),\n\t\t\"a_last\":              raftA.LastIndex(),\n\t\t\"a_commit\":            raftA.CommitIndex(),\n\t\t\"newest_config_index\": dualNewestConfigIdx(logs[0]),\n\t})\n\n\t// Partition B from A so the change cannot reach it; C was never A's peer\n\t// under the stale configuration.\n\ttrans[0] = transA2\n\ttransA2.Disconnect(\"B\")\n\ttrans[1].Disconnect(\"A\")\n\n\tchangeErr := raftA.AddVoter(\"E\", \"E\", 0, 2*time.Second).Error()\n\txIndex := dualNewestConfigIdx(logs[0])\n\tcommitted := xIndex > configBeforeRestart && raftA.CommitIndex() >= xIndex\n\tentryTypeAtX, entryTermAtX := dualEntry(logs[0], xIndex)\n\teTypeAtX, _ := dualEntry(logs[3], xIndex)\n\tdualEvent(t, \"silent_change\", map[string]interface{}{\n\t\t\"change_err\":           fmt.Sprintf(\"%v\", changeErr),\n\t\t\"x_index\":              xIndex,\n\t\t\"committed\":            committed,\n\t\t\"a_commit\":             raftA.CommitIndex(),\n\t\t\"entry_type_at_x\":      entryTypeAtX,\n\t\t\"entry_term_at_x\":      entryTermAtX,\n\t\t\"e_entry_type_at_x\":    eTypeAtX,\n\t\t\"a_servers\":            dualServers(raftA),\n\t\t\"b_log_last\":           raftB.LastIndex(),\n\t\t\"b_servers\":            dualServers(raftB),\n\t\t\"c_servers\":            dualServers(raftC),\n\t})\n\n\t// A client write on the {A,B,E} side: committed with A and E.\n\twriteErr := raftA.Apply([]byte(\"client-write\"), 2*time.Second).Error()\n\tdualEvent(t, \"client_write\", map[string]interface{}{\n\t\t\"x_index\":        xIndex,\n\t\t\"write_applied\":  writeErr == nil,\n\t\t\"write_err\":      fmt.Sprintf(\"%v\", writeErr),\n\t\t\"fsm_a_logs\":     len(fsmA2.Logs()),\n\t\t\"fsm_e_logs\":     len(fsms[3].Logs()),\n\t\t\"applied_a\":      raftA.AppliedIndex(),\n\t\t\"a_commit\":       raftA.CommitIndex(),\n\t})\n\n\t// The old majority {B,C} may now elect one of themselves.\n\toldSide := dualLeaderAmong([]*Raft{raftB, raftC}, 12*time.Second)\n\toldLeaderID := \"\"\n\tif oldSide != nil {\n\t\toldLeaderID = string(oldSide.localID)\n\t}\n\tdualEvent(t, \"old_side_elected\", map[string]interface{}{\n\t\t\"x_index\":         xIndex,\n\t\t\"old_leader\":      oldLeaderID,\n\t\t\"old_leader_term\": func() uint64 { if oldSide == nil { return 0 }; return oldSide.CurrentTerm() }(),\n\t\t\"b_log_last\":      raftB.LastIndex(),\n\t\t\"c_log_last\":      raftC.LastIndex(),\n\t\t\"a_still_leader\":  raftA.State() == Leader,\n\t\t\"a_servers\":       dualServers(raftA),\n\t})\n\n\t// Heal the partition and let the higher-term side reach A.\n\ttransA2.Connect(\"B\", trans[1])\n\ttrans[1].Connect(\"A\", transA2)\n\ttime.Sleep(2500 * time.Millisecond)\n\n\tafterType, afterTerm := dualEntry(logs[0], xIndex)\n\tdualEvent(t, \"after_heal\", map[string]interface{}{\n\t\t\"x_index\":                  xIndex,\n\t\t\"entry_type_at_x\":          afterType,\n\t\t\"entry_term_at_x\":          afterTerm,\n\t\t\"committed_entry_truncated\": afterType != entryTypeAtX,\n\t\t\"a_last\":                   raftA.LastIndex(),\n\t\t\"a_servers\":                dualServers(raftA),\n\t\t\"a_state\":                  raftA.State().String(),\n\t\t\"fsm_a_logs\":               len(fsmA2.Logs()),\n\t\t\"fsm_b_logs\":               len(fsms[1].Logs()),\n\t\t\"fsm_logs_equal\":           len(fsmA2.Logs()) == len(fsms[1].Logs()),\n\t\t\"applied_a\":                raftA.AppliedIndex(),\n\t})\n\n\tfor _, r := range []*Raft{raftA, raftB, raftC, raftE} {\n\t\t_ = r.Shutdown()\n\t}\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "admit_dual_truncation2",
+            "event": "silent_change",
+            "conditions": [
+              {
+                "field": "committed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "entry_type_at_x",
+                "op": "eq",
+                "value": "LogConfiguration",
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "admit_dual_fsm",
+            "event": "client_write",
+            "conditions": [
+              {
+                "field": "write_applied",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// Self-contained harness: only this file is copied into the captured package.\n\nfunc dualEvent(t *testing.T, kind string, fields map[string]interface{}) {\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc dualNewestConfigIdx(logs LogStore) uint64 {\n\tfirst, err := logs.FirstIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tlast, err := logs.LastIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tfor i := last; i >= first && i > 0; i-- {\n\t\tvar l Log\n\t\tif logs.GetLog(i, &l) == nil && l.Type == LogConfiguration {\n\t\t\treturn i\n\t\t}\n\t}\n\treturn 0\n}\n\nfunc dualEntry(logs LogStore, idx uint64) (string, uint64) {\n\tvar l Log\n\tif idx == 0 || logs.GetLog(idx, &l) != nil {\n\t\treturn \"missing\", 0\n\t}\n\treturn l.Type.String(), l.Term\n}\n\nfunc dualLeaderAmong(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range rs {\n\t\t\tif r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc dualServers(r *Raft) int {\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn -1\n\t}\n\treturn len(f.Configuration().Servers)\n}\n\nfunc dualWaitCatchUp(a *Raft, other *Raft, d time.Duration) bool {\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tif other.LastIndex() >= a.LastIndex() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn other.LastIndex() >= a.LastIndex()\n}\n\n// TestAssurance_DualMajoritiesAfterSilentChange builds a three-voter cluster,\n// snapshots it, adds a caught-up nonvoter, then restarts the leader with\n// RestoreCommittedLogs so its in-memory configuration is the older {A,B}. That\n// stale base turns the next AddVoter into a two-server change ({A,B,C} ->\n// {A,B,E}). With the old voter B partitioned, the change commits on A plus the\n// promoted nonvoter E. The probe then observes whether the old majority {B,C}\n// can elect a leader that truncates A's committed entry once the partition is\n// healed.\nfunc TestAssurance_DualMajoritiesAfterSilentChange(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.HeartbeatTimeout = 300 * time.Millisecond\n\tconf.ElectionTimeout = 300 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 300 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = 10 * time.Minute\n\tconf.TrailingLogs = 10\n\n\tids := []ServerID{\"A\", \"B\", \"C\", \"E\"}\n\ttrans := make([]*InmemTransport, len(ids))\n\tconfs := make([]*Config, len(ids))\n\tlogs := make([]*InmemCommitTrackingStore, len(ids))\n\tstables := make([]*InmemStore, len(ids))\n\tsnaps := make([]*InmemSnapshotStore, len(ids))\n\tfor i, id := range ids {\n\t\t_, trans[i] = NewInmemTransport(ServerAddress(id))\n\t\tc := *conf\n\t\tc.LocalID = id\n\t\t// Only the leader that is restarted replays committed logs.\n\t\tc.RestoreCommittedLogs = id == \"A\"\n\t\tconfs[i] = &c\n\t\tlogs[i] = NewInmemCommitTrackingStore()\n\t\tstables[i] = NewInmemStore()\n\t\tsnaps[i] = NewInmemSnapshotStore()\n\t}\n\tconnect := func(ts []*InmemTransport) {\n\t\tfor i := range ts {\n\t\t\tfor j := range ts {\n\t\t\t\tif i != j {\n\t\t\t\t\tts[i].Connect(ts[j].LocalAddr(), ts[j])\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\tconnect(trans)\n\n\tif err := BootstrapCluster(confs[0], logs[0], stables[0], snaps[0], trans[0], Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t}}); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\n\tfsms := make([]*MockFSM, len(ids))\n\tfor i := range ids {\n\t\tfsms[i] = new(MockFSM)\n\t}\n\tfsmA2 := new(MockFSM)\n\trafts := make([]*Raft, len(ids))\n\tfor i := range ids {\n\t\tr, err := NewRaft(confs[i], fsms[i], logs[i], stables[i], snaps[i], trans[i])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"NewRaft %s: %v\", ids[i], err)\n\t\t}\n\t\trafts[i] = r\n\t}\n\traftA, raftB, raftC, raftE := rafts[0], rafts[1], rafts[2], rafts[3]\n\n\tif dualLeaderAmong([]*Raft{raftA, raftB}, 10*time.Second) != raftA {\n\t\tt.Fatalf(\"A did not become leader\")\n\t}\n\t// The FSM needs something applied before it can snapshot.\n\tif err := raftA.Apply([]byte(\"pre0\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"pre-apply: %v\", err)\n\t}\n\tif err := raftA.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tif err := raftA.AddNonvoter(\"E\", \"E\", 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter E: %v\", err)\n\t}\n\tif !dualWaitCatchUp(raftA, raftE, 5*time.Second) {\n\t\tt.Fatalf(\"E did not catch up: E=%d A=%d\", raftE.LastIndex(), raftA.LastIndex())\n\t}\n\tif err := raftA.AddVoter(\"C\", \"C\", 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddVoter C: %v\", err)\n\t}\n\tif !dualWaitCatchUp(raftA, raftC, 5*time.Second) {\n\t\tt.Fatalf(\"C did not catch up: C=%d A=%d\", raftC.LastIndex(), raftA.LastIndex())\n\t}\n\tfor i := 0; i < 4; i++ {\n\t\tif err := raftA.Apply([]byte(fmt.Sprintf(\"cmd%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %d: %v\", i, err)\n\t\t}\n\t}\n\tconfigBeforeRestart := dualNewestConfigIdx(logs[0])\n\tdualEvent(t, \"setup\", map[string]interface{}{\n\t\t\"a_servers\":           dualServers(raftA),\n\t\t\"c_servers\":           dualServers(raftC),\n\t\t\"e_servers\":           dualServers(raftE),\n\t\t\"a_last\":              raftA.LastIndex(),\n\t\t\"a_commit\":            raftA.CommitIndex(),\n\t\t\"e_last\":              raftE.LastIndex(),\n\t\t\"c_last\":              raftC.LastIndex(),\n\t\t\"newest_config_index\": configBeforeRestart,\n\t})\n\n\t// Keep the other voters from campaigning while the restarted leader wins again.\n\tfor _, r := range []*Raft{raftB, raftC, raftE} {\n\t\trc := r.ReloadableConfig()\n\t\trc.HeartbeatTimeout = 3 * time.Second\n\t\trc.ElectionTimeout = 3 * time.Second\n\t\tif err := r.ReloadConfig(rc); err != nil {\n\t\t\tt.Fatalf(\"reload: %v\", err)\n\t\t}\n\t}\n\n\t// Restart A: its configuration now comes from the snapshot, not the log.\n\tif err := raftA.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown A: %v\", err)\n\t}\n\t_, transA2 := NewInmemTransport(\"A\")\n\ttransA2.Connect(\"B\", trans[1])\n\ttransA2.Connect(\"C\", trans[2])\n\ttransA2.Connect(\"E\", trans[3])\n\ttrans[1].Connect(\"A\", transA2)\n\ttrans[2].Connect(\"A\", transA2)\n\ttrans[3].Connect(\"A\", transA2)\n\traftA, err := NewRaft(confs[0], fsmA2, logs[0], stables[0], snaps[0], transA2)\n\tif err != nil {\n\t\tt.Fatalf(\"restart A: %v\", err)\n\t}\n\tif dualLeaderAmong([]*Raft{raftA}, 6*time.Second) != raftA {\n\t\tdualEvent(t, \"not_reached\", map[string]interface{}{\n\t\t\t\"reason\":       \"restarted A did not become leader\",\n\t\t\t\"a_servers\":    dualServers(raftA),\n\t\t\t\"a_state\":      raftA.State().String(),\n\t\t})\n\t\tfor _, r := range []*Raft{raftA, raftB, raftC, raftE} {\n\t\t\t_ = r.Shutdown()\n\t\t}\n\t\treturn\n\t}\n\tdualEvent(t, \"stale_leader\", map[string]interface{}{\n\t\t\"a_servers\":           dualServers(raftA),\n\t\t\"a_last\":              raftA.LastIndex(),\n\t\t\"a_commit\":            raftA.CommitIndex(),\n\t\t\"newest_config_index\": dualNewestConfigIdx(logs[0]),\n\t})\n\n\t// Partition B from A so the change cannot reach it; C was never A's peer\n\t// under the stale configuration.\n\ttrans[0] = transA2\n\ttransA2.Disconnect(\"B\")\n\ttrans[1].Disconnect(\"A\")\n\n\tchangeErr := raftA.AddVoter(\"E\", \"E\", 0, 2*time.Second).Error()\n\txIndex := dualNewestConfigIdx(logs[0])\n\tcommitted := xIndex > configBeforeRestart && raftA.CommitIndex() >= xIndex\n\tentryTypeAtX, entryTermAtX := dualEntry(logs[0], xIndex)\n\teTypeAtX, _ := dualEntry(logs[3], xIndex)\n\tdualEvent(t, \"silent_change\", map[string]interface{}{\n\t\t\"change_err\":           fmt.Sprintf(\"%v\", changeErr),\n\t\t\"x_index\":              xIndex,\n\t\t\"committed\":            committed,\n\t\t\"a_commit\":             raftA.CommitIndex(),\n\t\t\"entry_type_at_x\":      entryTypeAtX,\n\t\t\"entry_term_at_x\":      entryTermAtX,\n\t\t\"e_entry_type_at_x\":    eTypeAtX,\n\t\t\"a_servers\":            dualServers(raftA),\n\t\t\"b_log_last\":           raftB.LastIndex(),\n\t\t\"b_servers\":            dualServers(raftB),\n\t\t\"c_servers\":            dualServers(raftC),\n\t})\n\n\t// A client write on the {A,B,E} side: committed with A and E.\n\twriteErr := raftA.Apply([]byte(\"client-write\"), 2*time.Second).Error()\n\tdualEvent(t, \"client_write\", map[string]interface{}{\n\t\t\"x_index\":        xIndex,\n\t\t\"write_applied\":  writeErr == nil,\n\t\t\"write_err\":      fmt.Sprintf(\"%v\", writeErr),\n\t\t\"fsm_a_logs\":     len(fsmA2.Logs()),\n\t\t\"fsm_e_logs\":     len(fsms[3].Logs()),\n\t\t\"applied_a\":      raftA.AppliedIndex(),\n\t\t\"a_commit\":       raftA.CommitIndex(),\n\t})\n\n\t// Does leadership confirmation also follow the stale quorum?\n\taLeadsAtVerify := raftA.State() == Leader\n\tverifyErr := raftA.VerifyLeader().Error()\n\tdualEvent(t, \"stale_verify_pre\", map[string]interface{}{\n\t\t\"x_index\":      xIndex,\n\t\t\"a_is_leader\":  aLeadsAtVerify,\n\t\t\"verify_ok\":    verifyErr == nil,\n\t\t\"verify_err\":   fmt.Sprintf(\"%v\", verifyErr),\n\t})\n\n\t// The old majority {B,C} may now elect one of themselves.\n\toldSide := dualLeaderAmong([]*Raft{raftB, raftC}, 12*time.Second)\n\toldLeaderID := \"\"\n\tif oldSide != nil {\n\t\toldLeaderID = string(oldSide.localID)\n\t}\n\tdualEvent(t, \"old_side_elected\", map[string]interface{}{\n\t\t\"x_index\":         xIndex,\n\t\t\"old_leader\":      oldLeaderID,\n\t\t\"old_leader_term\": func() uint64 { if oldSide == nil { return 0 }; return oldSide.CurrentTerm() }(),\n\t\t\"b_log_last\":      raftB.LastIndex(),\n\t\t\"c_log_last\":      raftC.LastIndex(),\n\t\t\"a_still_leader\":  raftA.State() == Leader,\n\t\t\"a_servers\":       dualServers(raftA),\n\t})\n\n\tdualEvent(t, \"stale_verify\", map[string]interface{}{\n\t\t\"x_index\":     xIndex,\n\t\t\"verify_ok\":   verifyErr == nil,\n\t\t\"old_leader\":  oldLeaderID,\n\t\t\"verify_confirmed_while_other_leader\": verifyErr == nil && oldSide != nil,\n\t})\n\n\t// Heal the partition and let the higher-term side reach A.\n\ttransA2.Connect(\"B\", trans[1])\n\ttrans[1].Connect(\"A\", transA2)\n\ttime.Sleep(2500 * time.Millisecond)\n\n\tafterType, afterTerm := dualEntry(logs[0], xIndex)\n\tdualEvent(t, \"after_heal\", map[string]interface{}{\n\t\t\"x_index\":                  xIndex,\n\t\t\"entry_type_at_x\":          afterType,\n\t\t\"entry_term_at_x\":          afterTerm,\n\t\t\"committed_entry_truncated\": afterType != entryTypeAtX,\n\t\t\"a_last\":                   raftA.LastIndex(),\n\t\t\"a_servers\":                dualServers(raftA),\n\t\t\"a_state\":                  raftA.State().String(),\n\t\t\"fsm_a_logs\":               len(fsmA2.Logs()),\n\t\t\"fsm_b_logs\":               len(fsms[1].Logs()),\n\t\t\"fsm_logs_equal\":           len(fsmA2.Logs()) == len(fsms[1].Logs()),\n\t\t\"applied_a\":                raftA.AppliedIndex(),\n\t})\n\n\tfor _, r := range []*Raft{raftA, raftB, raftC, raftE} {\n\t\t_ = r.Shutdown()\n\t}\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "admit_dual_truncation2",
+            "event": "silent_change",
+            "conditions": [
+              {
+                "field": "committed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "entry_type_at_x",
+                "op": "eq",
+                "value": "LogConfiguration",
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "admit_dual_fsm",
+            "event": "client_write",
+            "conditions": [
+              {
+                "field": "write_applied",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "admit_dual_verify",
+            "event": "stale_verify_pre",
+            "conditions": [
+              {
+                "field": "a_is_leader",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "source_ids": {
+      "before": [
+        "newraft_scan",
+        "restore_committed",
+        "snapshot_config",
+        "append_config_entry",
+        "next_configuration",
+        "commit_config_on_append",
+        "truncate_conflict",
+        "cfg_change_gate"
+      ],
+      "after": [
+        "newraft_scan",
+        "restore_committed",
+        "snapshot_config",
+        "append_config_entry",
+        "next_configuration",
+        "commit_config_on_append",
+        "truncate_conflict",
+        "vote_prevote_checks"
+      ]
+    },
+    "scope": {
+      "before": {
+        "description": "Four in-process nodes at protocol version 3 with 300ms heartbeat/election/lease: A and B bootstrapped as voters {A,B}; A snapshots, adds E as a caught-up nonvoter, adds C as a voter, commits four commands. A is restarted with RestoreCommittedLogs=true so its configuration comes from the snapshot ({A,B}) while its log holds {A,B,C}; B is partitioned; A issues AddVoter E, which the stale base turns into the two-server change {A,B,E} and which commits on A plus E. The probe then issues one client command on A (committed with A and E) and finally heals the partition, observing the entry at the created index and the FSM contents of A and of the old-majority leader.",
+        "assumptions": [
+          "E is a caught-up nonvoter before the change, so {A,B,E} commits with A and E alone once B is partitioned.",
+          "The client command is an ordinary Apply on the leader that has a quorum of the configuration recorded in its own log ({A,B,E}: A and E).",
+          "MockFSM records one entry per LogCommand applied, so its length is the number of committed commands that node's FSM has consumed.",
+          "Both sides keep running the protocol; the partition is applied by disconnecting in-memory transports in both directions."
+        ],
+        "excluded": [
+          "No control variant: with the flag disabled the configuration is current, so the same AddVoter is a single-server change and cannot create the disjoint majorities (nextConfiguration over the current configuration).",
+          "Leader concurrency is not asserted as a comparison here because its window depends on when the higher-term vote requests reach the stale leader."
+        ],
+        "parameters": {
+          "protocol_version": 3,
+          "nodes": 4,
+          "heartbeat_timeout_ms": 300,
+          "election_timeout_ms": 300,
+          "leader_lease_timeout_ms": 300,
+          "other_side_election_timeout_ms": 3000
+        }
+      },
+      "after": {
+        "description": "Same four-node scenario as the executed revision (A/B bootstrapped, A snapshots, E added as a caught-up nonvoter, C added as a voter, A restarted with RestoreCommittedLogs so its configuration is the stale {A,B}, B partitioned, AddVoter E committing the two-server change {A,B,E} on A plus E, one client command applied on A), with one addition: while A still leads on the stale membership, the probe calls VerifyLeader on A and records the result, then observes whether the old majority {B,C} elects a leader in a higher term, and emits both together.",
+        "assumptions": [
+          "VerifyLeader is the documented protection clients use to avoid returning stale data from a peer that has lost leadership.",
+          "The stale leader's confirmation uses the acknowledgements available to it under its in-memory configuration {A,B,E}, which is exactly the configuration its own log does not contain.",
+          "The old majority's election is decided independently of the stale leader because B is partitioned from A."
+        ],
+        "excluded": [
+          "No control variant: with the flag disabled the configuration is current and the two-server change cannot arise.",
+          "Reads themselves are not issued; the observation is the confirmation call's result, not a data read."
+        ],
+        "parameters": {
+          "protocol_version": 3,
+          "nodes": 4,
+          "heartbeat_timeout_ms": 300,
+          "election_timeout_ms": 300,
+          "leader_lease_timeout_ms": 300
+        }
+      }
+    },
+    "prefix": {
+      "before": "Real bootstrap, real snapshot, real AddNonvoter catch-up, real AddVoter, real commits, graceful shutdown and restart of the leader on the same InmemCommitTrackingStore/InmemStore/InmemSnapshotStore instances, real client Apply, real transport partition and real healing. Nothing is fabricated.",
+      "after": "Identical to the executed revision: real bootstrap, real snapshot, real AddNonvoter catch-up, real AddVoter, real commits, graceful shutdown and restart of the leader on the same stores, real client Apply, real transport partition and real healing; the only addition is a VerifyLeader call on the stale leader between the client write and the old side's election."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "after_heal",
+          "identity_fields": [
+            "x_index"
+          ],
+          "admission_alias": "admit_dual_truncation2",
+          "assertion": {
+            "field": "committed_entry_truncated",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "An entry committed under the configuration recorded in the logs must not be replaced after the partition heals."
+        },
+        {
+          "event": "after_heal",
+          "identity_fields": [
+            "x_index"
+          ],
+          "admission_alias": "admit_dual_fsm",
+          "assertion": {
+            "field": "fsm_logs_equal",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "After a client write returns success on the leader, every node that follows the same log must apply the same committed commands; the FSMs of A and of the old-majority leader must not differ."
+        }
+      ],
+      "after": [
+        {
+          "event": "after_heal",
+          "identity_fields": [
+            "x_index"
+          ],
+          "admission_alias": "admit_dual_truncation2",
+          "assertion": {
+            "field": "committed_entry_truncated",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "An entry committed under the configuration recorded in the logs must not be replaced after the partition heals."
+        },
+        {
+          "event": "after_heal",
+          "identity_fields": [
+            "x_index"
+          ],
+          "admission_alias": "admit_dual_fsm",
+          "assertion": {
+            "field": "fsm_logs_equal",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "After a client write returns success, every node following the same log must apply the same committed commands."
+        },
+        {
+          "event": "stale_verify",
+          "identity_fields": [
+            "x_index"
+          ],
+          "admission_alias": "admit_dual_verify",
+          "assertion": {
+            "field": "verify_confirmed_while_other_leader",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "A node must not confirm leadership for a client while a different majority of the committed configuration has elected a leader in a higher term."
+        }
+      ]
+    }
+  },
+  "revision_reason": "This revision adds the client-contract observation to the same scenario: after the silent change and the acknowledged client write, the probe asks the stale-membership leader to confirm leadership (VerifyLeader) while it still leads with the promoted voter's acknowledgements, and then records whether the old majority elects a leader in a higher term in the same run. Predictions, earlier observations and comparisons are unchanged; one comparison is added for the new event."
+}
