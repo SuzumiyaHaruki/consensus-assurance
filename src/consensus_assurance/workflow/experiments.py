@@ -4,6 +4,7 @@ import time
 from consensus_assurance.core.types import FixedExperiment, FailureAttribution
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin, now
 from consensus_assurance.core.events import event_requirements, match_prerequisites, comparison_requirements
+from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events, install_harness
@@ -31,21 +32,38 @@ def validate_basis(state, basis, implementation):
             raise ValueError(error)
         from consensus_assurance.core.types import CodeAnchor
         anchor.anchor = CodeAnchor.model_validate(located)
-    if basis.requirement and (not basis.responsibility.strip() or not basis.anchors):
-        raise ValueError('A requirement needs sourced applicability reasoning and verified code anchors')
+    if basis.requirement:
+        missing = [name for name, present in (('responsibility', basis.responsibility.strip()),
+                                             ('anchors', basis.anchors)) if not present]
+        if missing:
+            raise DiagnosticError([Diagnostic(code='requirement_basis', category='semantic',
+                paths=['/experiment/' + name for name in missing], details={'missing_fields': missing},
+                message='A requirement needs sourced applicability reasoning in responsibility and verified code anchors; '
+                        'missing fields: ' + ', '.join(missing))])
     declared = event_requirements(basis.harness.prerequisites)
-    for comparison in basis.comparisons:
-        comparison_requirements(comparison, declared)
-        conditions = comparison.applicability_conditions
-        assertion = comparison.assertion
-        if assertion.field in comparison.identity_fields:
-            raise ValueError('Compared value cannot establish independent operation identity')
-        if any(c.field == assertion.field for c in conditions):
-            raise ValueError('Applicability cannot filter on the compared result')
-        antecedent = comparison.antecedent
-        if antecedent and (antecedent.reference or antecedent.field in comparison.identity_fields or
-                any(c.field == antecedent.field for c in conditions)):
-            raise ValueError('An observed antecedent cannot establish identity or applicability')
+    for index, comparison in enumerate(basis.comparisons):
+        try:
+            comparison_requirements(comparison, declared)
+            conditions = comparison.applicability_conditions
+            assertion = comparison.assertion
+            if assertion.field in comparison.identity_fields:
+                raise ValueError('Compared value cannot establish independent operation identity')
+            if any(c.field == assertion.field for c in conditions):
+                raise ValueError('Applicability cannot filter on the compared result')
+            antecedent = comparison.antecedent
+            if antecedent and (antecedent.reference or antecedent.field in comparison.identity_fields or
+                    any(c.field == antecedent.field for c in conditions)):
+                raise ValueError('An observed antecedent cannot establish identity or applicability')
+        except ValueError as exc:
+            diagnostics = exc.diagnostics if isinstance(exc, DiagnosticError) else [
+                Diagnostic(code='comparison', category='semantic', message=str(exc))]
+            raise DiagnosticError([d.model_copy(update={
+                'paths': ['/experiment/comparisons/' + str(index)],
+                'details': {**d.details, 'comparison_index': index, 'event': comparison.event,
+                            'admission_alias': comparison.admission_alias},
+                'message': f'Comparison {index} (result event {comparison.event!r}, '
+                           f'admission alias {comparison.admission_alias!r}): {d.message}'})
+                for d in diagnostics]) from exc
 
 
 def fixed_files(root, fixed, *, write=False):

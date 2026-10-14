@@ -140,9 +140,16 @@ for operation, value in [('case',3),('control',2)]:
 '''
         return sub,files
     def explain(state):
+        from consensus_assurance.workflow.research import operation_summary
         fixed=e.state.experiments[0]
         check=next(c for c in e.state.checks if c.experiment_id==fixed.id)
-        events=observed(fixed,check,e.root)['events']
+        measured=observed(fixed,check,e.root)
+        events=measured['events']
+        feedback=operation_summary(e.state,e.root)['questions'][0]['execution']
+        assert feedback['events']==events
+        assert [c['result']['outcome'] for c in feedback['comparisons']]==[c['outcome'] for c in measured['comparisons']]
+        assert [c['result']['missing_indices'] for c in feedback['comparisons']]==[c['missing_indices'] for c in measured['comparisons']]
+        assert feedback['parsing_error_count']==len(measured['parsing_errors'])
         return opinion(state,conclusion='violated' if case=='mismatch' else 'conditional' if outcome=='unknown' else outcome,
             executions={check.id:[i for i,v in enumerate(events) if v['event']=='returned']},
             rationale='The sampled capacity result is undesirable under the sourced preservation contract; the control increments',

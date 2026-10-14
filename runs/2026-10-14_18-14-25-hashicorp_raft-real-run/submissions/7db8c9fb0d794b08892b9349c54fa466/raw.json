@@ -1,0 +1,96 @@
+{
+  "rationale": "One limitation of the configuration-recovery account was that the empty-configuration case had only been observed on a single-voter prefix, leaving the multi-node consequence of a voter that can never participate argued rather than observed. This batch registers the fixed experiment that measures it in a three-voter group, with the same node and log restarted with the replay on and off.",
+  "experiment": {
+    "investigation_id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+    "harness_path": "assurance_multi_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "src_newraft_startup",
+      "src_restore_committed",
+      "src_process_config_entry",
+      "src_follower_election_guard",
+      "src_quorum_size"
+    ],
+    "scope": {
+      "description": "Three in-memory voters A, B and C. A leader is chosen, three commands are committed so A's staged commit index is non-zero, A is stopped and restarted over its own stores in one case with Config.RestoreCommittedLogs enabled and in the other with it disabled, and the harness records A's tracked configuration. The other two voters are then shut down, and the harness samples A's state every 5ms for 1500ms, reporting how often it was a follower, a candidate or a leader.",
+      "assumptions": [
+        "The cluster configuration is stable, so no new configuration entry reaches A after its restart and its tracked configuration can only come from its own startup path.",
+        "A's stores hold no snapshot, so with the replay enabled the startup scan is skipped and A ends up with an empty tracked configuration; with the replay disabled the scan covers the log and A recovers the three-voter configuration.",
+        "Removing the other voters by shutting them down tests whether the surviving voter attempts candidacy, not whether it can win; with the recovered three-voter configuration A cannot win either, since its quorum is two.",
+        "The two cases use separate clusters built the same way, so the flag is the only difference."
+      ],
+      "excluded": [
+        "No assertion about winning an election or about cluster availability; the observation is the candidate attempt itself.",
+        "No membership change after the restart, no partitioned-but-live peer, and no production store or process-level restart."
+      ],
+      "parameters": {
+        "cases": [
+          "empty_config",
+          "recovered_config"
+        ],
+        "voters": 3,
+        "commands_before_restart": 3,
+        "sampling_interval_ms": 5,
+        "sampling_window_ms": 1500
+      }
+    },
+    "prefix": "For each case the harness builds three assuranceMultiNode values (random in-memory transport addresses, inmemConfig with RestoreCommittedLogs true and a fresh MockFSM per node), wires the transports pairwise, calls BootstrapCluster with the same three-voter configuration on each and NewRaft for each. It waits for a real leader and commits three commands through it, then records A's staged commit index and shuts A down. A new transport bound to A's address is connected to B and C, and NewRaft is called on A's stores with a fresh MockFSM and the case's RestoreCommittedLogs value; the harness reads A's tracked configurations through r.configurationsCh and reports the latest index, the voter count and the member ids. It then shuts B and C down, samples A's state every 5ms for 1500ms, and reports the follower, candidate and leader sample counts together with the last snapshot index and the final state.",
+    "responsibility": "raft's startup recovery is responsible for establishing the configuration the log already contains, and a voter's follower loop is responsible for attempting to acquire leadership when it stops hearing from a leader and its configuration allows it.",
+    "prerequisites": [
+      {
+        "alias": "admit_empty_config",
+        "event": "assurance.authority.restart.empty_config",
+        "conditions": [
+          {
+            "field": "restore_committed_logs",
+            "value": true
+          },
+          {
+            "field": "latest_config_voters",
+            "value": 0
+          }
+        ]
+      },
+      {
+        "alias": "admit_recovered_config",
+        "event": "assurance.authority.restart.recovered_config",
+        "conditions": [
+          {
+            "field": "restore_committed_logs",
+            "value": false
+          },
+          {
+            "field": "latest_config_voters",
+            "value": 3
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "assurance.authority.attempt.empty_config",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_empty_config",
+        "assertion": {
+          "field": "attempted_candidacy",
+          "value": true
+        },
+        "description": "A voter whose own log establishes the cluster configuration must attempt candidacy once it hears no leader and the other voters are gone; a violating witness shows a configured voter that can never become a candidate."
+      },
+      {
+        "event": "assurance.authority.attempt.recovered_config",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_recovered_config",
+        "assertion": {
+          "field": "attempted_candidacy",
+          "value": true
+        },
+        "description": "Control: the same node with the same log restarted with the replay disabled recovers its configuration and does attempt candidacy, which attributes the inertness in the companion case to the recovery path."
+      }
+    ]
+  }
+}

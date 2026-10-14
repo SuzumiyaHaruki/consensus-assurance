@@ -1,0 +1,57 @@
+{
+  "rationale": "The fixed experiment for the replay-completion question has been executed by the controller (receipt 3d04552f58e548b0ae089192392b564f). The requirement predicate was contradicted by a complete witness with the flag on and the flag-off control held, so this batch replaces the source-only account with the receipt-cited account.",
+  "interpretations": [
+    {
+      "investigation_id": "29e4214f5ee146b393957fa23a33a73d-question-0",
+      "experiment_id": "29e4214f5ee146b393957fa23a33a73d-experiment",
+      "source_ids": [
+        "src_process_logs_batching",
+        "src_fsm_mutate_channel",
+        "src_newraft_goroutine_start",
+        "src_restore_committed",
+        "src_should_snapshot",
+        "src_default_config"
+      ],
+      "executions": {
+        "3d04552f58e548b0ae089192392b564f": [16, 17, 18, 19, 20, 21, 22]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Receipt 3d04552f58e548b0ae089192392b564f restarted two independently built single-voter prefixes whose retained store holds a committed log about 9000 entries above an absent snapshot: event 16 records 9000 applied commands, log_last_index 9002, staged_commit_index 9001, snapshot_index 0 and the resulting 141 replay batches at MaxAppendEntries 64, and event 19 records the same for the control prefix. Comparison 0 is violated by witness event 18: the restart admitted by event 17 (restore_committed_logs true) did not return from NewRaft within the 8000ms window (new_raft_returned false), and the sampled goroutine stack names the replay frames in order, processLogs at raft.go:1346 called from restoreFromCommittedLogs at api.go:753 called from NewRaft, which is the batch send on fsmMutateCh. Comparison 1 holds at event 21: the same prefix shape restarted with the flag off (admission event 20) returned from NewRaft in 1ms (new_raft_returned true, elapsed_ms 1) and then reached leadership (event 22, final_state Leader, commit_index 9003). The two restarts differ only in the flag, so the non-return is not a property of the prefix, the log volume or the transport. Source side, the mechanism is settled and makes the block permanent rather than slow: processLogs delivers each batch of at most MaxAppendEntries commit tuples through a select whose only other case is shutdownCh (raft.go:1302-1312), fsmMutateCh is created with capacity 128 (api.go:560), and its only consumer runFSM is started by api.go:636-638 after restoreFromCommittedLogs has returned. The replay needs ceil((commitIndex - lastApplied)/MaxAppendEntries) = ceil(9001/64) = 141 sends, so the 129th send waits for a consumer that cannot exist until the call it is blocking has finished, with no timeout, and the only escape is a shutdown channel that the caller cannot close because NewRaft has not returned the object. Scope of the defect statement: with Config.RestoreCommittedLogs enabled, NewRaft cannot complete startup whenever the committed log it replays needs more than 128 batches, that is more than 128*MaxAppendEntries entries above the restored snapshot index; the bound is 8192 entries with the default MaxAppendEntries of 64, and is smaller in proportion to any smaller legal value. The failure is startup liveness, not a wrong decision: the node never begins participating at all, so a single-voter group stays down and a larger group permanently loses one member. The counterevidence is about how easily a default deployment reaches the bound, not about whether the block occurs once it is reached.",
+      "knowledge": [
+        {
+          "entry_id": "29e4214f5ee146b393957fa23a33a73d-knowledge-0",
+          "revision": 1,
+          "assertion": "Each batch is delivered with a select between a send on fsmMutateCh and shutdownCh, so a full channel with no consumer waits indefinitely."
+        },
+        {
+          "entry_id": "29e4214f5ee146b393957fa23a33a73d-knowledge-1",
+          "revision": 1,
+          "assertion": "fsmMutateCh has capacity 128 and its consumer runFSM starts only after the startup replay returns."
+        },
+        {
+          "entry_id": "29e4214f5ee146b393957fa23a33a73d-knowledge-2",
+          "revision": 1,
+          "assertion": "The number of entries replayed above the snapshot is what sets the batch count, and the automatic snapshot cadence is the only bound on that range in a default deployment."
+        },
+        {
+          "entry_id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-1",
+          "revision": 1,
+          "assertion": "With the flag on, lastApplied is set to the persisted commit index before the replay, so the replay range spans the committed log above the snapshot."
+        }
+      ],
+      "counterevidence": [
+        "The evidence that NewRaft did not return is a single 8000ms window plus one stack sample (event 18). The claim that the wait is permanent does not rest on that sample: the source shows no timeout, exactly one consumer started after the blocked call returns, and an escape that requires an object the caller has not received. The flag-off control returning in 1ms (event 21) shows the wait is not simply the cost of the work.",
+        "With the default SnapshotThreshold of 8192 and MaxAppendEntries of 64, the automatic snapshot cadence keeps the replay range near the 8192-entry bound, so a default node blocks only when the range overshoots the bound, for example because entries kept arriving between the snapshot trigger and the snapshot completing. The harness therefore raised SnapshotThreshold, a legal Config field, to place the range unambiguously above the bound. The receipt establishes that crossing the bound blocks startup; it does not measure how often a default deployment crosses it.",
+        "The control's FSM catch-up was not observed to completion: event 22 samples last_applied 0 right after leadership, so the receipt shows only that the flag-off restart returns promptly and elects itself, not that its later catch-up finishes.",
+        "The blocked goroutine was abandoned inside the test process; the test completed because NewRaft ran in a separate goroutine. That is a harness choice, not a repair: the abandoned call still cannot be shut down, since the caller never received the object."
+      ],
+      "limitations": [
+        "Both prefixes are single-voter in-memory clusters over an in-memory commit-tracking log store with SnapshotThreshold raised so no automatic snapshot moves the replay bound; the proportional relation for smaller MaxAppendEntries is source-derived (ceil(range/MaxAppendEntries) against a 128-slot buffer) and was not measured.",
+        "No multi-node cluster is exercised, so the member loss caused by a node that cannot start is argued rather than observed.",
+        "The bound itself depends on the caller-side store: the replay range comes from the store's persisted commit index, and the harness uses a test store whose staging is not atomic with its log writes.",
+        "Only one wait length (8000ms) was used, and the same case was not repeated; schedule variation is not characterized."
+      ]
+    }
+  ]
+}

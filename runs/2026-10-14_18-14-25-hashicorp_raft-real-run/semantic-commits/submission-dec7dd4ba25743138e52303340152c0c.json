@@ -1,0 +1,609 @@
+{
+  "input": {
+    "rationale": "Registers the one identified direction from this run's evidence that has no experiment yet, so it is preserved as a sourced question with a concrete discriminator rather than only as a sentence in a limitation. Nothing else changes.",
+    "sources": [],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_stale_snapshot_propagation",
+        "question": "Can the configuration state that a node writes into its snapshot metadata - which this run shows can be an older or empty membership even though the node's log establishes a newer one - reach another node through InstallSnapshot? A leader ships its newest snapshot to a follower whose next index lies below its compacted log start, and installSnapshot installs that snapshot's committed configuration and index (raft.go:1960-1961) before the follower applies the entries the leader sends above the snapshot index.",
+        "source_ids": [
+          "src_snapshot_carries_config",
+          "src_restore_snapshot_config",
+          "src_process_config_entry",
+          "src_snapshot_cadence",
+          "src_quorum_size",
+          "src_commitment_from_config"
+        ],
+        "hypothesis": "Two outcomes are both plausible from the source. If the stale configuration recorded in a leader's snapshot is corrected by the configuration entries the leader re-sends above the snapshot index, the propagation is transient and only the snapshot's own index and membership are wrong until those entries arrive; if the intervening configuration entries have been trimmed from the leader's log, or the leader's own tracked configuration is the stale one so that the entries it sends continue it, the receiving node's decision state stays on the older membership, which would extend the defect's reach to a node whose own log and stores were never damaged.",
+        "discriminator": "Build a group whose leader has a compacted log and a snapshot carrying an older configuration (raise TrailingLogs appropriately, take the snapshot before a committed removal, then restart the leader with the replay enabled so its tracked configuration is the snapshot's), add a fresh voter with an empty log, and compare the joiner's tracked configuration after it installs the snapshot and after it applies the entries the leader sends above the snapshot index, against the configuration entry list in the leader's log and against the committed configuration. The transient hypothesis predicts the joiner's configuration converges to the committed one once those entries arrive; the persistent hypothesis predicts it stays at the snapshot's older membership and that the entries above the snapshot index do not contain the configuration entries needed to correct it.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+        "version": 1,
+        "question": "When Config.RestoreCommittedLogs is enabled, does NewRaft recover the membership configuration that the node's own log already contains, and what does the recovered node then do with the configuration-dependent decisions (election eligibility and quorum membership) that follow?",
+        "source_ids": [
+          "src_newraft_startup",
+          "src_restore_committed",
+          "src_process_config_entry",
+          "src_follower_election_guard"
+        ],
+        "hypothesis": "restoreFromCommittedLogs sets lastApplied to the persisted commit index before the startup configuration scan, so the scan begins above every configuration entry at an index <= that commit index. The node keeps the snapshot's committed configuration, or an empty configuration when it has no snapshot, even though its log holds newer committed configuration entries. Because that configuration state decides election eligibility, quorumSize, and the membership used by the leader's commitment, the recovery can leave a node unable to participate, and it can leave a node that can win an election counting quorum from a stale member set.",
+        "discriminator": "Restart two identically built real prefixes on top of the same stores: one with RestoreCommittedLogs on and one with it off. Compare the recovered configuration (index, voter/nonvoter membership) against the newest configuration entry in the node's own log, and whether the node reaches leadership within a fixed window.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "98ee8dfd5fac4b84915f91ed4b094bcf-gap-0",
+            "question": "Which startup inputs are permitted to establish the node's tracked configuration: the log scan, the snapshot metadata, and the restored FSM are separate sources, and only some of them write r.configurations. Which one is authoritative for a restart with RestoreCommittedLogs enabled?",
+            "experiment_id": null,
+            "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+          },
+          {
+            "id": "98ee8dfd5fac4b84915f91ed4b094bcf-gap-1",
+            "question": "Does a recovered stale or empty configuration view change a decision that is observable outside the node - an election it wins, a vote it grants, or a commit index it advances using a quorum that the actual committed configuration does not contain?",
+            "experiment_id": null,
+            "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+          },
+          {
+            "id": "54dee3b26c0e415f90b11dd070752bc2-gap-9",
+            "question": "Knowledge 98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-2: The earlier statement restricted the writers of the tracked configuration to processConfigurationLogEntry for log entries, which understates the sources: the snapshot paths and the leader's own configuration append also write it, so the tracked state can be established without any configuration entry being processed.",
+            "experiment_id": "e080feeb9663426b82b2c8cd316eaec0-experiment",
+            "operation_id": "54dee3b26c0e415f90b11dd070752bc2"
+          }
+        ],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "29e4214f5ee146b393957fa23a33a73d-question-0",
+        "version": 1,
+        "question": "Can the startup replay that Config.RestoreCommittedLogs performs fail to complete? restoreFromCommittedLogs applies committed entries through processLogs before NewRaft starts the FSM goroutine, and processLogs hands each batch to a fixed-capacity channel, so the completion of NewRaft may depend on how much committed log lies above the snapshot.",
+        "source_ids": [
+          "src_process_logs_batching",
+          "src_fsm_mutate_channel",
+          "src_newraft_goroutine_start",
+          "src_restore_committed",
+          "src_default_config"
+        ],
+        "hypothesis": "processLogs sends each batch of at most MaxAppendEntries commit tuples to fsmMutateCh, a buffered channel created with capacity 128 whose only consumer is runFSM, started only after restoreFromCommittedLogs returns, and the send blocks until buffer space appears or shutdownCh closes. A replay containing more than 128 batches therefore blocks inside NewRaft, before the consumer exists and before any goroutine that could report an error runs; since NewRaft has not returned, no caller can close shutdownCh, so the send is not merely slow but unrepairable from within the process. The number of batches is ceil((commitIndex - lastApplied)/MaxAppendEntries), and at startup with the flag on lastApplied is the restored snapshot index, so the trigger is a committed log more than 128*MaxAppendEntries above the snapshot: 8192 entries with the default MaxAppendEntries of 64, which is the same order as the default SnapshotThreshold of 8192, and proportionally less with any smaller legal MaxAppendEntries.",
+        "discriminator": "Build prefixes whose committed log lies far above an absent snapshot, then restart them with RestoreCommittedLogs on and off. If the replay volume alone were the problem, both restarts would stall or both would finish; if the ordering of the replay against the FSM consumer is the problem, only the flag-on restart fails to return, and a stack sample of the blocked goroutine names the replay frames.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "3bdf46ca8b274b719cc26e672b951e75-gap-2",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-0: The earlier statement said processLogs batches committed entries; the batch count is set by the entries that prepareLog turns into commit tuples, not by every replayed entry. No-op entries consume no batch slot, and configuration entries do so only above protocol version 2, so any batch count computed from a log index range is an upper bound.",
+            "experiment_id": "16c25787045d480683724439289a6ecc-experiment",
+            "operation_id": "3bdf46ca8b274b719cc26e672b951e75"
+          },
+          {
+            "id": "3bdf46ca8b274b719cc26e672b951e75-gap-3",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-0: The earlier statement said processLogs batches committed entries; the batch count is set by the entries that prepareLog turns into commit tuples, not by every replayed entry. No-op entries consume no batch slot, and configuration entries do so only above protocol version 2, so any batch count computed from a log index range is an upper bound.",
+            "experiment_id": "34b43ec09b264d5ba452005b4498cd52-experiment",
+            "operation_id": "3bdf46ca8b274b719cc26e672b951e75"
+          },
+          {
+            "id": "3bdf46ca8b274b719cc26e672b951e75-gap-4",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-0: The earlier statement said processLogs batches committed entries; the batch count is set by the entries that prepareLog turns into commit tuples, not by every replayed entry. No-op entries consume no batch slot, and configuration entries do so only above protocol version 2, so any batch count computed from a log index range is an upper bound.",
+            "experiment_id": "29e4214f5ee146b393957fa23a33a73d-experiment",
+            "operation_id": "3bdf46ca8b274b719cc26e672b951e75"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-5",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "29e4214f5ee146b393957fa23a33a73d-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-6",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "34b43ec09b264d5ba452005b4498cd52-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-7",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "16c25787045d480683724439289a6ecc-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-8",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "3bdf46ca8b274b719cc26e672b951e75-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          }
+        ],
+        "history": [],
+        "operation_id": "29e4214f5ee146b393957fa23a33a73d"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "dec7dd4ba25743138e52303340152c0c",
+      "result": {
+        "submission": "update45.json",
+        "summary": "Registered the one identified direction from this run's evidence that has no experiment yet, so a continuation has a sourced question with a concrete discriminator instead of a sentence in a limitation. The new investigation @q_stale_snapshot_propagation asks whether the configuration a node writes into its snapshot metadata - which this run shows can be an older or empty membership although the node's log establishes a newer one - can reach another node through InstallSnapshot, since a leader ships its newest snapshot when a follower's next index falls below its compacted log start and installSnapshot installs that snapshot's committed configuration and index (raft.go:1960-1961) before the follower applies the entries sent above the snapshot index. It records two rival readings both consistent with the source: a transient one, where the configuration entries the leader re-sends above the snapshot index correct the joiner's state, and a persistent one, where those entries are absent because the leader's log was trimmed or because the leader's own tracked configuration is the stale one, so the joiner's decision state would stay on the older membership even though its own log and stores were never damaged. The discriminator is a compacted-log leader whose snapshot carries a pre-removal configuration plus a fresh voter joiner, comparing the joiner's tracked configuration after the install and after the subsequent entries against the leader's configuration entries and the committed configuration. The run's two defect accounts and their receipts are unchanged; this batch creates only that investigation."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-98ee8dfd5fac4b84915f91ed4b094bcf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-98ee8dfd5fac4b84915f91ed4b094bcf.json"
+      },
+      "submission-afb62091645f43ef86ef604794d29bc8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-afb62091645f43ef86ef604794d29bc8.json"
+      },
+      "submission-29e4214f5ee146b393957fa23a33a73d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-29e4214f5ee146b393957fa23a33a73d.json"
+      },
+      "submission-eddfe06513d44cb19c93ee0ca1a756bf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-eddfe06513d44cb19c93ee0ca1a756bf.json"
+      },
+      "submission-34b43ec09b264d5ba452005b4498cd52": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-34b43ec09b264d5ba452005b4498cd52.json"
+      },
+      "submission-736ab89982f34699abc625486013480d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-736ab89982f34699abc625486013480d.json"
+      },
+      "submission-6b30dd76d4b64190be2808a0e7abb041": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-6b30dd76d4b64190be2808a0e7abb041.json"
+      },
+      "submission-bf92fdb38535413ca18d171812c22f8b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-bf92fdb38535413ca18d171812c22f8b.json"
+      },
+      "submission-47aa9318d7fb43729a63a57146a1ea26": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-47aa9318d7fb43729a63a57146a1ea26.json"
+      },
+      "submission-e080feeb9663426b82b2c8cd316eaec0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-e080feeb9663426b82b2c8cd316eaec0.json"
+      },
+      "submission-9e3f8a75105f44bdab6c207c54235de8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-9e3f8a75105f44bdab6c207c54235de8.json"
+      },
+      "submission-16c25787045d480683724439289a6ecc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-16c25787045d480683724439289a6ecc.json"
+      },
+      "submission-9f9ca8becd0245e6840de1cd88dee503": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-9f9ca8becd0245e6840de1cd88dee503.json"
+      },
+      "submission-3bdf46ca8b274b719cc26e672b951e75": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-3bdf46ca8b274b719cc26e672b951e75.json"
+      },
+      "submission-fa57b063fe3142098a3f7162ec282806": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-fa57b063fe3142098a3f7162ec282806.json"
+      },
+      "submission-cc6db88285bf412691a7ed8768b7f5e6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-cc6db88285bf412691a7ed8768b7f5e6.json"
+      },
+      "submission-87e05159dda24b4fbd32cabaea9f4304": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-87e05159dda24b4fbd32cabaea9f4304.json"
+      },
+      "submission-3b4f2310a3bf43a492eea0cfedd79dd0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-3b4f2310a3bf43a492eea0cfedd79dd0.json"
+      },
+      "submission-618564c0f0db4aa18873c2419a34352f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-618564c0f0db4aa18873c2419a34352f.json"
+      },
+      "submission-298f72ba2eb14d5b841f1cb93dc85f03": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-298f72ba2eb14d5b841f1cb93dc85f03.json"
+      },
+      "submission-7db8c9fb0d794b08892b9349c54fa466": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-7db8c9fb0d794b08892b9349c54fa466.json"
+      },
+      "submission-15dea274de8846298f758a20b3004eaf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-15dea274de8846298f758a20b3004eaf.json"
+      },
+      "submission-51f6431b64424e248137ba028f99b1cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-51f6431b64424e248137ba028f99b1cf.json"
+      },
+      "submission-6040551c93f54b1b8ce470447f30e025": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-6040551c93f54b1b8ce470447f30e025.json"
+      },
+      "submission-1196b1f476d04ad7a07fe4d176d6e631": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-1196b1f476d04ad7a07fe4d176d6e631.json"
+      },
+      "submission-8dd0e551241244af988706dc6380ba58": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-8dd0e551241244af988706dc6380ba58.json"
+      },
+      "submission-64f67925189748089ddaff8f0edb7547": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-64f67925189748089ddaff8f0edb7547.json"
+      },
+      "submission-1908cee9cdd5417c986bc4c70ec5c5a0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-1908cee9cdd5417c986bc4c70ec5c5a0.json"
+      },
+      "submission-6109c0fa960e43ce8bff3bc05efcc1d7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-6109c0fa960e43ce8bff3bc05efcc1d7.json"
+      },
+      "submission-fd16a0f85bce442995f132e587111c52": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-fd16a0f85bce442995f132e587111c52.json"
+      },
+      "submission-c21104a6cce14b9e810accfc1f61a154": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-c21104a6cce14b9e810accfc1f61a154.json"
+      },
+      "submission-d28b3b9b47b94197b7be7a32b20158f7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-d28b3b9b47b94197b7be7a32b20158f7.json"
+      },
+      "submission-a078637722f54161b0afeabe24f8b79c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-a078637722f54161b0afeabe24f8b79c.json"
+      },
+      "submission-292c24a38b754cf08c0a4320b9579547": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-292c24a38b754cf08c0a4320b9579547.json"
+      },
+      "submission-341e128828854db2a05ee7e8e8a98bf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-341e128828854db2a05ee7e8e8a98bf6.json"
+      },
+      "submission-d958d473b5d74a9a83c0de5b55a64ce5": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-d958d473b5d74a9a83c0de5b55a64ce5.json"
+      },
+      "submission-9e2eb5b8065b4ed7adcae9e7cafa6276": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-9e2eb5b8065b4ed7adcae9e7cafa6276.json"
+      },
+      "submission-0cad9d5f0a074906abf964f9d006b756": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-0cad9d5f0a074906abf964f9d006b756.json"
+      },
+      "submission-c39556a8b4fd423dbe88e918cb2ad90c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-c39556a8b4fd423dbe88e918cb2ad90c.json"
+      },
+      "submission-a4d21936f18b47a082bcd77d54bb1b33": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-a4d21936f18b47a082bcd77d54bb1b33.json"
+      },
+      "submission-dc1dbb3857eb41919edae0aefd47c2aa": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-dc1dbb3857eb41919edae0aefd47c2aa.json"
+      },
+      "submission-336003f12bb242e8b65347b51645bdca": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-336003f12bb242e8b65347b51645bdca.json"
+      },
+      "submission-0f4dc87c611f4eda9b1a855ab1155108": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-0f4dc87c611f4eda9b1a855ab1155108.json"
+      },
+      "submission-c95a553c3a534e8bbb38f476a331d44d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-c95a553c3a534e8bbb38f476a331d44d.json"
+      },
+      "submission-8d521d6ed34941308ba2f976b1f41dc6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-8d521d6ed34941308ba2f976b1f41dc6.json"
+      },
+      "submission-29a676205f1c43a1a48fb82e4a7c196f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-29a676205f1c43a1a48fb82e4a7c196f.json"
+      },
+      "submission-b5a2d2c3cff04fefb1ea25ed2cb70ee3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-b5a2d2c3cff04fefb1ea25ed2cb70ee3.json"
+      },
+      "submission-54dee3b26c0e415f90b11dd070752bc2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-54dee3b26c0e415f90b11dd070752bc2.json"
+      },
+      "submission-8afcaa2327d94db1a6720eae0efbd4e3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-8afcaa2327d94db1a6720eae0efbd4e3.json"
+      },
+      "submission-bf351a1cb2894120a11ec439c30d6e3a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-bf351a1cb2894120a11ec439c30d6e3a.json"
+      },
+      "submission-a9408c6eb836433d9881ba8bce354e6f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-a9408c6eb836433d9881ba8bce354e6f.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+        "version": 1,
+        "question": "When Config.RestoreCommittedLogs is enabled, does NewRaft recover the membership configuration that the node's own log already contains, and what does the recovered node then do with the configuration-dependent decisions (election eligibility and quorum membership) that follow?",
+        "source_ids": [
+          "src_newraft_startup",
+          "src_restore_committed",
+          "src_process_config_entry",
+          "src_follower_election_guard"
+        ],
+        "hypothesis": "restoreFromCommittedLogs sets lastApplied to the persisted commit index before the startup configuration scan, so the scan begins above every configuration entry at an index <= that commit index. The node keeps the snapshot's committed configuration, or an empty configuration when it has no snapshot, even though its log holds newer committed configuration entries. Because that configuration state decides election eligibility, quorumSize, and the membership used by the leader's commitment, the recovery can leave a node unable to participate, and it can leave a node that can win an election counting quorum from a stale member set.",
+        "discriminator": "Restart two identically built real prefixes on top of the same stores: one with RestoreCommittedLogs on and one with it off. Compare the recovered configuration (index, voter/nonvoter membership) against the newest configuration entry in the node's own log, and whether the node reaches leadership within a fixed window.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "98ee8dfd5fac4b84915f91ed4b094bcf-gap-0",
+            "question": "Which startup inputs are permitted to establish the node's tracked configuration: the log scan, the snapshot metadata, and the restored FSM are separate sources, and only some of them write r.configurations. Which one is authoritative for a restart with RestoreCommittedLogs enabled?",
+            "experiment_id": null,
+            "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+          },
+          {
+            "id": "98ee8dfd5fac4b84915f91ed4b094bcf-gap-1",
+            "question": "Does a recovered stale or empty configuration view change a decision that is observable outside the node - an election it wins, a vote it grants, or a commit index it advances using a quorum that the actual committed configuration does not contain?",
+            "experiment_id": null,
+            "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+          },
+          {
+            "id": "54dee3b26c0e415f90b11dd070752bc2-gap-9",
+            "question": "Knowledge 98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-2: The earlier statement restricted the writers of the tracked configuration to processConfigurationLogEntry for log entries, which understates the sources: the snapshot paths and the leader's own configuration append also write it, so the tracked state can be established without any configuration entry being processed.",
+            "experiment_id": "e080feeb9663426b82b2c8cd316eaec0-experiment",
+            "operation_id": "54dee3b26c0e415f90b11dd070752bc2"
+          }
+        ],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "29e4214f5ee146b393957fa23a33a73d-question-0",
+        "version": 1,
+        "question": "Can the startup replay that Config.RestoreCommittedLogs performs fail to complete? restoreFromCommittedLogs applies committed entries through processLogs before NewRaft starts the FSM goroutine, and processLogs hands each batch to a fixed-capacity channel, so the completion of NewRaft may depend on how much committed log lies above the snapshot.",
+        "source_ids": [
+          "src_process_logs_batching",
+          "src_fsm_mutate_channel",
+          "src_newraft_goroutine_start",
+          "src_restore_committed",
+          "src_default_config"
+        ],
+        "hypothesis": "processLogs sends each batch of at most MaxAppendEntries commit tuples to fsmMutateCh, a buffered channel created with capacity 128 whose only consumer is runFSM, started only after restoreFromCommittedLogs returns, and the send blocks until buffer space appears or shutdownCh closes. A replay containing more than 128 batches therefore blocks inside NewRaft, before the consumer exists and before any goroutine that could report an error runs; since NewRaft has not returned, no caller can close shutdownCh, so the send is not merely slow but unrepairable from within the process. The number of batches is ceil((commitIndex - lastApplied)/MaxAppendEntries), and at startup with the flag on lastApplied is the restored snapshot index, so the trigger is a committed log more than 128*MaxAppendEntries above the snapshot: 8192 entries with the default MaxAppendEntries of 64, which is the same order as the default SnapshotThreshold of 8192, and proportionally less with any smaller legal MaxAppendEntries.",
+        "discriminator": "Build prefixes whose committed log lies far above an absent snapshot, then restart them with RestoreCommittedLogs on and off. If the replay volume alone were the problem, both restarts would stall or both would finish; if the ordering of the replay against the FSM consumer is the problem, only the flag-on restart fails to return, and a stack sample of the blocked goroutine names the replay frames.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "3bdf46ca8b274b719cc26e672b951e75-gap-2",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-0: The earlier statement said processLogs batches committed entries; the batch count is set by the entries that prepareLog turns into commit tuples, not by every replayed entry. No-op entries consume no batch slot, and configuration entries do so only above protocol version 2, so any batch count computed from a log index range is an upper bound.",
+            "experiment_id": "16c25787045d480683724439289a6ecc-experiment",
+            "operation_id": "3bdf46ca8b274b719cc26e672b951e75"
+          },
+          {
+            "id": "3bdf46ca8b274b719cc26e672b951e75-gap-3",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-0: The earlier statement said processLogs batches committed entries; the batch count is set by the entries that prepareLog turns into commit tuples, not by every replayed entry. No-op entries consume no batch slot, and configuration entries do so only above protocol version 2, so any batch count computed from a log index range is an upper bound.",
+            "experiment_id": "34b43ec09b264d5ba452005b4498cd52-experiment",
+            "operation_id": "3bdf46ca8b274b719cc26e672b951e75"
+          },
+          {
+            "id": "3bdf46ca8b274b719cc26e672b951e75-gap-4",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-0: The earlier statement said processLogs batches committed entries; the batch count is set by the entries that prepareLog turns into commit tuples, not by every replayed entry. No-op entries consume no batch slot, and configuration entries do so only above protocol version 2, so any batch count computed from a log index range is an upper bound.",
+            "experiment_id": "29e4214f5ee146b393957fa23a33a73d-experiment",
+            "operation_id": "3bdf46ca8b274b719cc26e672b951e75"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-5",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "29e4214f5ee146b393957fa23a33a73d-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-6",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "34b43ec09b264d5ba452005b4498cd52-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-7",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "16c25787045d480683724439289a6ecc-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          },
+          {
+            "id": "d28b3b9b47b94197b7be7a32b20158f7-gap-8",
+            "question": "Knowledge 29e4214f5ee146b393957fa23a33a73d-knowledge-2: The earlier statement said the automatic snapshot cadence normally keeps the committed range above the snapshot near SnapshotThreshold. It does not: the check runs only when a randomized timeout of up to SnapshotInterval expires, so the range can pass the threshold and keep growing between checks - measured as 12001 entries above an absent snapshot against a threshold of 8192, with no snapshot taken.",
+            "experiment_id": "3bdf46ca8b274b719cc26e672b951e75-experiment",
+            "operation_id": "d28b3b9b47b94197b7be7a32b20158f7"
+          }
+        ],
+        "history": [],
+        "operation_id": "29e4214f5ee146b393957fa23a33a73d"
+      },
+      {
+        "id": "dec7dd4ba25743138e52303340152c0c-question-0",
+        "version": 1,
+        "question": "Can the configuration state that a node writes into its snapshot metadata - which this run shows can be an older or empty membership even though the node's log establishes a newer one - reach another node through InstallSnapshot? A leader ships its newest snapshot to a follower whose next index lies below its compacted log start, and installSnapshot installs that snapshot's committed configuration and index (raft.go:1960-1961) before the follower applies the entries the leader sends above the snapshot index.",
+        "source_ids": [
+          "src_snapshot_carries_config",
+          "src_restore_snapshot_config",
+          "src_process_config_entry",
+          "src_snapshot_cadence",
+          "src_quorum_size",
+          "src_commitment_from_config"
+        ],
+        "hypothesis": "Two outcomes are both plausible from the source. If the stale configuration recorded in a leader's snapshot is corrected by the configuration entries the leader re-sends above the snapshot index, the propagation is transient and only the snapshot's own index and membership are wrong until those entries arrive; if the intervening configuration entries have been trimmed from the leader's log, or the leader's own tracked configuration is the stale one so that the entries it sends continue it, the receiving node's decision state stays on the older membership, which would extend the defect's reach to a node whose own log and stores were never damaged.",
+        "discriminator": "Build a group whose leader has a compacted log and a snapshot carrying an older configuration (raise TrailingLogs appropriately, take the snapshot before a committed removal, then restart the leader with the replay enabled so its tracked configuration is the snapshot's), add a fresh voter with an empty log, and compare the joiner's tracked configuration after it installs the snapshot and after it applies the entries the leader sends above the snapshot index, against the configuration entry list in the leader's log and against the committed configuration. The transient hypothesis predicts the joiner's configuration converges to the committed one once those entries arrive; the persistent hypothesis predicts it stays at the snapshot's older membership and that the entries above the snapshot index do not contain the configuration entries needed to correct it.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "dec7dd4ba25743138e52303340152c0c"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "dec7dd4ba25743138e52303340152c0c",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@q_stale_snapshot_propagation": "dec7dd4ba25743138e52303340152c0c-question-0"
+      },
+      "effects": [
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@q_stale_snapshot_propagation"
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-98ee8dfd5fac4b84915f91ed4b094bcf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-98ee8dfd5fac4b84915f91ed4b094bcf.json"
+      },
+      "submission-afb62091645f43ef86ef604794d29bc8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-afb62091645f43ef86ef604794d29bc8.json"
+      },
+      "submission-29e4214f5ee146b393957fa23a33a73d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-29e4214f5ee146b393957fa23a33a73d.json"
+      },
+      "submission-eddfe06513d44cb19c93ee0ca1a756bf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-eddfe06513d44cb19c93ee0ca1a756bf.json"
+      },
+      "submission-34b43ec09b264d5ba452005b4498cd52": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-34b43ec09b264d5ba452005b4498cd52.json"
+      },
+      "submission-736ab89982f34699abc625486013480d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-736ab89982f34699abc625486013480d.json"
+      },
+      "submission-6b30dd76d4b64190be2808a0e7abb041": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-6b30dd76d4b64190be2808a0e7abb041.json"
+      },
+      "submission-bf92fdb38535413ca18d171812c22f8b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-bf92fdb38535413ca18d171812c22f8b.json"
+      },
+      "submission-47aa9318d7fb43729a63a57146a1ea26": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-47aa9318d7fb43729a63a57146a1ea26.json"
+      },
+      "submission-e080feeb9663426b82b2c8cd316eaec0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-e080feeb9663426b82b2c8cd316eaec0.json"
+      },
+      "submission-9e3f8a75105f44bdab6c207c54235de8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-9e3f8a75105f44bdab6c207c54235de8.json"
+      },
+      "submission-16c25787045d480683724439289a6ecc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-16c25787045d480683724439289a6ecc.json"
+      },
+      "submission-9f9ca8becd0245e6840de1cd88dee503": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-9f9ca8becd0245e6840de1cd88dee503.json"
+      },
+      "submission-3bdf46ca8b274b719cc26e672b951e75": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-3bdf46ca8b274b719cc26e672b951e75.json"
+      },
+      "submission-fa57b063fe3142098a3f7162ec282806": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-fa57b063fe3142098a3f7162ec282806.json"
+      },
+      "submission-cc6db88285bf412691a7ed8768b7f5e6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-cc6db88285bf412691a7ed8768b7f5e6.json"
+      },
+      "submission-87e05159dda24b4fbd32cabaea9f4304": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-87e05159dda24b4fbd32cabaea9f4304.json"
+      },
+      "submission-3b4f2310a3bf43a492eea0cfedd79dd0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-3b4f2310a3bf43a492eea0cfedd79dd0.json"
+      },
+      "submission-618564c0f0db4aa18873c2419a34352f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-618564c0f0db4aa18873c2419a34352f.json"
+      },
+      "submission-298f72ba2eb14d5b841f1cb93dc85f03": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-298f72ba2eb14d5b841f1cb93dc85f03.json"
+      },
+      "submission-7db8c9fb0d794b08892b9349c54fa466": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-7db8c9fb0d794b08892b9349c54fa466.json"
+      },
+      "submission-15dea274de8846298f758a20b3004eaf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-15dea274de8846298f758a20b3004eaf.json"
+      },
+      "submission-51f6431b64424e248137ba028f99b1cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-51f6431b64424e248137ba028f99b1cf.json"
+      },
+      "submission-6040551c93f54b1b8ce470447f30e025": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-6040551c93f54b1b8ce470447f30e025.json"
+      },
+      "submission-1196b1f476d04ad7a07fe4d176d6e631": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-1196b1f476d04ad7a07fe4d176d6e631.json"
+      },
+      "submission-8dd0e551241244af988706dc6380ba58": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-8dd0e551241244af988706dc6380ba58.json"
+      },
+      "submission-64f67925189748089ddaff8f0edb7547": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-64f67925189748089ddaff8f0edb7547.json"
+      },
+      "submission-1908cee9cdd5417c986bc4c70ec5c5a0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-1908cee9cdd5417c986bc4c70ec5c5a0.json"
+      },
+      "submission-6109c0fa960e43ce8bff3bc05efcc1d7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-6109c0fa960e43ce8bff3bc05efcc1d7.json"
+      },
+      "submission-fd16a0f85bce442995f132e587111c52": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-fd16a0f85bce442995f132e587111c52.json"
+      },
+      "submission-c21104a6cce14b9e810accfc1f61a154": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-c21104a6cce14b9e810accfc1f61a154.json"
+      },
+      "submission-d28b3b9b47b94197b7be7a32b20158f7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-d28b3b9b47b94197b7be7a32b20158f7.json"
+      },
+      "submission-a078637722f54161b0afeabe24f8b79c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-a078637722f54161b0afeabe24f8b79c.json"
+      },
+      "submission-292c24a38b754cf08c0a4320b9579547": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-292c24a38b754cf08c0a4320b9579547.json"
+      },
+      "submission-341e128828854db2a05ee7e8e8a98bf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-341e128828854db2a05ee7e8e8a98bf6.json"
+      },
+      "submission-d958d473b5d74a9a83c0de5b55a64ce5": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-d958d473b5d74a9a83c0de5b55a64ce5.json"
+      },
+      "submission-9e2eb5b8065b4ed7adcae9e7cafa6276": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-9e2eb5b8065b4ed7adcae9e7cafa6276.json"
+      },
+      "submission-0cad9d5f0a074906abf964f9d006b756": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-0cad9d5f0a074906abf964f9d006b756.json"
+      },
+      "submission-c39556a8b4fd423dbe88e918cb2ad90c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-c39556a8b4fd423dbe88e918cb2ad90c.json"
+      },
+      "submission-a4d21936f18b47a082bcd77d54bb1b33": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-a4d21936f18b47a082bcd77d54bb1b33.json"
+      },
+      "submission-dc1dbb3857eb41919edae0aefd47c2aa": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-dc1dbb3857eb41919edae0aefd47c2aa.json"
+      },
+      "submission-336003f12bb242e8b65347b51645bdca": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-336003f12bb242e8b65347b51645bdca.json"
+      },
+      "submission-0f4dc87c611f4eda9b1a855ab1155108": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-0f4dc87c611f4eda9b1a855ab1155108.json"
+      },
+      "submission-c95a553c3a534e8bbb38f476a331d44d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-c95a553c3a534e8bbb38f476a331d44d.json"
+      },
+      "submission-8d521d6ed34941308ba2f976b1f41dc6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-8d521d6ed34941308ba2f976b1f41dc6.json"
+      },
+      "submission-29a676205f1c43a1a48fb82e4a7c196f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-29a676205f1c43a1a48fb82e4a7c196f.json"
+      },
+      "submission-b5a2d2c3cff04fefb1ea25ed2cb70ee3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-b5a2d2c3cff04fefb1ea25ed2cb70ee3.json"
+      },
+      "submission-54dee3b26c0e415f90b11dd070752bc2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-54dee3b26c0e415f90b11dd070752bc2.json"
+      },
+      "submission-8afcaa2327d94db1a6720eae0efbd4e3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-8afcaa2327d94db1a6720eae0efbd4e3.json"
+      },
+      "submission-bf351a1cb2894120a11ec439c30d6e3a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-bf351a1cb2894120a11ec439c30d6e3a.json"
+      },
+      "submission-a9408c6eb836433d9881ba8bce354e6f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-a9408c6eb836433d9881ba8bce354e6f.json"
+      },
+      "submission-dec7dd4ba25743138e52303340152c0c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-dec7dd4ba25743138e52303340152c0c.json"
+      }
+    }
+  }
+}

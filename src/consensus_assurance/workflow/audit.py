@@ -54,7 +54,16 @@ class Inputs:
         if not name or Path(name).is_absolute() or '..' in Path(name).parts:
             raise ValueError('Invalid submitted input path')
         if name not in self.contents:
-            self.contents[name] = draft_bytes(self.root, name)
+            try:
+                self.contents[name] = draft_bytes(self.root, name)
+            except (OSError, ValueError) as exc:
+                from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
+                raise DiagnosticError([Diagnostic(code='submitted_input', category='location',
+                    details={'input_path': name, 'input_root': str(self.root),
+                             'resolved_path': str(self.root / name)},
+                    message=f'Cannot read submitted input {name!r} at {str(self.root / name)!r}: {exc}. '
+                            'Submitted input paths are relative to the draft directory '
+                            f'(input root {str(self.root)!r}).')]) from exc
         return self.contents[name].decode('utf-8')
 
     def json(self, name):
@@ -472,7 +481,6 @@ def accept_received(engine):
         if (check and check.action == 'agent_turn' and check.status == ExecutionStatus.TIMEOUT
                 and check.parameters.get('timeout_limit') == 'agent_turn_timeout'
                 and check.parameters.get('agent_diagnostic',{}).get('message') == ''
-                and not check.parameters.get('agent_turn_completed')
                 and not check.parameters.get('agent_session_unavailable')
                 and engine.state.agent_session_id
                 and check.parameters.get('agent_session_id') == engine.state.agent_session_id):

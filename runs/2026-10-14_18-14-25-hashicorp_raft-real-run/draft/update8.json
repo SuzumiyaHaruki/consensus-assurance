@@ -1,0 +1,100 @@
+{
+  "rationale": "The predecessor execution failed on a harness race, so this batch resubmits the fixed experiment for the open gap with a deterministic leadership setup and explicit shutdowns. Four local construction runs of the revised harness produced the intended witness; the retained execution is requested again.",
+  "sources": [
+    {
+      "id": "src_follower_append_entries",
+      "file": "raft.go",
+      "start_line": 1458,
+      "end_line": 1603,
+      "kind": "code_observation"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+    "harness_path": "assurance_multi_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "src_newraft_startup",
+      "src_restore_committed",
+      "src_process_config_entry",
+      "src_setup_leader_state",
+      "src_commitment_from_config",
+      "src_quorum_size",
+      "src_follower_append_entries"
+    ],
+    "scope": {
+      "description": "Three in-memory voters A, B and C on one another's transports. A snapshots while {A,B,C} is committed; the leader then removes C, which commits against {A,B}, and commits three more entries. A is shut down and restarted with Config.RestoreCommittedLogs enabled over the same stores, while B is disconnected from A and C. The harness reports A's tracked configuration, whether A wins the election, and for a command applied after that: the client result, A's commit and applied index, whether A's FSM applied the payload, and whether the entry is present in A's, B's and C's logs.",
+      "assumptions": [
+        "The removed server C keeps running and keeps answering AppendEntries, which is what a removal without shutting the process down leaves in place; the harness does not simulate C being killed.",
+        "A's snapshot is taken through the normal snapshot goroutine while the committed configuration is still {A,B,C}, so its configuration index is the bootstrap entry's index and its configuration contains C.",
+        "B is partitioned before A is restarted, so the committed configuration's only other voter cannot contribute an acknowledgement.",
+        "The nodes are in-memory transports and stores in one process; leadership, terms and quorum arithmetic are the real code paths."
+      ],
+      "excluded": [
+        "No process-level restart, no production log store, and no attempt to complete the downstream loss of the entry; the predicate stops at the commitment rule.",
+        "No case in which the restarted node is the only stale voter or in which the stale configuration excludes a voter rather than including a removed one."
+      ],
+      "parameters": {
+        "voters": 3,
+        "removed_server": "C",
+        "restarted_server": "A",
+        "partitioned_server": "B",
+        "commands_before_snapshot": 1,
+        "commands_after_removal": 3,
+        "leader_wait_ms": 5000,
+        "apply_timeout_ms": 2000
+      }
+    },
+    "prefix": "The harness builds three assuranceMultiNode values: NewInmemTransport with a random address each, inmemConfig with LocalID = 'server-' + address and RestoreCommittedLogs true for every node, plus NewInmemCommitTrackingStore, NewInmemStore and NewInmemSnapshotStore per node. All transports are connected pairwise; BootstrapCluster is called on each node with the same three-voter configuration; NewRaft is called for each with a fresh MockFSM. The harness then waits for a real leader, applies one command through it, and takes a user snapshot on A through A.raft.Snapshot() while {A,B,C} is committed. It calls RemoveServer(C) on the leader and waits for that future, then applies three more commands, and records A's staged commit index, last index and the newest configuration entry in A's log. A is shut down and B is disconnected from A's transport and C's transport; a new transport bound to A's old address is created and connected to C only. NewRaft is called again on A's stores with RestoreCommittedLogs true and a fresh MockFSM. The harness reads A's tracked configurations through r.configurationsCh, waits up to five seconds for A to lead, and if it does, applies the payload 'stale-quorum-entry' with a two second timeout, then samples A's log entry term, the same index in B's and C's logs, A's commit and applied indexes, and A's FSM log contents.",
+    "responsibility": "raft's leader is responsible for committing an entry only when a majority of the configuration it is bound to has stored it, and raft's startup recovery is responsible for binding the leader to the configuration the committed log establishes rather than to an older one.",
+    "prerequisites": [
+      {
+        "alias": "admit_stale_restart",
+        "event": "assurance.multi.restart",
+        "conditions": [
+          {
+            "field": "latest_config_voters",
+            "value": 3
+          },
+          {
+            "field": "log_config_voters",
+            "value": 2
+          },
+          {
+            "field": "b_connected",
+            "value": false
+          },
+          {
+            "field": "c_connected",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "assurance.multi.outcome",
+        "identity_fields": [
+          "b_connected"
+        ],
+        "admission_alias": "admit_stale_restart",
+        "assertion": {
+          "field": "committed_config_majority_lacks_entry",
+          "value": false
+        },
+        "description": "Where the restart that tracks the snapshot's older three-voter configuration became leader while its log's committed configuration has two voters, committing an entry that its FSM applied and the client accepted while the committed configuration's other voter lacks it is a violation; such a witness shows the commit was decided by the removed server. Where A did not lead, the antecedent is false and nothing is claimed.",
+        "antecedent": {
+          "field": "a_became_leader",
+          "value": true
+        }
+      }
+    ],
+    "previous_id": "6b30dd76d4b64190be2808a0e7abb041-experiment",
+    "revision_reason": "The predecessor execution failed at its snapshot step (receipt 4ed46b198c8d41618cc855df0a63d469, exit 1, 'snapshot on A failed: nothing new to snapshot'; the initial leader was C rather than A). This revision makes the case deterministic and self-terminating: leadership is transferred to A through the library's own transfer before the snapshot, a command is committed and awaited in A's FSM before the snapshot request, and every node is shut down on all exit paths. Four local construction runs of the revised harness reproduce the predicate; the predecessor receipt is retained as an explained harness failure, not as a comparison result.",
+    "semantic_changes": [
+      "Leadership is moved to A with LeadershipTransferToServer before the snapshot, because the election winner is arbitrary and removing the leader (ShutdownOnRemove defaults to true) would shut it down; the predecessor removed whichever node C was even when C led.",
+      "The pre-snapshot command is committed through A and the harness waits until A's FSM has applied a command entry, because runFSM refuses a snapshot request while its own last applied index is zero and a plain MockFSM never observes configuration or no-op entries.",
+      "Every node is shut down on all exit paths so no raft goroutine logs through the test logger after the test returns, which panicked the predecessor's later iterations."
+    ]
+  }
+}

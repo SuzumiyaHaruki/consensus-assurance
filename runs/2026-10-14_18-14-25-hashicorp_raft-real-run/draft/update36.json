@@ -1,0 +1,80 @@
+{
+  "rationale": "The replay-completion account records the availability consequence only at MaxAppendEntries 16, and its limitation names that as one of the single-parameter results. The same harness at the library's default batch size settles it: 9000 committed commands give a replayed range of 9001 entries, 141 batches against a bound of 128, and the rest of the case is unchanged. This batch revises the availability experiment's harness to add that case.",
+  "experiment": {
+    "investigation_id": "29e4214f5ee146b393957fa23a33a73d-question-0",
+    "previous_id": "16c25787045d480683724439289a6ecc-experiment",
+    "revision_reason": "Adds a third case to the availability harness at Config.MaxAppendEntries 64, the library default, with 9000 committed commands so the replayed range is 9001 entries and needs 141 batches against the 128-batch bound; the two earlier cases at MaxAppendEntries 16 are unchanged. The purpose is to show the availability consequence - a member that cannot start plus one further stop costs the group its ability to commit - does not depend on the smaller batch size.",
+    "harness_path": "assurance_multi_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "src_process_logs_batching",
+      "src_fsm_mutate_channel",
+      "src_newraft_goroutine_start",
+      "src_restore_committed",
+      "src_default_config",
+      "src_quorum_size",
+      "src_leader_stepdown_inflight"
+    ],
+    "scope": {
+      "description": "Three in-memory voters A, B and C, with A's committed log driven far above any snapshot before A is restarted with the replay enabled in a goroutine. One case uses the default MaxAppendEntries of 64 and 9000 committed commands; when NewRaft does not return, the harness commits one command with two members live, stops the member that is neither the leader nor A, commits again, and reports both client results.",
+      "assumptions": [
+        "9001 replayed entries at MaxAppendEntries 64 need 141 delivered batches, above the 128-batch capacity of the FSM channel, so the flag-on restart is expected not to return.",
+        "The commit while two members are live is evidence that the group was healthy before the extra stop, and the failing commit afterwards is what attributes the loss to the member that never started.",
+        "The rest of the case is identical to the two executed earlier: same cluster construction, same leader placement away from A, same sampling of the blocked goroutine's stack."
+      ],
+      "excluded": [
+        "No flag-off control at the default batch size; the flag-off path is covered by the two earlier cases and by the replays of this experiment.",
+        "No production store, process-level restart or disk fault."
+      ],
+      "parameters": {
+        "cases": [
+          "replay_on",
+          "replay_off",
+          "replay_on_default_batch"
+        ],
+        "new_case": "replay_on_default_batch",
+        "commands_applied": 9000,
+        "max_append_entries": 64,
+        "expected_replay_batches": 141,
+        "batch_bound": 128,
+        "apply_timeout_ms": 3000
+      }
+    },
+    "prefix": "For the added case the harness builds three assuranceMultiNode values with in-memory transports and commit-tracking stores, wires them, bootstraps the same three-voter configuration and starts each with a fresh MockFSM. It waits for a real leader and moves leadership away from A with LeadershipTransferToServer if A won. About 9000 commands are applied through the leader, each waiting for its future, and the harness records A's staged commit index, A's log last index, A's snapshot index and the implied replay batch count. A is shut down, a new transport bound to A's address is connected to B and C, and NewRaft is called in a separate goroutine on A's stores with a fresh MockFSM and Config.RestoreCommittedLogs enabled; the main goroutine waits up to 8000ms and, on non-return, samples all goroutine stacks and reports the excerpt around the first frame naming restoreFromCommittedLogs. The harness then commits one command through the leader, shuts down the member that is neither the leader nor A, commits one further command, and reports both results.",
+    "responsibility": "raft's leader owns the group's ability to keep committing, and a member that never completes startup is a member the group does not have; this case shows that consequence is not an artefact of a small replication batch size.",
+    "prerequisites": [
+      {
+        "alias": "admit_availability_default_batch",
+        "event": "assurance.availability.restart.replay_on_default_batch",
+        "conditions": [
+          {
+            "field": "restore_committed_logs",
+            "value": true
+          },
+          {
+            "field": "max_append_entries",
+            "value": 64
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "assurance.availability.outcome.replay_on_default_batch",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_availability_default_batch",
+        "antecedent": {
+          "field": "a_new_raft_returned",
+          "value": false
+        },
+        "assertion": {
+          "field": "commit_after_stop_ok",
+          "value": true
+        },
+        "description": "With the default batch size, where the restart did not return, stopping one further member must not cost the group its ability to commit; the companion commit_while_two_live_ok field records that the group was committing before that stop."
+      }
+    ]
+  }
+}

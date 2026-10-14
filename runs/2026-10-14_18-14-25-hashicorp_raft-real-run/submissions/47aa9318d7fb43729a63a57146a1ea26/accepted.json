@@ -1,0 +1,97 @@
+{
+  "rationale": "The multi-node experiment for the open gap has now been executed (receipt 79a9cc34b3ce42e197c384775efecc3a, comparison violated with a valid witness). This batch replaces the account of the configuration-recovery question with one that spans both receipts, resolves the gap that asked whether the stale view changes an externally observable decision, and records the failed first execution of the experiment as a harness artifact.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+      "experiment_id": "bf92fdb38535413ca18d171812c22f8b-experiment",
+      "source_ids": [
+        "src_newraft_startup",
+        "src_restore_committed",
+        "src_process_config_entry",
+        "src_follower_election_guard",
+        "src_setup_leader_state",
+        "src_commitment_from_config",
+        "src_quorum_size",
+        "src_follower_append_entries",
+        "src_restore_committed_docs"
+      ],
+      "executions": {
+        "9a373c13725a42aa9f48f59c0f2f2f1c": [
+          2,
+          3,
+          6,
+          7,
+          10,
+          11,
+          14,
+          15
+        ],
+        "79a9cc34b3ce42e197c384775efecc3a": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Recovery. Receipt 9a373c13725a42aa9f48f59c0f2f2f1c restarted four real single-voter prefixes on their retained stores with Config.RestoreCommittedLogs on and off. With the flag on and no snapshot, the node recovered an empty configuration (event 2: latest_config_index 0, no members, 268 polls with no leader) even though its log holds the bootstrap configuration entry at index 1 (event 0), while the flag-off control on the same prefix shape tracked that entry and elected itself in 17 polls (event 6); with a snapshot taken before a committed AddNonvoter, the flag-on node recovered the snapshot's index-1 configuration and never the log's committed index-7 configuration (events 10, 11), while the flag-off control recovered index 7 (event 15). Source side, the mechanism is settled: restoreFromCommittedLogs stores the persisted commit index and calls processLogs with it (api.go:723-754), which advances lastApplied before NewRaft runs the scan that rebuilds tracked configuration state from max(snapshotIndex, lastApplied)+1 (api.go:602-621); committed configuration entries at or below that bound are therefore never passed to processConfigurationLogEntry (raft.go:1605-1624), and the FSM's ConfigurationStore is not read back. The tracked configuration is what decides election eligibility (raft.go:225-246), quorum size (raft.go:1085-1094), the leader's commitment membership (raft.go:456-467, commitment.go:35-64) and the vote-admission checks. Consequence, now observed. Receipt 79a9cc34b3ce42e197c384775efecc3a builds three voters A, B and C (event 0), snapshots A while the committed configuration is still {A,B,C} (event 1, snapshot index 4), removes C so the committed configuration becomes {A,B} at log index 5 (event 2), then restarts A with the flag on while B is partitioned and C stays connected. A's tracked configuration is the snapshot's index-1 three-voter configuration and it contains C (event 3: latest_config_index 1, latest_config_voters 3, latest_config_ids including C, log_config_index 5, log_config_voters 2). A then won the election - counting C's vote, a server the committed configuration no longer contains - and, in event 4, applied the client command 'stale-quorum-entry' with apply_error null at index 10 term 4, advancing its commit index and applied index to 10, while B's log does not contain that index and C's log contains it at the same term 4. A's own match index alone cannot form a majority of three, and B had no transport path to A, so the second match the commitment counted can only have come from C: the entry was committed, applied to A's FSM and reported successful to the client by a quorum that is not a majority of the committed configuration {A,B}. Defect account for the whole question: with Config.RestoreCommittedLogs enabled and a commit-tracking log store, NewRaft cannot roll the node's tracked membership configuration forward past max(snapshot index, persisted commit index), so a restarted node may keep an older or empty membership although its log already contains the committed configuration entries; the recovered node can then be permanently unable to participate (empty configuration), or, as observed here, decide leadership and commit index from a member set the committed configuration does not match, committing an entry that a real voter of the committed configuration does not hold. The failed predecessor execution of the multi-node experiment (receipt 4ed46b198c8d41618cc855df0a63d469, exit 1) is retained in the run's logs but is not cited as an execution of this interpretation: it stopped in the harness at the snapshot step with 'nothing new to snapshot' because the elected leader was not A and A had applied no entry, so it produced no comparison result about the target. The library's own test for the feature (raft_test.go:1183-1270) restarts with a snapshot whose configuration already equals the final configuration and asserts only the applied index, so it does not constrain this path.",
+      "answers": {
+        "98ee8dfd5fac4b84915f91ed4b094bcf-gap-1": {
+          "explanation": "Resolved by receipt 79a9cc34b3ce42e197c384775efecc3a. The stale recovered configuration changed two decisions observable outside the node: the election A won (event 4, a_became_leader true) counted C, a server the committed configuration had removed, towards the majority of its tracked three-voter configuration, and the commit that followed (event 4: entry index 10, term 4, apply_error null, a_commit_index 10, a_applied_index 10, a_fsm_applied_payload true) was decided while the committed configuration's other voter B, partitioned from A, did not hold the entry (b_log_has_entry false) and the removed server C did (c_log_has_entry true, c_entry_term 4). Because A's own match cannot form a majority of three and B had no transport path to A, the second match must have come from C, so the commit rule was applied against a member set that is not a majority of the committed configuration {A,B}.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-0",
+          "revision": 1,
+          "assertion": "The startup configuration scan runs from max(lastSnapshotIndex, lastApplied)+1, so entries at or below that bound never reach processConfigurationLogEntry at startup."
+        },
+        {
+          "entry_id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-1",
+          "revision": 1,
+          "assertion": "restoreFromCommittedLogs stores the store's commit index and calls processLogs with it only when the flag is set, which advances lastApplied to that index before the scan runs."
+        },
+        {
+          "entry_id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-2",
+          "revision": 1,
+          "assertion": "processConfigurationLogEntry is the only writer of the tracked configuration state; FSM-side configuration storage does not feed back into it."
+        },
+        {
+          "entry_id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-3",
+          "revision": 1,
+          "assertion": "The tracked latest configuration feeds quorumSize, the leader's commitment membership, leader-lease voter counting and the vote-admission checks."
+        },
+        {
+          "entry_id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-4",
+          "revision": 1,
+          "assertion": "A follower with configurations.latestIndex equal to 0 does not start an election, which is terminal when no reachable peer can supply a configuration entry."
+        }
+      ],
+      "counterevidence": [
+        "The doc comment for RestoreCommittedLogs (config.go:243-254) promises only that committed logs are replayed to catch the FSM up and says nothing about membership recovery, so the stale tracked configuration can be read as an unnamed side effect of a feature that never claimed to preserve it. The counter is that the startup scan at api.go:610-621 exists to rebuild that state from the log, and the replay merely moves its lower bound; the observed consequence is a commit decided against a member set the committed configuration does not contain.",
+        "The violating scenario needs the removed server C to stay running and reachable after its removal, since its acknowledgement is what the stale majority counted. If an operator removes a server and also stops it, or if it is unreachable, the same stale configuration would instead leave A unable to commit, so the receipt shows the reachable-removed-server case rather than every case.",
+        "The harness chose A as the restarting leader and B as the partitioned node, and it moved leadership to A with the library's leadership transfer before the snapshot; those are setup choices. They do not supply the stale configuration (event 3 shows A tracking a configuration its log had already superseded) and they do not supply the acknowledgement (C's log holds the entry at the same term), but a different assignment of roles is not exercised.",
+        "The receipt shows that the leader committed and applied the entry and returned success to the caller, and that the committed configuration's other voter lacked it; it does not follow the entry to a later term to observe an actual loss from a state machine, so the demonstrated violation is of the commitment rule rather than a completed divergence.",
+        "The first execution of the multi-node experiment failed in the harness before any comparison (receipt 4ed46b198c8d41618cc855df0a63d469, exit 1, 'snapshot on A failed: nothing new to snapshot'), and its single parsed event carries no configuration operands; it is retained as a harness artifact and not as evidence about the target."
+      ],
+      "limitations": [
+        "All nodes are in-memory transports and stores in one process, with a test log store whose staging is not atomic with its log writes; the caller-side durability contract of CommitTrackingLogStore is assumed, not verified.",
+        "The multi-node case is one prefix shape with one restart and one committed removal; the empty-configuration case is single-voter only, so the multi-node consequence of an empty recovered configuration (a voter that can never participate) is argued rather than observed.",
+        "The removed server is kept running deliberately, and no message loss, reordering or crash of the leader is injected, so the observation is a decision defect under a clean transport rather than a fault-injection study.",
+        "Schedule variation is limited: the multi-node harness was run four times during construction with the same witness, and the retained receipt is a single execution."
+      ],
+      "joint_history": "Both receipts are executions of this investigation's fixed experiments on the same captured source revision, sharing no mutable state between them. Receipt 9a373c13725a42aa9f48f59c0f2f2f1c established the recovery behavior on four single-voter prefixes: with RestoreCommittedLogs on, the restarted node's tracked configuration was the snapshot's configuration or the empty configuration rather than the newest configuration entry in its own log (events 2, 3, 11), with the flag-off controls holding (events 6, 7, 15). Receipt 79a9cc34b3ce42e197c384775efecc3a uses that same recovery as the setup of a three-voter cluster and independently observes the same operand on the restarted node: event 3 shows latest_config_index 1 with three voters against a log whose newest configuration entry is index 5 with two voters, so the premise each receipt relies on is observed in both, and the newer receipt adds the consequences the older prefix could not show.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

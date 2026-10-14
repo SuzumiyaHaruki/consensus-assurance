@@ -92,3 +92,24 @@ impl Second {
     assert locate(binding(fragment,'take',9,9),{fragment.id:fragment})[0]
     incomplete=material('pub fn take(value:i64) {\n value+1\n',file='sample.rs')
     assert locate(binding(incomplete,'take',2,2),{incomplete.id:incomplete})[0] is None
+
+
+@pytest.mark.parametrize('responsibility,anchored,missing',[
+    ('',True,['responsibility']),
+    ('The acquired function handles the required input.',False,['anchors']),
+    (' ',False,['responsibility','anchors'])])
+def test_requirement_diagnostic_identifies_only_missing_fields(responsibility,anchored,missing):
+    from types import SimpleNamespace
+    from consensus_assurance.core.types import ExperimentBasis
+    from consensus_assurance.core.diagnostics import DiagnosticError
+    from consensus_assurance.workflow.experiments import validate_basis
+    m=material('func accept() {\n value++\n}\n')
+    basis=ExperimentBasis(harness={'kind':'test','source':'fixture'},source_ids=[m.id],
+        scope={'description':'One local call'},prefix='Use the acquired local function.',
+        requirement='The operation increments the input.',responsibility=responsibility,
+        anchors=[binding(m)] if anchored else [])
+    with pytest.raises(DiagnosticError) as rejected:
+        validate_basis(SimpleNamespace(materials=[m],knowledge=[]),basis,SimpleNamespace(harness_kind='test'))
+    diagnostic,=rejected.value.diagnostics
+    assert diagnostic.paths==['/experiment/'+name for name in missing]
+    assert diagnostic.details['missing_fields']==missing

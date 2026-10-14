@@ -1,5 +1,6 @@
 """Bounded event lookup and correlation, independent of workflow and tools."""
 from .types import EventRequirement, Comparison
+from .diagnostics import Diagnostic, DiagnosticError
 
 MISSING = object()
 
@@ -63,8 +64,11 @@ def comparison_requirements(comparison, requirements):
         *(c.reference.partition('.')[0] for c in conditions if c.reference)])
     for condition in conditions:
         event_requirements(selected, condition.reference)
-    if any(r.event == comparison.event for r in selected):
-        raise ValueError('Result events cannot establish their own prerequisites')
+    conflicts = [r.alias for r in selected if r.event == comparison.event]
+    if conflicts:
+        raise DiagnosticError([Diagnostic(code='comparison_prerequisites', category='semantic',
+            message='Result events cannot establish their own prerequisites; conflicting aliases: ' + ', '.join(conflicts),
+            details={'conflicting_aliases': conflicts, 'prerequisite_aliases': [r.alias for r in selected]})])
     return selected
 
 

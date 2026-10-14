@@ -1,0 +1,1184 @@
+{
+  "input": {
+    "rationale": "Startup recovery path of hashiscorp/raft: with Config.RestoreCommittedLogs enabled, NewRaft advances lastApplied to the commit index read from the commit-tracking log store before running the startup scan that exists to rebuild the node's configuration from its log. The scan therefore starts above committed configuration entries, and the recovered node keeps the snapshot's configuration or an empty one. This batch records the sourced question, the underlying behaviors, the two necessary gaps, and one fixed experiment that restarts real single-voter prefixes with the flag on and off.",
+    "sources": [
+      {
+        "id": "src_newraft_startup",
+        "file": "api.go",
+        "start_line": 602,
+        "end_line": 621,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_restore_committed",
+        "file": "api.go",
+        "start_line": 723,
+        "end_line": 754,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_follower_election_guard",
+        "file": "raft.go",
+        "start_line": 225,
+        "end_line": 246,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_process_config_entry",
+        "file": "raft.go",
+        "start_line": 1605,
+        "end_line": 1624,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_setup_leader_state",
+        "file": "raft.go",
+        "start_line": 456,
+        "end_line": 467,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_quorum_size",
+        "file": "raft.go",
+        "start_line": 1085,
+        "end_line": 1094,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_commitment_from_config",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 64,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_try_stage_commit_index",
+        "file": "raft.go",
+        "start_line": 1392,
+        "end_line": 1405,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_append_entries_staging",
+        "file": "raft.go",
+        "start_line": 1553,
+        "end_line": 1561,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_commit_tracking_contract",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 215,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_restore_committed_docs",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_existing_restore_test",
+        "file": "raft_test.go",
+        "start_line": 1183,
+        "end_line": 1270,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_config_recovery",
+        "question": "When Config.RestoreCommittedLogs is enabled, does NewRaft recover the membership configuration that the node's own log already contains, and what does the recovered node then do with the configuration-dependent decisions (election eligibility and quorum membership) that follow?",
+        "source_ids": [
+          "src_newraft_startup",
+          "src_restore_committed",
+          "src_process_config_entry",
+          "src_follower_election_guard"
+        ],
+        "hypothesis": "restoreFromCommittedLogs sets lastApplied to the persisted commit index before the startup configuration scan, so the scan begins above every configuration entry at an index <= that commit index. The node keeps the snapshot's committed configuration, or an empty configuration when it has no snapshot, even though its log holds newer committed configuration entries. Because that configuration state decides election eligibility, quorumSize, and the membership used by the leader's commitment, the recovery can leave a node unable to participate, and it can leave a node that can win an election counting quorum from a stale member set.",
+        "discriminator": "Restart two identically built real prefixes on top of the same stores: one with RestoreCommittedLogs on and one with it off. Compare the recovered configuration (index, voter/nonvoter membership) against the newest configuration entry in the node's own log, and whether the node reaches leadership within a fixed window.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_scan_start",
+        "kind": "behavior",
+        "statement": "NewRaft rebuilds configuration state by iterating log indices from max(lastSnapshotIndex, lastApplied) + 1 up to the last log index and calling processConfigurationLogEntry for each entry; entries at or below max(lastSnapshotIndex, lastApplied) are never passed to that function during startup.",
+        "conditions": "Applies to every NewRaft call, before the background goroutines start (api.go:602-621).",
+        "source_ids": [
+          "src_newraft_startup"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_restore_sets_last_applied",
+        "kind": "behavior",
+        "statement": "When and only when Config.RestoreCommittedLogs is set, NewRaft calls restoreFromCommittedLogs: it reads CommitTrackingLogStore.GetCommitIndex, clamps it to the store's last index, stores it as the node's commit index, and calls processLogs with it, which advances lastApplied to that index (index <= lastApplied returns early without applying).",
+        "conditions": "Requires the log store to implement CommitTrackingLogStore; otherwise NewRaft fails with ErrIncompatibleLogStore (api.go:723-754, log.go:194-215).",
+        "source_ids": [
+          "src_restore_committed",
+          "src_commit_tracking_contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_config_state_producers",
+        "kind": "fact",
+        "statement": "processConfigurationLogEntry is the only writer of r.configurations.latest/committed for LogConfiguration and deprecated peer entries; its callers are appendEntries for newly appended entries and the NewRaft startup scan. Applying a committed configuration entry to the FSM (runFSM -> FSM.Apply or ConfigurationStore.StoreConfiguration) does not write r.configurations.",
+        "conditions": "LogConfiguration entries are passed to the FSM as commit tuples when protocolVersion > 2, so FSM-side configuration storage is independent of the node's tracked configuration state.",
+        "source_ids": [
+          "src_process_config_entry",
+          "src_newraft_startup"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_config_state_consumers",
+        "kind": "fact",
+        "statement": "The node's tracked latest configuration is the sole input to quorumSize(), to the voter counting in checkLeaderLease, to the membership map built by newCommitment/setConfiguration for the leader's commit index, and to the inConfiguration/hasVote admission checks that decide vote and pre-vote grants.",
+        "conditions": "Holds for a leader and during elections; the leader builds its commitment from r.configurations.latest at leader setup and on each committed configuration change (raft.go:456-467, 1085-1094; commitment.go:35-64).",
+        "source_ids": [
+          "src_setup_leader_state",
+          "src_quorum_size",
+          "src_commitment_from_config"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_follower_election_guard",
+        "kind": "behavior",
+        "statement": "On heartbeat timeout a follower avoids starting an election when configurations.latestIndex == 0 (logs 'no known peers, aborting election'), and when the latest configuration is already committed and does not contain the local node as a voter; a node without voters in its tracked configuration therefore stays in the follower state indefinitely unless a newer configuration entry arrives.",
+        "conditions": "Observed on the follower heartbeat-timeout branch; with no reachable peers, nothing else can change the tracked configuration (raft.go:225-246).",
+        "source_ids": [
+          "src_follower_election_guard"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_staging_only_with_flag",
+        "kind": "behavior",
+        "statement": "The commit index is written to a commit-tracking log store only through tryStageCommitIndex, which returns immediately when RestoreCommittedLogs is not set; it is called before StoreLogs in dispatchLogs (leader) and before StoreLogs of newly received entries in appendEntries (follower).",
+        "conditions": "So a prefix that never enabled RestoreCommittedLogs has no staged commit index for a later restart to read (raft.go:1392-1405, 1553-1561).",
+        "source_ids": [
+          "src_try_stage_commit_index",
+          "src_append_entries_staging"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [
+      {
+        "investigation_id": "@q_config_recovery",
+        "question": "Which startup inputs are permitted to establish the node's tracked configuration: the log scan, the snapshot metadata, and the restored FSM are separate sources, and only some of them write r.configurations. Which one is authoritative for a restart with RestoreCommittedLogs enabled?",
+        "experiment_id": null
+      },
+      {
+        "investigation_id": "@q_config_recovery",
+        "question": "Does a recovered stale or empty configuration view change a decision that is observable outside the node - an election it wins, a vote it grants, or a commit index it advances using a quorum that the actual committed configuration does not contain?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [
+      {
+        "investigation_id": "@q_config_recovery",
+        "experiment_id": null,
+        "source_ids": [
+          "src_newraft_startup",
+          "src_restore_committed",
+          "src_process_config_entry",
+          "src_follower_election_guard",
+          "src_commitment_from_config",
+          "src_quorum_size",
+          "src_existing_restore_test",
+          "src_try_stage_commit_index",
+          "src_append_entries_staging",
+          "src_restore_committed_docs"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "Source trace. NewRaft restores the newest usable snapshot, then, only with RestoreCommittedLogs, reads the persisted commit index from the commit-tracking log store, stores it and calls processLogs with it (api.go:723-754); processLogs sets lastApplied to that index (raft.go:1296-1364). Only after that does NewRaft run the scan that rebuilds the node's configuration from the log, and that scan starts at max(lastSnapshotIndex, lastApplied) + 1 (api.go:602-621). With the feature off, lastApplied equals the snapshot index, so the scan covers every configuration entry in the log; with the feature on, lastApplied is the commit index, which for a node that committed entries above its newest snapshot is strictly larger, so every configuration entry at an index <= that commit index is skipped even though it is present in the node's log and was applied to the FSM. The skipped entries can only have been processed by processConfigurationLogEntry, the sole writer of the tracked configuration state, and its startup caller is exactly that scan; FSM-side configuration storage does not feed back into r.configurations (raft.go:1605-1624). The resulting configuration state is not inert: configurations.latestIndex == 0 makes a follower refuse to start an election (raft.go:225-241), and configurations.latest supplies quorumSize, the voter set counted by checkLeaderLease, the membership map used by the leader's commitment, and the inConfiguration/hasVote admission checks for vote grants (raft.go:456-467, 1085-1094; commitment.go:35-64). Two consequences follow directly: a node with no snapshot recovers an empty configuration and can never elect itself (no reachable producer of AppendEntries or configuration entries exists in a single-voter cluster), and a node with a snapshot recovers the snapshot's older membership, including a member set that omits an entry its log already committed. The existing test for this feature (raft_test.go:1183-1270) restarts with a snapshot whose configuration is identical to the final configuration and asserts only the applied index, so it does not constrain this case. The defect is scoped to deployments that enable RestoreCommittedLogs and use a commit-tracking log store; the intended duty is that the node recover the configuration its own log establishes, which the scan exists to do.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The doc comment for RestoreCommittedLogs (config.go:243-254) describes replaying committed logs to bring the FSM up to date and says nothing about configuration recovery, so one could argue that a stale configuration view is an unnamed side effect rather than a broken contract. The counter is that the scan at api.go:610-621 exists precisely to rebuild configuration state from the log at startup, and its start index is the only reason entries are skipped; no other path restores that state after the replay.",
+          "The skip also removes work: with RestoreCommittedLogs, configuration entries below the persisted commit index were already delivered to the FSM as commit tuples, so an FSM implementing ConfigurationStore has seen them. That does not restore r.configurations, which is raft's own decision input and is not derived from the FSM."
+        ],
+        "limitations": [
+          "The predicate recorded here is source-derived; the fixed experiment for this question has been submitted with this batch and its retained receipt is not yet part of this account. A native local run of the same harness was used only to validate operands while constructing it and is not offered as evidence.",
+          "Both prefix cases restart a single-voter cluster on an in-memory transport with an in-memory commit-tracking log store, so the observation window (1.5s = 30 election timeouts) measures non-participation of that node, not of a multi-node cluster.",
+          "The stale-membership consequence for a leader's commit index is argued from the code path that builds the commitment from configurations.latest; no scenario in this batch partitions a multi-node cluster to show a commit decided by a member set that the committed configuration does not contain.",
+          "The persisted commit index is staged only on log writes (raft.go:1392-1405, 1553-1561), so its value in the stored prefix is not necessarily the highest committed index; this does not affect the ordering argument, since any staged value above 0 exceeds the snapshot index in these cases."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "@q_config_recovery",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": ".",
+      "source_ids": [
+        "src_newraft_startup",
+        "src_restore_committed",
+        "src_follower_election_guard",
+        "src_setup_leader_state",
+        "src_restore_committed_docs"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "Restart a single-voter raft node on top of its own retained stores, once with RestoreCommittedLogs enabled and once with it disabled, on two prefix shapes: a prefix with no snapshot, and a prefix whose snapshot precedes a committed configuration change. Report the recovered configuration (index, membership) beside the newest configuration entry in the node's own log, and whether the restarted node reaches leadership inside a 1.5s window (30 election/heartbeat timeouts at 50ms).",
+        "assumptions": [
+          "The prefix runs with RestoreCommittedLogs enabled so that the commit index is staged into the commit-tracking log store; otherwise a restart with the feature enabled reads 0 and the scan start would equal the snapshot index.",
+          "The restarted node keeps the same address and ID as the prefix, so the configuration recorded in its log and snapshot still refers to it.",
+          "The FSM is an in-memory MockFSM and a fresh instance is used for each restart, which is the mode the feature targets; the FSM state is therefore rebuilt from the snapshot plus the replayed committed logs.",
+          "InmemCommitTrackingStore is a test facility whose StageCommitIndex does not share a write with StoreLogs; the probe uses it only as the store that exposes a persisted commit index and does not claim its durability properties."
+        ],
+        "excluded": [
+          "No multi-node cluster, partition, or crash of a leader is exercised, so the commit-loss consequence of a stale member set is not measured here.",
+          "No snapshot-on-start or FSM-implemented ConfigurationStore variant is exercised.",
+          "No production log store (for example a bolt-backed store) is exercised; the caller-side durability contract of CommitTrackingLogStore is assumed, not verified."
+        ],
+        "parameters": {
+          "cases": [
+            "no_snapshot_restore_on",
+            "no_snapshot_restore_off",
+            "snapshot_then_config_restore_on",
+            "snapshot_then_config_restore_off"
+          ],
+          "heartbeat_timeout_ms": 50,
+          "election_timeout_ms": 50,
+          "observation_ms": 1500,
+          "poll_interval_ms": 5,
+          "prefix_commands_before_snapshot": 4,
+          "prefix_commands_after_snapshot": 2,
+          "config_change_after_snapshot": "AddNonvoter(assurance-peer-2, assurance-peer-2-addr)"
+        }
+      },
+      "prefix": "Each case calls assuranceBuildPrefix: NewInmemTransport with a fresh random address; inmemConfig with LocalID = 'server-' + address and RestoreCommittedLogs = true; NewInmemCommitTrackingStore, NewInmemStore and NewInmemSnapshotStore; BootstrapCluster with a single Voter server at that address; NewRaft with a fresh MockFSM. The prefix then waits for real leadership through the normal election path, applies four LogCommand entries, and for the snapshot cases takes a real Snapshot, then issues AddNonvoter for a peer that never connects (committed by the single voter) and applies two more commands. GetCommitIndex, LastIndex and a per-index log scan record the persisted commit index and every configuration entry with its index and membership, then Shutdown closes the node. The case then creates a new transport bound to the same address, copies the config with RestoreCommittedLogs set to the case value, and calls NewRaft with the same log store, stable store, snapshot store and a fresh MockFSM. It polls State() every 5ms for 1500ms, then asks the main thread for the tracked configurations through r.configurationsCh (the same channel takeSnapshot uses) and reads snapshot index, AppliedIndex, CommitIndex and LastIndex.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "raft's NewRaft is responsible for re-establishing the node's membership configuration from the node's own durable state before any election or quorum decision is made; the caller is responsible for supplying a log store whose GetCommitIndex is atomic with StoreLogs and for enabling RestoreCommittedLogs deliberately.",
+      "prerequisites": [
+        {
+          "alias": "admit_no_snapshot_restore_on",
+          "event": "assurance.restart.no_snapshot_restore_on",
+          "conditions": [
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_no_snapshot_restore_off",
+          "event": "assurance.restart.no_snapshot_restore_off",
+          "conditions": [
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_snapshot_then_config_restore_on",
+          "event": "assurance.restart.snapshot_then_config_restore_on",
+          "conditions": [
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_snapshot_then_config_restore_off",
+          "event": "assurance.restart.snapshot_then_config_restore_off",
+          "conditions": [
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "assurance.outcome.no_snapshot_restore_on",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "admit_no_snapshot_restore_on",
+          "assertion": {
+            "field": "leader_observed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "snapshot_present",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "A node restarted with RestoreCommittedLogs on top of stores whose log holds a committed configuration entry must still be able to elect a leader inside the observation window."
+        },
+        {
+          "event": "assurance.outcome.no_snapshot_restore_off",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "admit_no_snapshot_restore_off",
+          "assertion": {
+            "field": "leader_observed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "snapshot_present",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: the same prefix shape restarted with RestoreCommittedLogs off reaches leadership, which shows the nonprogress is specific to the replay path and not to the prefix."
+        },
+        {
+          "event": "assurance.config_recovery.no_snapshot_restore_on",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "admit_no_snapshot_restore_on",
+          "assertion": {
+            "field": "config_matches_last_log_config",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "snapshot_present",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "The configuration recovered at startup must equal the newest configuration entry in the node's own log (index and voter/nonvoter membership)."
+        },
+        {
+          "event": "assurance.config_recovery.no_snapshot_restore_off",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "admit_no_snapshot_restore_off",
+          "assertion": {
+            "field": "config_matches_last_log_config",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "snapshot_present",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: with the feature off the same predicate holds on the same prefix shape."
+        },
+        {
+          "event": "assurance.config_recovery.snapshot_then_config_restore_on",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "admit_snapshot_then_config_restore_on",
+          "assertion": {
+            "field": "config_matches_last_log_config",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "snapshot_present",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "After restarting on a snapshot that predates a committed configuration change, the recovered configuration must include that committed entry."
+        },
+        {
+          "event": "assurance.config_recovery.snapshot_then_config_restore_off",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "admit_snapshot_then_config_restore_off",
+          "assertion": {
+            "field": "config_matches_last_log_config",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "snapshot_present",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Control: the same snapshot-plus-configuration prefix restarted with the feature off does recover the committed configuration entry."
+        }
+      ],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "interpretations": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf",
+      "result": {
+        "submission": "update.json",
+        "summary": "Opened the RestoreCommittedLogs startup-recovery question in hashicorp/raft: recorded 12 sources, 6 behaviors/facts, 2 necessary gaps, and one source-grounded interpretation asserting that with Config.RestoreCommittedLogs enabled NewRaft advances lastApplied to the persisted commit index before the startup configuration scan (api.go:602-621, 723-754), so committed configuration entries at or below that index are never processed and the node keeps the snapshot's or an empty configuration - which decides election eligibility (raft.go:225-246), quorum size (raft.go:1085-1094) and leader commitment membership (commitment.go:35-64). Submitted one fixed experiment (draft/assurance_generated_test.go) that restarts real single-voter prefixes with the flag on and off, on a no-snapshot prefix and on a snapshot-plus-committed-config-change prefix, with six comparisons against controls. Retained receipt not yet part of the account; the multi-node stale-quorum consequence and the gap answers remain open."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+        "version": 1,
+        "question": "When Config.RestoreCommittedLogs is enabled, does NewRaft recover the membership configuration that the node's own log already contains, and what does the recovered node then do with the configuration-dependent decisions (election eligibility and quorum membership) that follow?",
+        "source_ids": [
+          "src_newraft_startup",
+          "src_restore_committed",
+          "src_process_config_entry",
+          "src_follower_election_guard"
+        ],
+        "hypothesis": "restoreFromCommittedLogs sets lastApplied to the persisted commit index before the startup configuration scan, so the scan begins above every configuration entry at an index <= that commit index. The node keeps the snapshot's committed configuration, or an empty configuration when it has no snapshot, even though its log holds newer committed configuration entries. Because that configuration state decides election eligibility, quorumSize, and the membership used by the leader's commitment, the recovery can leave a node unable to participate, and it can leave a node that can win an election counting quorum from a stale member set.",
+        "discriminator": "Restart two identically built real prefixes on top of the same stores: one with RestoreCommittedLogs on and one with it off. Compare the recovered configuration (index, voter/nonvoter membership) against the newest configuration entry in the node's own log, and whether the node reaches leadership within a fixed window.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "98ee8dfd5fac4b84915f91ed4b094bcf-gap-0",
+            "question": "Which startup inputs are permitted to establish the node's tracked configuration: the log scan, the snapshot metadata, and the restored FSM are separate sources, and only some of them write r.configurations. Which one is authoritative for a restart with RestoreCommittedLogs enabled?",
+            "experiment_id": null,
+            "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+          },
+          {
+            "id": "98ee8dfd5fac4b84915f91ed4b094bcf-gap-1",
+            "question": "Does a recovered stale or empty configuration view change a decision that is observable outside the node - an election it wins, a vote it grants, or a commit index it advances using a quorum that the actual committed configuration does not contain?",
+            "experiment_id": null,
+            "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+          }
+        ],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "NewRaft rebuilds configuration state by iterating log indices from max(lastSnapshotIndex, lastApplied) + 1 up to the last log index and calling processConfigurationLogEntry for each entry; entries at or below max(lastSnapshotIndex, lastApplied) are never passed to that function during startup.",
+        "conditions": "Applies to every NewRaft call, before the background goroutines start (api.go:602-621).",
+        "source_ids": [
+          "src_newraft_startup"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "When and only when Config.RestoreCommittedLogs is set, NewRaft calls restoreFromCommittedLogs: it reads CommitTrackingLogStore.GetCommitIndex, clamps it to the store's last index, stores it as the node's commit index, and calls processLogs with it, which advances lastApplied to that index (index <= lastApplied returns early without applying).",
+        "conditions": "Requires the log store to implement CommitTrackingLogStore; otherwise NewRaft fails with ErrIncompatibleLogStore (api.go:723-754, log.go:194-215).",
+        "source_ids": [
+          "src_restore_committed",
+          "src_commit_tracking_contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "processConfigurationLogEntry is the only writer of r.configurations.latest/committed for LogConfiguration and deprecated peer entries; its callers are appendEntries for newly appended entries and the NewRaft startup scan. Applying a committed configuration entry to the FSM (runFSM -> FSM.Apply or ConfigurationStore.StoreConfiguration) does not write r.configurations.",
+        "conditions": "LogConfiguration entries are passed to the FSM as commit tuples when protocolVersion > 2, so FSM-side configuration storage is independent of the node's tracked configuration state.",
+        "source_ids": [
+          "src_process_config_entry",
+          "src_newraft_startup"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-3",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The node's tracked latest configuration is the sole input to quorumSize(), to the voter counting in checkLeaderLease, to the membership map built by newCommitment/setConfiguration for the leader's commit index, and to the inConfiguration/hasVote admission checks that decide vote and pre-vote grants.",
+        "conditions": "Holds for a leader and during elections; the leader builds its commitment from r.configurations.latest at leader setup and on each committed configuration change (raft.go:456-467, 1085-1094; commitment.go:35-64).",
+        "source_ids": [
+          "src_setup_leader_state",
+          "src_quorum_size",
+          "src_commitment_from_config"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-4",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On heartbeat timeout a follower avoids starting an election when configurations.latestIndex == 0 (logs 'no known peers, aborting election'), and when the latest configuration is already committed and does not contain the local node as a voter; a node without voters in its tracked configuration therefore stays in the follower state indefinitely unless a newer configuration entry arrives.",
+        "conditions": "Observed on the follower heartbeat-timeout branch; with no reachable peers, nothing else can change the tracked configuration (raft.go:225-246).",
+        "source_ids": [
+          "src_follower_election_guard"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      },
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-5",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The commit index is written to a commit-tracking log store only through tryStageCommitIndex, which returns immediately when RestoreCommittedLogs is not set; it is called before StoreLogs in dispatchLogs (leader) and before StoreLogs of newly received entries in appendEntries (follower).",
+        "conditions": "So a prefix that never enabled RestoreCommittedLogs has no staged commit index for a later restart to read (raft.go:1392-1405, 1553-1561).",
+        "source_ids": [
+          "src_try_stage_commit_index",
+          "src_append_entries_staging"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-experiment",
+        "investigation_id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sort\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\n// TestAssuranceRestoreCommittedLogsConfigurationRecovery\n//\n// Sourced question: when Config.RestoreCommittedLogs is enabled, does a node that\n// restarts on top of its persisted stores still recover the membership configuration\n// that its own log already contains?\n//\n// api.go starts the startup configuration scan at max(snapshotIndex, lastApplied)+1.\n// restoreFromCommittedLogs() sets lastApplied to the commit index read from the log\n// store before that scan runs, so every configuration entry at an index <= that\n// commit index is skipped even though it is present in the node's log.\n//\n// The harness builds real (bootstrap -> election -> client applies -> shutdown)\n// single-voter prefixes on top of a commit-tracking log store, then restarts the node\n// with the same stores and a fresh in-memory FSM, once with RestoreCommittedLogs on and\n// once with it off, and reports the operands of the recovery.\n\ntype assuranceEvent map[string]interface{}\n\nfunc assuranceEmit(ev assuranceEvent) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tfmt.Println(`CA_EVENT {\"event\":\"assurance.marshal_error\"}`)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\ntype assuranceStores struct {\n\taddr   ServerAddress\n\tlocal  ServerID\n\tconf   *Config\n\tlogs   *InmemCommitTrackingStore\n\tstable *InmemStore\n\tsnaps  *InmemSnapshotStore\n}\n\nfunc assuranceWaitElected(t *testing.T, r *Raft, timeout time.Duration) bool {\n\tdeadline := time.Now().Add(timeout)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == Leader {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn r.State() == Leader\n}\n\n// assuranceBuildPrefix runs the pre-restart life of one node and returns the stores it\n// leaves behind. applyAfterSnapshot entries are applied after the optional snapshot, and\n// the optional configuration change (AddNonvoter of a peer that never connects) is made\n// after that snapshot as well, so the node has a committed configuration entry above its\n// newest snapshot.\nfunc assuranceBuildPrefix(t *testing.T, withSnapshot bool, caseName string) *assuranceStores {\n\tt.Helper()\n\n\taddr, trans := NewInmemTransport(\"\")\n\tlocal := ServerID(\"server-\" + string(addr))\n\tconf := inmemConfig(t)\n\tconf.LocalID = local\n\t// The prefix must run with the feature enabled, otherwise no commit index is ever\n\t// staged into the log store and the restart has nothing to read.\n\tconf.RestoreCommittedLogs = true\n\tconf.TrailingLogs = 16\n\n\tstores := &assuranceStores{\n\t\taddr:   addr,\n\t\tlocal:  local,\n\t\tconf:   conf,\n\t\tlogs:   NewInmemCommitTrackingStore(),\n\t\tstable: NewInmemStore(),\n\t\tsnaps:  NewInmemSnapshotStore(),\n\t}\n\tconfiguration := Configuration{Servers: []Server{{\n\t\tSuffrage: Voter,\n\t\tID:       local,\n\t\tAddress:  addr,\n\t}}}\n\tif err := BootstrapCluster(conf, stores.logs, stores.stable, stores.snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"bootstrap failed: %v\", err)\n\t}\n\n\tr, err := NewRaft(conf, &MockFSM{}, stores.logs, stores.stable, stores.snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"prefix NewRaft failed: %v\", err)\n\t}\n\tif !assuranceWaitElected(t, r, 3*time.Second) {\n\t\tt.Fatalf(\"prefix node never became leader\")\n\t}\n\n\tfor i := 0; i < 4; i++ {\n\t\tif err := r.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"prefix apply failed: %v\", err)\n\t\t}\n\t}\n\n\tif withSnapshot {\n\t\tif err := r.Snapshot().Error(); err != nil {\n\t\t\tt.Fatalf(\"prefix snapshot failed: %v\", err)\n\t\t}\n\t\t// A committed configuration entry strictly above the snapshot index.\n\t\tf := r.AddNonvoter(ServerID(\"assurance-peer-2\"), ServerAddress(\"assurance-peer-2-addr\"), 0, 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"prefix AddNonvoter failed: %v\", err)\n\t\t}\n\t\tfor i := 0; i < 2; i++ {\n\t\t\tif err := r.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 0).Error(); err != nil {\n\t\t\t\tt.Fatalf(\"prefix post apply failed: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\n\t// Record the persisted state before shutdown.\n\tstagedCommit, err := stores.logs.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex failed: %v\", err)\n\t}\n\tlastIndex, err := stores.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex failed: %v\", err)\n\t}\n\tconfigs, err := assuranceLogConfigEntries(stores.logs, lastIndex)\n\tif err != nil {\n\t\tt.Fatalf(\"log scan failed: %v\", err)\n\t}\n\tsnapIndex, snapTerm := r.getLastSnapshot()\n\tassuranceEmit(assuranceEvent{\n\t\t\"event\":                 \"assurance.prefix\",\n\t\t\"case\":                  caseName,\n\t\t\"snapshot_present\":      withSnapshot,\n\t\t\"snapshot_index\":        snapIndex,\n\t\t\"snapshot_term\":         snapTerm,\n\t\t\"log_last_index\":        lastIndex,\n\t\t\"staged_commit_index\":   stagedCommit,\n\t\t\"config_entries\":        configs.summary,\n\t\t\"last_config_index\":     configs.lastIndex,\n\t\t\"last_config_voters\":    configs.lastVoters,\n\t\t\"last_config_nonvoters\": configs.lastNonvoters,\n\t\t\"recording_label_count\": 0,\n\t})\n\n\tif err := r.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"prefix shutdown failed: %v\", err)\n\t}\n\treturn stores\n}\n\ntype assuranceConfigScan struct {\n\tsummary       string\n\tlastIndex     uint64\n\tlastVoters    int\n\tlastNonvoters int\n\tlastIDs       []string\n}\n\nfunc assuranceLogConfigEntries(logs *InmemCommitTrackingStore, lastIndex uint64) (assuranceConfigScan, error) {\n\tout := assuranceConfigScan{summary: \"\"}\n\tfor idx := uint64(1); idx <= lastIndex; idx++ {\n\t\tvar entry Log\n\t\tif err := logs.GetLog(idx, &entry); err != nil {\n\t\t\treturn out, err\n\t\t}\n\t\tswitch entry.Type {\n\t\tcase LogConfiguration:\n\t\t\tconf := DecodeConfiguration(entry.Data)\n\t\t\tvoters, nonvoters := assuranceSuffrageCounts(conf)\n\t\t\tout.summary += fmt.Sprintf(\"LogConfiguration@%d(servers=%d,voters=%d)\", idx, len(conf.Servers), voters)\n\t\t\tout.lastIndex = idx\n\t\t\tout.lastVoters = voters\n\t\t\tout.lastNonvoters = nonvoters\n\t\t\tout.lastIDs = assuranceSortedIDs(conf)\n\t\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\t\tout.summary += fmt.Sprintf(\"DeprecatedPeers@%d\", idx)\n\t\t\tout.lastIndex = idx\n\t\t}\n\t}\n\treturn out, nil\n}\n\nfunc assuranceSuffrageCounts(conf Configuration) (voters, nonvoters int) {\n\tfor _, s := range conf.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t} else {\n\t\t\tnonvoters++\n\t\t}\n\t}\n\treturn voters, nonvoters\n}\n\nfunc assuranceConfigIDs(conf Configuration) string {\n\tout := \"\"\n\tfor i, s := range conf.Servers {\n\t\tif i > 0 {\n\t\t\tout += \",\"\n\t\t}\n\t\tout += string(s.ID)\n\t}\n\treturn out\n}\n\n// assuranceSortedIDs returns a comparable, order independent list of server IDs.\nfunc assuranceSortedIDs(conf Configuration) []string {\n\tout := make([]string, 0, len(conf.Servers))\n\tfor _, s := range conf.Servers {\n\t\tout = append(out, string(s.ID))\n\t}\n\tsort.Strings(out)\n\treturn out\n}\n\n// assuranceConfigurations asks the node's main thread for its current view of the\n// tracked configurations, mirroring the pattern used by takeSnapshot.\nfunc assuranceConfigurations(r *Raft) configurations {\n\tfut := &configurationsFuture{}\n\tfut.ShutdownCh = r.shutdownCh\n\tfut.init()\n\tselect {\n\tcase r.configurationsCh <- fut:\n\tcase <-r.shutdownCh:\n\t\treturn configurations{}\n\t}\n\tif err := fut.Error(); err != nil {\n\t\treturn configurations{}\n\t}\n\treturn fut.configurations\n}\n\n// assuranceRunCase restarts the node on top of the stored prefix and reports what the\n// recovered node does with its configuration.\nfunc assuranceRunCase(t *testing.T, caseName string, withSnapshot, restoreCommittedLogs bool) {\n\tt.Helper()\n\n\tstores := assuranceBuildPrefix(t, withSnapshot, caseName)\n\tstagedCommit, err := stores.logs.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex failed: %v\", err)\n\t}\n\tlastIndex, err := stores.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex failed: %v\", err)\n\t}\n\tlogConfigs, err := assuranceLogConfigEntries(stores.logs, lastIndex)\n\tif err != nil {\n\t\tt.Fatalf(\"log scan failed: %v\", err)\n\t}\n\n\t// The fresh transport keeps the node's address (and therefore its ID) stable.\n\t_, trans := NewInmemTransport(stores.addr)\n\tconf := *stores.conf\n\tconf.RestoreCommittedLogs = restoreCommittedLogs\n\n\tassuranceEmit(assuranceEvent{\n\t\t\"event\":                   \"assurance.restart.\" + caseName,\n\t\t\"case\":                    caseName,\n\t\t\"restore_committed_logs\":  restoreCommittedLogs,\n\t\t\"snapshot_present\":        withSnapshot,\n\t\t\"log_last_index\":          lastIndex,\n\t\t\"staged_commit_index\":     stagedCommit,\n\t\t\"log_last_config_index\":   logConfigs.lastIndex,\n\t\t\"log_last_config_voters\":  logConfigs.lastVoters,\n\t\t\"log_last_config_servers\": logConfigs.lastVoters + logConfigs.lastNonvoters,\n\t})\n\n\tr, err := NewRaft(&conf, &MockFSM{}, stores.logs, stores.stable, stores.snaps, trans)\n\tif err != nil {\n\t\tassuranceEmit(assuranceEvent{\n\t\t\t\"event\":                  \"assurance.outcome.\" + caseName,\n\t\t\t\"case\":                   caseName,\n\t\t\t\"restore_committed_logs\": restoreCommittedLogs,\n\t\t\t\"snapshot_present\":       withSnapshot,\n\t\t\t\"new_raft_error\":         err.Error(),\n\t\t})\n\t\treturn\n\t}\n\n\t// Observation window: 1.5s is 30 election/heartbeat timeouts of this in-memory\n\t// configuration (HeartbeatTimeout = ElectionTimeout = 50ms).\n\tdeadline := time.Now().Add(1500 * time.Millisecond)\n\tleaderObserved := false\n\tpolls := 0\n\tfor time.Now().Before(deadline) {\n\t\tpolls++\n\t\tif r.State() == Leader {\n\t\t\tleaderObserved = true\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\n\tsnapIndex, _ := r.getLastSnapshot()\n\tlastApplied := r.AppliedIndex()\n\tleaderAddr, leaderID := r.LeaderWithID()\n\n\t// Ask the main thread for the configuration the node is actually tracking.\n\tconfs := assuranceConfigurations(r)\n\tlatestVoters, latestNonvoters := assuranceSuffrageCounts(confs.latest)\n\tcommittedVoters, committedNonvoters := assuranceSuffrageCounts(confs.committed)\n\tlatestIDs := assuranceSortedIDs(confs.latest)\n\tlogIDs := logConfigs.lastIDs\n\tsameMembership := len(latestIDs) == len(logIDs)\n\tif sameMembership {\n\t\tfor i := range latestIDs {\n\t\t\tif latestIDs[i] != logIDs[i] {\n\t\t\t\tsameMembership = false\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n\n\tassuranceEmit(assuranceEvent{\n\t\t\"event\":                      \"assurance.outcome.\" + caseName,\n\t\t\"case\":                       caseName,\n\t\t\"restore_committed_logs\":     restoreCommittedLogs,\n\t\t\"snapshot_present\":           withSnapshot,\n\t\t\"leader_observed\":            leaderObserved,\n\t\t\"final_state\":                r.State().String(),\n\t\t\"polls\":                      polls,\n\t\t\"observation_ms\":             1500,\n\t\t\"leader_id\":                  string(leaderID),\n\t\t\"leader_addr\":                string(leaderAddr),\n\t\t\"latest_config_index\":        confs.latestIndex,\n\t\t\"committed_config_index\":     confs.committedIndex,\n\t\t\"latest_config_voters\":       latestVoters,\n\t\t\"latest_config_nonvoters\":    latestNonvoters,\n\t\t\"latest_config_ids\":          assuranceConfigIDs(confs.latest),\n\t\t\"committed_config_voters\":    committedVoters,\n\t\t\"committed_config_ids\":       assuranceConfigIDs(confs.committed),\n\t\t\"snapshot_index\":             snapIndex,\n\t\t\"last_applied\":               lastApplied,\n\t\t\"commit_index\":               r.CommitIndex(),\n\t\t\"last_index\":                 r.LastIndex(),\n\t\t\"committed_config_nonvoters\": committedNonvoters,\n\t})\n\n\t// Does the recovered configuration equal the newest configuration entry in the\n\t// node's own log? Both operands are reported above; this flag is the comparison.\n\tmatches := logConfigs.lastIndex != 0 &&\n\t\tsameMembership &&\n\t\tlatestVoters == logConfigs.lastVoters &&\n\t\tlatestNonvoters == logConfigs.lastNonvoters\n\tassuranceEmit(assuranceEvent{\n\t\t\"event\":                          \"assurance.config_recovery.\" + caseName,\n\t\t\"case\":                           caseName,\n\t\t\"restore_committed_logs\":         restoreCommittedLogs,\n\t\t\"snapshot_present\":               withSnapshot,\n\t\t\"log_last_config_index\":          logConfigs.lastIndex,\n\t\t\"log_last_config_voters\":         logConfigs.lastVoters,\n\t\t\"log_last_config_nonvoters\":      logConfigs.lastNonvoters,\n\t\t\"log_last_config_ids\":            strings.Join(logConfigs.lastIDs, \",\"),\n\t\t\"latest_config_index\":            confs.latestIndex,\n\t\t\"latest_config_voters\":           latestVoters,\n\t\t\"latest_config_nonvoters\":        latestNonvoters,\n\t\t\"latest_config_ids\":              strings.Join(latestIDs, \",\"),\n\t\t\"config_matches_last_log_config\": matches,\n\t})\n\n\t_ = r.Shutdown().Error()\n}\n\nfunc TestAssuranceRestoreCommittedLogsConfigurationRecovery(t *testing.T) {\n\tassuranceRunCase(t, \"no_snapshot_restore_on\", false, true)\n\tassuranceRunCase(t, \"no_snapshot_restore_off\", false, false)\n\tassuranceRunCase(t, \"snapshot_then_config_restore_on\", true, true)\n\tassuranceRunCase(t, \"snapshot_then_config_restore_off\", true, false)\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "admit_no_snapshot_restore_on",
+                "event": "assurance.restart.no_snapshot_restore_on",
+                "conditions": [
+                  {
+                    "field": "restore_committed_logs",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "admit_no_snapshot_restore_off",
+                "event": "assurance.restart.no_snapshot_restore_off",
+                "conditions": [
+                  {
+                    "field": "restore_committed_logs",
+                    "op": "eq",
+                    "value": false,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "admit_snapshot_then_config_restore_on",
+                "event": "assurance.restart.snapshot_then_config_restore_on",
+                "conditions": [
+                  {
+                    "field": "restore_committed_logs",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "admit_snapshot_then_config_restore_off",
+                "event": "assurance.restart.snapshot_then_config_restore_off",
+                "conditions": [
+                  {
+                    "field": "restore_committed_logs",
+                    "op": "eq",
+                    "value": false,
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "src_newraft_startup",
+            "src_restore_committed",
+            "src_follower_election_guard",
+            "src_setup_leader_state",
+            "src_restore_committed_docs"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Restart a single-voter raft node on top of its own retained stores, once with RestoreCommittedLogs enabled and once with it disabled, on two prefix shapes: a prefix with no snapshot, and a prefix whose snapshot precedes a committed configuration change. Report the recovered configuration (index, membership) beside the newest configuration entry in the node's own log, and whether the restarted node reaches leadership inside a 1.5s window (30 election/heartbeat timeouts at 50ms).",
+            "assumptions": [
+              "The prefix runs with RestoreCommittedLogs enabled so that the commit index is staged into the commit-tracking log store; otherwise a restart with the feature enabled reads 0 and the scan start would equal the snapshot index.",
+              "The restarted node keeps the same address and ID as the prefix, so the configuration recorded in its log and snapshot still refers to it.",
+              "The FSM is an in-memory MockFSM and a fresh instance is used for each restart, which is the mode the feature targets; the FSM state is therefore rebuilt from the snapshot plus the replayed committed logs.",
+              "InmemCommitTrackingStore is a test facility whose StageCommitIndex does not share a write with StoreLogs; the probe uses it only as the store that exposes a persisted commit index and does not claim its durability properties."
+            ],
+            "excluded": [
+              "No multi-node cluster, partition, or crash of a leader is exercised, so the commit-loss consequence of a stale member set is not measured here.",
+              "No snapshot-on-start or FSM-implemented ConfigurationStore variant is exercised.",
+              "No production log store (for example a bolt-backed store) is exercised; the caller-side durability contract of CommitTrackingLogStore is assumed, not verified."
+            ],
+            "parameters": {
+              "cases": [
+                "no_snapshot_restore_on",
+                "no_snapshot_restore_off",
+                "snapshot_then_config_restore_on",
+                "snapshot_then_config_restore_off"
+              ],
+              "heartbeat_timeout_ms": 50,
+              "election_timeout_ms": 50,
+              "observation_ms": 1500,
+              "poll_interval_ms": 5,
+              "prefix_commands_before_snapshot": 4,
+              "prefix_commands_after_snapshot": 2,
+              "config_change_after_snapshot": "AddNonvoter(assurance-peer-2, assurance-peer-2-addr)"
+            }
+          },
+          "prefix": "Each case calls assuranceBuildPrefix: NewInmemTransport with a fresh random address; inmemConfig with LocalID = 'server-' + address and RestoreCommittedLogs = true; NewInmemCommitTrackingStore, NewInmemStore and NewInmemSnapshotStore; BootstrapCluster with a single Voter server at that address; NewRaft with a fresh MockFSM. The prefix then waits for real leadership through the normal election path, applies four LogCommand entries, and for the snapshot cases takes a real Snapshot, then issues AddNonvoter for a peer that never connects (committed by the single voter) and applies two more commands. GetCommitIndex, LastIndex and a per-index log scan record the persisted commit index and every configuration entry with its index and membership, then Shutdown closes the node. The case then creates a new transport bound to the same address, copies the config with RestoreCommittedLogs set to the case value, and calls NewRaft with the same log store, stable store, snapshot store and a fresh MockFSM. It polls State() every 5ms for 1500ms, then asks the main thread for the tracked configurations through r.configurationsCh (the same channel takeSnapshot uses) and reads snapshot index, AppliedIndex, CommitIndex and LastIndex.",
+          "requirement": null,
+          "responsibility": "raft's NewRaft is responsible for re-establishing the node's membership configuration from the node's own durable state before any election or quorum decision is made; the caller is responsible for supplying a log store whose GetCommitIndex is atomic with StoreLogs and for enabling RestoreCommittedLogs deliberately.",
+          "comparisons": [
+            {
+              "event": "assurance.outcome.no_snapshot_restore_on",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "admit_no_snapshot_restore_on",
+              "assertion": {
+                "field": "leader_observed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "snapshot_present",
+                  "op": "eq",
+                  "value": false,
+                  "reference": null
+                }
+              ],
+              "description": "A node restarted with RestoreCommittedLogs on top of stores whose log holds a committed configuration entry must still be able to elect a leader inside the observation window."
+            },
+            {
+              "event": "assurance.outcome.no_snapshot_restore_off",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "admit_no_snapshot_restore_off",
+              "assertion": {
+                "field": "leader_observed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "snapshot_present",
+                  "op": "eq",
+                  "value": false,
+                  "reference": null
+                }
+              ],
+              "description": "Control: the same prefix shape restarted with RestoreCommittedLogs off reaches leadership, which shows the nonprogress is specific to the replay path and not to the prefix."
+            },
+            {
+              "event": "assurance.config_recovery.no_snapshot_restore_on",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "admit_no_snapshot_restore_on",
+              "assertion": {
+                "field": "config_matches_last_log_config",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "snapshot_present",
+                  "op": "eq",
+                  "value": false,
+                  "reference": null
+                }
+              ],
+              "description": "The configuration recovered at startup must equal the newest configuration entry in the node's own log (index and voter/nonvoter membership)."
+            },
+            {
+              "event": "assurance.config_recovery.no_snapshot_restore_off",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "admit_no_snapshot_restore_off",
+              "assertion": {
+                "field": "config_matches_last_log_config",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "snapshot_present",
+                  "op": "eq",
+                  "value": false,
+                  "reference": null
+                }
+              ],
+              "description": "Control: with the feature off the same predicate holds on the same prefix shape."
+            },
+            {
+              "event": "assurance.config_recovery.snapshot_then_config_restore_on",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "admit_snapshot_then_config_restore_on",
+              "assertion": {
+                "field": "config_matches_last_log_config",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "snapshot_present",
+                  "op": "eq",
+                  "value": true,
+                  "reference": null
+                }
+              ],
+              "description": "After restarting on a snapshot that predates a committed configuration change, the recovered configuration must include that committed entry."
+            },
+            {
+              "event": "assurance.config_recovery.snapshot_then_config_restore_off",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "admit_snapshot_then_config_restore_off",
+              "assertion": {
+                "field": "config_matches_last_log_config",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "snapshot_present",
+                  "op": "eq",
+                  "value": true,
+                  "reference": null
+                }
+              ],
+              "description": "Control: the same snapshot-plus-configuration prefix restarted with the feature off does recover the committed configuration entry."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "95895e670b9e4f5c83526ac50ea19579",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "98ee8dfd5fac4b84915f91ed4b094bcf-interpretation-0",
+        "investigation_id": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_newraft_startup",
+          "src_restore_committed",
+          "src_process_config_entry",
+          "src_follower_election_guard",
+          "src_commitment_from_config",
+          "src_quorum_size",
+          "src_existing_restore_test",
+          "src_try_stage_commit_index",
+          "src_append_entries_staging",
+          "src_restore_committed_docs"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "Source trace. NewRaft restores the newest usable snapshot, then, only with RestoreCommittedLogs, reads the persisted commit index from the commit-tracking log store, stores it and calls processLogs with it (api.go:723-754); processLogs sets lastApplied to that index (raft.go:1296-1364). Only after that does NewRaft run the scan that rebuilds the node's configuration from the log, and that scan starts at max(lastSnapshotIndex, lastApplied) + 1 (api.go:602-621). With the feature off, lastApplied equals the snapshot index, so the scan covers every configuration entry in the log; with the feature on, lastApplied is the commit index, which for a node that committed entries above its newest snapshot is strictly larger, so every configuration entry at an index <= that commit index is skipped even though it is present in the node's log and was applied to the FSM. The skipped entries can only have been processed by processConfigurationLogEntry, the sole writer of the tracked configuration state, and its startup caller is exactly that scan; FSM-side configuration storage does not feed back into r.configurations (raft.go:1605-1624). The resulting configuration state is not inert: configurations.latestIndex == 0 makes a follower refuse to start an election (raft.go:225-241), and configurations.latest supplies quorumSize, the voter set counted by checkLeaderLease, the membership map used by the leader's commitment, and the inConfiguration/hasVote admission checks for vote grants (raft.go:456-467, 1085-1094; commitment.go:35-64). Two consequences follow directly: a node with no snapshot recovers an empty configuration and can never elect itself (no reachable producer of AppendEntries or configuration entries exists in a single-voter cluster), and a node with a snapshot recovers the snapshot's older membership, including a member set that omits an entry its log already committed. The existing test for this feature (raft_test.go:1183-1270) restarts with a snapshot whose configuration is identical to the final configuration and asserts only the applied index, so it does not constrain this case. The defect is scoped to deployments that enable RestoreCommittedLogs and use a commit-tracking log store; the intended duty is that the node recover the configuration its own log establishes, which the scan exists to do.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The doc comment for RestoreCommittedLogs (config.go:243-254) describes replaying committed logs to bring the FSM up to date and says nothing about configuration recovery, so one could argue that a stale configuration view is an unnamed side effect rather than a broken contract. The counter is that the scan at api.go:610-621 exists precisely to rebuild configuration state from the log at startup, and its start index is the only reason entries are skipped; no other path restores that state after the replay.",
+          "The skip also removes work: with RestoreCommittedLogs, configuration entries below the persisted commit index were already delivered to the FSM as commit tuples, so an FSM implementing ConfigurationStore has seen them. That does not restore r.configurations, which is raft's own decision input and is not derived from the FSM."
+        ],
+        "limitations": [
+          "The predicate recorded here is source-derived; the fixed experiment for this question has been submitted with this batch and its retained receipt is not yet part of this account. A native local run of the same harness was used only to validate operands while constructing it and is not offered as evidence.",
+          "Both prefix cases restart a single-voter cluster on an in-memory transport with an in-memory commit-tracking log store, so the observation window (1.5s = 30 election timeouts) measures non-participation of that node, not of a multi-node cluster.",
+          "The stale-membership consequence for a leader's commit index is argued from the code path that builds the commitment from configurations.latest; no scenario in this batch partitions a multi-node cluster to show a commit decided by a member set that the committed configuration does not contain.",
+          "The persisted commit index is staged only on log writes (raft.go:1392-1405, 1553-1561), so its value in the stored prefix is not necessarily the highest committed index; this does not affect the ordering argument, since any staged value above 0 exceeds the snapshot index in these cases."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_newraft_startup",
+        "file": "api.go",
+        "start_line": 602,
+        "end_line": 621,
+        "kind": "code_observation",
+        "text": "\tif err := r.restoreSnapshot(); err != nil {\n\t\treturn nil, err\n\t}\n\n\tif err := r.restoreFromCommittedLogs(); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Scan through the log for any configuration change entries.\n\tsnapshotIndex, _ := r.getLastSnapshot()\n\tlastappliedIndex := r.getLastApplied()\n\tfor index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {\n\t\tvar entry Log\n\t\tif err := r.logs.GetLog(index, &entry); err != nil {\n\t\t\tr.logger.Error(\"failed to get log\", \"index\", index, \"error\", err)\n\t\t\tpanic(err)\n\t\t}\n\t\tif err := r.processConfigurationLogEntry(&entry); err != nil {\n\t\t\treturn nil, err\n\t\t}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "src_restore_committed",
+        "file": "api.go",
+        "start_line": 723,
+        "end_line": 754,
+        "kind": "code_observation",
+        "text": "// restoreFromCommittedLogs recovers the Raft node from committed logs.\nfunc (r *Raft) restoreFromCommittedLogs() error {\n\tif !r.RestoreCommittedLogs {\n\t\treturn nil\n\t}\n\n\t// If the store implements CommitTrackingLogStore, we can read the commit index from the store.\n\t// This is useful when the store is able to track the commit index and we can avoid replaying logs.\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tr.logger.Warn(\"restore committed logs enabled but log store does not support it\", \"log_store\", fmt.Sprintf(\"%T\", r.logs))\n\t\treturn ErrIncompatibleLogStore\n\t}\n\n\tcommitIndex, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get commit index from store\", \"error\", err)\n\t\treturn err\n\t}\n\n\tlastIndex, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index from store\", \"error\", err)\n\t\treturn err\n\t}\n\tif commitIndex > lastIndex {\n\t\tcommitIndex = lastIndex\n\t}\n\n\tr.setCommitIndex(commitIndex)\n\tr.processLogs(commitIndex, nil)\n\treturn nil",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "src_follower_election_guard",
+        "file": "raft.go",
+        "start_line": 225,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"heartbeat_timeout\"}, 1)\n\t\t\t\tif hasVote(r.configurations.latest, r.localID) {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, starting election\", \"last-leader-addr\", lastLeaderAddr, \"last-leader-id\", lastLeaderID)\n\t\t\t\t\tr.setState(Candidate)\n\t\t\t\t\treturn",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_process_config_entry",
+        "file": "raft.go",
+        "start_line": 1605,
+        "end_line": 1624,
+        "kind": "code_observation",
+        "text": "// processConfigurationLogEntry takes a log entry and updates the latest\n// configuration if the entry results in a new configuration. This must only be\n// called from the main thread, or from NewRaft() before any threads have begun.\nfunc (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_setup_leader_state",
+        "file": "raft.go",
+        "start_line": 456,
+        "end_line": 467,
+        "kind": "code_observation",
+        "text": "func (r *Raft) setupLeaderState() {\n\tr.leaderState.commitCh = make(chan struct{}, 1)\n\tr.leaderState.commitment = newCommitment(r.leaderState.commitCh,\n\t\tr.configurations.latest,\n\t\tr.getLastIndex()+1 /* first index that may be committed in this term */)\n\tr.leaderState.inflight = list.New()\n\tr.leaderState.replState = make(map[ServerID]*followerReplication)\n\tr.leaderState.notify = make(map[*verifyFuture]struct{})\n\tr.leaderState.stepDown = make(chan struct{}, 1)\n}\n\n// runLeader runs the main loop while in leader state. Do the setup here and drop into",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_quorum_size",
+        "file": "raft.go",
+        "start_line": 1085,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_commitment_from_config",
+        "file": "commitment.go",
+        "start_line": 35,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64) *commitment {\n\tmatchIndexes := make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tmatchIndexes[server.ID] = 0\n\t\t}\n\t}\n\treturn &commitment{\n\t\tcommitCh:     commitCh,\n\t\tmatchIndexes: matchIndexes,\n\t\tcommitIndex:  0,\n\t\tstartIndex:   startIndex,\n\t}\n}\n\n// Called when a new cluster membership configuration is created: it will be\n// used to determine commitment from now on. 'configuration' is the servers in\n// the cluster.\nfunc (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "c1a6bedd86d67ae0e1bdaafd0ea2310ae25a1ce0b956e2e4747cd7f5606c38f3"
+      },
+      {
+        "id": "src_try_stage_commit_index",
+        "file": "raft.go",
+        "start_line": 1392,
+        "end_line": 1405,
+        "kind": "code_observation",
+        "text": "// tryStageCommitIndex updates the commit index in persist store if restore committed logs is enabled and log store implements CommitTrackingLogStore.\nfunc (r *Raft) tryStageCommitIndex(commitIndex uint64) {\n\tif !r.RestoreCommittedLogs {\n\t\treturn\n\t}\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\treturn\n\t}\n\tif err := store.StageCommitIndex(commitIndex); err != nil {\n\t\tr.logger.Error(\"failed to stage commit index in commit tracking log store\", \"index\", commitIndex, \"error\", err)\n\t}\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_append_entries_staging",
+        "file": "raft.go",
+        "start_line": 1553,
+        "end_line": 1561,
+        "kind": "code_observation",
+        "text": "\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Stage the future commit index if possible\n\t\t\tlastNewIndex := newEntries[len(newEntries)-1].Index\n\t\t\tcommitIndex := min(a.LeaderCommitIndex, lastNewIndex)\n\t\t\tr.tryStageCommitIndex(commitIndex)\n\n\t\t\t// Append the new entries",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_commit_tracking_contract",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 215,
+        "kind": "code_observation",
+        "text": "type CommitTrackingLogStore interface {\n\tLogStore\n\n\t// StageCommitIndex stages a new commit index to be persisted.\n\t// The staged commit index MUST only be persisted in a manner that is atomic\n\t// with the following StoreLogs call in the face of a crash.\n\t// This allows the Raft implementation to optimize commit index updates\n\t// without risking inconsistency between the commit index and the log entries.\n\t//\n\t// The implementation MUST NOT persist this value separately from the log entries.\n\t// Instead, it should stage the value to be written atomically with the next\n\t// StoreLogs call.\n\t//\n\t// GetCommitIndex MUST never return a value higher than the last index in the log,\n\t// even if a higher value has been staged with this method.\n\t//\n\t// idx is the new commit index to stage.\n\tStageCommitIndex(idx uint64) error\n\n\t// GetCommitIndex returns the latest persisted commit index from the latest log entry\n\t// in the store at startup.\n\t//",
+        "content_digest": "7a890bd749cd6863faef212b586320b8c6d9574bb7158f56c4e022408abff0b4"
+      },
+      {
+        "id": "src_restore_committed_docs",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "code_observation",
+        "text": "\t// RestoreCommittedLogs controls if the Raft server should use the restore committed logs\n\t// mechanism. Restore committed logs requires a LogStore implementation that\n\t// support commit tracking. When such a store is used and this config\n\t// enabled, raft nodes will replay all known-committed logs on disk\n\t// before completing `NewRaft` on startup. This is mainly useful where\n\t// the application allows relaxed-consistency reads from followers as it\n\t// will reduce how far behind the follower's FSM is when it starts. If all reads\n\t// are forwarded to the leader then there won't be observable benefit from this feature.\n\t//\n\t// Notice: If this is enabled, the log store MUST implement the CommitTrackingLogStore\n\t// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.\n\tRestoreCommittedLogs bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "src_existing_restore_test",
+        "file": "raft_test.go",
+        "start_line": 1183,
+        "end_line": 1270,
+        "kind": "code_observation",
+        "text": "func TestRaft_RestoreCommittedLogs(t *testing.T) {\n\t// Make the cluster\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.RestoreCommittedLogs = true\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\n\t// Commit a lot of things\n\tvar future Future\n\tfor i := 0; i < 100; i++ {\n\t\tfuture = leader.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0)\n\t}\n\n\t// Wait for the last future to apply\n\tif err := future.Error(); err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\t// Take a snapshot\n\tsnapFuture := leader.Snapshot()\n\tif err := snapFuture.Error(); err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\t// Check for snapshot\n\tsnaps, _ := leader.snapshots.List()\n\tif len(snaps) != 1 {\n\t\tt.Fatalf(\"should have a snapshot\")\n\t}\n\tsnap := snaps[0]\n\n\t// Logs should be trimmed\n\tfirstIdx, err := leader.logs.FirstIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\tif firstIdx != snap.Index-conf.TrailingLogs+1 {\n\t\tt.Fatalf(\"should trim logs to %d: but is %d\", snap.Index-conf.TrailingLogs+1, firstIdx)\n\t}\n\n\t// Commit a lot of things (for restore committed logs test)\n\tfor i := 0; i < 100; i++ {\n\t\tfuture = leader.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0)\n\t}\n\n\t// Wait for the last future to apply\n\tif err := future.Error(); err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\t// Shutdown\n\tshutdown := leader.Shutdown()\n\tif err := shutdown.Error(); err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\t// Restart the Raft\n\tr := leader\n\t// Can't just reuse the old transport as it will be closed\n\t_, trans2 := NewInmemTransport(r.trans.LocalAddr())\n\tcfg := r.config()\n\tr, err = NewRaft(&cfg, r.fsm, r.logs, r.stable, r.snapshots, trans2)\n\tif err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\tc.rafts[0] = r\n\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tt.Fatal(\"err: raft log store does not implement CommitTrackingLogStore interface\")\n\t}\n\tcommitIdx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\t// We should have applied all committed logs\n\tif last := r.getLastApplied(); last != commitIdx {\n\t\tt.Fatalf(\"bad last index: %d, expecting %d\", last, commitIdx)",
+        "content_digest": "33d02fbb915164a24d1387e087ffe4d4f5c52d8861e73cbe828152fb3edfdb15"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "98ee8dfd5fac4b84915f91ed4b094bcf",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_scan_start": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-0",
+        "@k_restore_sets_last_applied": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-1",
+        "@k_config_state_producers": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-2",
+        "@k_config_state_consumers": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-3",
+        "@k_follower_election_guard": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-4",
+        "@k_staging_only_with_flag": "98ee8dfd5fac4b84915f91ed4b094bcf-knowledge-5",
+        "@q_config_recovery": "98ee8dfd5fac4b84915f91ed4b094bcf-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_newraft_startup"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_restore_committed"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_follower_election_guard"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_process_config_entry"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_setup_leader_state"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_quorum_size"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_commitment_from_config"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_try_stage_commit_index"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_append_entries_staging"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_commit_tracking_contract"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_restore_committed_docs"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_existing_restore_test"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_scan_start"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_restore_sets_last_applied"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_config_state_producers"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_config_state_consumers"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_follower_election_guard"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_staging_only_with_flag"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@q_config_recovery"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "@q_config_recovery"
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "98ee8dfd5fac4b84915f91ed4b094bcf-experiment"
+    },
+    "applied_operations": {
+      "submission-98ee8dfd5fac4b84915f91ed4b094bcf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_18-14-25-hashicorp_raft-real-run/semantic-commits/submission-98ee8dfd5fac4b84915f91ed4b094bcf.json"
+      }
+    }
+  }
+}

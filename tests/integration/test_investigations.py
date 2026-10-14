@@ -12,14 +12,41 @@ from consensus_assurance.workflow.research import operation_summary, excerpt
 @pytest.mark.parametrize('gap',[False,True])
 def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
     seen = []
+    def start(state):
+        sub,files=combined(state)
+        sub['experiment']['source_ids'].append('protocol-pack:none')
+        return sub,files
     def interpret(state):
         seen.append(json.loads((e.root/'research.json').read_text()))
+        before=e.state.model_dump(mode='json')
+        summary=operation_summary(e.state,e.root)
+        question=summary['questions'][0]
+        assert (question['question_state'],question['version'],question['hypothesis'])==('current',1,'The boundary may wrap')
+        execution=question['execution']
+        raw=json.loads((e.root/execution['observations']).read_text())
+        assert execution['events']==raw['events'] and execution['events_omitted_count']==0
+        assert execution['event_count']==2 and execution['parsing_error_count']==0
+        assert execution['comparisons'][0]['definition']==state['experiments'][0]['basis']['comparisons'][0]
+        assert execution['comparisons'][0]['result']['valid_witness_indices']==[1]
+        code=next(m for m in execution['sources'] if m['id']=='code')
+        assert code==dict(id='code',path='agent-source/target.py',start_line=1,end_line=2,
+                         record=dict(path='state.json',collection='materials',id='code'))
+        pack=next(m for m in execution['sources'] if m['id']=='protocol-pack:none')
+        assert 'path' not in pack and pack['record']==dict(path='state.json',collection='materials',id=pack['id'])
+        assert execution['anchors'][0]['material_id']=='code'
+        assert (e.root/execution['harness']).read_text()==state['experiments'][0]['basis']['harness']['source']
+        assert e.state.model_dump(mode='json')==before and not state['interpretations']
         sub,files=opinion(state)
         if gap:sub['gaps']=[dict(investigation_id=state['investigations'][0]['id'],
             experiment_id=state['experiments'][0]['id'],question='Does the producer establish the sampled input?')]
         return sub,files
     def duplicate(state):
-        assert operation_summary(e.state,e.root)['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
+        summary=operation_summary(e.state,e.root)
+        assert summary['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
+        assert 'execution' not in summary['questions'][0]
+        change=summary['interpretation_changes'][0]
+        assert change['previous'] is None and change['current']['id']==state['interpretations'][0]['id']
+        assert change['executions'][0]['event_indices']==[1] and 'events' not in change['executions'][0]
         return opinion(state)
     def finish(state):
         index = json.loads((e.root/'research.json').read_text())
@@ -27,6 +54,7 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
         assert index['investigations'][0]['latest_interpretation']['executions']
         summary=operation_summary(e.state,e.root)
         assert summary['no_change'] and not summary['questions']
+        assert 'interpretation_changes' not in summary
         assert bool(summary['necessary_gaps'])==gap
         if gap:assert summary['necessary_gaps'][0]['investigation_id']==state['investigations'][0]['id']
         assert summary['reselection']['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
@@ -39,7 +67,8 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
         assert (actual['stdout'],actual['stderr'])==(check['stdout'],check['stderr'])
         assert 'CA_EVENT ' in Path(actual['stdout']).read_text() and Path(actual['stderr']).is_file()
         return stop(state)
-    e, repo = engine_for(tmp_path,[combined,interpret,duplicate,finish])
+    e, repo = engine_for(tmp_path,[start,interpret,duplicate,finish])
+    e.knowledge='A fixture protocol candidate, not target source.'
     state = e.start(repo)
     assert len(state.investigations) == len(state.experiments) == len(state.interpretations) == 1
     assert state.usage == {'agent_calls':4,'experiments':1}
@@ -50,6 +79,67 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
     assert result['outcome'] == 'violated' and 'Scripted or nonoriginal execution' in str(result['blockers'])
     assert result['comparisons'][0]['valid_witness_indices'] == [1]
     assert not any(name in type(state).model_fields for name in ('units','claims','bindings','relations','evidence','findings'))
+
+
+@pytest.mark.parametrize('large',['many_events','large_value','missing_long_identity'])
+def test_execution_feedback_omits_whole_large_event_sets_without_rewriting_receipts(tmp_path,large):
+    def start(state):
+        sub,files=combined(state)
+        files['check.py'] += {
+            'many_events':"for i in range(9): print('CA_EVENT '+json.dumps(dict(event='extra',operation=str(i))))\n",
+            'large_value':"print('CA_EVENT '+json.dumps(dict(event='extra',operation='large',value='x'*7000)))\n",
+            'missing_long_identity':"for name in ('admitted','returned'): print('CA_EVENT '+json.dumps(dict(event=name,operation='x'*7000)))\n",
+        }[large]
+        return sub,files
+    def inspect(state):
+        before=e.state.model_dump(mode='json')
+        saved={p:p.read_bytes() for p in (e.root/'logs').rglob('*') if p.is_file()}
+        value=operation_summary(e.state,e.root)['questions'][0]['execution']
+        raw=json.loads((e.root/value['observations']).read_text())
+        assert value['events']==[] and value['event_count']==value['events_omitted_count']==len(raw['events'])
+        assert value['comparisons'][0]['result']['valid_witness_indices']==[1]
+        assert value['comparisons'][0]['result']['evaluated_indices']==[1]
+        if large=='missing_long_identity':
+            assert value['comparisons'][0]['result']['missing_indices']
+            assert value['comparisons'][0]['omitted_detail_counts']['diagnostics']>0
+            assert 'x'*7000 not in json.dumps(value)
+        assert e.state.model_dump(mode='json')==before
+        assert all(p.read_bytes()==data for p,data in saved.items())
+        return stop(state)
+    e,repo=engine_for(tmp_path,[start,inspect])
+    e.start(repo)
+
+
+def test_interpretation_feedback_uses_its_own_receipts_after_another_question_executes(tmp_path):
+    def another(state):
+        request,files=experiment('@other')
+        return {'rationale':'Investigate another sourced question',
+            'investigations':[dict(ref='@other',question='What does another caller observe?',source_ids=['code'])],
+            'experiment':request},files
+    def correct(state):
+        original=state['experiments'][0]
+        check=next(c for c in state['checks'] if c.get('experiment_id')==original['id'])
+        sub,files=opinion(state,investigation_id=original['investigation_id'],experiment_id=original['id'],
+            executions={check['id']:[1]},conclusion='explained',defect_claim='refuted',
+            rationale='The receipt is unchanged; the current source interpretation narrows the responsibility')
+        sub['investigations']=[dict(id=original['investigation_id'],hypothesis='The local contract permits the sampled return')]
+        return sub,files
+    def finish(state):
+        summary=operation_summary(e.state,e.root)
+        change,=summary['interpretation_changes']
+        old,new=state['interpretations']
+        assert change['previous']==dict(id=old['id'],conclusion='violated',defect_claim='asserted')
+        assert change['current']==dict(id=new['id'],conclusion='explained',defect_claim='refuted')
+        assert change['executions'][0]['experiment_id']==state['experiments'][0]['id']
+        assert summary['latest_actual_execution']['experiment_id']==state['experiments'][1]['id']
+        assert summary['questions'][0]['question_state']=='current' and summary['questions'][0]['version']==2
+        assert 'execution' not in summary['questions'][0]
+        effect=next(v for v in summary['effects'] if v['object']=='interpretations')
+        assert {'conclusion','defect_claim','rationale'} <= set(effect['changed_fields'])
+        return stop(state)
+    e,repo=engine_for(tmp_path,[combined,lambda state:opinion(state,defect_claim='asserted'),another,correct,finish])
+    state=e.start(repo)
+    assert state.usage['experiments']==2 and len(state.interpretations)==2
 
 
 def test_preflight_reports_effect_without_acceptance_or_execution(tmp_path,monkeypatch):

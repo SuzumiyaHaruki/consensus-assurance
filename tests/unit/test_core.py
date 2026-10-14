@@ -19,3 +19,96 @@ def test_execution_transition_and_budget_limits(tmp_path):
     assert tracker.remaining()>0
     store=Store(tmp_path/'saved');store.save(state,'test')
     assert store.load()==state
+
+
+@pytest.mark.parametrize('transitive',[False,True])
+def test_comparison_diagnostic_identifies_actual_conflicting_chain(transitive):
+    from types import SimpleNamespace
+    from consensus_assurance.core.types import ExperimentBasis
+    from consensus_assurance.core.diagnostics import DiagnosticError
+    from consensus_assurance.workflow.experiments import validate_basis
+    prerequisites=[dict(alias='plain',event='admitted'),dict(alias='unrelated',event='result')]
+    if transitive:
+        prerequisites.extend([
+            dict(alias='producer_a',event='result'),dict(alias='producer_b',event='result'),
+            dict(alias='middle',event='prepared',conditions=[
+                dict(field='operation',reference='producer_a.operation'),
+                dict(field='operation',reference='producer_b.operation')]),
+            dict(alias='start',event='started',conditions=[dict(field='operation',reference='middle.operation')])])
+    else:
+        prerequisites.append(dict(alias='start',event='result'))
+    basis=ExperimentBasis(harness={'kind':'test','source':'fixture','prerequisites':prerequisites},
+        source_ids=['source'],scope={'description':'One local call'},prefix='Use observed producers.',
+        comparisons=[dict(event='other',admission_alias='plain',identity_fields=['operation'],
+                          assertion=dict(field='value',value=True)),
+                     dict(event='result',admission_alias='start',identity_fields=['operation'],
+                          assertion=dict(field='value',value=True))])
+    with pytest.raises(DiagnosticError) as rejected:
+        validate_basis(SimpleNamespace(materials=[SimpleNamespace(id='source')],knowledge=[]),
+                       basis,SimpleNamespace(harness_kind='test'))
+    diagnostic,=rejected.value.diagnostics
+    assert diagnostic.paths==['/experiment/comparisons/1']
+    assert diagnostic.details==dict(comparison_index=1,event='result',admission_alias='start',
+        conflicting_aliases=['producer_a','producer_b'] if transitive else ['start'],
+        prerequisite_aliases=['producer_a','producer_b','middle','start'] if transitive else ['start'])
+    assert "Comparison 1 (result event 'result', admission alias 'start')" in diagnostic.message
+    assert all(alias in diagnostic.message for alias in diagnostic.details['conflicting_aliases'])
+    assert 'unrelated' not in diagnostic.message
+
+
+@pytest.mark.parametrize('change',[
+    {'assertion':dict(field='operation',value=True)},
+    {'applicability_conditions':[dict(field='value',value=True)]},
+    {'antecedent':dict(field='operation',value=True)},
+    {'admission_alias':'missing'}])
+def test_other_comparison_failures_keep_explicit_comparison_context(change):
+    from types import SimpleNamespace
+    from consensus_assurance.core.types import ExperimentBasis
+    from consensus_assurance.core.diagnostics import DiagnosticError
+    from consensus_assurance.workflow.experiments import validate_basis
+    comparison=dict(event='result',admission_alias='start',identity_fields=['operation'],
+                    assertion=dict(field='value',value=True))
+    basis=ExperimentBasis(harness={'kind':'test','source':'fixture',
+        'prerequisites':[dict(alias='start',event='admitted')]},source_ids=['source'],
+        scope={'description':'One local call'},prefix='Use observed producers.',
+        comparisons=[comparison,{**comparison,**change}])
+    with pytest.raises(DiagnosticError) as rejected:
+        validate_basis(SimpleNamespace(materials=[SimpleNamespace(id='source')],knowledge=[]),
+                       basis,SimpleNamespace(harness_kind='test'))
+    diagnostic,=rejected.value.diagnostics
+    assert diagnostic.paths==['/experiment/comparisons/1']
+    assert diagnostic.details==dict(comparison_index=1,event='result',
+                                   admission_alias=change.get('admission_alias','start'))
+
+
+def test_submitted_input_diagnostic_explains_draft_relative_resolution(tmp_path):
+    from consensus_assurance.core.diagnostics import DiagnosticError
+    from consensus_assurance.workflow.audit import Inputs, draft_file
+    draft=tmp_path/'draft';draft.mkdir()
+    (draft/'check.py').write_text('fixture')
+    inputs=Inputs(draft)
+    with pytest.raises(DiagnosticError) as rejected:
+        inputs.read('draft/check.py')
+    diagnostic,=rejected.value.diagnostics
+    assert diagnostic.details==dict(input_path='draft/check.py',input_root=str(draft),
+                                   resolved_path=str(draft/'draft/check.py'))
+    assert 'relative to the draft directory' in diagnostic.message
+    assert str(draft/'draft/check.py') in diagnostic.message
+    assert inputs.contents=={}
+    assert inputs.read('check.py')=='fixture'
+    with pytest.raises(ValueError) as source_rejected:
+        draft_file(tmp_path/'source','missing.py')
+    assert not isinstance(source_rejected.value,DiagnosticError)
+    assert 'relative to the draft directory' not in str(source_rejected.value)
+
+
+def test_submitted_input_diagnostics_preserve_path_boundaries(tmp_path):
+    from consensus_assurance.workflow.audit import Inputs
+    draft=tmp_path/'draft';draft.mkdir()
+    outside=tmp_path/'outside.py';outside.write_text('outside fixture')
+    (draft/'linked.py').symlink_to(outside)
+    (draft/'linked-dir').symlink_to(tmp_path,target_is_directory=True)
+    inputs=Inputs(draft)
+    for name in ('../outside.py',str(outside),'linked.py','linked-dir/outside.py'):
+        with pytest.raises(ValueError):inputs.read(name)
+    assert inputs.contents=={}

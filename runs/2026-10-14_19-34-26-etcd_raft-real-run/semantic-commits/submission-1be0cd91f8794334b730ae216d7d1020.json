@@ -1,0 +1,1048 @@
+{
+  "input": {
+    "rationale": "The fixed harness ran as CheckRun 238d3a23d8624c438b85ec18f90a7b2b (status completed, outcome tests_passed, exit 0, 10 CA_EVENT observations, 0 parsing errors, harness fixed-experiments/075c21493fd94adc9bdc30a30b2cbff1-experiment/assurance_generated_test.go). I inspected the parsed observations and the runner log rather than the draft-side output: events 0-5 are the campaign-admission probe, events 6-9 the ReadIndex/authority-change probe, and the runner log independently shows the two suppression warnings ('1 cannot campaign at term 1 since there are still pending configuration changes to apply', delivered on both the MsgHup path and the MsgTimeoutNow path) plus the post-apply campaign ('1 is starting a new election at term 1', 'became candidate at term 2', 'sent MsgVote request to 2/3 at term 2'). This turn interprets those events against the two registered questions, answers both necessary gaps, promotes the two observed behaviors as execution-backed knowledge, and registers one follow-up question on the bounded-liveness side of a requested leadership transfer that the guard touches but this harness did not exercise. No experiment is requested this turn: the follow-up needs new harness scaffolding (a real transfer over the network with a lagging transferee), which is construction work for the next turn rather than a rerun of the fixed harness.",
+    "sources": [],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@transfer_stall",
+        "question": "The campaign guard is verified to suppress a MsgTimeoutNow-triggered campaign when the transferee has a committed-but-unapplied conf change (CheckRun 238d3a23d8624c438b85ec18f90a7b2b events 0-2). Which observable sequence follows for a requested leadership transfer whose transferee lags application: does the leader keep sending MsgTimeoutNow/MsgApp until tickHeartbeat aborts the transfer at the election timeout, can the cluster still make progress through the existing leader in the meantime (proposals dropped while leadTransferee != None), and is a later transfer possible once the transferee's application catches up? This is the bounded-liveness side of the same guard, where a duty the leader explicitly accepted (transfer) cannot complete and the leader also refuses proposals.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_leader",
+          "s_raft_conf"
+        ],
+        "hypothesis": "The transfer neither completes nor deadlocks: the transferee refuses to campaign while the conf change is unapplied, the leader keeps proposing the transfer (and drops new proposals) until its election timeout elapses, then abortLeaderTransfer() clears leadTransferee and proposals resume, so the cost is bounded by one election timeout and the transfer can be retried after the transformer catches up.",
+        "discriminator": "In one process, elect a 3-node leader, give the transferee a committed-but-unapplied conf-change entry (applied < committed) via its storage/HardState and Config.Applied, call TransferLeader to it, then tick the leader past its election timeout and record: whether MsgTimeoutNow was sent, whether MsgProp is rejected with ErrProposalDropped while leadTransferee != None, whether leadTransferee is cleared after the timeout, and whether a second TransferLeader attempt after applying the entry completes with the transferee campaigning at term+1. Expected if the claim holds: transfer aborted within one election timeout, proposals accepted again afterwards, second attempt succeeding after application catches up; the alternative to distinguish is a forever-pending transfer (leadTransferee never cleared or proposals permanently dropped) or a transfer that completes with a stale voter set.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_transfer_probe_note",
+        "kind": "behavior",
+        "statement": "Probe C of the extended harness drives the bounded-liveness side of the campaign guard: a 3-node leader (term 1, committed 2) with a committed ConfChangeV2 learner addition replicated to follower r2 (applied=0, committed=2, hasUnappliedConfChanges=true, leader's Match for r2 == lastIndex) accepts a TransferLeader request to r2 by setting leadTransferee=2 while r2 stays StateFollower(term 1), rejects a proposal with ErrProposalDropped during that window, clears leadTransferee to 0 after electionTimeout ticks with the leader still StateLeader(term 1) and accepts proposals again, and completes the retry (r2 StateLeader term 2, former leader StateFollower term 2) once the transferee's applied index reaches its committed index. This is a regressed construction note from the draft-side run pending the receipt requested this turn, so it is recorded as behavior under stated conditions rather than as an observed defect.",
+        "conditions": "Local construction run of draft/assurance_generated_test.go (Probe C) against the captured snapshot before the isolated execution requested in this submission; no controller receipt exists yet for these operands.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_leader",
+          "s_raft_conf"
+        ],
+        "executions": {},
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+            "revision": 1,
+            "assertion": "the campaign guard also suppresses the leadership-transfer path reached through MsgTimeoutNow"
+          }
+        ],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_guard_observed",
+        "kind": "behavior",
+        "statement": "Observed: a voter whose committed-but-unapplied entry is an EntryConfChangeV2 (references: has_unapplied=true with applied=1, committed=2, entry2_type=EntryConfChangeV2, promotable=true) remains in StateFollower with term=1 and emits no messages both on MsgHup and on a term-carrying MsgTimeoutNow, while the same node after raftLog.appliedTo(2,0) reports has_unapplied=false and campaigns (StateCandidate, term=2, vote=1, MsgVote addressed to voters [2,3]); the control node with a normal entry at index 2 and the same applied=1/committed=2 gap reports has_unapplied=false and campaigns immediately. The suppression therefore depends on the entry type in (applied, committed], not on the applied/committed gap as such, and it ends as soon as raft's applied index covers the entry.",
+        "conditions": "Voter built from MemoryStorage entries [1]=EntryNormal, [2]=EntryConfChangeV2 at term 1 with HardState{Term:1,Commit:2} and Config.Applied=1; triggered by MsgHup and by MsgTimeoutNow{From:3,Term:1}; control with a normal entry at index 2.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+            "revision": 1,
+            "assertion": "hup() refuses to campaign on both the time-based and the leadership-transfer path while hasUnappliedConfChanges() is true"
+          }
+        ],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_read_drop_observed",
+        "kind": "behavior",
+        "statement": "Observed: a leader that has committed an entry in its term (committed=2, committed_entry_in_term=true) admits a MsgReadIndex request (unconfirmed_reads=1, read_states=0, admission commit index 2); after a real peer campaign at term 2 the same node is StateFollower(term=2) with read_states=0, ctx_A_completed=false, unconfirmed_reads=0 and confirmed_reads=0, i.e. the admitted request is dropped without any completion or staleness signal. The control shows the confirmation path still works after the authority change: a read admitted on the new leader (index_B=3, commit_now=3) is released with read_states_before_ack=0, read_states_after_ack=1 and ctx_B_completed=true once one peer heartbeat response echoing the leader's context arrives.",
+        "conditions": "Three-node in-process network (newNetwork over newTestRaft with withPeers(1,2,3)); leader elected by MsgHup, one proposal committed, MsgReadIndex stepped directly into the leader with no heartbeat responses delivered, then peer 2 campaigns via the network; the control read is admitted on the new leader and confirmed by a single MsgHeartbeatResp carrying the leader's heartbeat context.",
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-1",
+            "revision": 1,
+            "assertion": "reset() on a term change discards readOnly together with all unconfirmed reads and acks"
+          }
+        ],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [
+      {
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "question": "Is an unconfirmed ReadIndex request answered, dropped, or answered with a stale index when the leader loses its term between admission and quorum acknowledgement, and which of those outcomes is observable from the ReadState stream?",
+        "experiment_id": null
+      },
+      {
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "question": "With a committed-but-unapplied conf change in the log, does the node refrain from campaigning (and if so, is a later campaign possible once application catches up), and which voter set would a campaign use if it did proceed?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [
+      {
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "experiment_id": "075c21493fd94adc9bdc30a30b2cbff1-experiment",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The suspicion had two branches: (i) the guard may be bypassed so a node campaigns with a stale voter set, and (ii) the guard may permanently block a legal campaign. Branch (i) is refuted by events 1 and 2: with has_unapplied=true and an already-promotable voter, both the MsgHup path and the MsgTimeoutNow path leave the node in StateFollower(term=1) with msgs=0, and the runner log shows the same suppression reason on both paths, so the transfer path reaches campaign() only through the same guard. The voter set used when campaigning is legitimate rather than stale: after the application catches up (event 3) the node reports has_unapplied=false and campaigns at term 2 with vote=1 and MsgVote addressed to voters [2,3], and event 0 records that this config (voters_before=[1,2,3]) is the applied configuration. Branch (ii) is refuted by the same event 3 plus the control at events 4-5: the block is transient, keyed on the entry type in (applied, committed] rather than on the applied/committed gap itself (the control has the identical gap and campaigns immediately). What remains is a bounded-liveness cost, not a safety defect: while the entry is unapplied the node cannot campaign and cannot take over a requested transfer, which is the documented intent that configurations take effect on application.",
+        "answers": {
+          "c6f44be10c0445b7a091b7db545cd614-gap-1": {
+            "explanation": "With a committed-but-unapplied conf change the node refrains from campaigning on both triggers (events 1-2: StateFollower, term 1, msgs=0; runner log 'cannot campaign at term 1 since there are still pending configuration changes to apply' on the MsgHup and MsgTimeoutNow paths), and a later campaign is possible once raft's applied index covers the entry (event 3: has_unapplied=false, StateCandidate at term 2, MsgVote to voters [2,3]; control events 4-5 show the effect is caused by the entry type, not by the applied/committed gap).",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+            "revision": 1,
+            "assertion": "hup() returns without campaigning when hasUnappliedConfChanges() is true, for both MsgHup and MsgTimeoutNow"
+          },
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-0",
+            "revision": 1,
+            "assertion": "campaign() addresses vote requests to the tracked voters of the current configuration, here [2,3]"
+          }
+        ],
+        "counterevidence": [
+          "The node is promotable=true throughout (events 0, 4), so the refusal does not come from promotable(); it is specifically hasUnappliedConfChanges, which strengthens the reading that the guard is the cause rather than an admission in promotable.",
+          "The post-apply campaign (event 3) carries vote targets [2,3] from the pre-change configuration because the harness only advanced raftLog.applied without calling ApplyConfChange; the voter set used in the probe is therefore the stored config, which is the config a leader would legitimately campaign with at that point."
+        ],
+        "limitations": [
+          "The probe drives MsgHup/MsgTimeoutNow directly on a node whose storage prefix and Config.Applied are supplied, not a tick-driven election of a live cluster, so it establishes the guard's effect and its transience but not the wall-clock or tick cost of the suppression inside a running cluster.",
+          "The bounded-liveness cost for a requested transfer (leader keeps dropping proposals while leadTransferee != None) is visible in source but was not exercised by this harness; it is registered as investigation @transfer_stall."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      },
+      {
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_doc"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The question had two possible defect shapes: a stale (too small) read index, or a lost completion. Events 6-9 select the second and exclude the first for the exercised path. Event 7 shows the request admitted with unconfirmed_reads=1, read_states=0 and the admission commit index recorded as 2; event 8 shows that after the term change the node holds read_states=0, unconfirmed_reads=0, confirmed_reads=0 and ctx_A_completed=false, so the request is dropped, never emitted with a smaller index. Event 9 is the control that separates 'drops on term change' from 'read confirmation is broken': a read admitted on the new leader (commit_now=3, index_B=3) goes from read_states_before_ack=0 to read_states_after_ack=1 with ctx_B_completed=true as soon as one peer heartbeat response carrying the leader's context arrives, which is also the count-based confirmation the source predicted. A dropped completion is not a defect under the applicable contract: Node.ReadIndex documents that the request can be lost without notice and that ensuring read index retries is the user's job, so the caller duty is established by the target's own interface statement, and the exercised drop is exactly that documented lossiness rather than a wrong index being served.",
+        "answers": {
+          "c6f44be10c0445b7a091b7db545cd614-gap-0": {
+            "explanation": "The request is dropped, not answered stale: after admission with unconfirmed_reads=1 (event 7), the term change leaves read_states=0, unconfirmed_reads=0, confirmed_reads=0 and ctx_A_completed=false (event 8), so nothing is emitted for that context and no smaller index can be observed; the confirmation path itself still functions on the new leader (event 9: ctx_B_completed=true with index_B=3 equal to the commit index at admission), and the lossiness is the caller duty stated by Node.ReadIndex.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-1",
+            "revision": 1,
+            "assertion": "a released ReadState is justified by a quorum of ack positions and carries the commit index recorded at admission"
+          }
+        ],
+        "counterevidence": [],
+        "limitations": [
+          "The probe steps MsgReadIndex directly into the leader rather than through Node.ReadIndex/RawNode.ReadIndex, so it shows the state-machine outcome and not the API-level return value or the Ready/ReadStates plumbing; the documented caller duty was read from node.go/doc.go rather than exercised.",
+          "Only one trigger of the term change was exercised (a higher-term campaign message from a peer); other authority losses that rebuild readOnly (for example a snapshot restore or a leadership transfer racing an admitted read) were not covered."
+        ],
+        "joint_history": "Same single invocation as the campaign-admission interpretation: CheckRun 238d3a23d8624c438b85ec18f90a7b2b is one execution of one fixed harness (fixed-experiments/075c21493fd94adc9bdc30a30b2cbff1-experiment/assurance_generated_test.go) containing both probes, so events 6-9 and events 0-5 come from the same process, the same fixed inputs and the same receipt, with no separate producer or intermediate history between them. The experiment record is attached to question-1 because the submission can carry only one experiment request; the receipt itself is shared, and its parsed indices 6-9 are the decisive operands for this question.",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "@transfer_stall",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "source_ids": [
+        "s_raft_campaign",
+        "s_raft_leader",
+        "s_raft_conf"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "Same fixed harness as the previous execution with one added case. Probes A and B are unchanged (campaign admission with a committed-but-unapplied EntryConfChangeV2; ReadOnlySafe completion across a term change with its control). Probe C (TestAssuranceTransferWithLaggingTransferee) adds the bounded-liveness case for a requested leadership transfer: elect a 3-node leader over the in-process network, propose a ConfChangeV2 learner addition so followers hold a committed conf-change entry while their applied index lags, request TransferLeader to that lagging follower, and record leadTransferee, the transferee's state/term and hasUnappliedConfChanges, the error from a proposal issued while the transfer is pending, leadTransferee and proposal acceptance after the leader is ticked through its election timeout, and the outcome of a retry after the transferee's applied index reaches its committed index.",
+        "assumptions": [
+          "Nodes come from the snapshot's own test constructors (newTestRaft/newTestConfig/newTestMemoryStorage/newNetwork) in one process; messages are delivered by the repository's own network helper.",
+          "The lagging applied index is produced by not advancing raftLog.applied for the transferee, which models an application that has not yet applied committed entries.",
+          "Ticks are the protocol's own logical time unit; the transfer is aborted by tickHeartbeat, not by a wall-clock timeout.",
+          "No production logic is modified."
+        ],
+        "excluded": [],
+        "parameters": {}
+      },
+      "prefix": "Probe C: newNetwork over newTestRaft(1,10,1,withPeers(1,2,3)) for ids 1..3; MsgHup on node 1 to elect; confChangeToMsg(ConfChangeV2{AddLearnerNode 4}) proposed via MsgProp on the leader and delivered by the network so both followers store the conf-change entry while their applied index stays behind; then MsgTransferLeader{From:2,Term:leader.Term} stepped into the leader; then MsgProp on the leader while leadTransferee != None; then electionTimeout tick() calls on the leader followed by another MsgProp; then raftLog.appliedTo(committed,0) on the transferee and a second MsgTransferLeader, which the network delivers and which lets the transferee campaign via MsgTimeoutNow.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "",
+      "prerequisites": [],
+      "comparisons": [],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": "This investigation has no predecessor experiment of its own, so no previous_id is set: the request extends the harness used by the campaign-admission experiment with one added case (Probe C, TestAssuranceTransferWithLaggingTransferee) that exercises the bounded-liveness side of the campaign admission guard for a requested leadership transfer. Probes A and B are byte-identical to that earlier revision; a fresh execution is required because the harness bytes and the case set changed."
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "version": 1,
+        "question": "In this snapshot, ReadOnlySafe confirmation is count-based rather than commit-index-based (read_only.go addRequest/recvAck/maybeAdvance/heartbeatCtx with confirmedReads, driven from stepLeader MsgHeartbeatResp and sendMsgReadIndexResponse). Which conditions establish that a released ReadState carries an index at least as new as the commit index at the moment the request was admitted, and what happens to still-unconfirmed reads when the leader's term changes (reset() rebuilds readOnly) or when the leader is a fresh leader that has not yet committed an entry in its term (pendingReadIndexMessages)?",
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader",
+          "s_raft_conf"
+        ],
+        "hypothesis": "A released read index is never smaller than the commit index recorded at admission of that read request, because positions are monotonic counts and acks are per-voter maxima; the open risk is a lost completion (request dropped by reset/term change) rather than a stale index.",
+        "discriminator": "Drive a real 3-node cluster in one process: elect a leader, admit a read request (MsgReadIndex via Step), delay only MsgHeartbeatResp so no quorum ack exists yet, then remove the leader (isolate) and elect a new leader that commits an entry. Deliver the delayed heartbeat responses to the stale leader and record every ReadState and every dropped request. Expected if the count-based claim holds: no ReadState is emitted whose Index is below the commit index at admission; expected counter-shape: an emitted ReadState with a too-small Index (stale read) or a request that is silently never answered after the leader's term changed (lost completion).",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "c6f44be10c0445b7a091b7db545cd614-gap-0",
+            "question": "Is an unconfirmed ReadIndex request answered, dropped, or answered with a stale index when the leader loses its term between admission and quorum acknowledgement, and which of those outcomes is observable from the ReadState stream?",
+            "experiment_id": null,
+            "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+          }
+        ],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "version": 1,
+        "question": "hup() refuses to campaign whenever hasUnappliedConfChanges() is true, i.e. whenever any entry in (applied, committed] is an EntryConfChange/EntryConfChangeV2, and promotable() additionally vetoes campaign while an unstable or in-progress snapshot exists. No existing test references hasUnappliedConfChanges directly. Which permitted histories leave a node with committed-but-unapplied configuration entries, and can such a node campaign with a voter set that does not include its own committed configuration (for example after restoring a snapshot, after ReadIndex-style lag in application, or when the application rejects a config change by zeroing NodeId)?",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf",
+          "s_confchange",
+          "s_node"
+        ],
+        "hypothesis": "The guard is a deliberate safety measure (campaign only with an applied configuration) and is correct for the paths it covers, but its interaction with (a) applied<committed gaps created by the application, (b) MsgTimeoutNow-triggered campaigning, and (c) restore/bootstrap paths is untested and may either block a legal transfer or admit a campaign with a stale voter set.",
+        "discriminator": "Construct a voter whose storage holds a committed EntryConfChangeV2 that the application has not applied (Config.Applied below committed) and whose stored ConfState predates it, then (i) tick into an election timeout and (ii) deliver MsgTimeoutNow, and read back whether it becomes candidate, which voter IDs it addresses in the MsgVote/MsgPreVote messages, and which quorum quorum.VoteResult uses; the alternative outcome to distinguish is a campaign that proceeds despite the unapplied change, or a permanent inability to campaign after the application refuses the change.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "c6f44be10c0445b7a091b7db545cd614-gap-1",
+            "question": "With a committed-but-unapplied conf change in the log, does the node refrain from campaigning (and if so, is a later campaign possible once application catches up), and which voter set would a campaign use if it did proceed?",
+            "experiment_id": null,
+            "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+          }
+        ],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "campaign() enumerates only r.trk.Voters.IDs() and sends the self-vote as a self-addressed MsgVoteResp/MsgPreVoteResp through r.send, which routes vote responses into msgsAfterAppend so the self-vote is counted only after the term/vote is durable; poll() records the first vote seen per ID via ProgressTracker.RecordVote and TallyVotes returns Voters.VoteResult over the joint config, so a joint quorum requires a majority in both halves and learners or IDs outside the config contribute no votes.",
+        "conditions": "State machine in StateCandidate/StatePreCandidate after campaign() or campaignPreElection(); CheckQuorum/PreVote per Config.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_send",
+          "s_tracker",
+          "s_quorum_majority",
+          "s_quorum_joint"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "ReadOnlySafe read confirmation is count-based: readOnly.addRequest appends the request with the commit index observed at admission, heartbeatCtx encodes confirmedReads+len(unconfirmedReads) as an 8-byte little-endian position, recvAck stores per-voter maxima of echoed positions (including the leader's own ack taken immediately in sendMsgReadIndexResponse), and maybeAdvance releases a prefix of unconfirmedReads only when quorum.CommittedIndex over those per-voter positions covers it. The leader postpones MsgReadIndex into pendingReadIndexMessages while it has not committed an entry in its current term, and reset() (any term change) discards readOnly together with all unconfirmed reads and acks.",
+        "conditions": "ReadOnlyOption=ReadOnlySafe on a leader; the release happens in stepLeader's MsgHeartbeatResp path after readOnly.recvAck.",
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "hup() returns without campaigning when the node is unpromotable (not in the progress map, learner, or holding an unstable/in-progress snapshot) or when hasUnappliedConfChanges() finds an EntryConfChange/EntryConfChangeV2 in the index range (applied, committed]; the same guard therefore also applies to the leadership-transfer path, which reaches campaign() only through MsgTimeoutNow -> hup(campaignTransfer).",
+        "conditions": "Any MsgHup, whether from tickElection or from MsgTimeoutNow on a follower, at the term and log state of the node.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "075c21493fd94adc9bdc30a30b2cbff1-experiment",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"google.golang.org/protobuf/proto\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc caEvent(t *testing.T, kind string, fields map[string]any) {\n\tt.Helper()\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// mkConfChangeVoter builds a voter (id=1) whose storage holds entries [1]=normal,\n// [2]=entry of the requested type at term 1, a HardState committing index 2, and a\n// Config that has applied only index 1 (so applied < committed).\nfunc mkConfChangeVoter(t *testing.T, secondIsConfChange bool) *raft {\n\tt.Helper()\n\tcc := &pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{{\n\t\tType:   pb.ConfChangeAddNode.Enum(),\n\t\tNodeId: new(uint64(4)),\n\t}}}\n\tdata, err := proto.Marshal(cc)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tms := newTestMemoryStorage(withPeers(1, 2, 3))\n\tents := []*pb.Entry{{Term: new(uint64(1)), Index: new(uint64(1))}}\n\tif secondIsConfChange {\n\t\tents = append(ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(2)), Type: pb.EntryConfChangeV2.Enum(), Data: data})\n\t} else {\n\t\tents = append(ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(2))})\n\t}\n\tif err := ms.Append(ents); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tif err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Vote: new(uint64(0)), Commit: new(uint64(2))}); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tcfg := newTestConfig(1, 10, 1, ms)\n\tcfg.Applied = 1 // index 2 is committed but not applied\n\treturn newRaft(cfg)\n}\n\n// TestAssuranceCampaignWithUnappliedConfChange probes whether a voter with a\n// committed-but-unapplied conf change campaigns on MsgHup / MsgTimeoutNow, which\n// voter set it would use, and whether it can campaign once application catches up.\nfunc TestAssuranceCampaignWithUnappliedConfChange(t *testing.T) {\n\tvoterIDs := func(msgs []*pb.Message, typ pb.MessageType) []uint64 {\n\t\tvar ids []uint64\n\t\tfor _, m := range msgs {\n\t\t\tif m.GetType() == typ {\n\t\t\t\tids = append(ids, m.GetTo())\n\t\t\t}\n\t\t}\n\t\treturn ids\n\t}\n\n\t// Case A: conf-change entry committed but unapplied.\n\ta := mkConfChangeVoter(t, true)\n\tcaEvent(t, \"unapplied_conf_change\", map[string]any{\n\t\t\"case\":                \"committed_unapplied_v2\",\n\t\t\"promotable\":          a.promotable(),\n\t\t\"has_unapplied\":       a.hasUnappliedConfChanges(),\n\t\t\"applied\":             a.raftLog.applied,\n\t\t\"committed\":           a.raftLog.committed,\n\t\t\"state_before\":        a.state.String(),\n\t\t\"voters_before\":       a.trk.VoterNodes(),\n\t\t\"entry2_type\":         a.raftLog.allEntries()[1].GetType().String(),\n\t\t\"cfg_applied_note\":    \"newRaft applied Config.Applied=1\",\n\t})\n\tif err := a.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"hup: %v\", err)\n\t}\n\tmsgsA := a.readMessages()\n\tcaEvent(t, \"hup_with_unapplied\", map[string]any{\n\t\t\"state\":        a.state.String(),\n\t\t\"term\":         a.Term,\n\t\t\"vote\":         a.Vote,\n\t\t\"msgs\":         len(msgsA),\n\t\t\"vote_targets\": voterIDs(msgsA, pb.MsgVote),\n\t})\n\n\t// Case A2: same node, leadership-transfer trigger (MsgTimeoutNow carries the term).\n\ta2 := mkConfChangeVoter(t, true)\n\tif err := a2.Step(&pb.Message{From: new(uint64(3)), Term: new(a2.Term), Type: pb.MsgTimeoutNow.Enum()}); err != nil {\n\t\tt.Fatalf(\"timeoutnow: %v\", err)\n\t}\n\tmsgsA2 := a2.readMessages()\n\tcaEvent(t, \"timeoutnow_with_unapplied\", map[string]any{\n\t\t\"state\":        a2.state.String(),\n\t\t\"term\":         a2.Term,\n\t\t\"msgs\":         len(msgsA2),\n\t\t\"vote_targets\": voterIDs(msgsA2, pb.MsgVote),\n\t})\n\n\t// Case A3: same node after the application catches up (applied == committed).\n\ta3 := mkConfChangeVoter(t, true)\n\ta3.raftLog.appliedTo(2, 0)\n\thasUnappliedAfter := a3.hasUnappliedConfChanges()\n\tif err := a3.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"hup after apply: %v\", err)\n\t}\n\tmsgsA3 := a3.readMessages()\n\tcaEvent(t, \"hup_after_apply\", map[string]any{\n\t\t\"has_unapplied\": hasUnappliedAfter,\n\t\t\"state\":         a3.state.String(),\n\t\t\"term\":          a3.Term,\n\t\t\"vote\":          a3.Vote,\n\t\t\"msgs\":          len(msgsA3),\n\t\t\"vote_targets\":  voterIDs(msgsA3, pb.MsgVote),\n\t})\n\n\t// Control: no conf change in the log at the same position, applied < committed.\n\tc := mkConfChangeVoter(t, false)\n\tcaEvent(t, \"control_no_conf_change\", map[string]any{\n\t\t\"case\":          \"committed_unapplied_normal_entry\",\n\t\t\"promotable\":    c.promotable(),\n\t\t\"has_unapplied\": c.hasUnappliedConfChanges(),\n\t\t\"applied\":       c.raftLog.applied,\n\t\t\"committed\":     c.raftLog.committed,\n\t\t\"entry2_type\":   c.raftLog.allEntries()[1].GetType().String(),\n\t})\n\tif err := c.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"control hup: %v\", err)\n\t}\n\tmsgsC := c.readMessages()\n\tcaEvent(t, \"control_hup\", map[string]any{\n\t\t\"state\":        c.state.String(),\n\t\t\"term\":         c.Term,\n\t\t\"vote\":         c.Vote,\n\t\t\"msgs\":         len(msgsC),\n\t\t\"vote_targets\": voterIDs(msgsC, pb.MsgVote),\n\t})\n}\n\n// TestAssuranceReadIndexAcrossTermChange probes what happens to an admitted but\n// unconfirmed ReadOnlySafe read request when the leader's term changes before any\n// quorum acknowledgement arrives, and whether the confirmation path still works\n// for a read admitted after the new leader has committed in its own term.\nfunc TestAssuranceReadIndexAcrossTermChange(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnt := newNetwork(r1, r2, r3)\n\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgProp.Enum(), Entries: []*pb.Entry{{Data: []byte(\"op\")}}})\n\tcaEvent(t, \"stale_leader_state\", map[string]any{\n\t\t\"state\":                    r1.state.String(),\n\t\t\"term\":                     r1.Term,\n\t\t\"committed\":                r1.raftLog.committed,\n\t\t\"committed_entry_in_term\":  r1.committedEntryInCurrentTerm(),\n\t\t\"read_states\":              len(r1.readStates),\n\t\t\"unconfirmed_reads\":        len(r1.readOnly.unconfirmedReads),\n\t})\n\n\t// Admit a read request on the leader with no heartbeat responses delivered, so\n\t// no quorum acknowledgement can exist and the request cannot be confirmed.\n\tif err := r1.Step(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: []byte(\"A\")}}}); err != nil {\n\t\tt.Fatalf(\"readindex: %v\", err)\n\t}\n\tcaEvent(t, \"read_admitted\", map[string]any{\n\t\t\"read_states\":       len(r1.readStates),\n\t\t\"unconfirmed_reads\": len(r1.readOnly.unconfirmedReads),\n\t\t\"confirmed_reads\":   r1.readOnly.confirmedReads,\n\t\t\"commit_at_entry\":   r1.readOnly.unconfirmedReads[0].index,\n\t\t\"term\":              r1.Term,\n\t})\n\n\t// A real peer campaigns at a higher term; its MsgVote reaches r1.\n\tnt.send(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgHup.Enum()})\n\tvar ctxA []byte\n\tfor _, rs := range r1.readStates {\n\t\tif string(rs.RequestCtx) == \"A\" {\n\t\t\tctxA = rs.RequestCtx\n\t\t}\n\t}\n\tcaEvent(t, \"after_term_change\", map[string]any{\n\t\t\"state\":              r1.state.String(),\n\t\t\"term\":               r1.Term,\n\t\t\"vote\":               r1.Vote,\n\t\t\"read_states\":        len(r1.readStates),\n\t\t\"ctx_A_completed\":    ctxA != nil,\n\t\t\"unconfirmed_reads\":  len(r1.readOnly.unconfirmedReads),\n\t\t\"confirmed_reads\":    r1.readOnly.confirmedReads,\n\t\t\"new_leader_state\":   r2.state.String(),\n\t\t\"new_leader_term\":    r2.Term,\n\t})\n\n\t// Control: the new leader admits a read in its own term and a single peer ack\n\t// echoing the leader's heartbeat context confirms it.\n\t_ = r2.Step(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: []byte(\"B\")}}})\n\tvar hbCtx []byte\n\tfor _, m := range r2.readMessages() {\n\t\tif m.GetType() == pb.MsgHeartbeat && m.GetTo() == 3 {\n\t\t\thbCtx = m.GetContext()\n\t\t}\n\t}\n\tbeforeAck := len(r2.readStates)\n\tif err := r2.Step(&pb.Message{From: new(uint64(3)), Term: new(r2.Term), Type: pb.MsgHeartbeatResp.Enum(), Context: hbCtx}); err != nil {\n\t\tt.Fatalf(\"heartbeatresp: %v\", err)\n\t}\n\tvar idxB uint64\n\tvar gotB bool\n\tfor _, rs := range r2.readStates {\n\t\tif string(rs.RequestCtx) == \"B\" {\n\t\t\tidxB, gotB = rs.Index, true\n\t\t}\n\t}\n\tcaEvent(t, \"new_leader_read_confirmed\", map[string]any{\n\t\t\"read_states_before_ack\": beforeAck,\n\t\t\"read_states_after_ack\":  len(r2.readStates),\n\t\t\"ctx_B_completed\":        gotB,\n\t\t\"index_B\":                idxB,\n\t\t\"commit_now\":             r2.raftLog.committed,\n\t\t\"hb_ctx_set\":             len(hbCtx) != 0,\n\t})\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "s_raft_campaign",
+            "s_raft_conf",
+            "s_confchange",
+            "s_read_only",
+            "s_raft_readindex"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "One fixed harness with two sourced probes. Probe A (TestAssuranceCampaignWithUnappliedConfChange) covers the campaign admission guard: a voter built from MemoryStorage with entries [1]=normal and [2]=EntryConfChangeV2 at term 1, HardState.Commit=2 and Config.Applied=1, driven by MsgHup and by MsgTimeoutNow (term-carrying), then re-driven after raftLog.appliedTo(2,0); a control node has the same applied/committed gap but a normal entry at index 2. Probe B (TestAssuranceReadIndexAcrossTermChange) covers ReadOnlySafe completion across an authority change: elect a leader over a real 3-node in-process network, commit an entry in its term, admit a MsgReadIndex with no heartbeat responses delivered, then deliver a real higher-term campaign message from peer 2, and finally confirm a read admitted on the new leader with a single peer heartbeat response echoing the leader's context. Each case prints one CA_EVENT JSON line with the observed operands (state, term, vote, applied, committed, has_unapplied, unconfirmed_reads, confirmed_reads, read_states, vote targets, read index).",
+            "assumptions": [
+              "Both probes use the snapshot's own test facilities (newTestRaft/newTestConfig/newTestMemoryStorage/withPeers/newNetwork) in one process.",
+              "Probe A's supplied state is a real MemoryStorage prefix plus a HardState and Config.Applied=1, so the applied<committed gap is produced by the application lag the field models.",
+              "Probe B's authority change is produced by a real peer campaigning over the in-process network, not by calling an internal transition.",
+              "No production logic is modified."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "Probe A initializes a voter through newRaft(newTestConfig(1,10,1,ms)) with ms holding entries 1..2 and HardState{Term:1,Commit:2}, then steps MsgHup, then a second identical node steps MsgTimeoutNow{From:3,Term:r.Term}, then raftLog.appliedTo(2,0) followed by MsgHup, plus a control node whose entry 2 is normal. Probe B elects a leader with MsgHup through newNetwork, commits one proposal, admits MsgReadIndex{Entries:[{Data:\"A\"}]} directly on the leader, then lets peer 2 campaign via the network, and finally admits MsgReadIndex{Data:\"B\"} on the new leader and steps one MsgHeartbeatResp carrying the context of the leader's own heartbeat.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "f9dd630f8a1e49948dc10fabd0bcd05d",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "go.etcd.io/raft/v3",
+            "variant": "etcd_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "075c21493fd94adc9bdc30a30b2cbff1",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-interpretation-0",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Source-only reading of the count-based read-only flow. Positive part: positions are monotonically increasing counts (never reused for a later batch), acks are maxima, and a released read carries the commit index recorded at admission, so a confirmed read cannot be justified by acknowledgements collected for an earlier request; the leader's own ack is the admission position, so a majority echo is still required for confirmation, and pendingReadIndexMessages are answered only after the leader commits in its term, which can only raise the emitted index. Unresolved part: the term-change path. reset() replaces r.readOnly with a fresh instance (unconfirmed reads and acks dropped) while r.readStates is untouched, and releasePendingReadIndexMessages only replies when committedEntryInCurrentTerm() holds. I have not yet observed whether a read admitted just before a term change is dropped silently (a lost completion under a legal trigger) or answered later; the snapshot's own TestReadOnlyDuplicateRequest covers only the duplicate-ctx/delayed-heartbeat case and asserts indices are not too small, not that every admitted request completes.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The repo's own read-index selections (TestReadOnlyOptionSafe/Lease/WithLearner/ForNewLeader/DuplicateRequest, TestRaftFreesReadOnlyMem) pass in native local feedback, and TestReadOnlyDuplicateRequest explicitly asserts no too-small read index under delayed duplicate requests plus a leader change, which weakens the stale-index side of the suspicion."
+        ],
+        "limitations": [
+          "No retained execution receipt yet: the local test runs are construction feedback and cannot establish a formal conclusion.",
+          "Doc.go's Ready/Advance contract does not state that every admitted ReadIndex request must be answered, so a dropped request would have to be argued as a bounded-liveness consequence of an actual trigger rather than a contract violation."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-interpretation-1",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf",
+          "s_confchange"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Source-only reading of the campaign admission guard. hasUnappliedConfChanges scans (applied, committed] with pagination and returns true on the first conf-change entry; hup() then refuses to campaign, and promotable() independently refuses while a snapshot is pending/unstable. The guard is consistent with doc.go's statement that configurations take effect when applied, and with applyConfChange/switchToConfig which only reconfigure on application, so a node that campaigns while lagging application would otherwise campaign with a stale voter set. What remains open is whether the guard is complete for the paths that can present a stale voter set (restore from snapshot with only ConfState initialized, bootstrap with applied<committed, an application that rejects a change by zeroing NodeId, and MsgTimeoutNow where the guard also suppresses a requested transfer), and whether the suppression can be permanent for an otherwise eligible voter.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "No existing test references hasUnappliedConfChanges directly, so its behavior is currently only read from source; it must be probed with a real log/apply prefix rather than asserted."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "1be0cd91f8794334b730ae216d7d1020",
+      "result": {
+        "submission": "update.json",
+        "summary": "Interpreted the actual retained receipt for the fixed harness (CheckRun 238d3a23d8624c438b85ec18f90a7b2b: completed, tests_passed, exit 0, 10 parsed CA_EVENT observations, 0 parse errors) and closed out both registered questions as source-and-evidence explained with no defect asserted. Campaign admission (events 0-5): the node is promotable yet has_unapplied=true with applied=1/committed=2 and entry2_type=EntryConfChangeV2, and both MsgHup and the term-carrying MsgTimeoutNow leave it StateFollower(term 1) with 0 messages - the runner log shows the same suppression reason on both paths - while after raftLog.appliedTo(2,0) it becomes candidate at term 2 with MsgVote to voters [2,3], and the control with an identical applied/committed gap but a normal entry at index 2 campaigns immediately, so the suppression is keyed on the entry type and is transient rather than a stale-voter-set campaign. ReadIndex across a term change (events 6-9): the admitted request (unconfirmed_reads=1, admission commit=2) is dropped after the term change (read_states=0, ctx_A_completed=false, confirmed/ unconfirmed=0) rather than answered stale, the confirmation path still works on the new leader (ctx_B_completed=true with index_B=3 equal to the commit index at admission), and that lossiness is the caller duty the Node.ReadIndex contract already states. Both necessary gaps are answered resolved, two observed behaviors are promoted as execution-backed knowledge citing the exact receipt indices, and each interpretation carries its counterevidence and limits (direct Step of MsgReadIndex rather than the Node API, one term-change trigger, supplied Config.Applied for the store-level probe). I also extended the harness with a third case for the one boundary the two answers leave open - whether a leadership transfer requested for a transferee whose committed conf change is unapplied is a bounded cost or a lost duty - and requested a fresh isolated execution of that extended harness (probes A/B unchanged, probe C added; no previous_id because this investigation has no predecessor experiment). Draft-side that probe showed leadTransferee set while the transferee stays follower, ErrProposalDropped during the window, leadTransferee cleared after one electionTimeout with the leader still leader and proposals accepted again, and the retry completing once the transferee's applied index caught up, but those operands are construction feedback only and await the receipt."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-c6f44be10c0445b7a091b7db545cd614": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_19-34-26-etcd_raft-real-run/semantic-commits/submission-c6f44be10c0445b7a091b7db545cd614.json"
+      },
+      "submission-075c21493fd94adc9bdc30a30b2cbff1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_19-34-26-etcd_raft-real-run/semantic-commits/submission-075c21493fd94adc9bdc30a30b2cbff1.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "version": 1,
+        "question": "In this snapshot, ReadOnlySafe confirmation is count-based rather than commit-index-based (read_only.go addRequest/recvAck/maybeAdvance/heartbeatCtx with confirmedReads, driven from stepLeader MsgHeartbeatResp and sendMsgReadIndexResponse). Which conditions establish that a released ReadState carries an index at least as new as the commit index at the moment the request was admitted, and what happens to still-unconfirmed reads when the leader's term changes (reset() rebuilds readOnly) or when the leader is a fresh leader that has not yet committed an entry in its term (pendingReadIndexMessages)?",
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader",
+          "s_raft_conf"
+        ],
+        "hypothesis": "A released read index is never smaller than the commit index recorded at admission of that read request, because positions are monotonic counts and acks are per-voter maxima; the open risk is a lost completion (request dropped by reset/term change) rather than a stale index.",
+        "discriminator": "Drive a real 3-node cluster in one process: elect a leader, admit a read request (MsgReadIndex via Step), delay only MsgHeartbeatResp so no quorum ack exists yet, then remove the leader (isolate) and elect a new leader that commits an entry. Deliver the delayed heartbeat responses to the stale leader and record every ReadState and every dropped request. Expected if the count-based claim holds: no ReadState is emitted whose Index is below the commit index at admission; expected counter-shape: an emitted ReadState with a too-small Index (stale read) or a request that is silently never answered after the leader's term changed (lost completion).",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "c6f44be10c0445b7a091b7db545cd614-gap-0",
+            "question": "Is an unconfirmed ReadIndex request answered, dropped, or answered with a stale index when the leader loses its term between admission and quorum acknowledgement, and which of those outcomes is observable from the ReadState stream?",
+            "experiment_id": null,
+            "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+          }
+        ],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "version": 1,
+        "question": "hup() refuses to campaign whenever hasUnappliedConfChanges() is true, i.e. whenever any entry in (applied, committed] is an EntryConfChange/EntryConfChangeV2, and promotable() additionally vetoes campaign while an unstable or in-progress snapshot exists. No existing test references hasUnappliedConfChanges directly. Which permitted histories leave a node with committed-but-unapplied configuration entries, and can such a node campaign with a voter set that does not include its own committed configuration (for example after restoring a snapshot, after ReadIndex-style lag in application, or when the application rejects a config change by zeroing NodeId)?",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf",
+          "s_confchange",
+          "s_node"
+        ],
+        "hypothesis": "The guard is a deliberate safety measure (campaign only with an applied configuration) and is correct for the paths it covers, but its interaction with (a) applied<committed gaps created by the application, (b) MsgTimeoutNow-triggered campaigning, and (c) restore/bootstrap paths is untested and may either block a legal transfer or admit a campaign with a stale voter set.",
+        "discriminator": "Construct a voter whose storage holds a committed EntryConfChangeV2 that the application has not applied (Config.Applied below committed) and whose stored ConfState predates it, then (i) tick into an election timeout and (ii) deliver MsgTimeoutNow, and read back whether it becomes candidate, which voter IDs it addresses in the MsgVote/MsgPreVote messages, and which quorum quorum.VoteResult uses; the alternative outcome to distinguish is a campaign that proceeds despite the unapplied change, or a permanent inability to campaign after the application refuses the change.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "c6f44be10c0445b7a091b7db545cd614-gap-1",
+            "question": "With a committed-but-unapplied conf change in the log, does the node refrain from campaigning (and if so, is a later campaign possible once application catches up), and which voter set would a campaign use if it did proceed?",
+            "experiment_id": null,
+            "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+          }
+        ],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-question-0",
+        "version": 1,
+        "question": "The campaign guard is verified to suppress a MsgTimeoutNow-triggered campaign when the transferee has a committed-but-unapplied conf change (CheckRun 238d3a23d8624c438b85ec18f90a7b2b events 0-2). Which observable sequence follows for a requested leadership transfer whose transferee lags application: does the leader keep sending MsgTimeoutNow/MsgApp until tickHeartbeat aborts the transfer at the election timeout, can the cluster still make progress through the existing leader in the meantime (proposals dropped while leadTransferee != None), and is a later transfer possible once the transferee's application catches up? This is the bounded-liveness side of the same guard, where a duty the leader explicitly accepted (transfer) cannot complete and the leader also refuses proposals.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_leader",
+          "s_raft_conf"
+        ],
+        "hypothesis": "The transfer neither completes nor deadlocks: the transferee refuses to campaign while the conf change is unapplied, the leader keeps proposing the transfer (and drops new proposals) until its election timeout elapses, then abortLeaderTransfer() clears leadTransferee and proposals resume, so the cost is bounded by one election timeout and the transfer can be retried after the transformer catches up.",
+        "discriminator": "In one process, elect a 3-node leader, give the transferee a committed-but-unapplied conf-change entry (applied < committed) via its storage/HardState and Config.Applied, call TransferLeader to it, then tick the leader past its election timeout and record: whether MsgTimeoutNow was sent, whether MsgProp is rejected with ErrProposalDropped while leadTransferee != None, whether leadTransferee is cleared after the timeout, and whether a second TransferLeader attempt after applying the entry completes with the transferee campaigning at term+1. Expected if the claim holds: transfer aborted within one election timeout, proposals accepted again afterwards, second attempt succeeding after application catches up; the alternative to distinguish is a forever-pending transfer (leadTransferee never cleared or proposals permanently dropped) or a transfer that completes with a stale voter set.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "campaign() enumerates only r.trk.Voters.IDs() and sends the self-vote as a self-addressed MsgVoteResp/MsgPreVoteResp through r.send, which routes vote responses into msgsAfterAppend so the self-vote is counted only after the term/vote is durable; poll() records the first vote seen per ID via ProgressTracker.RecordVote and TallyVotes returns Voters.VoteResult over the joint config, so a joint quorum requires a majority in both halves and learners or IDs outside the config contribute no votes.",
+        "conditions": "State machine in StateCandidate/StatePreCandidate after campaign() or campaignPreElection(); CheckQuorum/PreVote per Config.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_send",
+          "s_tracker",
+          "s_quorum_majority",
+          "s_quorum_joint"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "ReadOnlySafe read confirmation is count-based: readOnly.addRequest appends the request with the commit index observed at admission, heartbeatCtx encodes confirmedReads+len(unconfirmedReads) as an 8-byte little-endian position, recvAck stores per-voter maxima of echoed positions (including the leader's own ack taken immediately in sendMsgReadIndexResponse), and maybeAdvance releases a prefix of unconfirmedReads only when quorum.CommittedIndex over those per-voter positions covers it. The leader postpones MsgReadIndex into pendingReadIndexMessages while it has not committed an entry in its current term, and reset() (any term change) discards readOnly together with all unconfirmed reads and acks.",
+        "conditions": "ReadOnlyOption=ReadOnlySafe on a leader; the release happens in stepLeader's MsgHeartbeatResp path after readOnly.recvAck.",
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "hup() returns without campaigning when the node is unpromotable (not in the progress map, learner, or holding an unstable/in-progress snapshot) or when hasUnappliedConfChanges() finds an EntryConfChange/EntryConfChangeV2 in the index range (applied, committed]; the same guard therefore also applies to the leadership-transfer path, which reaches campaign() only through MsgTimeoutNow -> hup(campaignTransfer).",
+        "conditions": "Any MsgHup, whether from tickElection or from MsgTimeoutNow on a follower, at the term and log state of the node.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Probe C of the extended harness drives the bounded-liveness side of the campaign guard: a 3-node leader (term 1, committed 2) with a committed ConfChangeV2 learner addition replicated to follower r2 (applied=0, committed=2, hasUnappliedConfChanges=true, leader's Match for r2 == lastIndex) accepts a TransferLeader request to r2 by setting leadTransferee=2 while r2 stays StateFollower(term 1), rejects a proposal with ErrProposalDropped during that window, clears leadTransferee to 0 after electionTimeout ticks with the leader still StateLeader(term 1) and accepts proposals again, and completes the retry (r2 StateLeader term 2, former leader StateFollower term 2) once the transferee's applied index reaches its committed index. This is a regressed construction note from the draft-side run pending the receipt requested this turn, so it is recorded as behavior under stated conditions rather than as an observed defect.",
+        "conditions": "Local construction run of draft/assurance_generated_test.go (Probe C) against the captured snapshot before the isolated execution requested in this submission; no controller receipt exists yet for these operands.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_leader",
+          "s_raft_conf"
+        ],
+        "executions": {},
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+            "revision": 1,
+            "assertion": "the campaign guard also suppresses the leadership-transfer path reached through MsgTimeoutNow"
+          }
+        ],
+        "history": [],
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020"
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Observed: a voter whose committed-but-unapplied entry is an EntryConfChangeV2 (references: has_unapplied=true with applied=1, committed=2, entry2_type=EntryConfChangeV2, promotable=true) remains in StateFollower with term=1 and emits no messages both on MsgHup and on a term-carrying MsgTimeoutNow, while the same node after raftLog.appliedTo(2,0) reports has_unapplied=false and campaigns (StateCandidate, term=2, vote=1, MsgVote addressed to voters [2,3]); the control node with a normal entry at index 2 and the same applied=1/committed=2 gap reports has_unapplied=false and campaigns immediately. The suppression therefore depends on the entry type in (applied, committed], not on the applied/committed gap as such, and it ends as soon as raft's applied index covers the entry.",
+        "conditions": "Voter built from MemoryStorage entries [1]=EntryNormal, [2]=EntryConfChangeV2 at term 1 with HardState{Term:1,Commit:2} and Config.Applied=1; triggered by MsgHup and by MsgTimeoutNow{From:3,Term:1}; control with a normal entry at index 2.",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+            "revision": 1,
+            "assertion": "hup() refuses to campaign on both the time-based and the leadership-transfer path while hasUnappliedConfChanges() is true"
+          }
+        ],
+        "history": [],
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020"
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Observed: a leader that has committed an entry in its term (committed=2, committed_entry_in_term=true) admits a MsgReadIndex request (unconfirmed_reads=1, read_states=0, admission commit index 2); after a real peer campaign at term 2 the same node is StateFollower(term=2) with read_states=0, ctx_A_completed=false, unconfirmed_reads=0 and confirmed_reads=0, i.e. the admitted request is dropped without any completion or staleness signal. The control shows the confirmation path still works after the authority change: a read admitted on the new leader (index_B=3, commit_now=3) is released with read_states_before_ack=0, read_states_after_ack=1 and ctx_B_completed=true once one peer heartbeat response echoing the leader's context arrives.",
+        "conditions": "Three-node in-process network (newNetwork over newTestRaft with withPeers(1,2,3)); leader elected by MsgHup, one proposal committed, MsgReadIndex stepped directly into the leader with no heartbeat responses delivered, then peer 2 campaigns via the network; the control read is admitted on the new leader and confirmed by a single MsgHeartbeatResp carrying the leader's heartbeat context.",
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-1",
+            "revision": 1,
+            "assertion": "reset() on a term change discards readOnly together with all unconfirmed reads and acks"
+          }
+        ],
+        "history": [],
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "075c21493fd94adc9bdc30a30b2cbff1-experiment",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"google.golang.org/protobuf/proto\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc caEvent(t *testing.T, kind string, fields map[string]any) {\n\tt.Helper()\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// mkConfChangeVoter builds a voter (id=1) whose storage holds entries [1]=normal,\n// [2]=entry of the requested type at term 1, a HardState committing index 2, and a\n// Config that has applied only index 1 (so applied < committed).\nfunc mkConfChangeVoter(t *testing.T, secondIsConfChange bool) *raft {\n\tt.Helper()\n\tcc := &pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{{\n\t\tType:   pb.ConfChangeAddNode.Enum(),\n\t\tNodeId: new(uint64(4)),\n\t}}}\n\tdata, err := proto.Marshal(cc)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tms := newTestMemoryStorage(withPeers(1, 2, 3))\n\tents := []*pb.Entry{{Term: new(uint64(1)), Index: new(uint64(1))}}\n\tif secondIsConfChange {\n\t\tents = append(ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(2)), Type: pb.EntryConfChangeV2.Enum(), Data: data})\n\t} else {\n\t\tents = append(ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(2))})\n\t}\n\tif err := ms.Append(ents); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tif err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Vote: new(uint64(0)), Commit: new(uint64(2))}); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tcfg := newTestConfig(1, 10, 1, ms)\n\tcfg.Applied = 1 // index 2 is committed but not applied\n\treturn newRaft(cfg)\n}\n\n// TestAssuranceCampaignWithUnappliedConfChange probes whether a voter with a\n// committed-but-unapplied conf change campaigns on MsgHup / MsgTimeoutNow, which\n// voter set it would use, and whether it can campaign once application catches up.\nfunc TestAssuranceCampaignWithUnappliedConfChange(t *testing.T) {\n\tvoterIDs := func(msgs []*pb.Message, typ pb.MessageType) []uint64 {\n\t\tvar ids []uint64\n\t\tfor _, m := range msgs {\n\t\t\tif m.GetType() == typ {\n\t\t\t\tids = append(ids, m.GetTo())\n\t\t\t}\n\t\t}\n\t\treturn ids\n\t}\n\n\t// Case A: conf-change entry committed but unapplied.\n\ta := mkConfChangeVoter(t, true)\n\tcaEvent(t, \"unapplied_conf_change\", map[string]any{\n\t\t\"case\":                \"committed_unapplied_v2\",\n\t\t\"promotable\":          a.promotable(),\n\t\t\"has_unapplied\":       a.hasUnappliedConfChanges(),\n\t\t\"applied\":             a.raftLog.applied,\n\t\t\"committed\":           a.raftLog.committed,\n\t\t\"state_before\":        a.state.String(),\n\t\t\"voters_before\":       a.trk.VoterNodes(),\n\t\t\"entry2_type\":         a.raftLog.allEntries()[1].GetType().String(),\n\t\t\"cfg_applied_note\":    \"newRaft applied Config.Applied=1\",\n\t})\n\tif err := a.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"hup: %v\", err)\n\t}\n\tmsgsA := a.readMessages()\n\tcaEvent(t, \"hup_with_unapplied\", map[string]any{\n\t\t\"state\":        a.state.String(),\n\t\t\"term\":         a.Term,\n\t\t\"vote\":         a.Vote,\n\t\t\"msgs\":         len(msgsA),\n\t\t\"vote_targets\": voterIDs(msgsA, pb.MsgVote),\n\t})\n\n\t// Case A2: same node, leadership-transfer trigger (MsgTimeoutNow carries the term).\n\ta2 := mkConfChangeVoter(t, true)\n\tif err := a2.Step(&pb.Message{From: new(uint64(3)), Term: new(a2.Term), Type: pb.MsgTimeoutNow.Enum()}); err != nil {\n\t\tt.Fatalf(\"timeoutnow: %v\", err)\n\t}\n\tmsgsA2 := a2.readMessages()\n\tcaEvent(t, \"timeoutnow_with_unapplied\", map[string]any{\n\t\t\"state\":        a2.state.String(),\n\t\t\"term\":         a2.Term,\n\t\t\"msgs\":         len(msgsA2),\n\t\t\"vote_targets\": voterIDs(msgsA2, pb.MsgVote),\n\t})\n\n\t// Case A3: same node after the application catches up (applied == committed).\n\ta3 := mkConfChangeVoter(t, true)\n\ta3.raftLog.appliedTo(2, 0)\n\thasUnappliedAfter := a3.hasUnappliedConfChanges()\n\tif err := a3.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"hup after apply: %v\", err)\n\t}\n\tmsgsA3 := a3.readMessages()\n\tcaEvent(t, \"hup_after_apply\", map[string]any{\n\t\t\"has_unapplied\": hasUnappliedAfter,\n\t\t\"state\":         a3.state.String(),\n\t\t\"term\":          a3.Term,\n\t\t\"vote\":          a3.Vote,\n\t\t\"msgs\":          len(msgsA3),\n\t\t\"vote_targets\":  voterIDs(msgsA3, pb.MsgVote),\n\t})\n\n\t// Control: no conf change in the log at the same position, applied < committed.\n\tc := mkConfChangeVoter(t, false)\n\tcaEvent(t, \"control_no_conf_change\", map[string]any{\n\t\t\"case\":          \"committed_unapplied_normal_entry\",\n\t\t\"promotable\":    c.promotable(),\n\t\t\"has_unapplied\": c.hasUnappliedConfChanges(),\n\t\t\"applied\":       c.raftLog.applied,\n\t\t\"committed\":     c.raftLog.committed,\n\t\t\"entry2_type\":   c.raftLog.allEntries()[1].GetType().String(),\n\t})\n\tif err := c.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"control hup: %v\", err)\n\t}\n\tmsgsC := c.readMessages()\n\tcaEvent(t, \"control_hup\", map[string]any{\n\t\t\"state\":        c.state.String(),\n\t\t\"term\":         c.Term,\n\t\t\"vote\":         c.Vote,\n\t\t\"msgs\":         len(msgsC),\n\t\t\"vote_targets\": voterIDs(msgsC, pb.MsgVote),\n\t})\n}\n\n// TestAssuranceReadIndexAcrossTermChange probes what happens to an admitted but\n// unconfirmed ReadOnlySafe read request when the leader's term changes before any\n// quorum acknowledgement arrives, and whether the confirmation path still works\n// for a read admitted after the new leader has committed in its own term.\nfunc TestAssuranceReadIndexAcrossTermChange(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnt := newNetwork(r1, r2, r3)\n\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgProp.Enum(), Entries: []*pb.Entry{{Data: []byte(\"op\")}}})\n\tcaEvent(t, \"stale_leader_state\", map[string]any{\n\t\t\"state\":                    r1.state.String(),\n\t\t\"term\":                     r1.Term,\n\t\t\"committed\":                r1.raftLog.committed,\n\t\t\"committed_entry_in_term\":  r1.committedEntryInCurrentTerm(),\n\t\t\"read_states\":              len(r1.readStates),\n\t\t\"unconfirmed_reads\":        len(r1.readOnly.unconfirmedReads),\n\t})\n\n\t// Admit a read request on the leader with no heartbeat responses delivered, so\n\t// no quorum acknowledgement can exist and the request cannot be confirmed.\n\tif err := r1.Step(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: []byte(\"A\")}}}); err != nil {\n\t\tt.Fatalf(\"readindex: %v\", err)\n\t}\n\tcaEvent(t, \"read_admitted\", map[string]any{\n\t\t\"read_states\":       len(r1.readStates),\n\t\t\"unconfirmed_reads\": len(r1.readOnly.unconfirmedReads),\n\t\t\"confirmed_reads\":   r1.readOnly.confirmedReads,\n\t\t\"commit_at_entry\":   r1.readOnly.unconfirmedReads[0].index,\n\t\t\"term\":              r1.Term,\n\t})\n\n\t// A real peer campaigns at a higher term; its MsgVote reaches r1.\n\tnt.send(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgHup.Enum()})\n\tvar ctxA []byte\n\tfor _, rs := range r1.readStates {\n\t\tif string(rs.RequestCtx) == \"A\" {\n\t\t\tctxA = rs.RequestCtx\n\t\t}\n\t}\n\tcaEvent(t, \"after_term_change\", map[string]any{\n\t\t\"state\":              r1.state.String(),\n\t\t\"term\":               r1.Term,\n\t\t\"vote\":               r1.Vote,\n\t\t\"read_states\":        len(r1.readStates),\n\t\t\"ctx_A_completed\":    ctxA != nil,\n\t\t\"unconfirmed_reads\":  len(r1.readOnly.unconfirmedReads),\n\t\t\"confirmed_reads\":    r1.readOnly.confirmedReads,\n\t\t\"new_leader_state\":   r2.state.String(),\n\t\t\"new_leader_term\":    r2.Term,\n\t})\n\n\t// Control: the new leader admits a read in its own term and a single peer ack\n\t// echoing the leader's heartbeat context confirms it.\n\t_ = r2.Step(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: []byte(\"B\")}}})\n\tvar hbCtx []byte\n\tfor _, m := range r2.readMessages() {\n\t\tif m.GetType() == pb.MsgHeartbeat && m.GetTo() == 3 {\n\t\t\thbCtx = m.GetContext()\n\t\t}\n\t}\n\tbeforeAck := len(r2.readStates)\n\tif err := r2.Step(&pb.Message{From: new(uint64(3)), Term: new(r2.Term), Type: pb.MsgHeartbeatResp.Enum(), Context: hbCtx}); err != nil {\n\t\tt.Fatalf(\"heartbeatresp: %v\", err)\n\t}\n\tvar idxB uint64\n\tvar gotB bool\n\tfor _, rs := range r2.readStates {\n\t\tif string(rs.RequestCtx) == \"B\" {\n\t\t\tidxB, gotB = rs.Index, true\n\t\t}\n\t}\n\tcaEvent(t, \"new_leader_read_confirmed\", map[string]any{\n\t\t\"read_states_before_ack\": beforeAck,\n\t\t\"read_states_after_ack\":  len(r2.readStates),\n\t\t\"ctx_B_completed\":        gotB,\n\t\t\"index_B\":                idxB,\n\t\t\"commit_now\":             r2.raftLog.committed,\n\t\t\"hb_ctx_set\":             len(hbCtx) != 0,\n\t})\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "s_raft_campaign",
+            "s_raft_conf",
+            "s_confchange",
+            "s_read_only",
+            "s_raft_readindex"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "One fixed harness with two sourced probes. Probe A (TestAssuranceCampaignWithUnappliedConfChange) covers the campaign admission guard: a voter built from MemoryStorage with entries [1]=normal and [2]=EntryConfChangeV2 at term 1, HardState.Commit=2 and Config.Applied=1, driven by MsgHup and by MsgTimeoutNow (term-carrying), then re-driven after raftLog.appliedTo(2,0); a control node has the same applied/committed gap but a normal entry at index 2. Probe B (TestAssuranceReadIndexAcrossTermChange) covers ReadOnlySafe completion across an authority change: elect a leader over a real 3-node in-process network, commit an entry in its term, admit a MsgReadIndex with no heartbeat responses delivered, then deliver a real higher-term campaign message from peer 2, and finally confirm a read admitted on the new leader with a single peer heartbeat response echoing the leader's context. Each case prints one CA_EVENT JSON line with the observed operands (state, term, vote, applied, committed, has_unapplied, unconfirmed_reads, confirmed_reads, read_states, vote targets, read index).",
+            "assumptions": [
+              "Both probes use the snapshot's own test facilities (newTestRaft/newTestConfig/newTestMemoryStorage/withPeers/newNetwork) in one process.",
+              "Probe A's supplied state is a real MemoryStorage prefix plus a HardState and Config.Applied=1, so the applied<committed gap is produced by the application lag the field models.",
+              "Probe B's authority change is produced by a real peer campaigning over the in-process network, not by calling an internal transition.",
+              "No production logic is modified."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "Probe A initializes a voter through newRaft(newTestConfig(1,10,1,ms)) with ms holding entries 1..2 and HardState{Term:1,Commit:2}, then steps MsgHup, then a second identical node steps MsgTimeoutNow{From:3,Term:r.Term}, then raftLog.appliedTo(2,0) followed by MsgHup, plus a control node whose entry 2 is normal. Probe B elects a leader with MsgHup through newNetwork, commits one proposal, admits MsgReadIndex{Entries:[{Data:\"A\"}]} directly on the leader, then lets peer 2 campaign via the network, and finally admits MsgReadIndex{Data:\"B\"} on the new leader and steps one MsgHeartbeatResp carrying the context of the leader's own heartbeat.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "f9dd630f8a1e49948dc10fabd0bcd05d",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "go.etcd.io/raft/v3",
+            "variant": "etcd_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "075c21493fd94adc9bdc30a30b2cbff1",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-experiment",
+        "investigation_id": "1be0cd91f8794334b730ae216d7d1020-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"google.golang.org/protobuf/proto\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc caEvent(t *testing.T, kind string, fields map[string]any) {\n\tt.Helper()\n\tfields[\"event\"] = kind\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// mkConfChangeVoter builds a voter (id=1) whose storage holds entries [1]=normal,\n// [2]=entry of the requested type at term 1, a HardState committing index 2, and a\n// Config that has applied only index 1 (so applied < committed).\nfunc mkConfChangeVoter(t *testing.T, secondIsConfChange bool) *raft {\n\tt.Helper()\n\tcc := &pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{{\n\t\tType:   pb.ConfChangeAddNode.Enum(),\n\t\tNodeId: new(uint64(4)),\n\t}}}\n\tdata, err := proto.Marshal(cc)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tms := newTestMemoryStorage(withPeers(1, 2, 3))\n\tents := []*pb.Entry{{Term: new(uint64(1)), Index: new(uint64(1))}}\n\tif secondIsConfChange {\n\t\tents = append(ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(2)), Type: pb.EntryConfChangeV2.Enum(), Data: data})\n\t} else {\n\t\tents = append(ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(2))})\n\t}\n\tif err := ms.Append(ents); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tif err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Vote: new(uint64(0)), Commit: new(uint64(2))}); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tcfg := newTestConfig(1, 10, 1, ms)\n\tcfg.Applied = 1 // index 2 is committed but not applied\n\treturn newRaft(cfg)\n}\n\n// TestAssuranceCampaignWithUnappliedConfChange probes whether a voter with a\n// committed-but-unapplied conf change campaigns on MsgHup / MsgTimeoutNow, which\n// voter set it would use, and whether it can campaign once application catches up.\nfunc TestAssuranceCampaignWithUnappliedConfChange(t *testing.T) {\n\tvoterIDs := func(msgs []*pb.Message, typ pb.MessageType) []uint64 {\n\t\tvar ids []uint64\n\t\tfor _, m := range msgs {\n\t\t\tif m.GetType() == typ {\n\t\t\t\tids = append(ids, m.GetTo())\n\t\t\t}\n\t\t}\n\t\treturn ids\n\t}\n\n\t// Case A: conf-change entry committed but unapplied.\n\ta := mkConfChangeVoter(t, true)\n\tcaEvent(t, \"unapplied_conf_change\", map[string]any{\n\t\t\"case\":                \"committed_unapplied_v2\",\n\t\t\"promotable\":          a.promotable(),\n\t\t\"has_unapplied\":       a.hasUnappliedConfChanges(),\n\t\t\"applied\":             a.raftLog.applied,\n\t\t\"committed\":           a.raftLog.committed,\n\t\t\"state_before\":        a.state.String(),\n\t\t\"voters_before\":       a.trk.VoterNodes(),\n\t\t\"entry2_type\":         a.raftLog.allEntries()[1].GetType().String(),\n\t\t\"cfg_applied_note\":    \"newRaft applied Config.Applied=1\",\n\t})\n\tif err := a.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"hup: %v\", err)\n\t}\n\tmsgsA := a.readMessages()\n\tcaEvent(t, \"hup_with_unapplied\", map[string]any{\n\t\t\"state\":        a.state.String(),\n\t\t\"term\":         a.Term,\n\t\t\"vote\":         a.Vote,\n\t\t\"msgs\":         len(msgsA),\n\t\t\"vote_targets\": voterIDs(msgsA, pb.MsgVote),\n\t})\n\n\t// Case A2: same node, leadership-transfer trigger (MsgTimeoutNow carries the term).\n\ta2 := mkConfChangeVoter(t, true)\n\tif err := a2.Step(&pb.Message{From: new(uint64(3)), Term: new(a2.Term), Type: pb.MsgTimeoutNow.Enum()}); err != nil {\n\t\tt.Fatalf(\"timeoutnow: %v\", err)\n\t}\n\tmsgsA2 := a2.readMessages()\n\tcaEvent(t, \"timeoutnow_with_unapplied\", map[string]any{\n\t\t\"state\":        a2.state.String(),\n\t\t\"term\":         a2.Term,\n\t\t\"msgs\":         len(msgsA2),\n\t\t\"vote_targets\": voterIDs(msgsA2, pb.MsgVote),\n\t})\n\n\t// Case A3: same node after the application catches up (applied == committed).\n\ta3 := mkConfChangeVoter(t, true)\n\ta3.raftLog.appliedTo(2, 0)\n\thasUnappliedAfter := a3.hasUnappliedConfChanges()\n\tif err := a3.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"hup after apply: %v\", err)\n\t}\n\tmsgsA3 := a3.readMessages()\n\tcaEvent(t, \"hup_after_apply\", map[string]any{\n\t\t\"has_unapplied\": hasUnappliedAfter,\n\t\t\"state\":         a3.state.String(),\n\t\t\"term\":          a3.Term,\n\t\t\"vote\":          a3.Vote,\n\t\t\"msgs\":          len(msgsA3),\n\t\t\"vote_targets\":  voterIDs(msgsA3, pb.MsgVote),\n\t})\n\n\t// Control: no conf change in the log at the same position, applied < committed.\n\tc := mkConfChangeVoter(t, false)\n\tcaEvent(t, \"control_no_conf_change\", map[string]any{\n\t\t\"case\":          \"committed_unapplied_normal_entry\",\n\t\t\"promotable\":    c.promotable(),\n\t\t\"has_unapplied\": c.hasUnappliedConfChanges(),\n\t\t\"applied\":       c.raftLog.applied,\n\t\t\"committed\":     c.raftLog.committed,\n\t\t\"entry2_type\":   c.raftLog.allEntries()[1].GetType().String(),\n\t})\n\tif err := c.Step(&pb.Message{From: new(uint64(1)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"control hup: %v\", err)\n\t}\n\tmsgsC := c.readMessages()\n\tcaEvent(t, \"control_hup\", map[string]any{\n\t\t\"state\":        c.state.String(),\n\t\t\"term\":         c.Term,\n\t\t\"vote\":         c.Vote,\n\t\t\"msgs\":         len(msgsC),\n\t\t\"vote_targets\": voterIDs(msgsC, pb.MsgVote),\n\t})\n}\n\n// TestAssuranceReadIndexAcrossTermChange probes what happens to an admitted but\n// unconfirmed ReadOnlySafe read request when the leader's term changes before any\n// quorum acknowledgement arrives, and whether the confirmation path still works\n// for a read admitted after the new leader has committed in its own term.\nfunc TestAssuranceReadIndexAcrossTermChange(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnt := newNetwork(r1, r2, r3)\n\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgProp.Enum(), Entries: []*pb.Entry{{Data: []byte(\"op\")}}})\n\tcaEvent(t, \"stale_leader_state\", map[string]any{\n\t\t\"state\":                    r1.state.String(),\n\t\t\"term\":                     r1.Term,\n\t\t\"committed\":                r1.raftLog.committed,\n\t\t\"committed_entry_in_term\":  r1.committedEntryInCurrentTerm(),\n\t\t\"read_states\":              len(r1.readStates),\n\t\t\"unconfirmed_reads\":        len(r1.readOnly.unconfirmedReads),\n\t})\n\n\t// Admit a read request on the leader with no heartbeat responses delivered, so\n\t// no quorum acknowledgement can exist and the request cannot be confirmed.\n\tif err := r1.Step(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: []byte(\"A\")}}}); err != nil {\n\t\tt.Fatalf(\"readindex: %v\", err)\n\t}\n\tcaEvent(t, \"read_admitted\", map[string]any{\n\t\t\"read_states\":       len(r1.readStates),\n\t\t\"unconfirmed_reads\": len(r1.readOnly.unconfirmedReads),\n\t\t\"confirmed_reads\":   r1.readOnly.confirmedReads,\n\t\t\"commit_at_entry\":   r1.readOnly.unconfirmedReads[0].index,\n\t\t\"term\":              r1.Term,\n\t})\n\n\t// A real peer campaigns at a higher term; its MsgVote reaches r1.\n\tnt.send(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgHup.Enum()})\n\tvar ctxA []byte\n\tfor _, rs := range r1.readStates {\n\t\tif string(rs.RequestCtx) == \"A\" {\n\t\t\tctxA = rs.RequestCtx\n\t\t}\n\t}\n\tcaEvent(t, \"after_term_change\", map[string]any{\n\t\t\"state\":              r1.state.String(),\n\t\t\"term\":               r1.Term,\n\t\t\"vote\":               r1.Vote,\n\t\t\"read_states\":        len(r1.readStates),\n\t\t\"ctx_A_completed\":    ctxA != nil,\n\t\t\"unconfirmed_reads\":  len(r1.readOnly.unconfirmedReads),\n\t\t\"confirmed_reads\":    r1.readOnly.confirmedReads,\n\t\t\"new_leader_state\":   r2.state.String(),\n\t\t\"new_leader_term\":    r2.Term,\n\t})\n\n\t// Control: the new leader admits a read in its own term and a single peer ack\n\t// echoing the leader's heartbeat context confirms it.\n\t_ = r2.Step(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: []byte(\"B\")}}})\n\tvar hbCtx []byte\n\tfor _, m := range r2.readMessages() {\n\t\tif m.GetType() == pb.MsgHeartbeat && m.GetTo() == 3 {\n\t\t\thbCtx = m.GetContext()\n\t\t}\n\t}\n\tbeforeAck := len(r2.readStates)\n\tif err := r2.Step(&pb.Message{From: new(uint64(3)), Term: new(r2.Term), Type: pb.MsgHeartbeatResp.Enum(), Context: hbCtx}); err != nil {\n\t\tt.Fatalf(\"heartbeatresp: %v\", err)\n\t}\n\tvar idxB uint64\n\tvar gotB bool\n\tfor _, rs := range r2.readStates {\n\t\tif string(rs.RequestCtx) == \"B\" {\n\t\t\tidxB, gotB = rs.Index, true\n\t\t}\n\t}\n\tcaEvent(t, \"new_leader_read_confirmed\", map[string]any{\n\t\t\"read_states_before_ack\": beforeAck,\n\t\t\"read_states_after_ack\":  len(r2.readStates),\n\t\t\"ctx_B_completed\":        gotB,\n\t\t\"index_B\":                idxB,\n\t\t\"commit_now\":             r2.raftLog.committed,\n\t\t\"hb_ctx_set\":             len(hbCtx) != 0,\n\t})\n}\n\n// TestAssuranceTransferWithLaggingTransferee probes the bounded-liveness side of\n// the campaign admission guard: a leadership transfer requested to a transferee\n// whose committed conf change is still unapplied cannot complete, so the leader\n// must keep the duty bounded (drop proposals only while the transfer is pending,\n// abort at the election timeout) and the transfer must become possible once the\n// transferee's application catches up.\nfunc TestAssuranceTransferWithLaggingTransferee(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnt := newNetwork(r1, r2, r3)\n\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\tcc := &pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{{\n\t\tType:   pb.ConfChangeAddLearnerNode.Enum(),\n\t\tNodeId: new(uint64(4)),\n\t}}}\n\tmsg, err := confChangeToMsg(cc)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgProp.Enum(), Entries: msg.GetEntries()})\n\n\tcaEvent(t, \"pre_transfer\", map[string]any{\n\t\t\"leader_state\":      r1.state.String(),\n\t\t\"leader_term\":       r1.Term,\n\t\t\"leader_committed\":  r1.raftLog.committed,\n\t\t\"r2_state\":          r2.state.String(),\n\t\t\"r2_applied\":        r2.raftLog.applied,\n\t\t\"r2_committed\":      r2.raftLog.committed,\n\t\t\"r2_has_unapplied\":  r2.hasUnappliedConfChanges(),\n\t\t\"r2_last_index\":     r2.raftLog.lastIndex(),\n\t\t\"r1_match_r2\":       r1.trk.Progress[2].Match,\n\t\t\"r1_last_index\":     r1.raftLog.lastIndex(),\n\t})\n\n\t// Ask the leader to transfer to the lagging follower.\n\tnt.send(&pb.Message{From: new(uint64(2)), To: new(uint64(1)), Type: pb.MsgTransferLeader.Enum(), Term: new(r1.Term)})\n\tcaEvent(t, \"transfer_attempt\", map[string]any{\n\t\t\"lead_transferee\":   r1.leadTransferee,\n\t\t\"leader_state\":      r1.state.String(),\n\t\t\"transferee_state\":  r2.state.String(),\n\t\t\"transferee_term\":   r2.Term,\n\t\t\"transferee_has_unapplied\": r2.hasUnappliedConfChanges(),\n\t})\n\n\t// A proposal while the transfer is pending.\n\tproposalErr := r1.Step(&pb.Message{Type: pb.MsgProp.Enum(), From: new(uint64(1)), Entries: []*pb.Entry{{Data: []byte(\"during\")}}})\n\tcaEvent(t, \"proposal_during_transfer\", map[string]any{\n\t\t\"err\":               errString(proposalErr),\n\t\t\"is_proposal_dropped\": proposalErr == ErrProposalDropped,\n\t})\n\n\t// Tick the leader through its election timeout.\n\tfor i := 0; i < r1.electionTimeout; i++ {\n\t\tr1.tick()\n\t}\n\tafterAbortErr := r1.Step(&pb.Message{Type: pb.MsgProp.Enum(), From: new(uint64(1)), Entries: []*pb.Entry{{Data: []byte(\"after\")}}})\n\tcaEvent(t, \"after_election_timeout\", map[string]any{\n\t\t\"lead_transferee\":      r1.leadTransferee,\n\t\t\"leader_state\":         r1.state.String(),\n\t\t\"leader_term\":          r1.Term,\n\t\t\"proposal_err\":         errString(afterAbortErr),\n\t\t\"transferee_state\":     r2.state.String(),\n\t})\n\n\t// Let the transferee's application catch up, then retry the transfer.\n\tr2.raftLog.appliedTo(r2.raftLog.committed, 0)\n\tcaEvent(t, \"transferee_after_apply\", map[string]any{\n\t\t\"r2_applied\":       r2.raftLog.applied,\n\t\t\"r2_committed\":     r2.raftLog.committed,\n\t\t\"r2_has_unapplied\": r2.hasUnappliedConfChanges(),\n\t})\n\tnt.send(&pb.Message{From: new(uint64(2)), To: new(uint64(1)), Type: pb.MsgTransferLeader.Enum(), Term: new(r1.Term)})\n\tcaEvent(t, \"retry_after_apply\", map[string]any{\n\t\t\"lead_transferee\":  r1.leadTransferee,\n\t\t\"transferee_state\": r2.state.String(),\n\t\t\"transferee_term\":  r2.Term,\n\t\t\"old_leader_state\": r1.state.String(),\n\t\t\"old_leader_term\":  r1.Term,\n\t})\n}\n\nfunc errString(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "s_raft_campaign",
+            "s_raft_leader",
+            "s_raft_conf"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Same fixed harness as the previous execution with one added case. Probes A and B are unchanged (campaign admission with a committed-but-unapplied EntryConfChangeV2; ReadOnlySafe completion across a term change with its control). Probe C (TestAssuranceTransferWithLaggingTransferee) adds the bounded-liveness case for a requested leadership transfer: elect a 3-node leader over the in-process network, propose a ConfChangeV2 learner addition so followers hold a committed conf-change entry while their applied index lags, request TransferLeader to that lagging follower, and record leadTransferee, the transferee's state/term and hasUnappliedConfChanges, the error from a proposal issued while the transfer is pending, leadTransferee and proposal acceptance after the leader is ticked through its election timeout, and the outcome of a retry after the transferee's applied index reaches its committed index.",
+            "assumptions": [
+              "Nodes come from the snapshot's own test constructors (newTestRaft/newTestConfig/newTestMemoryStorage/newNetwork) in one process; messages are delivered by the repository's own network helper.",
+              "The lagging applied index is produced by not advancing raftLog.applied for the transferee, which models an application that has not yet applied committed entries.",
+              "Ticks are the protocol's own logical time unit; the transfer is aborted by tickHeartbeat, not by a wall-clock timeout.",
+              "No production logic is modified."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "Probe C: newNetwork over newTestRaft(1,10,1,withPeers(1,2,3)) for ids 1..3; MsgHup on node 1 to elect; confChangeToMsg(ConfChangeV2{AddLearnerNode 4}) proposed via MsgProp on the leader and delivered by the network so both followers store the conf-change entry while their applied index stays behind; then MsgTransferLeader{From:2,Term:leader.Term} stepped into the leader; then MsgProp on the leader while leadTransferee != None; then electionTimeout tick() calls on the leader followed by another MsgProp; then raftLog.appliedTo(committed,0) on the transferee and a second MsgTransferLeader, which the network delivers and which lets the transferee campaign via MsgTimeoutNow.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "f9dd630f8a1e49948dc10fabd0bcd05d",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "go.etcd.io/raft/v3",
+            "variant": "etcd_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": "This investigation has no predecessor experiment of its own, so no previous_id is set: the request extends the harness used by the campaign-admission experiment with one added case (Probe C, TestAssuranceTransferWithLaggingTransferee) that exercises the bounded-liveness side of the campaign admission guard for a requested leadership transfer. Probes A and B are byte-identical to that earlier revision; a fresh execution is required because the harness bytes and the case set changed."
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-interpretation-0",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_raft_leader"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Source-only reading of the count-based read-only flow. Positive part: positions are monotonically increasing counts (never reused for a later batch), acks are maxima, and a released read carries the commit index recorded at admission, so a confirmed read cannot be justified by acknowledgements collected for an earlier request; the leader's own ack is the admission position, so a majority echo is still required for confirmation, and pendingReadIndexMessages are answered only after the leader commits in its term, which can only raise the emitted index. Unresolved part: the term-change path. reset() replaces r.readOnly with a fresh instance (unconfirmed reads and acks dropped) while r.readStates is untouched, and releasePendingReadIndexMessages only replies when committedEntryInCurrentTerm() holds. I have not yet observed whether a read admitted just before a term change is dropped silently (a lost completion under a legal trigger) or answered later; the snapshot's own TestReadOnlyDuplicateRequest covers only the duplicate-ctx/delayed-heartbeat case and asserts indices are not too small, not that every admitted request completes.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The repo's own read-index selections (TestReadOnlyOptionSafe/Lease/WithLearner/ForNewLeader/DuplicateRequest, TestRaftFreesReadOnlyMem) pass in native local feedback, and TestReadOnlyDuplicateRequest explicitly asserts no too-small read index under delayed duplicate requests plus a leader change, which weakens the stale-index side of the suspicion."
+        ],
+        "limitations": [
+          "No retained execution receipt yet: the local test runs are construction feedback and cannot establish a formal conclusion.",
+          "Doc.go's Ready/Advance contract does not state that every admitted ReadIndex request must be answered, so a dropped request would have to be argued as a bounded-liveness consequence of an actual trigger rather than a contract violation."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "c6f44be10c0445b7a091b7db545cd614-interpretation-1",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf",
+          "s_confchange"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Source-only reading of the campaign admission guard. hasUnappliedConfChanges scans (applied, committed] with pagination and returns true on the first conf-change entry; hup() then refuses to campaign, and promotable() independently refuses while a snapshot is pending/unstable. The guard is consistent with doc.go's statement that configurations take effect when applied, and with applyConfChange/switchToConfig which only reconfigure on application, so a node that campaigns while lagging application would otherwise campaign with a stale voter set. What remains open is whether the guard is complete for the paths that can present a stale voter set (restore from snapshot with only ConfState initialized, bootstrap with applied<committed, an application that rejects a change by zeroing NodeId, and MsgTimeoutNow where the guard also suppresses a requested transfer), and whether the suppression can be permanent for an otherwise eligible voter.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "No existing test references hasUnappliedConfChanges directly, so its behavior is currently only read from source; it must be probed with a real log/apply prefix rather than asserted."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c6f44be10c0445b7a091b7db545cd614"
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-interpretation-0",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+        "experiment_id": "075c21493fd94adc9bdc30a30b2cbff1-experiment",
+        "source_ids": [
+          "s_raft_campaign",
+          "s_raft_conf"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The suspicion had two branches: (i) the guard may be bypassed so a node campaigns with a stale voter set, and (ii) the guard may permanently block a legal campaign. Branch (i) is refuted by events 1 and 2: with has_unapplied=true and an already-promotable voter, both the MsgHup path and the MsgTimeoutNow path leave the node in StateFollower(term=1) with msgs=0, and the runner log shows the same suppression reason on both paths, so the transfer path reaches campaign() only through the same guard. The voter set used when campaigning is legitimate rather than stale: after the application catches up (event 3) the node reports has_unapplied=false and campaigns at term 2 with vote=1 and MsgVote addressed to voters [2,3], and event 0 records that this config (voters_before=[1,2,3]) is the applied configuration. Branch (ii) is refuted by the same event 3 plus the control at events 4-5: the block is transient, keyed on the entry type in (applied, committed] rather than on the applied/committed gap itself (the control has the identical gap and campaigns immediately). What remains is a bounded-liveness cost, not a safety defect: while the entry is unapplied the node cannot campaign and cannot take over a requested transfer, which is the documented intent that configurations take effect on application.",
+        "answers": {
+          "c6f44be10c0445b7a091b7db545cd614-gap-1": {
+            "explanation": "With a committed-but-unapplied conf change the node refrains from campaigning on both triggers (events 1-2: StateFollower, term 1, msgs=0; runner log 'cannot campaign at term 1 since there are still pending configuration changes to apply' on the MsgHup and MsgTimeoutNow paths), and a later campaign is possible once raft's applied index covers the entry (event 3: has_unapplied=false, StateCandidate at term 2, MsgVote to voters [2,3]; control events 4-5 show the effect is caused by the entry type, not by the applied/committed gap).",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-2",
+            "revision": 1,
+            "assertion": "hup() returns without campaigning when hasUnappliedConfChanges() is true, for both MsgHup and MsgTimeoutNow"
+          },
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-0",
+            "revision": 1,
+            "assertion": "campaign() addresses vote requests to the tracked voters of the current configuration, here [2,3]"
+          }
+        ],
+        "counterevidence": [
+          "The node is promotable=true throughout (events 0, 4), so the refusal does not come from promotable(); it is specifically hasUnappliedConfChanges, which strengthens the reading that the guard is the cause rather than an admission in promotable.",
+          "The post-apply campaign (event 3) carries vote targets [2,3] from the pre-change configuration because the harness only advanced raftLog.applied without calling ApplyConfChange; the voter set used in the probe is therefore the stored config, which is the config a leader would legitimately campaign with at that point."
+        ],
+        "limitations": [
+          "The probe drives MsgHup/MsgTimeoutNow directly on a node whose storage prefix and Config.Applied are supplied, not a tick-driven election of a live cluster, so it establishes the guard's effect and its transience but not the wall-clock or tick cost of the suppression inside a running cluster.",
+          "The bounded-liveness cost for a requested transfer (leader keeps dropping proposals while leadTransferee != None) is visible in source but was not exercised by this harness; it is registered as investigation @transfer_stall."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020"
+      },
+      {
+        "id": "1be0cd91f8794334b730ae216d7d1020-interpretation-1",
+        "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "s_read_only",
+          "s_raft_readindex",
+          "s_doc"
+        ],
+        "executions": {
+          "238d3a23d8624c438b85ec18f90a7b2b": [
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "The question had two possible defect shapes: a stale (too small) read index, or a lost completion. Events 6-9 select the second and exclude the first for the exercised path. Event 7 shows the request admitted with unconfirmed_reads=1, read_states=0 and the admission commit index recorded as 2; event 8 shows that after the term change the node holds read_states=0, unconfirmed_reads=0, confirmed_reads=0 and ctx_A_completed=false, so the request is dropped, never emitted with a smaller index. Event 9 is the control that separates 'drops on term change' from 'read confirmation is broken': a read admitted on the new leader (commit_now=3, index_B=3) goes from read_states_before_ack=0 to read_states_after_ack=1 with ctx_B_completed=true as soon as one peer heartbeat response carrying the leader's context arrives, which is also the count-based confirmation the source predicted. A dropped completion is not a defect under the applicable contract: Node.ReadIndex documents that the request can be lost without notice and that ensuring read index retries is the user's job, so the caller duty is established by the target's own interface statement, and the exercised drop is exactly that documented lossiness rather than a wrong index being served.",
+        "answers": {
+          "c6f44be10c0445b7a091b7db545cd614-gap-0": {
+            "explanation": "The request is dropped, not answered stale: after admission with unconfirmed_reads=1 (event 7), the term change leaves read_states=0, unconfirmed_reads=0, confirmed_reads=0 and ctx_A_completed=false (event 8), so nothing is emitted for that context and no smaller index can be observed; the confirmation path itself still functions on the new leader (event 9: ctx_B_completed=true with index_B=3 equal to the commit index at admission), and the lossiness is the caller duty stated by Node.ReadIndex.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "c6f44be10c0445b7a091b7db545cd614-knowledge-1",
+            "revision": 1,
+            "assertion": "a released ReadState is justified by a quorum of ack positions and carries the commit index recorded at admission"
+          }
+        ],
+        "counterevidence": [],
+        "limitations": [
+          "The probe steps MsgReadIndex directly into the leader rather than through Node.ReadIndex/RawNode.ReadIndex, so it shows the state-machine outcome and not the API-level return value or the Ready/ReadStates plumbing; the documented caller duty was read from node.go/doc.go rather than exercised.",
+          "Only one trigger of the term change was exercised (a higher-term campaign message from a peer); other authority losses that rebuild readOnly (for example a snapshot restore or a leadership transfer racing an admitted read) were not covered."
+        ],
+        "joint_history": "Same single invocation as the campaign-admission interpretation: CheckRun 238d3a23d8624c438b85ec18f90a7b2b is one execution of one fixed harness (fixed-experiments/075c21493fd94adc9bdc30a30b2cbff1-experiment/assurance_generated_test.go) containing both probes, so events 6-9 and events 0-5 come from the same process, the same fixed inputs and the same receipt, with no separate producer or intermediate history between them. The experiment record is attached to question-1 because the submission can carry only one experiment request; the receipt itself is shared, and its parsed indices 6-9 are the decisive operands for this question.",
+        "failure_attribution": null,
+        "operation_id": "1be0cd91f8794334b730ae216d7d1020"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "1be0cd91f8794334b730ae216d7d1020",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_transfer_probe_note": "1be0cd91f8794334b730ae216d7d1020-knowledge-0",
+        "@k_guard_observed": "1be0cd91f8794334b730ae216d7d1020-knowledge-1",
+        "@k_read_drop_observed": "1be0cd91f8794334b730ae216d7d1020-knowledge-2",
+        "@transfer_stall": "1be0cd91f8794334b730ae216d7d1020-question-0"
+      },
+      "effects": [
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_transfer_probe_note"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_guard_observed"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_read_drop_observed"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@transfer_stall"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-1",
+          "changed_fields": [
+            "experiment_id",
+            "source_ids",
+            "executions",
+            "conclusion",
+            "defect_claim",
+            "rationale",
+            "answers",
+            "knowledge",
+            "counterevidence",
+            "limitations"
+          ]
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[1]",
+          "investigation_id": "c6f44be10c0445b7a091b7db545cd614-question-0",
+          "changed_fields": [
+            "source_ids",
+            "executions",
+            "conclusion",
+            "defect_claim",
+            "rationale",
+            "answers",
+            "knowledge",
+            "counterevidence",
+            "limitations",
+            "joint_history"
+          ]
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "1be0cd91f8794334b730ae216d7d1020-experiment"
+    },
+    "applied_operations": {
+      "submission-c6f44be10c0445b7a091b7db545cd614": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_19-34-26-etcd_raft-real-run/semantic-commits/submission-c6f44be10c0445b7a091b7db545cd614.json"
+      },
+      "submission-075c21493fd94adc9bdc30a30b2cbff1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_19-34-26-etcd_raft-real-run/semantic-commits/submission-075c21493fd94adc9bdc30a30b2cbff1.json"
+      },
+      "submission-1be0cd91f8794334b730ae216d7d1020": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_19-34-26-etcd_raft-real-run/semantic-commits/submission-1be0cd91f8794334b730ae216d7d1020.json"
+      }
+    }
+  }
+}

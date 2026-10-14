@@ -1,4 +1,5 @@
 """Read-only current-work projections over semantic owners and immutable receipts."""
+import json
 from consensus_assurance.core.types import FixedExperiment
 from .knowledge import gap_answers, open_gaps, use_paths
 from .experiments import assessment
@@ -163,6 +164,48 @@ def current_view(state, root, implementation=None):
         'costs':costs(state)}
 
 
+def execution_locator(check, fixed=None):
+    value = {'id':check.id, 'status':check.status.value, 'exit_code':check.exit_code,
+        'record':f'logs/{check.id}/check.json', 'observations':f'logs/{check.id}/observations.json',
+        'stdout':check.stdout, 'stderr':check.stderr}
+    if fixed:
+        value.update(experiment_id=fixed.id, investigation_id=fixed.investigation_id,
+            basis=f'fixed-experiments/{fixed.id}/basis.json',
+            harness=f'fixed-experiments/{fixed.id}/{fixed.harness_filename}')
+    return value
+
+
+def execution_feedback(state, root, fixed, check):
+    """Place fixed predicates beside retained observations, without inferring their meaning."""
+    from .audit import draft_bytes
+    value = execution_locator(check, fixed)
+    value.update(requirement=fixed.basis.requirement,
+        comparisons=[{'comparison_index':i, 'definition':c.model_dump(mode='json')}
+                     for i,c in enumerate(fixed.basis.comparisons)],
+        sources=[{'id':m.id, 'record':{'path':'state.json', 'collection':'materials', 'id':m.id},
+                  **({'path':'agent-source/'+m.file, 'start_line':m.start_line, 'end_line':m.end_line}
+                     if m.file in state.snapshot.files else {})}
+                 for m in state.materials if m.id in fixed.basis.source_ids],
+        anchors=[a.model_dump(mode='json') for a in fixed.basis.anchors])
+    try:
+        observed = json.loads(draft_bytes(root, value['observations']))
+    except (OSError, ValueError) as exc:
+        value['observation_error'] = str(exc)
+        return value
+    # Small receipts are shown whole; never select a favorable or "representative" event.
+    events = observed['events']
+    inline = len(events) <= 8 and len(json.dumps(events, ensure_ascii=False)) <= 6000
+    value.update(event_count=len(events), events=events if inline else [],
+        events_omitted_count=0 if inline else len(events),
+        parsing_error_count=len(observed['parsing_errors']), prerequisites=observed['prerequisites'])
+    for comparison, result in zip(value['comparisons'], observed['comparisons'], strict=True):
+        omitted = {} if inline else {k:len(result[k]) for k in ('correlations','diagnostics','limitations')}
+        comparison['result'] = {k:v for k,v in result.items() if k not in omitted}
+        if omitted:
+            comparison['omitted_detail_counts'] = omitted
+    return value
+
+
 def operation_summary(state, root):
     current = state.current_submission
     summary = {k:current[k] for k in ('phase','operation_id','experiment_id','no_change','references','effects','execution_gap') if k in current}
@@ -173,9 +216,11 @@ def operation_summary(state, root):
     if not current and turn and turn.status.value == 'timeout':
         summary['interrupted_turn'] = {'id':turn.id, 'reason':turn.reason,
             'record':f'logs/{turn.id}/check.json', 'stdout':turn.stdout, 'stderr':turn.stderr,
-            'next':'The preceding turn was interrupted; no submission was accepted from it. '
-                'Continue this session using retained drafts and logs and the current allocation; '
-                'a sourced partial update can precede further construction or testing.'}
+            'model_turn_completed':bool(turn.parameters.get('agent_turn_completed')),
+            'next':'The preceding process timed out; no submission was accepted from it. '
+                'Continue this session using retained drafts, logs and the current allocation. '
+                'If the model already finished, repair and deliver the existing update through the normal final-response format; '
+                'otherwise continue the unfinished work. Do not reconstruct work merely because delivery was interrupted.'}
     check = next((c for c in reversed(state.checks) if c.action == 'experiment'),None)
     fixed = next((a for a in state.experiments if a.id == check.experiment_id), None) if check else None
     summary['necessary_gaps'] = [{**preview({'investigation_id':q.id, 'id':g['id'],
@@ -222,10 +267,30 @@ def operation_summary(state, root):
         summary['correction_guidance'] = (
             'Recorded premise corrections and explicit uses are above; full history is at each record. '
             'Review the identified uses under their original investigations; necessary gaps remain in research.json.')
-    summary['questions'] = [record_preview({'id':q.id, 'question':q.question, 'disposition':q.disposition,
+    summary['questions'] = [record_preview({'id':q.id, 'version':q.version, 'question_state':'current',
+        'question':q.question, 'hypothesis':q.hypothesis, 'disposition':q.disposition, 'parent_id':q.parent_id,
         'discriminator':q.discriminator, 'knowledge':[u.model_dump() for u in q.knowledge],
         'latest_interpretation':interpretation_view(latest.get(q.id))}, 'investigations')
         for q in state.investigations if q.id in owners]
+    if (fixed and current.get('experiment_id') == fixed.id and current.get('phase') == 'executed'
+            and not current.get('execution_gap')):
+        question = next(q for q in summary['questions'] if q['id'] == fixed.investigation_id)
+        question['execution'] = execution_feedback(state, root, fixed, check)
+    previous, changes = {}, []
+    fixed_by_id = {a.id:a for a in state.experiments}
+    for opinion in state.interpretations:
+        prior = previous.get(opinion.investigation_id)
+        if opinion.operation_id == current.get('operation_id') and not current.get('no_change'):
+            changes.append({'investigation_id':opinion.investigation_id,
+                'previous':{'id':prior.id, 'conclusion':prior.conclusion, 'defect_claim':prior.defect_claim} if prior else None,
+                'current':{'id':opinion.id, 'conclusion':opinion.conclusion, 'defect_claim':opinion.defect_claim},
+                'record':{'path':'state.json', 'collection':'interpretations'},
+                'executions':[{**execution_locator(c, fixed_by_id.get(c.experiment_id)),
+                               'event_indices':opinion.executions[c.id]}
+                              for c in state.checks if c.id in opinion.executions]})
+        previous[opinion.investigation_id] = opinion
+    if changes:
+        summary['interpretation_changes'] = changes
     cited = {id for i in state.interpretations for id in i.executions}
     summary['uncited_executions'] = [{'id':c.id, 'experiment_id':c.experiment_id, 'status':c.status.value,
         'record':f'logs/{c.id}/check.json', 'observations':f'logs/{c.id}/observations.json'}
@@ -241,13 +306,7 @@ def operation_summary(state, root):
         'the available directions rather than inherit the last experiment. No separate selection submission is needed; '
         'do not repeat closing submissions.')
     if check:
-        summary['latest_actual_execution'] = {'id':check.id,'status':check.status.value,'exit_code':check.exit_code,
-            'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json',
-            'stdout':check.stdout,'stderr':check.stderr}
-        if fixed:
-            summary['latest_actual_execution'].update(experiment_id=fixed.id, investigation_id=fixed.investigation_id,
-                basis=f'fixed-experiments/{fixed.id}/basis.json',
-                harness=f'fixed-experiments/{fixed.id}/{fixed.harness_filename}')
+        summary['latest_actual_execution'] = execution_locator(check, fixed)
     return summary
 
 
