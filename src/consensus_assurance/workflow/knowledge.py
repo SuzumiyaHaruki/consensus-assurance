@@ -1,6 +1,7 @@
 """Sourced questions, reusable conditional knowledge and explicitly answered premises."""
 from consensus_assurance.core.types import Investigation, KnowledgeEntry, KnowledgeUse, Interpretation, Gap
 from consensus_assurance.core.types import FixedExperiment
+from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
 
 
 def require_sources(state, ids):
@@ -256,11 +257,22 @@ def interpret(state, root, changes, operation, aliases):
         gaps = {g.id: g for g in owner.gaps}
         if not set(change.answers) <= gaps.keys() or any(not v.explanation.strip() for v in change.answers.values()):
             raise ValueError('Respond to this investigation\'s exact registered gaps with a substantive explanation and explicit resolved judgment')
-        if change.experiment_id and any(gaps[id].experiment_id and
-                gaps[id].experiment_id not in lineage(state, change.experiment_id) for id in change.answers):
-            raise ValueError('Answer only gaps belonging to this experiment lineage, or give a source-only correction')
+        ancestors = lineage(state, change.experiment_id) if change.experiment_id else set()
+        mismatched = {id:gaps[id].experiment_id for id in change.answers
+            if change.experiment_id and gaps[id].experiment_id and gaps[id].experiment_id not in ancestors}
+        if mismatched:
+            raise DiagnosticError([Diagnostic(code='gap_lineage', category='association',
+                object_ids=[owner.id,change.experiment_id,*mismatched,*dict.fromkeys(mismatched.values())],
+                paths=[f'/interpretations/{number}/experiment_id',f'/interpretations/{number}/answers'],
+                details={'investigation_id':owner.id, 'experiment_id':change.experiment_id,
+                    'experiment_lineage':sorted(ancestors), 'gap_experiments':mismatched},
+                message='These gaps belong to another experiment lineage. Interpret the relevant saved experiment, '
+                    'or use a question-level explained/conditional/unresolved interpretation without experiment_id, '
+                    'retaining actual execution citations and applicable joint-history reasoning. Changed inputs need '
+                    'an explicit predecessor and fresh execution; never rewrite saved ancestry.')])
         if change.conclusion in {'violated','holds'} and not change.experiment_id:
-            raise ValueError('Measured conclusions require a fixed experiment; source-only answers use explained or unresolved')
+            raise ValueError('Measured conclusions require a fixed experiment; question-level explained/conditional/unresolved '
+                'accounts may cite actual executions without binding one experiment')
         value = Interpretation(id=operation + '-interpretation-' + str(number), operation_id=operation, **data)
         effective = value.model_dump(exclude={'id','operation_id'})
         prior = next((i for i in reversed(state.interpretations) if i.investigation_id == owner.id), None)

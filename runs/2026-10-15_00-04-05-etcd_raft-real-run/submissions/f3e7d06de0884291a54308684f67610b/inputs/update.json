@@ -1,0 +1,40 @@
+{
+  "rationale": "The Node-interface receipt (CheckRun 89b72b31226944e1b1175a08c2746c40) answered the child question with all three comparisons complete: a genuinely local type delivered from a peer through Node.Step left the reported leader untouched (index 41), the peer-form MsgForgetLeader delivered through the same path cleared it (index 42, lead_after=0, no error returned), and the intended local operation Node.ForgetLeader on the same node produced the same state change (index 43, lead 1 -> 0). So the gap is not a RawNode-only artefact: the public interface applications use for peer messages behaves the same way, which removes a scope objection rather than widening the severity. I record the child account, promote the observation to a Fact, and add the source-based inference about the local producers bypassing the filter, because that is what makes a minimal remedy (classifying the type as local) sufficient without disabling the intended API; no execution is claimed for that inference.",
+  "knowledge": [
+    {
+      "ref": "@forged_forget_node_path_observed",
+      "kind": "fact",
+      "statement": "A real raft.Node with id 2 started by RestartNode, whose reported leader was set to 1 by delivering a real leader heartbeat through Node.Step, had that leader cleared to 0 by delivering a peer-form MsgForgetLeader (From=3, To=2, no term field) through the same Node.Step, with no error returned; Node.ForgetLeader on the same node produced the identical state change, and a genuinely local type (MsgCheckQuorum) delivered from a peer through Node.Step left the leader unchanged.",
+      "conditions": "Observation indices 41, 42 and 43 of CheckRun 89b72b31226944e1b1175a08c2746c40; config ElectionTick=10, HeartbeatTick=1, CheckQuorum+PreVote, voters {1,2,3} from equal storage snapshots at index=10/term=1; values are read from Node.Status (synchronized with the node's run loop by polling until the expected value appears, poll count reported as 0 at index 41 and 42); the node's Ready stream was drained by a goroutine calling Advance.",
+      "source_ids": ["src_nodestep", "src_islocal", "src_rawstep", "src_stepfollower_forget"],
+      "executions": {"89b72b31226944e1b1175a08c2746c40": [41, 42, 43]}
+    },
+    {
+      "ref": "@forget_local_producers_bypass",
+      "kind": "behavior",
+      "statement": "Both intended producers of MsgForgetLeader bypass the inbound filter rather than depending on it: RawNode.ForgetLeader calls raft.Step directly, and node.ForgetLeader uses the internal step path that sends the message to the receive channel instead of Node.Step. Classifying MsgForgetLeader as a local message would therefore leave both APIs working (their messages never pass IsLocalMsg) while making RawNode.Step return ErrStepLocalMsg and Node.Step ignore messages of that type received from a peer.",
+      "conditions": "Captured snapshot, source reading only: no execution is claimed for this statement. It follows from src_rawnode_forget (direct raft.Step call), src_nodestep (the Step filter that node.ForgetLeader does not use) and src_forgetdoc (the API that applications are meant to call), together with src_islocal (the filter predicate itself).",
+      "source_ids": ["src_rawnode_forget", "src_nodestep", "src_forgetdoc", "src_islocal"]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "ef81342a8c9c4ffe90f40676c4c8a73b-question-0",
+      "experiment_id": "ef81342a8c9c4ffe90f40676c4c8a73b-experiment",
+      "source_ids": ["src_nodestep", "src_islocal", "src_rawstep", "src_step_local", "src_stepfollower_forget", "src_forgetdoc"],
+      "executions": {"89b72b31226944e1b1175a08c2746c40": [41, 42, 43]},
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The child question is answered yes, and it is answered on the interface applications actually use. Control: a genuinely local type from peer 3, delivered through Node.Step, left the node's reported leader at 1 (index 41), so Node.Step does gate some message types from the network. Defect: the peer-form MsgForgetLeader delivered through the same path returned no error and cleared the reported leader to 0 (index 42) - the same state change as the earlier RawNode receipts, now observed on a real Node with its goroutine, receive channel and Ready/Advance loop rather than a synchronous RawNode. Intended path: Node.ForgetLeader on the same node produced exactly that change, 1 -> 0 (index 43), which is what makes the network path's acceptance wrong rather than merely redundant. The observation is synchronized with the node's own run loop (Node.Status polls, both defect observations settled on the first poll), so it is not a timing artefact. Consequence for the account: the earlier RawNode receipts were a scope limitation; it is now removed, while the severity bounds established earlier (per-message effect, repair by the next leader message, ReadOnlyLeaseBased refusing the type, no committed-entry loss after the forged election) are unchanged, since this receipt measures the same state change through a different wrapper.",
+      "counterevidence": [
+        "Node.Step does filter correctly for types that are in isLocalMsg, so this is a classification gap for one message type rather than a missing filter (index 41).",
+        "The effect is again per-message and reversible: the node re-learns the leader from the next real leader message, as the earlier receipts show, and index 43 shows the same transition is legitimate when an application asks for it."
+      ],
+      "limitations": [
+        "In-process delivery; no transport, authentication or multi-host behaviour is measured, and the poll ceiling (2000 x 1ms) bounds the observation rather than a latency claim.",
+        "The node under test is a follower with an equal log; leader-side effects of the same message type (a no-op in stepLeader) are not exercised here.",
+        "Fault-model assumption unchanged: a peer may construct and deliver a protobuf message of any type to the documented inbound path."
+      ]
+    }
+  ]
+}

@@ -81,7 +81,12 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     assert not {'counterevidence','limitations'} & s.investigations[0].model_dump().keys()
     assert 'Question counterevidence:' not in text and 'Question boundaries:' not in text
     for value in [s.interpretations[0].rationale,*s.interpretations[0].counterevidence,*s.interpretations[0].limitations]:
-        assert value in history and text.count(value)==1
+        assert value not in text
+    saved_history=json.loads((e.root/'state.json').read_text())['interpretations']
+    assert saved_history==[i.model_dump(mode='json') for i in s.interpretations]
+    assert f'[{s.interpretations[0].id}](state.json) → [{s.interpretations[1].id}](state.json)' in history
+    assert f'model claim asserted → {claim or "none"}' in history
+    assert 'changed fields:' in history and 'rationale' in history and 'source_ids' not in history
     assert 'historical interpretation; the question has a later account' in execution
     assert all(i.rationale not in execution for i in s.interpretations)
     assert [i.defect_claim for i in s.interpretations]==['asserted',claim]
@@ -89,7 +94,7 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     assert s.investigations[0].question not in claims and s.investigations[0].question in other
     assert f'Current model defect claim: {label}' in text
     assert text.count('### ')==1
-    assert 'Compare the actual return' in text
+    assert 'Compare the actual return' in saved_history[0]['rationale']
     assert 'confirmed' not in text and 'declared predicate does not hold' in text
     check=next(c for c in s.checks if c.experiment_id)
     citations=assessment(s,e.root,s.experiments[0],check)['interpretation_citations']
@@ -97,18 +102,18 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,
     assert [i['id'] for i in citations['current']]==([s.interpretations[-1].id] if claim is not None else [])
     assert ('Other current question interpretations explicitly citing this receipt' in execution)==(claim is not None)
     observation=f'logs/{check.id}/observations.json'
-    for section,cited in ((current,claim is not None),(history,True)):
-        assert '[code](state.json)' in section and '[doc](state.json)' in section
-        assert (f'logs/{check.id}/check.json' in section)==cited
-        assert (observation in section)==cited
-        assert ('event indices [1]' in section)==cited
-        assert ('No execution receipt explicitly cited by this interpretation' in section)==(not cited)
+    assert '[code](state.json)' in current and '[doc](state.json)' in current
+    assert (f'logs/{check.id}/check.json' in current)==(claim is not None)
+    assert (observation in current)==(claim is not None)
+    assert ('event indices [1]' in current)==(claim is not None)
+    assert ('No execution receipt explicitly cited by this interpretation' in current)==(claim is None)
     assert json.loads((e.root/observation).read_text())['events'][1]['value']==0
     assert s.model_dump(mode='json')==before
     clone=tmp_path/'moved';shutil.copytree(e.root,clone)
     original=e.root.with_name('unavailable');e.root.rename(original)
     from consensus_assurance.adapters.storage.files import Store
     saved=Store(clone).load()
+    assert saved.interpretations==s.interpretations
     moved=render_report(saved,clone).read_text()
     assert observation in moved and json.loads((clone/observation).read_text())['events'][1]['value']==0
     assert str(original) not in moved and str(e.root) not in moved

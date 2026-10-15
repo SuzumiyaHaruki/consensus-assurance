@@ -1,0 +1,711 @@
+{
+  "id": "46fd0d2e6aeb4b7db66966761e962c93-experiment",
+  "investigation_id": "b3759773bf3244adac911b60c063cc4c-question-0",
+  "version": 2,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft_test\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"go.etcd.io/raft/v3\"\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// emitCAEvent prints one CA_EVENT JSON line for the controller's parser.\nfunc emitCAEvent(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc errStringCA(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// deliverReady hands out the outstanding work and completes it through the\n// documented Ready/Advance contract, so outbound messages can be observed\n// without reaching into unexported state.\nfunc deliverReady(rn *raft.RawNode) raft.Ready {\n\trd := rn.Ready()\n\trn.Advance(rd)\n\treturn rd\n}\n\nfunc leadOf(rn *raft.RawNode) uint64 { return rn.BasicStatus().SoftState.Lead }\n\nfunc stateOf(rn *raft.RawNode) string { return rn.BasicStatus().SoftState.RaftState.String() }\n\nfunc findMsgs(rd raft.Ready, typ pb.MessageType, to uint64) []*pb.Message {\n\tvar out []*pb.Message\n\tfor _, m := range rd.Messages {\n\t\tif m.GetType() == typ && m.GetTo() == to {\n\t\t\tout = append(out, m)\n\t\t}\n\t}\n\treturn out\n}\n\n// caNewNode builds one real RawNode whose storage starts from the same snapshot\n// on all nodes: voters {1,2,3} with a shared log prefix at index=10, term=1.\nfunc caNewNode(t *testing.T, id uint64) *raft.RawNode {\n\tt.Helper()\n\tms := raft.NewMemoryStorage()\n\tsnap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{\n\t\tIndex:     new(uint64(10)),\n\t\tTerm:      new(uint64(1)),\n\t\tConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},\n\t}}\n\tif err := ms.ApplySnapshot(snap); err != nil {\n\t\tt.Fatalf(\"apply snapshot: %v\", err)\n\t}\n\tif err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(uint64(10))}); err != nil {\n\t\tt.Fatalf(\"set hard state: %v\", err)\n\t}\n\trn, err := raft.NewRawNode(&raft.Config{\n\t\tID:              id,\n\t\tElectionTick:    10,\n\t\tHeartbeatTick:   1,\n\t\tStorage:         ms,\n\t\tMaxSizePerMsg:   1 << 20,\n\t\tMaxInflightMsgs: 256,\n\t\tCheckQuorum:     true,\n\t\tPreVote:         true,\n\t})\n\tif err != nil {\n\t\tt.Fatalf(\"new raw node %d: %v\", id, err)\n\t}\n\treturn rn\n}\n\n// caElectNode1 runs a real election for node 1 and replicates its term-2 entry,\n// feeding every produced message through the receiver's public Step method.\nfunc caElectNode1(t *testing.T, leader, node2, node3 *raft.RawNode) {\n\tt.Helper()\n\tif err := leader.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign: %v\", err)\n\t}\n\tfor _, m := range deliverReady(leader).Messages {\n\t\tswitch m.GetTo() {\n\t\tcase 2:\n\t\t\tif err := node2.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t\t\t}\n\t\tcase 3:\n\t\t\tif err := node3.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote request on 3: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, rn := range []*raft.RawNode{node2, node3} {\n\t\tfor _, m := range deliverReady(rn).Messages {\n\t\t\tif err := leader.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote response on 1: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, m := range deliverReady(leader).Messages {\n\t\tswitch m.GetTo() {\n\t\tcase 2:\n\t\t\tif err := node2.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append on 2: %v\", err)\n\t\t\t}\n\t\tcase 3:\n\t\t\tif err := node3.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append on 3: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, rn := range []*raft.RawNode{node2, node3} {\n\t\tfor _, m := range deliverReady(rn).Messages {\n\t\t\tif err := leader.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append response on 1: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tdeliverReady(leader)\n}\n\n// TestAssuranceInboundForgetLeader measures, on one follower, what a peer-form\n// MsgForgetLeader delivered through RawNode.Step does to the live leader\n// context and to the support given to an up-to-date candidate's pre-vote, and\n// how the next real leader heartbeat closes that window.\nfunc TestAssuranceInboundForgetLeader(t *testing.T) {\n\tleader, follower, other := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, other)\n\n\t// A real heartbeat tick: node 2 receives it exactly once, establishing its\n\t// leader context and election-timer lease; node 3 receives the same\n\t// heartbeat so that it too holds a live leader context.\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := other.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"heartbeat_delivered\", \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"heartbeat_delivered_node3\", \"to\": 3, \"sender\": 1,\n\t\t\"term\": hbs3[0].GetTerm(), \"lead_after\": leadOf(other),\n\t})\n\n\t// The intended producer of \"forget the leader\": the local API on a follower\n\t// that still considers the leader live.\n\totherBefore := leadOf(other)\n\totherErr := other.ForgetLeader()\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"local_forget_leader_api\", \"to\": 3, \"lead_before\": otherBefore,\n\t\t\"lead_after\": leadOf(other), \"step_error\": errStringCA(otherErr),\n\t})\n\n\t// Control: a message type that is classified local, arriving from a peer\n\t// through the same inbound path, is rejected and changes nothing.\n\tlocalErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgCheckQuorum.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"inbound_local_msg\", \"to\": 2, \"sender\": 3, \"type\": \"MsgCheckQuorum\",\n\t\t\"step_error\": errStringCA(localErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// A real candidate (node 3) produces a real MsgPreVote request, delivered to\n\t// follower 2 verbatim.\n\tif err := other.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tpreVotes := findMsgs(deliverReady(other), pb.MsgPreVote, 2)\n\tif len(preVotes) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(preVotes))\n\t}\n\tpv := preVotes[0]\n\n\t// Control: with the leader context intact the pre-vote is ignored (no\n\t// response message at all).\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trd := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rd, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rd, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\n\t// The forged inbound message: the type only the local ForgetLeader API\n\t// produces, in the wire form a peer would produce (From=3, To=2, no term).\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"inbound_forget_leader\", \"to\": 2, \"sender\": 3, \"transport\": \"RawNode.Step\",\n\t\t\"accepted\": forgedErr == nil, \"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// The identical pre-vote request is delivered again after the forgery.\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trd2 := deliverReady(follower)\n\tresp2 := findMsgs(rd2, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(resp2) > 0,\n\t\t\"granted\":         len(resp2) > 0 && !resp2[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\n\t// The leader's next heartbeat is produced by one further logical tick and\n\t// delivered to follower 2: this is the repair path that closes the window.\n\tleader.Tick()\n\trestore := deliverReady(leader)\n\trhbs2 := findMsgs(restore, pb.MsgHeartbeat, 2)\n\tif len(rhbs2) != 1 {\n\t\tt.Fatalf(\"expected one restore heartbeat, got %d\", len(rhbs2))\n\t}\n\tif err := follower.Step(rhbs2[0]); err != nil {\n\t\tt.Fatalf(\"step restore heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"restore_heartbeat_delivered\", \"to\": 2, \"sender\": 1,\n\t\t\"term\": rhbs2[0].GetTerm(), \"leader_ticks_elapsed\": 1, \"heartbeat_timeout_ticks\": 1,\n\t\t\"lead_after\": leadOf(follower),\n\t})\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after restore): %v\", err)\n\t}\n\trd3 := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"after_restore\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rd3, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rd3, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd3, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n}\n\n// TestAssuranceForgedForgetQuorumElection runs the same forgery against a\n// quorum-relevant follower and then lets a real candidate campaign, to see\n// whether an up-to-date candidate can become leader at a higher term while the\n// incumbent leader is still serving.\nfunc TestAssuranceForgedForgetQuorumElection(t *testing.T) {\n\tleader, follower, candidate := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, candidate)\n\n\t// Node 2 (the quorum-relevant voter) hears from the live leader.\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := candidate.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_heartbeat_delivered\", \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\n\t// Real campaign by node 3; its request is delivered to the leased follower\n\t// first (control), and to the incumbent leader as well.\n\tif err := candidate.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tcamp := deliverReady(candidate)\n\tpv2 := findMsgs(camp, pb.MsgPreVote, 2)\n\tpv1 := findMsgs(camp, pb.MsgPreVote, 1)\n\tif len(pv2) != 1 || len(pv1) != 1 {\n\t\tt.Fatalf(\"expected pre-vote requests for 1 and 2, got %d/%d\", len(pv1), len(pv2))\n\t}\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trdCtrl := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_request\", \"node\": 3, \"leader\": 3, \"to\": 2, \"term\": pv2[0].GetTerm(), \"log_index\": 11,\n\t})\n\tif err := leader.Step(pv1[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on incumbent: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_at_incumbent\", \"node\": 1, \"to\": 1, \"candidate\": 3,\n\t\t\"term\": pv1[0].GetTerm(), \"responded\": len(findMsgs(deliverReady(leader), pb.MsgPreVoteResp, 3)) > 0,\n\t})\n\n\t// The forged message reaches the quorum-relevant follower.\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_inbound_forget_leader\", \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\"transport\": \"RawNode.Step\", \"accepted\": forgedErr == nil,\n\t\t\"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// The identical request is re-delivered, and its grant is fed back to the\n\t// candidate, which then campaigns for real.\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trdGrant := deliverReady(follower)\n\tgrants := findMsgs(rdGrant, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(grants) > 0,\n\t\t\"granted\":         len(grants) > 0 && !grants[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\tif len(grants) > 0 {\n\t\tif err := candidate.Step(grants[0]); err != nil {\n\t\t\tt.Fatalf(\"step pre-vote response on 3: %v\", err)\n\t\t}\n\t}\n\tvotes := deliverReady(candidate)\n\tvote2 := findMsgs(votes, pb.MsgVote, 2)\n\tvote1 := findMsgs(votes, pb.MsgVote, 1)\n\tif len(vote2) != 1 || len(vote1) != 1 {\n\t\tt.Fatalf(\"expected vote requests for 1 and 2, got %d/%d\", len(vote1), len(vote2))\n\t}\n\tif err := follower.Step(vote2[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t}\n\trdVote := deliverReady(follower)\n\tvoteResps := findMsgs(rdVote, pb.MsgVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_vote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"term\": vote2[0].GetTerm(),\n\t\t\"responded\": len(voteResps) > 0,\n\t\t\"granted\":   len(voteResps) > 0 && !voteResps[0].GetReject(),\n\t})\n\tif len(voteResps) > 0 {\n\t\tif err := candidate.Step(voteResps[0]); err != nil {\n\t\t\tt.Fatalf(\"step vote response on 3: %v\", err)\n\t\t}\n\t}\n\t// The incumbent leader also receives the vote request.\n\tif err := leader.Step(vote1[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on incumbent: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_vote_at_incumbent\", \"node\": 1, \"to\": 1, \"candidate\": 3, \"term\": vote1[0].GetTerm(),\n\t\t\"responded\": len(findMsgs(deliverReady(leader), pb.MsgVoteResp, 3)) > 0,\n\t})\n\tdeliverReady(candidate)\n\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_leadership_state\", \"node\": 3, \"state\": stateOf(candidate),\n\t\t\"term\": candidate.BasicStatus().GetTerm(),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_leadership_state\", \"node\": 1, \"state\": stateOf(leader),\n\t\t\"term\": leader.BasicStatus().GetTerm(),\n\t})\n}\n\n// TestAssuranceForgedForgetAftermath repeats the forged election and then lets\n// the new leader's append reach the deposed incumbent, to see whether the\n// authority transfer completes cleanly and whether the entry committed under the\n// incumbent survives in the new leader's log.\nfunc TestAssuranceForgedForgetAftermath(t *testing.T) {\n\tleader, follower, candidate := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, candidate)\n\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := candidate.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_heartbeat_delivered\", \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\n\tcommitBefore := candidate.BasicStatus().GetCommit()\n\tif err := candidate.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tcamp := deliverReady(candidate)\n\tpv2 := findMsgs(camp, pb.MsgPreVote, 2)\n\tif len(pv2) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(pv2))\n\t}\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trdCtrl := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_request\", \"node\": 3, \"leader\": 3, \"to\": 2, \"term\": pv2[0].GetTerm(), \"log_index\": 11,\n\t})\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_inbound_forget_leader\", \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\"transport\": \"RawNode.Step\", \"accepted\": forgedErr == nil,\n\t\t\"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trdGrant := deliverReady(follower)\n\tgrants := findMsgs(rdGrant, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(grants) > 0,\n\t\t\"granted\":         len(grants) > 0 && !grants[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\tif len(grants) > 0 {\n\t\tif err := candidate.Step(grants[0]); err != nil {\n\t\t\tt.Fatalf(\"step pre-vote response on 3: %v\", err)\n\t\t}\n\t}\n\tvotes := deliverReady(candidate)\n\tvote2 := findMsgs(votes, pb.MsgVote, 2)\n\tif len(vote2) != 1 {\n\t\tt.Fatalf(\"expected one vote request for node 2, got %d\", len(vote2))\n\t}\n\tif err := follower.Step(vote2[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t}\n\trdVote := deliverReady(follower)\n\tvoteResps := findMsgs(rdVote, pb.MsgVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_vote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"term\": vote2[0].GetTerm(),\n\t\t\"responded\": len(voteResps) > 0,\n\t\t\"granted\":   len(voteResps) > 0 && !voteResps[0].GetReject(),\n\t})\n\tif len(voteResps) > 0 {\n\t\tif err := candidate.Step(voteResps[0]); err != nil {\n\t\t\tt.Fatalf(\"step vote response on 3: %v\", err)\n\t\t}\n\t}\n\tnewLeaderWork := deliverReady(candidate)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_leadership_state\", \"node\": 3, \"state\": stateOf(candidate),\n\t\t\"term\": candidate.BasicStatus().GetTerm(),\n\t})\n\n\t// The new leader's first append to the deposed incumbent: the previous entry\n\t// must be the one the incumbent itself committed at (index=11, term=2), and\n\t// the new leader's own term-3 entry follows it.\n\tappends := findMsgs(newLeaderWork, pb.MsgApp, 1)\n\tif len(appends) != 1 {\n\t\tt.Fatalf(\"expected one append for the incumbent, got %d\", len(appends))\n\t}\n\tapp := appends[0]\n\tif err := leader.Step(app); err != nil {\n\t\tt.Fatalf(\"step new leader append on incumbent: %v\", err)\n\t}\n\trdInc := deliverReady(leader)\n\tresps := findMsgs(rdInc, pb.MsgAppResp, 3)\n\trejected := false\n\trespIndex := uint64(0)\n\tif len(resps) > 0 {\n\t\trejected = resps[0].GetReject()\n\t\trespIndex = resps[0].GetIndex()\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"c_append_to_incumbent\", \"node\": 1, \"leader\": 3,\n\t\t\"incumbent_commit_before\": leader.BasicStatus().GetCommit(),\n\t\t\"incumbent_committed_term\": leader.BasicStatus().GetTerm(),\n\t\t\"prev_index\": app.GetIndex(), \"prev_term\": app.GetLogTerm(),\n\t\t\"entry_index\": app.GetEntries()[len(app.GetEntries())-1].GetIndex(),\n\t\t\"entry_term\":  app.GetEntries()[len(app.GetEntries())-1].GetTerm(),\n\t\t\"rejected\":    rejected, \"resp_index\": respIndex,\n\t\t\"state_after\": stateOf(leader), \"term_after\": leader.BasicStatus().GetTerm(), \"lead_after\": leadOf(leader),\n\t})\n\tif len(resps) > 0 {\n\t\tif err := candidate.Step(resps[0]); err != nil {\n\t\t\tt.Fatalf(\"step incumbent append response on 3: %v\", err)\n\t\t}\n\t}\n\tdeliverReady(candidate)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"c_commit_progress\", \"node\": 3, \"commit_before\": commitBefore,\n\t\t\"commit_after\": candidate.BasicStatus().GetCommit(), \"state\": stateOf(candidate),\n\t})\n}\n\n// TestAssuranceForgedForgetPersistence repeats the forgery once per heartbeat\n// round, so the repair path and the re-opening of the window can be observed\n// over several rounds instead of once.\nfunc TestAssuranceForgedForgetPersistence(t *testing.T) {\n\tleader, follower, other := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, other)\n\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := other.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_heartbeat_delivered\", \"round\": 0, \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"lead_after\": leadOf(follower), \"forged_next\": false,\n\t})\n\tif err := other.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tpreVotes := findMsgs(deliverReady(other), pb.MsgPreVote, 2)\n\tif len(preVotes) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(preVotes))\n\t}\n\tpv := preVotes[0]\n\n\t// Round 0 control: no forged message is delivered.\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (control): %v\", err)\n\t}\n\trd0 := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_prevote_outcome\", \"round\": 0, \"node\": 2, \"to\": 2, \"forged\": false,\n\t\t\"forget_accepted\": false, \"lead\": leadOf(follower),\n\t\t\"responded\": len(findMsgs(rd0, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":   len(findMsgs(rd0, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd0, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t})\n\n\t// Rounds 1..3: repair by heartbeat, then the same forgery, then the same\n\t// pre-vote request retried by the candidate.\n\tfor round := 1; round <= 3; round++ {\n\t\tleader.Tick()\n\t\ttick := deliverReady(leader)\n\t\thb := findMsgs(tick, pb.MsgHeartbeat, 2)\n\t\tif len(hb) != 1 {\n\t\t\tt.Fatalf(\"round %d: expected one heartbeat for node 2, got %d\", round, len(hb))\n\t\t}\n\t\tbefore := leadOf(follower)\n\t\tif err := follower.Step(hb[0]); err != nil {\n\t\t\tt.Fatalf(\"round %d: step heartbeat on 2: %v\", round, err)\n\t\t}\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_heartbeat_restore\", \"round\": round, \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\t\"lead_before\": before, \"lead_after\": leadOf(follower), \"ticks_since_previous\": 1,\n\t\t})\n\t\tforgedErr := follower.Step(&pb.Message{\n\t\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t\t})\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_inbound_forget\", \"round\": round, \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\t\"accepted\": forgedErr == nil, \"lead_before\": 1, \"lead_after\": leadOf(follower),\n\t\t})\n\t\tif err := follower.Step(pv); err != nil {\n\t\t\tt.Fatalf(\"round %d: step pre-vote on 2: %v\", round, err)\n\t\t}\n\t\trd := deliverReady(follower)\n\t\tresps := findMsgs(rd, pb.MsgPreVoteResp, 3)\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_prevote_outcome\", \"round\": round, \"node\": 2, \"to\": 2, \"forged\": true,\n\t\t\t\"forget_accepted\": forgedErr == nil, \"lead\": leadOf(follower),\n\t\t\t\"responded\": len(resps) > 0,\n\t\t\t\"granted\":   len(resps) > 0 && !resps[0].GetReject(),\n\t\t})\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_leader_state\", \"node\": 1, \"state\": stateOf(leader),\n\t\t\"term\": leader.BasicStatus().GetTerm(),\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "p_lease",
+          "event": "p_heartbeat_delivered",
+          "conditions": [
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "p_forget_r1",
+          "event": "p_inbound_forget",
+          "conditions": [
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "p_forget_r2",
+          "event": "p_inbound_forget",
+          "conditions": [
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "p_forget_r3",
+          "event": "p_inbound_forget",
+          "conditions": [
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "src_islocal",
+      "src_rawstep",
+      "src_step_local",
+      "src_step_votelease",
+      "src_stepfollower_forget",
+      "src_stepfollower_leadset"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Unchanged fourth test function: one control round without any forged message, then three rounds each delivering the leader's real heartbeat, the same peer-form MsgForgetLeader (From=3, To=2, no term) through RawNode.Step, and the same retried pre-vote request produced by a real campaign.",
+      "assumptions": [
+        "A peer may deliver an arbitrary protobuf message type to the public inbound path repeatedly and at will.",
+        "Only the leader is ticked, so follower election timeouts never fire and the leader stays healthy.",
+        "The candidate's request is reused unchanged across rounds as a retry; the follower stays at term 2 because a pre-vote never changes the term.",
+        "All nodes start from equal storage snapshots (index=10, term=1, voters {1,2,3})."
+      ],
+      "excluded": [
+        "Wall-clock timing and multi-host transport behaviour.",
+        "ReadOnlyLeaseBased configurations.",
+        "What a real candidate does with the grants it receives (they are fed nowhere here)."
+      ],
+      "parameters": {
+        "election_tick": 10,
+        "heartbeat_tick": 1,
+        "rounds": 3
+      }
+    },
+    "prefix": "Elect node 1 for real, deliver its real heartbeat to follower 2, emit the control round without a forgery, then for rounds 1-3: tick the leader once, deliver the resulting real heartbeat to follower 2, deliver the peer-form MsgForgetLeader, and deliver the unchanged retried pre-vote, emitting the heartbeat's lead transition, the accepted message with its lead transition, and the pre-vote outcome for that round.",
+    "requirement": null,
+    "responsibility": "The raft module owns the lease rule that keeps a follower from supporting a candidate while it hears from a live leader, and owns which message types are acceptable from the network.",
+    "comparisons": [
+      {
+        "event": "p_prevote_outcome",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "p_lease",
+        "assertion": {
+          "field": "granted",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "forged",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: the round without a forged message grants nothing."
+      },
+      {
+        "event": "p_prevote_outcome",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "p_forget_r1",
+        "assertion": {
+          "field": "granted",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "forget_accepted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "forged",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "Persistence round 1: after the accepted forgery the retried pre-vote must still not be granted while the leader is alive."
+      },
+      {
+        "event": "p_prevote_outcome",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "p_forget_r2",
+        "assertion": {
+          "field": "granted",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "forget_accepted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "forged",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ],
+        "description": "Persistence round 2: same predicate one repair cycle later."
+      },
+      {
+        "event": "p_prevote_outcome",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "p_forget_r3",
+        "assertion": {
+          "field": "granted",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "forget_accepted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "forged",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "Persistence round 3: same predicate after a third repair cycle."
+      },
+      {
+        "event": "p_heartbeat_restore",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "p_forget_r1",
+        "assertion": {
+          "field": "lead_after",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "lead_before",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ],
+        "description": "Repair after round 1: the heartbeat following the first forgery restores the leader context, so the repeated loss comes from the sender's cadence, not from a broken repair path."
+      },
+      {
+        "event": "p_heartbeat_restore",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "p_forget_r2",
+        "assertion": {
+          "field": "lead_after",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "lead_before",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "Repair after round 2: the same repair holds after the second forgery."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "1207ab773c42412aa550b8686364ca1c",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "46fd0d2e6aeb4b7db66966761e962c93",
+  "previous_id": "b3759773bf3244adac911b60c063cc4c-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft_test\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"go.etcd.io/raft/v3\"\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// emitCAEvent prints one CA_EVENT JSON line for the controller's parser.\nfunc emitCAEvent(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc errStringCA(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// deliverReady hands out the outstanding work and completes it through the\n// documented Ready/Advance contract, so outbound messages can be observed\n// without reaching into unexported state.\nfunc deliverReady(rn *raft.RawNode) raft.Ready {\n\trd := rn.Ready()\n\trn.Advance(rd)\n\treturn rd\n}\n\nfunc leadOf(rn *raft.RawNode) uint64 { return rn.BasicStatus().SoftState.Lead }\n\nfunc stateOf(rn *raft.RawNode) string { return rn.BasicStatus().SoftState.RaftState.String() }\n\nfunc findMsgs(rd raft.Ready, typ pb.MessageType, to uint64) []*pb.Message {\n\tvar out []*pb.Message\n\tfor _, m := range rd.Messages {\n\t\tif m.GetType() == typ && m.GetTo() == to {\n\t\t\tout = append(out, m)\n\t\t}\n\t}\n\treturn out\n}\n\n// caNewNode builds one real RawNode whose storage starts from the same snapshot\n// on all nodes: voters {1,2,3} with a shared log prefix at index=10, term=1.\nfunc caNewNode(t *testing.T, id uint64) *raft.RawNode {\n\tt.Helper()\n\tms := raft.NewMemoryStorage()\n\tsnap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{\n\t\tIndex:     new(uint64(10)),\n\t\tTerm:      new(uint64(1)),\n\t\tConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},\n\t}}\n\tif err := ms.ApplySnapshot(snap); err != nil {\n\t\tt.Fatalf(\"apply snapshot: %v\", err)\n\t}\n\tif err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(uint64(10))}); err != nil {\n\t\tt.Fatalf(\"set hard state: %v\", err)\n\t}\n\trn, err := raft.NewRawNode(&raft.Config{\n\t\tID:              id,\n\t\tElectionTick:    10,\n\t\tHeartbeatTick:   1,\n\t\tStorage:         ms,\n\t\tMaxSizePerMsg:   1 << 20,\n\t\tMaxInflightMsgs: 256,\n\t\tCheckQuorum:     true,\n\t\tPreVote:         true,\n\t})\n\tif err != nil {\n\t\tt.Fatalf(\"new raw node %d: %v\", id, err)\n\t}\n\treturn rn\n}\n\n// caElectNode1 runs a real election for node 1 and replicates its term-2 entry,\n// feeding every produced message through the receiver's public Step method.\nfunc caElectNode1(t *testing.T, leader, node2, node3 *raft.RawNode) {\n\tt.Helper()\n\tif err := leader.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign: %v\", err)\n\t}\n\tfor _, m := range deliverReady(leader).Messages {\n\t\tswitch m.GetTo() {\n\t\tcase 2:\n\t\t\tif err := node2.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t\t\t}\n\t\tcase 3:\n\t\t\tif err := node3.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote request on 3: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, rn := range []*raft.RawNode{node2, node3} {\n\t\tfor _, m := range deliverReady(rn).Messages {\n\t\t\tif err := leader.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote response on 1: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, m := range deliverReady(leader).Messages {\n\t\tswitch m.GetTo() {\n\t\tcase 2:\n\t\t\tif err := node2.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append on 2: %v\", err)\n\t\t\t}\n\t\tcase 3:\n\t\t\tif err := node3.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append on 3: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, rn := range []*raft.RawNode{node2, node3} {\n\t\tfor _, m := range deliverReady(rn).Messages {\n\t\t\tif err := leader.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append response on 1: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tdeliverReady(leader)\n}\n\n// TestAssuranceInboundForgetLeader measures, on one follower, what a peer-form\n// MsgForgetLeader delivered through RawNode.Step does to the live leader\n// context and to the support given to an up-to-date candidate's pre-vote, and\n// how the next real leader heartbeat closes that window.\nfunc TestAssuranceInboundForgetLeader(t *testing.T) {\n\tleader, follower, other := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, other)\n\n\t// A real heartbeat tick: node 2 receives it exactly once, establishing its\n\t// leader context and election-timer lease; node 3 receives the same\n\t// heartbeat so that it too holds a live leader context.\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := other.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"heartbeat_delivered\", \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"heartbeat_delivered_node3\", \"to\": 3, \"sender\": 1,\n\t\t\"term\": hbs3[0].GetTerm(), \"lead_after\": leadOf(other),\n\t})\n\n\t// The intended producer of \"forget the leader\": the local API on a follower\n\t// that still considers the leader live.\n\totherBefore := leadOf(other)\n\totherErr := other.ForgetLeader()\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"local_forget_leader_api\", \"to\": 3, \"lead_before\": otherBefore,\n\t\t\"lead_after\": leadOf(other), \"step_error\": errStringCA(otherErr),\n\t})\n\n\t// Control: a message type that is classified local, arriving from a peer\n\t// through the same inbound path, is rejected and changes nothing.\n\tlocalErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgCheckQuorum.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"inbound_local_msg\", \"to\": 2, \"sender\": 3, \"type\": \"MsgCheckQuorum\",\n\t\t\"step_error\": errStringCA(localErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// A real candidate (node 3) produces a real MsgPreVote request, delivered to\n\t// follower 2 verbatim.\n\tif err := other.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tpreVotes := findMsgs(deliverReady(other), pb.MsgPreVote, 2)\n\tif len(preVotes) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(preVotes))\n\t}\n\tpv := preVotes[0]\n\n\t// Control: with the leader context intact the pre-vote is ignored (no\n\t// response message at all).\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trd := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rd, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rd, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\n\t// The forged inbound message: the type only the local ForgetLeader API\n\t// produces, in the wire form a peer would produce (From=3, To=2, no term).\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"inbound_forget_leader\", \"to\": 2, \"sender\": 3, \"transport\": \"RawNode.Step\",\n\t\t\"accepted\": forgedErr == nil, \"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// The identical pre-vote request is delivered again after the forgery.\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trd2 := deliverReady(follower)\n\tresp2 := findMsgs(rd2, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(resp2) > 0,\n\t\t\"granted\":         len(resp2) > 0 && !resp2[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\n\t// The leader's next heartbeat is produced by one further logical tick and\n\t// delivered to follower 2: this is the repair path that closes the window.\n\tleader.Tick()\n\trestore := deliverReady(leader)\n\trhbs2 := findMsgs(restore, pb.MsgHeartbeat, 2)\n\tif len(rhbs2) != 1 {\n\t\tt.Fatalf(\"expected one restore heartbeat, got %d\", len(rhbs2))\n\t}\n\tif err := follower.Step(rhbs2[0]); err != nil {\n\t\tt.Fatalf(\"step restore heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"restore_heartbeat_delivered\", \"to\": 2, \"sender\": 1,\n\t\t\"term\": rhbs2[0].GetTerm(), \"leader_ticks_elapsed\": 1, \"heartbeat_timeout_ticks\": 1,\n\t\t\"lead_after\": leadOf(follower),\n\t})\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after restore): %v\", err)\n\t}\n\trd3 := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"after_restore\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rd3, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rd3, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd3, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n}\n\n// TestAssuranceForgedForgetQuorumElection runs the same forgery against a\n// quorum-relevant follower and then lets a real candidate campaign, to see\n// whether an up-to-date candidate can become leader at a higher term while the\n// incumbent leader is still serving.\nfunc TestAssuranceForgedForgetQuorumElection(t *testing.T) {\n\tleader, follower, candidate := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, candidate)\n\n\t// Node 2 (the quorum-relevant voter) hears from the live leader.\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := candidate.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_heartbeat_delivered\", \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\n\t// Real campaign by node 3; its request is delivered to the leased follower\n\t// first (control), and to the incumbent leader as well.\n\tif err := candidate.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tcamp := deliverReady(candidate)\n\tpv2 := findMsgs(camp, pb.MsgPreVote, 2)\n\tpv1 := findMsgs(camp, pb.MsgPreVote, 1)\n\tif len(pv2) != 1 || len(pv1) != 1 {\n\t\tt.Fatalf(\"expected pre-vote requests for 1 and 2, got %d/%d\", len(pv1), len(pv2))\n\t}\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trdCtrl := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_request\", \"node\": 3, \"leader\": 3, \"to\": 2, \"term\": pv2[0].GetTerm(), \"log_index\": 11,\n\t})\n\tif err := leader.Step(pv1[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on incumbent: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_at_incumbent\", \"node\": 1, \"to\": 1, \"candidate\": 3,\n\t\t\"term\": pv1[0].GetTerm(), \"responded\": len(findMsgs(deliverReady(leader), pb.MsgPreVoteResp, 3)) > 0,\n\t})\n\n\t// The forged message reaches the quorum-relevant follower.\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_inbound_forget_leader\", \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\"transport\": \"RawNode.Step\", \"accepted\": forgedErr == nil,\n\t\t\"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// The identical request is re-delivered, and its grant is fed back to the\n\t// candidate, which then campaigns for real.\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trdGrant := deliverReady(follower)\n\tgrants := findMsgs(rdGrant, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(grants) > 0,\n\t\t\"granted\":         len(grants) > 0 && !grants[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\tif len(grants) > 0 {\n\t\tif err := candidate.Step(grants[0]); err != nil {\n\t\t\tt.Fatalf(\"step pre-vote response on 3: %v\", err)\n\t\t}\n\t}\n\tvotes := deliverReady(candidate)\n\tvote2 := findMsgs(votes, pb.MsgVote, 2)\n\tvote1 := findMsgs(votes, pb.MsgVote, 1)\n\tif len(vote2) != 1 || len(vote1) != 1 {\n\t\tt.Fatalf(\"expected vote requests for 1 and 2, got %d/%d\", len(vote1), len(vote2))\n\t}\n\tif err := follower.Step(vote2[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t}\n\trdVote := deliverReady(follower)\n\tvoteResps := findMsgs(rdVote, pb.MsgVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_vote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"term\": vote2[0].GetTerm(),\n\t\t\"responded\": len(voteResps) > 0,\n\t\t\"granted\":   len(voteResps) > 0 && !voteResps[0].GetReject(),\n\t})\n\tif len(voteResps) > 0 {\n\t\tif err := candidate.Step(voteResps[0]); err != nil {\n\t\t\tt.Fatalf(\"step vote response on 3: %v\", err)\n\t\t}\n\t}\n\t// The incumbent leader also receives the vote request.\n\tif err := leader.Step(vote1[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on incumbent: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_vote_at_incumbent\", \"node\": 1, \"to\": 1, \"candidate\": 3, \"term\": vote1[0].GetTerm(),\n\t\t\"responded\": len(findMsgs(deliverReady(leader), pb.MsgVoteResp, 3)) > 0,\n\t})\n\tdeliverReady(candidate)\n\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_leadership_state\", \"node\": 3, \"state\": stateOf(candidate),\n\t\t\"term\": candidate.BasicStatus().GetTerm(),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_leadership_state\", \"node\": 1, \"state\": stateOf(leader),\n\t\t\"term\": leader.BasicStatus().GetTerm(),\n\t})\n}\n\n// TestAssuranceForgedForgetAftermath repeats the forged election and then lets\n// the new leader's append reach the deposed incumbent, to see whether the\n// authority transfer completes cleanly and whether the entry committed under the\n// incumbent survives in the new leader's log.\nfunc TestAssuranceForgedForgetAftermath(t *testing.T) {\n\tleader, follower, candidate := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, candidate)\n\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := candidate.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_heartbeat_delivered\", \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\n\tcommitBefore := candidate.BasicStatus().GetCommit()\n\tif err := candidate.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tcamp := deliverReady(candidate)\n\tpv2 := findMsgs(camp, pb.MsgPreVote, 2)\n\tif len(pv2) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(pv2))\n\t}\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trdCtrl := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_request\", \"node\": 3, \"leader\": 3, \"to\": 2, \"term\": pv2[0].GetTerm(), \"log_index\": 11,\n\t})\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_inbound_forget_leader\", \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\"transport\": \"RawNode.Step\", \"accepted\": forgedErr == nil,\n\t\t\"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trdGrant := deliverReady(follower)\n\tgrants := findMsgs(rdGrant, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(grants) > 0,\n\t\t\"granted\":         len(grants) > 0 && !grants[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\tif len(grants) > 0 {\n\t\tif err := candidate.Step(grants[0]); err != nil {\n\t\t\tt.Fatalf(\"step pre-vote response on 3: %v\", err)\n\t\t}\n\t}\n\tvotes := deliverReady(candidate)\n\tvote2 := findMsgs(votes, pb.MsgVote, 2)\n\tif len(vote2) != 1 {\n\t\tt.Fatalf(\"expected one vote request for node 2, got %d\", len(vote2))\n\t}\n\tif err := follower.Step(vote2[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t}\n\trdVote := deliverReady(follower)\n\tvoteResps := findMsgs(rdVote, pb.MsgVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_vote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"term\": vote2[0].GetTerm(),\n\t\t\"responded\": len(voteResps) > 0,\n\t\t\"granted\":   len(voteResps) > 0 && !voteResps[0].GetReject(),\n\t})\n\tif len(voteResps) > 0 {\n\t\tif err := candidate.Step(voteResps[0]); err != nil {\n\t\t\tt.Fatalf(\"step vote response on 3: %v\", err)\n\t\t}\n\t}\n\tnewLeaderWork := deliverReady(candidate)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_leadership_state\", \"node\": 3, \"state\": stateOf(candidate),\n\t\t\"term\": candidate.BasicStatus().GetTerm(),\n\t})\n\n\t// The new leader's first append to the deposed incumbent: the previous entry\n\t// must be the one the incumbent itself committed at (index=11, term=2), and\n\t// the new leader's own term-3 entry follows it.\n\tappends := findMsgs(newLeaderWork, pb.MsgApp, 1)\n\tif len(appends) != 1 {\n\t\tt.Fatalf(\"expected one append for the incumbent, got %d\", len(appends))\n\t}\n\tapp := appends[0]\n\tif err := leader.Step(app); err != nil {\n\t\tt.Fatalf(\"step new leader append on incumbent: %v\", err)\n\t}\n\trdInc := deliverReady(leader)\n\tresps := findMsgs(rdInc, pb.MsgAppResp, 3)\n\trejected := false\n\trespIndex := uint64(0)\n\tif len(resps) > 0 {\n\t\trejected = resps[0].GetReject()\n\t\trespIndex = resps[0].GetIndex()\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"c_append_to_incumbent\", \"node\": 1, \"leader\": 3,\n\t\t\"incumbent_commit_before\": leader.BasicStatus().GetCommit(),\n\t\t\"incumbent_committed_term\": leader.BasicStatus().GetTerm(),\n\t\t\"prev_index\": app.GetIndex(), \"prev_term\": app.GetLogTerm(),\n\t\t\"entry_index\": app.GetEntries()[len(app.GetEntries())-1].GetIndex(),\n\t\t\"entry_term\":  app.GetEntries()[len(app.GetEntries())-1].GetTerm(),\n\t\t\"rejected\":    rejected, \"resp_index\": respIndex,\n\t\t\"state_after\": stateOf(leader), \"term_after\": leader.BasicStatus().GetTerm(), \"lead_after\": leadOf(leader),\n\t})\n\tif len(resps) > 0 {\n\t\tif err := candidate.Step(resps[0]); err != nil {\n\t\t\tt.Fatalf(\"step incumbent append response on 3: %v\", err)\n\t\t}\n\t}\n\tdeliverReady(candidate)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"c_commit_progress\", \"node\": 3, \"commit_before\": commitBefore,\n\t\t\"commit_after\": candidate.BasicStatus().GetCommit(), \"state\": stateOf(candidate),\n\t})\n}\n\n// TestAssuranceForgedForgetPersistence repeats the forgery once per heartbeat\n// round, so the repair path and the re-opening of the window can be observed\n// over several rounds instead of once.\nfunc TestAssuranceForgedForgetPersistence(t *testing.T) {\n\tleader, follower, other := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, other)\n\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := other.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_heartbeat_delivered\", \"round\": 0, \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"lead_after\": leadOf(follower), \"forged_next\": false,\n\t})\n\tif err := other.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tpreVotes := findMsgs(deliverReady(other), pb.MsgPreVote, 2)\n\tif len(preVotes) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(preVotes))\n\t}\n\tpv := preVotes[0]\n\n\t// Round 0 control: no forged message is delivered.\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (control): %v\", err)\n\t}\n\trd0 := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_prevote_outcome\", \"round\": 0, \"node\": 2, \"to\": 2, \"forged\": false,\n\t\t\"forget_accepted\": false, \"lead\": leadOf(follower),\n\t\t\"responded\": len(findMsgs(rd0, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":   len(findMsgs(rd0, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd0, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t})\n\n\t// Rounds 1..3: repair by heartbeat, then the same forgery, then the same\n\t// pre-vote request retried by the candidate.\n\tfor round := 1; round <= 3; round++ {\n\t\tleader.Tick()\n\t\ttick := deliverReady(leader)\n\t\thb := findMsgs(tick, pb.MsgHeartbeat, 2)\n\t\tif len(hb) != 1 {\n\t\t\tt.Fatalf(\"round %d: expected one heartbeat for node 2, got %d\", round, len(hb))\n\t\t}\n\t\tbefore := leadOf(follower)\n\t\tif err := follower.Step(hb[0]); err != nil {\n\t\t\tt.Fatalf(\"round %d: step heartbeat on 2: %v\", round, err)\n\t\t}\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_heartbeat_restore\", \"round\": round, \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\t\"lead_before\": before, \"lead_after\": leadOf(follower), \"ticks_since_previous\": 1,\n\t\t})\n\t\tforgedErr := follower.Step(&pb.Message{\n\t\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t\t})\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_inbound_forget\", \"round\": round, \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\t\"accepted\": forgedErr == nil, \"lead_before\": 1, \"lead_after\": leadOf(follower),\n\t\t})\n\t\tif err := follower.Step(pv); err != nil {\n\t\t\tt.Fatalf(\"round %d: step pre-vote on 2: %v\", round, err)\n\t\t}\n\t\trd := deliverReady(follower)\n\t\tresps := findMsgs(rd, pb.MsgPreVoteResp, 3)\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_prevote_outcome\", \"round\": round, \"node\": 2, \"to\": 2, \"forged\": true,\n\t\t\t\"forget_accepted\": forgedErr == nil, \"lead\": leadOf(follower),\n\t\t\t\"responded\": len(resps) > 0,\n\t\t\t\"granted\":   len(resps) > 0 && !resps[0].GetReject(),\n\t\t})\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_leader_state\", \"node\": 1, \"state\": stateOf(leader),\n\t\t\"term\": leader.BasicStatus().GetTerm(),\n\t})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "p_lease",
+            "event": "p_heartbeat_delivered",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "p_forget",
+            "event": "p_inbound_forget",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "p_forget_prev",
+            "event": "p_inbound_forget",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 2,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft_test\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"go.etcd.io/raft/v3\"\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// emitCAEvent prints one CA_EVENT JSON line for the controller's parser.\nfunc emitCAEvent(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc errStringCA(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n\n// deliverReady hands out the outstanding work and completes it through the\n// documented Ready/Advance contract, so outbound messages can be observed\n// without reaching into unexported state.\nfunc deliverReady(rn *raft.RawNode) raft.Ready {\n\trd := rn.Ready()\n\trn.Advance(rd)\n\treturn rd\n}\n\nfunc leadOf(rn *raft.RawNode) uint64 { return rn.BasicStatus().SoftState.Lead }\n\nfunc stateOf(rn *raft.RawNode) string { return rn.BasicStatus().SoftState.RaftState.String() }\n\nfunc findMsgs(rd raft.Ready, typ pb.MessageType, to uint64) []*pb.Message {\n\tvar out []*pb.Message\n\tfor _, m := range rd.Messages {\n\t\tif m.GetType() == typ && m.GetTo() == to {\n\t\t\tout = append(out, m)\n\t\t}\n\t}\n\treturn out\n}\n\n// caNewNode builds one real RawNode whose storage starts from the same snapshot\n// on all nodes: voters {1,2,3} with a shared log prefix at index=10, term=1.\nfunc caNewNode(t *testing.T, id uint64) *raft.RawNode {\n\tt.Helper()\n\tms := raft.NewMemoryStorage()\n\tsnap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{\n\t\tIndex:     new(uint64(10)),\n\t\tTerm:      new(uint64(1)),\n\t\tConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},\n\t}}\n\tif err := ms.ApplySnapshot(snap); err != nil {\n\t\tt.Fatalf(\"apply snapshot: %v\", err)\n\t}\n\tif err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(uint64(10))}); err != nil {\n\t\tt.Fatalf(\"set hard state: %v\", err)\n\t}\n\trn, err := raft.NewRawNode(&raft.Config{\n\t\tID:              id,\n\t\tElectionTick:    10,\n\t\tHeartbeatTick:   1,\n\t\tStorage:         ms,\n\t\tMaxSizePerMsg:   1 << 20,\n\t\tMaxInflightMsgs: 256,\n\t\tCheckQuorum:     true,\n\t\tPreVote:         true,\n\t})\n\tif err != nil {\n\t\tt.Fatalf(\"new raw node %d: %v\", id, err)\n\t}\n\treturn rn\n}\n\n// caElectNode1 runs a real election for node 1 and replicates its term-2 entry,\n// feeding every produced message through the receiver's public Step method.\nfunc caElectNode1(t *testing.T, leader, node2, node3 *raft.RawNode) {\n\tt.Helper()\n\tif err := leader.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign: %v\", err)\n\t}\n\tfor _, m := range deliverReady(leader).Messages {\n\t\tswitch m.GetTo() {\n\t\tcase 2:\n\t\t\tif err := node2.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t\t\t}\n\t\tcase 3:\n\t\t\tif err := node3.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote request on 3: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, rn := range []*raft.RawNode{node2, node3} {\n\t\tfor _, m := range deliverReady(rn).Messages {\n\t\t\tif err := leader.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step vote response on 1: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, m := range deliverReady(leader).Messages {\n\t\tswitch m.GetTo() {\n\t\tcase 2:\n\t\t\tif err := node2.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append on 2: %v\", err)\n\t\t\t}\n\t\tcase 3:\n\t\t\tif err := node3.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append on 3: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, rn := range []*raft.RawNode{node2, node3} {\n\t\tfor _, m := range deliverReady(rn).Messages {\n\t\t\tif err := leader.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"step append response on 1: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n\tdeliverReady(leader)\n}\n\n// TestAssuranceInboundForgetLeader measures, on one follower, what a peer-form\n// MsgForgetLeader delivered through RawNode.Step does to the live leader\n// context and to the support given to an up-to-date candidate's pre-vote, and\n// how the next real leader heartbeat closes that window.\nfunc TestAssuranceInboundForgetLeader(t *testing.T) {\n\tleader, follower, other := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, other)\n\n\t// A real heartbeat tick: node 2 receives it exactly once, establishing its\n\t// leader context and election-timer lease; node 3 receives the same\n\t// heartbeat so that it too holds a live leader context.\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := other.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"heartbeat_delivered\", \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"heartbeat_delivered_node3\", \"to\": 3, \"sender\": 1,\n\t\t\"term\": hbs3[0].GetTerm(), \"lead_after\": leadOf(other),\n\t})\n\n\t// The intended producer of \"forget the leader\": the local API on a follower\n\t// that still considers the leader live.\n\totherBefore := leadOf(other)\n\totherErr := other.ForgetLeader()\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"local_forget_leader_api\", \"to\": 3, \"lead_before\": otherBefore,\n\t\t\"lead_after\": leadOf(other), \"step_error\": errStringCA(otherErr),\n\t})\n\n\t// Control: a message type that is classified local, arriving from a peer\n\t// through the same inbound path, is rejected and changes nothing.\n\tlocalErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgCheckQuorum.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"inbound_local_msg\", \"to\": 2, \"sender\": 3, \"type\": \"MsgCheckQuorum\",\n\t\t\"step_error\": errStringCA(localErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// A real candidate (node 3) produces a real MsgPreVote request, delivered to\n\t// follower 2 verbatim.\n\tif err := other.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tpreVotes := findMsgs(deliverReady(other), pb.MsgPreVote, 2)\n\tif len(preVotes) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(preVotes))\n\t}\n\tpv := preVotes[0]\n\n\t// Control: with the leader context intact the pre-vote is ignored (no\n\t// response message at all).\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trd := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rd, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rd, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\n\t// The forged inbound message: the type only the local ForgetLeader API\n\t// produces, in the wire form a peer would produce (From=3, To=2, no term).\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"inbound_forget_leader\", \"to\": 2, \"sender\": 3, \"transport\": \"RawNode.Step\",\n\t\t\"accepted\": forgedErr == nil, \"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// The identical pre-vote request is delivered again after the forgery.\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trd2 := deliverReady(follower)\n\tresp2 := findMsgs(rd2, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(resp2) > 0,\n\t\t\"granted\":         len(resp2) > 0 && !resp2[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\n\t// The leader's next heartbeat is produced by one further logical tick and\n\t// delivered to follower 2: this is the repair path that closes the window.\n\tleader.Tick()\n\trestore := deliverReady(leader)\n\trhbs2 := findMsgs(restore, pb.MsgHeartbeat, 2)\n\tif len(rhbs2) != 1 {\n\t\tt.Fatalf(\"expected one restore heartbeat, got %d\", len(rhbs2))\n\t}\n\tif err := follower.Step(rhbs2[0]); err != nil {\n\t\tt.Fatalf(\"step restore heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"restore_heartbeat_delivered\", \"to\": 2, \"sender\": 1,\n\t\t\"term\": rhbs2[0].GetTerm(), \"leader_ticks_elapsed\": 1, \"heartbeat_timeout_ticks\": 1,\n\t\t\"lead_after\": leadOf(follower),\n\t})\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after restore): %v\", err)\n\t}\n\trd3 := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"prevote_outcome\", \"to\": 2, \"candidate\": 3, \"phase\": \"after_restore\",\n\t\t\"candidate_term\": pv.GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rd3, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rd3, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd3, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n}\n\n// TestAssuranceForgedForgetQuorumElection runs the same forgery against a\n// quorum-relevant follower and then lets a real candidate campaign, to see\n// whether an up-to-date candidate can become leader at a higher term while the\n// incumbent leader is still serving.\nfunc TestAssuranceForgedForgetQuorumElection(t *testing.T) {\n\tleader, follower, candidate := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, candidate)\n\n\t// Node 2 (the quorum-relevant voter) hears from the live leader.\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := candidate.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_heartbeat_delivered\", \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\n\t// Real campaign by node 3; its request is delivered to the leased follower\n\t// first (control), and to the incumbent leader as well.\n\tif err := candidate.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tcamp := deliverReady(candidate)\n\tpv2 := findMsgs(camp, pb.MsgPreVote, 2)\n\tpv1 := findMsgs(camp, pb.MsgPreVote, 1)\n\tif len(pv2) != 1 || len(pv1) != 1 {\n\t\tt.Fatalf(\"expected pre-vote requests for 1 and 2, got %d/%d\", len(pv1), len(pv2))\n\t}\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trdCtrl := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_request\", \"node\": 3, \"leader\": 3, \"to\": 2, \"term\": pv2[0].GetTerm(), \"log_index\": 11,\n\t})\n\tif err := leader.Step(pv1[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on incumbent: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_at_incumbent\", \"node\": 1, \"to\": 1, \"candidate\": 3,\n\t\t\"term\": pv1[0].GetTerm(), \"responded\": len(findMsgs(deliverReady(leader), pb.MsgPreVoteResp, 3)) > 0,\n\t})\n\n\t// The forged message reaches the quorum-relevant follower.\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_inbound_forget_leader\", \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\"transport\": \"RawNode.Step\", \"accepted\": forgedErr == nil,\n\t\t\"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\n\t// The identical request is re-delivered, and its grant is fed back to the\n\t// candidate, which then campaigns for real.\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trdGrant := deliverReady(follower)\n\tgrants := findMsgs(rdGrant, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(grants) > 0,\n\t\t\"granted\":         len(grants) > 0 && !grants[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\tif len(grants) > 0 {\n\t\tif err := candidate.Step(grants[0]); err != nil {\n\t\t\tt.Fatalf(\"step pre-vote response on 3: %v\", err)\n\t\t}\n\t}\n\tvotes := deliverReady(candidate)\n\tvote2 := findMsgs(votes, pb.MsgVote, 2)\n\tvote1 := findMsgs(votes, pb.MsgVote, 1)\n\tif len(vote2) != 1 || len(vote1) != 1 {\n\t\tt.Fatalf(\"expected vote requests for 1 and 2, got %d/%d\", len(vote1), len(vote2))\n\t}\n\tif err := follower.Step(vote2[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t}\n\trdVote := deliverReady(follower)\n\tvoteResps := findMsgs(rdVote, pb.MsgVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_vote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"term\": vote2[0].GetTerm(),\n\t\t\"responded\": len(voteResps) > 0,\n\t\t\"granted\":   len(voteResps) > 0 && !voteResps[0].GetReject(),\n\t})\n\tif len(voteResps) > 0 {\n\t\tif err := candidate.Step(voteResps[0]); err != nil {\n\t\t\tt.Fatalf(\"step vote response on 3: %v\", err)\n\t\t}\n\t}\n\t// The incumbent leader also receives the vote request.\n\tif err := leader.Step(vote1[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on incumbent: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_vote_at_incumbent\", \"node\": 1, \"to\": 1, \"candidate\": 3, \"term\": vote1[0].GetTerm(),\n\t\t\"responded\": len(findMsgs(deliverReady(leader), pb.MsgVoteResp, 3)) > 0,\n\t})\n\tdeliverReady(candidate)\n\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_leadership_state\", \"node\": 3, \"state\": stateOf(candidate),\n\t\t\"term\": candidate.BasicStatus().GetTerm(),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"q_leadership_state\", \"node\": 1, \"state\": stateOf(leader),\n\t\t\"term\": leader.BasicStatus().GetTerm(),\n\t})\n}\n\n// TestAssuranceForgedForgetAftermath repeats the forged election and then lets\n// the new leader's append reach the deposed incumbent, to see whether the\n// authority transfer completes cleanly and whether the entry committed under the\n// incumbent survives in the new leader's log.\nfunc TestAssuranceForgedForgetAftermath(t *testing.T) {\n\tleader, follower, candidate := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, candidate)\n\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := candidate.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_heartbeat_delivered\", \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"term\": hbs2[0].GetTerm(), \"lead_after\": leadOf(follower),\n\t})\n\n\tcommitBefore := candidate.BasicStatus().GetCommit()\n\tif err := candidate.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tcamp := deliverReady(candidate)\n\tpv2 := findMsgs(camp, pb.MsgPreVote, 2)\n\tif len(pv2) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(pv2))\n\t}\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (under lease): %v\", err)\n\t}\n\trdCtrl := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"under_lease\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":         len(findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rdCtrl, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t\t\"forget_accepted\": false,\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_request\", \"node\": 3, \"leader\": 3, \"to\": 2, \"term\": pv2[0].GetTerm(), \"log_index\": 11,\n\t})\n\tforgedErr := follower.Step(&pb.Message{\n\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t})\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_inbound_forget_leader\", \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\"transport\": \"RawNode.Step\", \"accepted\": forgedErr == nil,\n\t\t\"step_error\": errStringCA(forgedErr), \"lead_after\": leadOf(follower),\n\t})\n\tif err := follower.Step(pv2[0]); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (after forget): %v\", err)\n\t}\n\trdGrant := deliverReady(follower)\n\tgrants := findMsgs(rdGrant, pb.MsgPreVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_prevote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"phase\": \"after_forget\",\n\t\t\"candidate_term\": pv2[0].GetTerm(), \"lead\": leadOf(follower),\n\t\t\"responded\":       len(grants) > 0,\n\t\t\"granted\":         len(grants) > 0 && !grants[0].GetReject(),\n\t\t\"forget_accepted\": forgedErr == nil,\n\t})\n\tif len(grants) > 0 {\n\t\tif err := candidate.Step(grants[0]); err != nil {\n\t\t\tt.Fatalf(\"step pre-vote response on 3: %v\", err)\n\t\t}\n\t}\n\tvotes := deliverReady(candidate)\n\tvote2 := findMsgs(votes, pb.MsgVote, 2)\n\tif len(vote2) != 1 {\n\t\tt.Fatalf(\"expected one vote request for node 2, got %d\", len(vote2))\n\t}\n\tif err := follower.Step(vote2[0]); err != nil {\n\t\tt.Fatalf(\"step vote request on 2: %v\", err)\n\t}\n\trdVote := deliverReady(follower)\n\tvoteResps := findMsgs(rdVote, pb.MsgVoteResp, 3)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_vote_outcome\", \"node\": 2, \"to\": 2, \"candidate\": 3, \"term\": vote2[0].GetTerm(),\n\t\t\"responded\": len(voteResps) > 0,\n\t\t\"granted\":   len(voteResps) > 0 && !voteResps[0].GetReject(),\n\t})\n\tif len(voteResps) > 0 {\n\t\tif err := candidate.Step(voteResps[0]); err != nil {\n\t\t\tt.Fatalf(\"step vote response on 3: %v\", err)\n\t\t}\n\t}\n\tnewLeaderWork := deliverReady(candidate)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"a_leadership_state\", \"node\": 3, \"state\": stateOf(candidate),\n\t\t\"term\": candidate.BasicStatus().GetTerm(),\n\t})\n\n\t// The new leader's first append to the deposed incumbent: the previous entry\n\t// must be the one the incumbent itself committed at (index=11, term=2), and\n\t// the new leader's own term-3 entry follows it.\n\tappends := findMsgs(newLeaderWork, pb.MsgApp, 1)\n\tif len(appends) != 1 {\n\t\tt.Fatalf(\"expected one append for the incumbent, got %d\", len(appends))\n\t}\n\tapp := appends[0]\n\tif err := leader.Step(app); err != nil {\n\t\tt.Fatalf(\"step new leader append on incumbent: %v\", err)\n\t}\n\trdInc := deliverReady(leader)\n\tresps := findMsgs(rdInc, pb.MsgAppResp, 3)\n\trejected := false\n\trespIndex := uint64(0)\n\tif len(resps) > 0 {\n\t\trejected = resps[0].GetReject()\n\t\trespIndex = resps[0].GetIndex()\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"c_append_to_incumbent\", \"node\": 1, \"leader\": 3,\n\t\t\"incumbent_commit_before\": leader.BasicStatus().GetCommit(),\n\t\t\"incumbent_committed_term\": leader.BasicStatus().GetTerm(),\n\t\t\"prev_index\": app.GetIndex(), \"prev_term\": app.GetLogTerm(),\n\t\t\"entry_index\": app.GetEntries()[len(app.GetEntries())-1].GetIndex(),\n\t\t\"entry_term\":  app.GetEntries()[len(app.GetEntries())-1].GetTerm(),\n\t\t\"rejected\":    rejected, \"resp_index\": respIndex,\n\t\t\"state_after\": stateOf(leader), \"term_after\": leader.BasicStatus().GetTerm(), \"lead_after\": leadOf(leader),\n\t})\n\tif len(resps) > 0 {\n\t\tif err := candidate.Step(resps[0]); err != nil {\n\t\t\tt.Fatalf(\"step incumbent append response on 3: %v\", err)\n\t\t}\n\t}\n\tdeliverReady(candidate)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"c_commit_progress\", \"node\": 3, \"commit_before\": commitBefore,\n\t\t\"commit_after\": candidate.BasicStatus().GetCommit(), \"state\": stateOf(candidate),\n\t})\n}\n\n// TestAssuranceForgedForgetPersistence repeats the forgery once per heartbeat\n// round, so the repair path and the re-opening of the window can be observed\n// over several rounds instead of once.\nfunc TestAssuranceForgedForgetPersistence(t *testing.T) {\n\tleader, follower, other := caNewNode(t, 1), caNewNode(t, 2), caNewNode(t, 3)\n\tcaElectNode1(t, leader, follower, other)\n\n\tleader.Tick()\n\ttick := deliverReady(leader)\n\thbs2 := findMsgs(tick, pb.MsgHeartbeat, 2)\n\thbs3 := findMsgs(tick, pb.MsgHeartbeat, 3)\n\tif len(hbs2) != 1 || len(hbs3) != 1 {\n\t\tt.Fatalf(\"expected one heartbeat per follower, got %d/%d\", len(hbs2), len(hbs3))\n\t}\n\tif err := other.Step(hbs3[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 3: %v\", err)\n\t}\n\tif err := follower.Step(hbs2[0]); err != nil {\n\t\tt.Fatalf(\"step heartbeat on 2: %v\", err)\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_heartbeat_delivered\", \"round\": 0, \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\"lead_after\": leadOf(follower), \"forged_next\": false,\n\t})\n\tif err := other.Campaign(); err != nil {\n\t\tt.Fatalf(\"campaign 3: %v\", err)\n\t}\n\tpreVotes := findMsgs(deliverReady(other), pb.MsgPreVote, 2)\n\tif len(preVotes) != 1 {\n\t\tt.Fatalf(\"expected one pre-vote request for node 2, got %d\", len(preVotes))\n\t}\n\tpv := preVotes[0]\n\n\t// Round 0 control: no forged message is delivered.\n\tif err := follower.Step(pv); err != nil {\n\t\tt.Fatalf(\"step pre-vote on 2 (control): %v\", err)\n\t}\n\trd0 := deliverReady(follower)\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_prevote_outcome\", \"round\": 0, \"node\": 2, \"to\": 2, \"forged\": false,\n\t\t\"forget_accepted\": false, \"lead\": leadOf(follower),\n\t\t\"responded\": len(findMsgs(rd0, pb.MsgPreVoteResp, 3)) > 0,\n\t\t\"granted\":   len(findMsgs(rd0, pb.MsgPreVoteResp, 3)) > 0 && !findMsgs(rd0, pb.MsgPreVoteResp, 3)[0].GetReject(),\n\t})\n\n\t// Rounds 1..3: repair by heartbeat, then the same forgery, then the same\n\t// pre-vote request retried by the candidate.\n\tfor round := 1; round <= 3; round++ {\n\t\tleader.Tick()\n\t\ttick := deliverReady(leader)\n\t\thb := findMsgs(tick, pb.MsgHeartbeat, 2)\n\t\tif len(hb) != 1 {\n\t\t\tt.Fatalf(\"round %d: expected one heartbeat for node 2, got %d\", round, len(hb))\n\t\t}\n\t\tbefore := leadOf(follower)\n\t\tif err := follower.Step(hb[0]); err != nil {\n\t\t\tt.Fatalf(\"round %d: step heartbeat on 2: %v\", round, err)\n\t\t}\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_heartbeat_restore\", \"round\": round, \"node\": 2, \"to\": 2, \"sender\": 1,\n\t\t\t\"lead_before\": before, \"lead_after\": leadOf(follower), \"ticks_since_previous\": 1,\n\t\t})\n\t\tforgedErr := follower.Step(&pb.Message{\n\t\t\tType: pb.MsgForgetLeader.Enum(), From: new(uint64(3)), To: new(uint64(2)),\n\t\t})\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_inbound_forget\", \"round\": round, \"node\": 2, \"to\": 2, \"sender\": 3,\n\t\t\t\"accepted\": forgedErr == nil, \"lead_before\": 1, \"lead_after\": leadOf(follower),\n\t\t})\n\t\tif err := follower.Step(pv); err != nil {\n\t\t\tt.Fatalf(\"round %d: step pre-vote on 2: %v\", round, err)\n\t\t}\n\t\trd := deliverReady(follower)\n\t\tresps := findMsgs(rd, pb.MsgPreVoteResp, 3)\n\t\temitCAEvent(t, map[string]any{\n\t\t\t\"event\": \"p_prevote_outcome\", \"round\": round, \"node\": 2, \"to\": 2, \"forged\": true,\n\t\t\t\"forget_accepted\": forgedErr == nil, \"lead\": leadOf(follower),\n\t\t\t\"responded\": len(resps) > 0,\n\t\t\t\"granted\":   len(resps) > 0 && !resps[0].GetReject(),\n\t\t})\n\t}\n\temitCAEvent(t, map[string]any{\n\t\t\"event\": \"p_leader_state\", \"node\": 1, \"state\": stateOf(leader),\n\t\t\"term\": leader.BasicStatus().GetTerm(),\n\t})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "p_lease",
+            "event": "p_heartbeat_delivered",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "p_forget_r1",
+            "event": "p_inbound_forget",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 1,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "p_forget_r2",
+            "event": "p_inbound_forget",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 2,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "p_forget_r3",
+            "event": "p_inbound_forget",
+            "conditions": [
+              {
+                "field": "round",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Fourth test function in the same harness file: a real three-voter group elected for node 1, a real pre-vote request produced by a real campaign on node 3 and retried unchanged, and a loop of three rounds in which the leader is ticked, its real heartbeat is delivered to follower 2, the peer-form MsgForgetLeader (From=3, To=2, no term field) is delivered through RawNode.Step, and the retried pre-vote is delivered again.",
+        "assumptions": [
+          "A peer may deliver an arbitrary protobuf message type to the public inbound path RawNode.Step, repeatedly and at will.",
+          "Ticks are the target's logical clock; only the leader is ticked, so follower election timeouts never fire and the leader stays healthy throughout.",
+          "The candidate's request is reused unchanged across rounds, representing a retry by a candidate that is still waiting; the follower stays at term 2 because a pre-vote never changes the term.",
+          "All nodes start from equal storage snapshots (index=10, term=1, voters {1,2,3})."
+        ],
+        "excluded": [
+          "Wall-clock timing and multi-host transport behaviour.",
+          "ReadOnlyLeaseBased configurations.",
+          "Whether a real candidate would keep retrying after its first grant is taken (the grant is fed nowhere here)."
+        ],
+        "parameters": {
+          "election_tick": 10,
+          "heartbeat_tick": 1,
+          "rounds": 3
+        }
+      },
+      "after": {
+        "description": "Unchanged fourth test function: one control round without any forged message, then three rounds each delivering the leader's real heartbeat, the same peer-form MsgForgetLeader (From=3, To=2, no term) through RawNode.Step, and the same retried pre-vote request produced by a real campaign.",
+        "assumptions": [
+          "A peer may deliver an arbitrary protobuf message type to the public inbound path repeatedly and at will.",
+          "Only the leader is ticked, so follower election timeouts never fire and the leader stays healthy.",
+          "The candidate's request is reused unchanged across rounds as a retry; the follower stays at term 2 because a pre-vote never changes the term.",
+          "All nodes start from equal storage snapshots (index=10, term=1, voters {1,2,3})."
+        ],
+        "excluded": [
+          "Wall-clock timing and multi-host transport behaviour.",
+          "ReadOnlyLeaseBased configurations.",
+          "What a real candidate does with the grants it receives (they are fed nowhere here)."
+        ],
+        "parameters": {
+          "election_tick": 10,
+          "heartbeat_tick": 1,
+          "rounds": 3
+        }
+      }
+    },
+    "prefix": {
+      "before": "Elect node 1 for real, deliver its real heartbeat to follower 2, emit the pre-vote control round, then repeat three rounds: leader tick (one heartbeat), deliver the real heartbeat to follower 2, deliver the peer-form MsgForgetLeader, deliver the unchanged retried pre-vote. Each round emits the heartbeat's lead transition, the accepted message with its lead transition, and the pre-vote outcome (whether a MsgPreVoteResp was produced and whether it rejected).",
+      "after": "Elect node 1 for real, deliver its real heartbeat to follower 2, emit the control round without a forgery, then for rounds 1-3: tick the leader once, deliver the resulting real heartbeat to follower 2, deliver the peer-form MsgForgetLeader, and deliver the unchanged retried pre-vote, emitting the heartbeat's lead transition, the accepted message with its lead transition, and the pre-vote outcome for that round."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "p_prevote_outcome",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_lease",
+          "assertion": {
+            "field": "granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "forged",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: in the round without any forged message the retried pre-vote is not granted."
+        },
+        {
+          "event": "p_prevote_outcome",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget",
+          "assertion": {
+            "field": "granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "forget_accepted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "forged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Persistence: in every round that delivered the accepted message the follower must still not grant the retried pre-vote while the leader is alive; witnesses in rounds 1-3 are the violated case."
+        },
+        {
+          "event": "p_heartbeat_restore",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget_prev",
+          "assertion": {
+            "field": "lead_after",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "lead_before",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "applicability_conditions": [],
+          "description": "Repair is not broken: a round that starts without a leader context is restored to lead=1 by the leader's real heartbeat, so the repeated failure comes from the sender's cadence, not from a broken repair path."
+        }
+      ],
+      "after": [
+        {
+          "event": "p_prevote_outcome",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_lease",
+          "assertion": {
+            "field": "granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "forged",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: the round without a forged message grants nothing."
+        },
+        {
+          "event": "p_prevote_outcome",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget_r1",
+          "assertion": {
+            "field": "granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "forget_accepted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "forged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ],
+          "description": "Persistence round 1: after the accepted forgery the retried pre-vote must still not be granted while the leader is alive."
+        },
+        {
+          "event": "p_prevote_outcome",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget_r2",
+          "assertion": {
+            "field": "granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "forget_accepted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "forged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "Persistence round 2: same predicate one repair cycle later."
+        },
+        {
+          "event": "p_prevote_outcome",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget_r3",
+          "assertion": {
+            "field": "granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "forget_accepted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "forged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "Persistence round 3: same predicate after a third repair cycle."
+        },
+        {
+          "event": "p_heartbeat_restore",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget_r1",
+          "assertion": {
+            "field": "lead_after",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "lead_before",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "Repair after round 1: the heartbeat following the first forgery restores the leader context, so the repeated loss comes from the sender's cadence, not from a broken repair path."
+        },
+        {
+          "event": "p_heartbeat_restore",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "p_forget_r2",
+          "assertion": {
+            "field": "lead_after",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "lead_before",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "round",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "Repair after round 2: the same repair holds after the second forgery."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Same harness and same scenario; only the comparison wiring changes. Each round now has its own admission alias (p_forget_r1/r2/r3) bound to that round's p_inbound_forget event, and each persistence or repair comparison applies to exactly one round, so no comparison spans rounds whose results cannot be correlated. This removes the 'No corresponding prerequisite events reached' gaps that made the previous persistence comparison unknown."
+}

@@ -1,0 +1,193 @@
+{
+  "rationale": "Replaced the delayed-snapshot reachability story with a snapshot-failure one, which is the operational path the earlier limit pointed at. The live harness now gives the restarted node a snapshot store whose Create fails on every call after the early snapshot; the library logs and tolerates those failures (four attempts observed) so the node's last snapshot stays at index 7 while about 8300 committed entries accumulate above it, and the node then cannot finish NewRaft with the feature enabled while the same stores without the feature construct and stay at the snapshot index.",
+  "experiment": {
+    "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+    "harness_path": "assurance_live_replay_stall_test.go",
+    "execution_package": ".",
+    "previous_id": "fc99bbdbeea641cf80b8a76e44524bd1-experiment",
+    "revision_reason": "Reaches the gap through failing snapshots instead of a harness-chosen long SnapshotInterval: a wrapper store fails every Create after the early snapshot while SnapshotThreshold is 1000 and SnapshotInterval 100ms, so the library attempts and tolerates failures and the node's last snapshot never advances; the rest of the scenario is unchanged.",
+    "semantic_changes": [
+      "A snapshot-store wrapper that fails Create on demand is installed for the restarted node, and the failure flag is enabled after the early snapshot.",
+      "The restarted node's SnapshotInterval and SnapshotThreshold are set to 100ms and 1000 so the library actually attempts snapshots during the run.",
+      "The fixture event reports the number of failed Create attempts and whether failures were tolerated."
+    ],
+    "source_ids": [
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-fsmch",
+      "s-startup-order",
+      "s-staging"
+    ],
+    "scope": {
+      "description": "Live three-node cluster in which node A runs with Config.RestoreCommittedLogs enabled, snapshots once early, then has every further snapshot attempt fail (the library logs and tolerates this) while the cluster commits about 8300 further entries, so A's staged commit index is far above a snapshot that never advances; A is shut down while B and C keep a quorum and restarted twice from its own stores with the default MaxAppendEntries, once with the feature and once without it.",
+      "assumptions": [
+        "All cluster state comes from normal operations; only the snapshot store injected into A is a harness wrapper, and it delegates to the in-memory store for List and Open.",
+        "The failure injected is a store error on Create, which the runSnapshots loop logs and continues past, so it models a node whose snapshotting fails while replication continues.",
+        "A's SnapshotInterval (100ms) and SnapshotThreshold (1000) are set so the library attempts snapshots during the run rather than relying on a harness-chosen long interval.",
+        "Non-return is evaluated by constructing in a goroutine and waiting 5s; the control uses the same stores with the feature off.",
+        "Exact indexes vary with scheduling, so the admission asserts only mode, cluster ids, leader, the default batch size, the gap flag and that snapshot failures were tolerated."
+      ],
+      "excluded": [
+        "No crash, process kill or on-disk store is exercised.",
+        "The failing store is a harness wrapper rather than a production store; only the Create failure mode is modelled.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C",
+        "snapshot_store_failures_observed": 4,
+        "entries_to_replay_observed": 8299,
+        "expected_batches_observed": 130,
+        "max_append_entries": 64,
+        "channel_capacity_observed": 128,
+        "observation_window_seconds": 5
+      }
+    },
+    "prefix": "The harness builds three InmemTransports (A, B, C) in a full mesh with per-node InmemStore and InmemCommitTrackingStore; node A's snapshot store is a wrapper that delegates List and Open to an InmemSnapshotStore and fails Create once its flag is set, while B and C use plain in-memory snapshot stores. It bootstraps {A,B,C} from A with Config.RestoreCommittedLogs enabled, starts the three nodes with MockFSM, A configured with SnapshotInterval 100ms and SnapshotThreshold 1000, waits for a leader and transfers leadership to B if another node won. It applies five commands, waits until A has applied at least four entries, takes the early snapshot on A, then enables the failure flag so every later Create on A fails. It applies 8300 further commands, waits until A's staged commit index is at least 8200 above the early snapshot index, and emits 'fixture' with the snapshot index, staged commit index, log last index, entries to replay, expected batches, MaxAppendEntries, the gap flag, the number of failed Create attempts, whether failures were tolerated, the cluster ids and the leader. It shuts A down, confirms a leader survives, emits 'cluster_status', then restarts A twice in goroutines with fresh transports and a bounded window: 'stalled_restart' with the feature and 'control_restart' without it, whose event reports newraft_returned, state, last_applied, applied_at_snapshot, the observed channel capacity and whether the replay demand exceeds it, followed by 'control_restart_summary'.",
+    "responsibility": "hashicorp/raft NewRaft startup path together with the snapshot loop: snapshot failures are tolerated while the persisted commit index keeps advancing, so the replay a restart must perform can exceed what the FSM mutation channel holds before runFSM starts.",
+    "prerequisites": [
+      {
+        "alias": "adm_live",
+        "event": "fixture",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          },
+          {
+            "field": "cluster_ids",
+            "op": "eq",
+            "value": "A,B,C"
+          },
+          {
+            "field": "leader",
+            "op": "eq",
+            "value": "B"
+          },
+          {
+            "field": "max_append_entries",
+            "op": "eq",
+            "value": 64
+          },
+          {
+            "field": "gap_over_channel",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "snapshot_failures_tolerated",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "stalled_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "newraft_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "A follower whose snapshot attempts all failed and whose staged commit index is more than 128*64 above its last snapshot should still finish NewRaft."
+      },
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "newraft_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Control: the same stores restarted without the feature should construct normally."
+      },
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "applied_at_snapshot",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Control operand: without the replay the FSM stays at the snapshot index."
+      },
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "replay_exceeds_channel",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Mechanism operand: the batch demand exceeds the capacity observed on the same node in the control run."
+      },
+      {
+        "event": "cluster_status",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "cluster_alive_without_a",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The remaining two voters keep a quorum while the restarted node cannot start."
+      }
+    ]
+  }
+}

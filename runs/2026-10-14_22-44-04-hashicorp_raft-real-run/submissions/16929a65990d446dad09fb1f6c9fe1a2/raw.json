@@ -1,0 +1,175 @@
+{
+  "rationale": "Built and filed a probe for a cleaner manifestation of the same cause: a feature-enabled restart of a node that has no snapshot at all, so the only thing that could rebuild its membership is the log scan. Local construction feedback in a live three-node cluster: the follower holds no snapshots and a staged commit index of 12 over a log ending at 13, reports {A,B,C} while running, and after a restart with Config.RestoreCommittedLogs it reports an empty configuration (zero servers) although its FSM replayed to index 13; restarted without the feature it reports {A,B,C} as usual. That is the same scan-start mechanism as the parent question, with the consequence that the node loses its membership entirely instead of keeping a stale one.",
+  "experiment": {
+    "investigation_id": "@no_snapshot_config",
+    "harness_path": "assurance_no_snapshot_restart_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "s-scan",
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-confentry",
+      "s-quorumsize"
+    ],
+    "scope": {
+      "description": "Live three-node cluster {A,B,C} in which node A runs with Config.RestoreCommittedLogs enabled, receives ten committed commands plus the bootstrap configuration entry and takes no snapshot at all, is shut down and then restarted twice from its own stores: once with the feature enabled and once without it.",
+      "assumptions": [
+        "All state comes from normal operations: bootstrap {A,B,C} from A, election with leadership moved to B so A is a follower, ten committed applies and a graceful shutdown of A.",
+        "A takes no snapshot because the harness never snapshots it and SnapshotInterval is ten minutes, so A's snapshot store is empty at the restart.",
+        "A's log store implements CommitTrackingLogStore and stages a commit index while O is running with the feature enabled, so the replay has entries to cover.",
+        "The reported configuration is read through the node's atomic latest-configuration copy after each restart, with a 300ms settle.",
+        "Exact indexes are reported as operands but not asserted; the admission pins the absence of snapshots, the running node's configuration and the number of committed commands."
+      ],
+      "excluded": [
+        "No crash, on-disk store, or snapshot failure is injected; the node simply has no snapshot.",
+        "An election by the restarted node is not attempted, so the source-derived consequence that it will not campaign is not executed.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C",
+        "a_snapshots": 0,
+        "a_staged_commit_observed": 12,
+        "a_log_last_index_observed": 13,
+        "committed_commands": 10
+      }
+    },
+    "prefix": "The harness builds three InmemTransports (A, B, C) in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore, bootstraps {A,B,C} from A with Config.RestoreCommittedLogs enabled, starts A, B and C with MockFSM, waits for a leader and transfers leadership to B so A stays a follower. It applies ten commands on B, waits until A's log store reports a staged commit index, takes no snapshot on A, and emits a 'fixture' event with the number of snapshots A holds, A's staged commit index, its log last index, the configuration A reports while running, the leader and the number of committed commands. It then shuts A down and restarts it in a goroutine from its own stores with a fresh transport, twice in sequence: 'restart_with_feature' with Config.RestoreCommittedLogs enabled and 'restart_without_feature' with it disabled, each emitting newraft_returned, the node state, last applied index, the reported configuration id list and its length, and the number of voters in the log's configuration entry. All nodes are shut down afterwards. Event order: fixture, restart_with_feature, restart_without_feature.",
+    "responsibility": "hashicorp/raft NewRaft startup path: the post-restore configuration scan rebuilds r.configurations from the log only above max(lastSnapshotIndex, lastApplied), and the eager replay raises lastApplied to the persisted commit index.",
+    "prerequisites": [
+      {
+        "alias": "adm_fixture",
+        "event": "fixture",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart"
+          },
+          {
+            "field": "local_id",
+            "op": "eq",
+            "value": "A"
+          },
+          {
+            "field": "a_snapshots",
+            "op": "eq",
+            "value": 0
+          },
+          {
+            "field": "a_reported_config",
+            "op": "eq",
+            "value": "A,B,C"
+          },
+          {
+            "field": "committed_commands",
+            "op": "eq",
+            "value": 10
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "restart_with_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart"
+          }
+        ],
+        "assertion": {
+          "field": "reported_config_ids",
+          "op": "eq",
+          "value": "A,B,C"
+        },
+        "description": "With the feature enabled and no snapshot, the restarted node should rebuild its membership from the configuration entry in its log."
+      },
+      {
+        "event": "restart_with_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart"
+          }
+        ],
+        "assertion": {
+          "field": "reported_config_list_len",
+          "op": "eq",
+          "value": 3
+        },
+        "description": "Same predicate as the previous comparison expressed as the number of configured servers."
+      },
+      {
+        "event": "restart_without_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart"
+          }
+        ],
+        "assertion": {
+          "field": "reported_config_ids",
+          "op": "eq",
+          "value": "A,B,C"
+        },
+        "description": "Control: without the replay the same restart should rebuild the membership from the log."
+      },
+      {
+        "event": "restart_without_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart"
+          }
+        ],
+        "assertion": {
+          "field": "reported_config_list_len",
+          "op": "eq",
+          "value": 3
+        },
+        "description": "Control expressed as the number of configured servers."
+      }
+    ]
+  },
+  "investigations": [
+    {
+      "ref": "@no_snapshot_config",
+      "parent_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+      "question": "Which configuration does a node end up with when it is restarted with Config.RestoreCommittedLogs while it has no snapshot at all, so the log scan is the only mechanism that could rebuild its membership?",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize"
+      ],
+      "hypothesis": "Because the scan starts at max(lastSnapshotIndex, lastApplied)+1 and the replay raises lastApplied to the persisted commit index, a node with no snapshot processes no configuration entry at all and comes up with an empty configuration, whereas the same restart without the feature scans from index 1 and rebuilds the membership.",
+      "discriminator": "The same stores restarted with and without the feature: the feature-enabled restart is predicted to report an empty configuration while the control reports the bootstrap membership.",
+      "disposition": "active"
+    }
+  ]
+}

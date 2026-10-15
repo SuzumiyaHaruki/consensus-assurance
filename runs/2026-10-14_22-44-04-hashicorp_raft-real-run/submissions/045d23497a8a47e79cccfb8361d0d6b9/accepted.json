@@ -1,0 +1,263 @@
+{
+  "rationale": "Registered and executed the probe that answers the open necessary gap of the no-snapshot variant. A node restarted with Config.RestoreCommittedLogs and no snapshot holds no configuration at all, and vote admission skips the membership guard whenever the server list is empty (raft.go 1656-1680), so the derived consequence was that such a node grants a vote to a candidate it cannot see. The harness asks the same outside candidate for a vote twice - once while the node still holds the committed {A,B,C} and once after that restart - and then supplies a real node whose own log records the configuration {A,X} so the grant can be seen electing a leader the committed membership excludes. The gap is registered against this lineage so its explanation can be recorded when the receipt is interpreted.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [
+    {
+      "investigation_id": "16929a65990d446dad09fb1f6c9fe1a2-question-0",
+      "question": "Does a node running with an empty configuration actually grant its vote to a candidate that appears in no configuration it holds, and can such a grant let a candidate that the current cluster would not admit be elected?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "16929a65990d446dad09fb1f6c9fe1a2-question-0",
+    "harness_path": "assurance_empty_config_vote_test.go",
+    "files": {},
+    "execution_package": ".",
+    "source_ids": [
+      "s-votegrant",
+      "s-voteuptodate",
+      "s-election-gate",
+      "s-scan",
+      "s-quorumsize"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "The same node is asked for a vote by an outside candidate twice: once while it holds the committed configuration {A,B,C} and once after a restart with Config.RestoreCommittedLogs and no snapshot leaves its configuration empty. A real node whose log records a different configuration is then started against the emptied node to see whether the grant carries a leader the committed membership excludes.",
+      "assumptions": [
+        "Both probes carry a term one above the target's current term and a last log entry equal to the target's last entry, so the term branch and the log up-to-dateness branch cannot produce a refusal and the answer reflects the membership branch.",
+        "The target is disconnected from its peers before each probe and sampled until it knows no leader, so the leader branch cannot produce the refusal either.",
+        "The outside node X is given a log that is a copy of the restarted node's log with the bootstrap configuration entry replaced by {A,X}, so its last entry is level with the node's and the vote cannot be refused as out of date.",
+        "X is connected only to the emptied node and is its only voter partner, so X's own quorum is itself plus that node.",
+        "The cluster takes no snapshot because the interval is ten minutes, and X is started with the same scaled 50ms timeouts as the cluster."
+      ],
+      "excluded": [
+        "No snapshot failure or crash is injected; the absence of snapshots is arranged by the interval.",
+        "No commands are applied while the probes are in flight.",
+        "The cluster's own leader B is not contacted by the emptied node during the probes; the two sides stay partitioned, so no conflicting write is executed.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C",
+        "outside_candidate": "P (probe identity), X (real node with configuration {A,X})",
+        "observation_window_ms": 1200,
+        "heartbeat_timeout_ms": 50,
+        "committed_commands": 10,
+        "snapshot_interval_minutes": 10
+      }
+    },
+    "prefix": "The harness builds three in-memory transports in a full mesh with per-node in-memory commit-tracking stores and snapshot stores, bootstraps {A,B,C} from A, and starts the three nodes with Config.RestoreCommittedLogs enabled and MockFSM. It elects B as leader, applies ten commands and takes no snapshot on A, then emits a 'fixture' event carrying A's snapshot count, staged commit index, last log index, live configuration, the configuration recorded in A's log, the leader id and the committed command count. It disconnects A from B and C, samples A's state every 5ms for 1.2s, and emits 'configured_isolated' with the configured server count, the configuration ids, whether candidate or leader state was ever observed, the term at the start and end of the window, whether a leader is known and the state. It then sends a single RequestVote to A on behalf of the probe transport P, an identity that appears in no configuration of the cluster, with a term one above A's current term and a last log entry equal to A's, and emits 'configured_probe' with the configured server count, the configuration ids, whether the candidate is in that configuration, whether a leader is known, the probe term, the response term, whether the vote was granted, the probe error and the state. It shuts A down, replaces its transport, reconnects it to B and C, restarts it from the same stores with the feature enabled, waits 300ms and emits 'restart_with_feature' with the returned flag, state, last applied index, reported configuration and the configuration recorded in A's log. It disconnects A again, samples for a further 1.2s, repeats the identical probe and emits 'empty_config_probe' with the same operands plus whether campaigning was observed and the last applied index. Finally it copies A's log into fresh in-memory stores with the bootstrap configuration entry replaced by {A,X}, sets that store's current term to A's, starts a real Raft node X with the same timeouts connected only to A, waits up to six seconds for X to reach leader state and then emits 'outsider_election' with X's configuration ids, the index of the configuration entry in X's log, the type of X's first entry, X's last log index, X's state, term and leadership, A's state, term, leader address and id, whether A follows the outsider, A's configured server count and configuration ids, the configuration recorded in A's log, A's log index before and after, and the state, id and term of the cluster's own leader. Event order: fixture, configured_isolated, configured_probe, restart_with_feature, empty_config_probe, outsider_election.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "hashicorp/raft vote admission: the membership guard in requestVote is conditional on a non-empty server list, and the NewRaft configuration scan can leave a restarted node with an empty configuration.",
+    "prerequisites": [
+      {
+        "alias": "adm_fixture",
+        "event": "fixture",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "empty_configuration_vote",
+            "reference": null
+          },
+          {
+            "field": "a_snapshots",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "a_reported_config",
+            "op": "eq",
+            "value": "A,B,C",
+            "reference": null
+          },
+          {
+            "field": "committed_commands",
+            "op": "eq",
+            "value": 10,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "configured_probe",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "response_granted",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "configured_servers",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "Control: while the node holds the three-server committed configuration, the same outside candidate is refused a vote."
+      },
+      {
+        "event": "configured_probe",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "candidate_in_config",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "has_leader",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: the refused candidacy is genuinely outside the node's configuration and the node knows no leader, so the refusal is the membership branch."
+      },
+      {
+        "event": "empty_config_probe",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "response_granted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "configured_servers",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The node whose configuration is empty grants the vote to the candidate that appears in no configuration it holds."
+      },
+      {
+        "event": "outsider_election",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "x_is_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "a_config_servers",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The grant is enough: the outside node, whose only voter partner is the emptied node, reaches leader state."
+      },
+      {
+        "event": "outsider_election",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "a_followed_outsider",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "a_config_servers",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The emptied node follows that leader, so the exclusion it granted reached its own state as well."
+      },
+      {
+        "event": "outsider_election",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "a_log_config_ids",
+          "op": "eq",
+          "value": "A,B,C",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "a_config_servers",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The configuration recorded in the node's own committed log still names {A,B,C}, which is the membership the elected outsider is absent from."
+      },
+      {
+        "event": "outsider_election",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "two_leaders_observed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "a_config_servers",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The cluster's own leader keeps its leadership at the same time, so the election produced two leaders at once."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,113 @@
+{
+  "rationale": "With the main account closed, I spent the remaining investigation on the one supporting mechanism it did not touch - read-request completion when leadership changes - because that is where a queued client duty could be lost. Source reading answers it and I record the outcome honestly, including that it is not a defect: a read request queued by a leader that has not yet committed in its term is released only by that leader's own commit path, nothing clears the queue on a term change, and the Node contract explicitly tells callers that read requests can be lost and must be retried. This closes the axis with a sourced account rather than leaving it unexamined.",
+  "sources": [
+    {
+      "id": "src_readindex_field",
+      "file": "raft.go",
+      "start_line": 428,
+      "end_line": 435,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_readindex_queue",
+      "file": "raft.go",
+      "start_line": 1361,
+      "end_line": 1368,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_readindex_release",
+      "file": "raft.go",
+      "start_line": 2127,
+      "end_line": 2143,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_readindex_call",
+      "file": "raft.go",
+      "start_line": 1548,
+      "end_line": 1556,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_readindex_doc",
+      "file": "node.go",
+      "start_line": 218,
+      "end_line": 224,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@readindex_pending_lifecycle",
+      "question": "When a leader queues a MsgReadIndex because it has not yet committed an entry in its own term, who completes or cancels that pending request if that leader loses leadership before it commits?",
+      "source_ids": [
+        "src_readindex_field",
+        "src_readindex_queue",
+        "src_readindex_release",
+        "src_readindex_call",
+        "src_readindex_doc"
+      ],
+      "hypothesis": "The queue is only ever drained by the release helper, which refuses to run unless the local node is a leader that has committed in its current term, and it is called from exactly one place (the leader's own append-response commit path); nothing clears it on a term change, so a request queued before a leadership loss is either answered later if the same node becomes leader again and commits in the new term, or never answered at all.",
+      "discriminator": "A tree-wide search for the field: if a writer existed on the leadership-change path (reset, becomeFollower or becomeCandidate) the request would be cancelled; if the release helper were reachable from a follower path the request could be completed without leadership. Neither holds, and the caller contract states the acceptable outcome explicitly.",
+      "disposition": null,
+      "parent_id": "ce33f7b508af4244883ac9c81a2a4696-question-0",
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@readindex_pending_behavior",
+      "kind": "behavior",
+      "statement": "A MsgReadIndex received by a leader that has not committed an entry in its own term is appended to pendingReadIndexMessages and answered only through releasePendingReadIndexMessages, which is called from a single site - the leader's append-response path once commit progress releases the queue - and which first requires committedEntryInCurrentTerm, otherwise it logs an error and leaves the queue intact. No other code path writes or clears the field: the search over the tree finds only the field declaration, the queueing site and that helper with its one call site, so a request queued before the node loses leadership is never cancelled; it is answered only if the same node again becomes leader and commits in a later term, in which case it is answered with the commit index reached at release time, and it otherwise stays unanswered.",
+      "conditions": "Captured snapshot, source reading only (no execution claimed): field declaration raft.go 428-435, queueing at raft.go 1361-1368, the release helper at raft.go 2127-2143 and its single call at raft.go 1548-1556. The caller contract that makes the unanswered case acceptable is node.go 218-224 (ReadIndex: 'request can be lost without notice, therefore it is user's job to ensure read index retries'). Not a defect finding; recorded because it bounds what the module guarantees about completion of an accepted read duty, and because a caller that assumed otherwise would retry unnecessarily - or not at all.",
+      "source_ids": [
+        "src_readindex_field",
+        "src_readindex_queue",
+        "src_readindex_release",
+        "src_readindex_call",
+        "src_readindex_doc"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@readindex_pending_lifecycle",
+      "experiment_id": null,
+      "source_ids": [
+        "src_readindex_field",
+        "src_readindex_queue",
+        "src_readindex_release",
+        "src_readindex_call",
+        "src_readindex_doc"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": null,
+      "rationale": "The question is answered from the sources and the answer is a documented, permitted gap rather than a defect. Queueing happens only in stepLeader's MsgReadIndex arm when the leader has not yet committed in its own term (raft.go 1361-1368); completion happens only through releasePendingReadIndexMessages (raft.go 2127-2143), which guards on committedEntryInCurrentTerm and is invoked from exactly one place, the leader's append-response commit path (raft.go 1548-1556); and a search for the field shows no writer on any leadership-change path (raft.go 428-435 declares it, and no other occurrence exists). Consequences, stated precisely: if the node that queued the request loses leadership before committing, the request is not cancelled, not re-forwarded and not answered by anyone else; it is answered only if that same node becomes leader again and commits in the new term, and then with the commit index reached at release time (which is at least as new as the original, so the answer stays linearizable-safe); otherwise it is simply never answered. The caller contract in the same snapshot spells this out - read requests can be lost without notice and the application must retry - so the module neither violates a promise nor leaves a caller stranded who followed the documented contract. What it does mean, and what is worth knowing when reading the main finding, is that the module's completion guarantee for an accepted read duty is weaker than for a vote or an append: those are retried by the protocol itself, whereas a queued read depends on the same node regaining leadership.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The unanswered case is explicitly permitted by the same snapshot's interface documentation, so it cannot be scored as a defect without importing a stronger requirement than the module states.",
+        "The answered case remains safe: release requires a commit in the current term and uses the commit index at release time, so a late answer is not stale."
+      ],
+      "limitations": [
+        "Source reading only; no execution exercised this path in this run, so the account rests on the cited ranges and the tree-wide search for the field, not on a receipt.",
+        "Memory retention of unanswered requests, and the retry behaviour of applications, are outside this snapshot."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,204 @@
+{
+  "rationale": "Interpreted the repair-path receipt and answered the question it belongs to. Receipt 112186e8b9544b51b4f7818a04c78a84 parsed five events and evaluated all six comparisons: the snapshot install engaged (holds, index 4), the restarted node's applied write became majority-write (holds, index 4), its minority write is gone (holds, index 4), the conflict index entry no longer exists in its log (holds, index 4), and its reported configuration is {A,B,C,D,E} afterwards (holds, index 4), while cluster-wide applied consistency is still violated (index 4) because the node that stayed up to date was not sent a snapshot. I recorded the installSnapshot effects as reusable knowledge with that receipt, answered the repair question as explained with no defect judgment of its own, and corrected the parent and child accounts so their \"no repair path exercised\" limitation becomes the observed per-node repair scope.",
+  "sources": [
+    {
+      "id": "s-installsnap",
+      "file": "raft.go",
+      "start_line": 1935,
+      "end_line": 1972,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@installsnapshot_repairs",
+      "kind": "behavior",
+      "statement": "On a follower that receives an InstallSnapshot, the handler streams and finalises the snapshot, restores the FSM through fsmMutateCh, sets lastApplied and the last snapshot to the request's last log index and term, and replaces the latest and committed configuration from the request; the local log is then either removed entirely (monotonic stores) or compacted up to the snapshot index. A follower that has fallen behind a leader whose log was compacted is therefore sent a snapshot and ends up with the leader's FSM state, entry suffix and configuration, replacing any divergent entry it held at an index the leader also used.",
+      "conditions": "Follower receives InstallSnapshot because the leader can no longer serve the entries it needs (its log was compacted past the follower's position); observed with in-memory stores after the stale-configuration split was healed, where the leader snapshotted with TrailingLogs 0 and the disconnected node was then reconnected.",
+      "source_ids": [
+        "s-installsnap",
+        "s-installsnapcfg",
+        "s-snaprestorecfg"
+      ],
+      "executions": {
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+      "experiment_id": "761ecfb0e8b14df99a7f85eacbd9b87a-experiment",
+      "source_ids": [
+        "s-installsnap",
+        "s-installsnapcfg",
+        "s-dupskip",
+        "s-confentry"
+      ],
+      "executions": {
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4,
+          0
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": null,
+      "rationale": "The declared predicates about the ordinary recovery path are satisfied by the single witness event, and the one violated predicate is the scope limitation rather than a defect. Admission index 0 establishes the restart fixture; at event index 4, after the current-configuration leader committed ten entries and snapshotted with TrailingLogs 0 while the restarted node was unreachable and the node was then reconnected, the restarted node installed the snapshot (comparison 0 holds), its applied write list became majority-write (1 holds), the minority write is absent (2 holds), the conflict index entry is gone from its log (3 holds) and its reported configuration is {A,B,C,D,E} (4 holds); comparison 5 is violated because the applied lists still differ across the cluster, which is exactly the per-node scope of the mechanism: the node that stayed up to date was never sent a snapshot because it is not behind. Mechanism per source: the InstallSnapshot handler restores the FSM, sets lastApplied and the last snapshot, replaces latest and committed configuration from the request and removes or compacts the local log (raft.go 1935-1972). Limits: the lag that triggers the install was arranged by the harness (disconnect, ten commits, snapshot with TrailingLogs 0) rather than observed organically; one repaired sample; in-memory stores; the user Restore path and a term-changing truncation were not exercised.",
+      "limitations": [
+        "The triggering lag was arranged by the harness rather than observed as an organic operational event.",
+        "One repaired sample; the user Restore path and term-changing truncation are not exercised.",
+        "In-memory stores with scaled timeouts; the leader's snapshot used TrailingLogs 0, which is legal configuration but chosen by the harness."
+      ],
+      "counterevidence": [
+        "The same receipt shows the cluster's applied state still differs because an up-to-date node is not repaired by another node's snapshot install, so the mechanism is per node rather than cluster-wide.",
+        "The repaired node's log no longer contains the conflict index at all, which shows the repair replaces the node's entry suffix rather than reconciling the two entries."
+      ],
+      "joint_history": "Two receipts of two fixed experiments from the same scenario lineage: fa1f90c2eefd45e6af45d7593ac53205 records the healed divergent state before any repair, and 112186e8b9544b51b4f7818a04c78a84 is the further revision of the same harness that adds the repair phase and records the post-install state. They are compatible because both observe the same cluster identity, configuration contents and conflict index (fixture event index 0 in each, conflict index 11, term 3), and the repair receipt's fixture and healed events carry the same values as the earlier receipt's healed event; each outcome is read from its own receipt and no value is combined across them."
+    },
+    {
+      "investigation_id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+      "source_ids": [
+        "s-installsnap",
+        "s-installsnapcfg",
+        "s-dupskip",
+        "s-confentry"
+      ],
+      "executions": {
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4,
+          0
+        ],
+        "fa1f90c2eefd45e6af45d7593ac53205": [
+          3
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": null,
+      "rationale": "Answer: the library does engage a repair path on its own, but only for a node that falls behind a compacted leader's log. Receipt 112186e8b9544b51b4f7818a04c78a84 shows the sequence: with the split already healed and the restarted node's entry and applied state divergent (receipt fa1f90c2eefd45e6af45d7593ac53205), a current-configuration leader commits further entries and snapshots with TrailingLogs 0, the restarted node is temporarily unreachable so its position falls behind the leader's compacted log, and on reconnection the leader sends a snapshot instead of entries; the node installs it and its applied write becomes majority-write, its minority write disappears, the conflict index entry is gone and its configuration becomes {A,B,C,D,E}. The mechanism is the InstallSnapshot handler's restore plus configuration replacement and log removal (raft.go 1935-1972). What is not repaired by this path is a node that keeps up: the same receipt shows the other stale node (C) still holding the minority write, because it is never behind and so is never sent a snapshot; reconciling that node needs the same lag-triggered install, a user Restore, or a truncation caused by a different term. Scope: one repaired sample, harness-arranged lag, in-memory stores and TrailingLogs 0; no user Restore and no term-changing truncation was exercised.",
+      "limitations": [
+        "One repaired sample with harness-arranged lag; nothing establishes how often a divergent node would fall behind in operation.",
+        "The user Restore path and truncation by a different term are not exercised.",
+        "In-memory stores and a harness-chosen TrailingLogs 0."
+      ],
+      "counterevidence": [
+        "Cluster-wide applied consistency is still violated after the repair, so the path repairs nodes individually.",
+        "The repair needed the node to be unreachable long enough for the leader to compact past it; a divergent node that keeps up with the leader is not repaired by any observed mechanism."
+      ],
+      "joint_history": "Two receipts of two fixed experiments from the same scenario lineage: fa1f90c2eefd45e6af45d7593ac53205 records the healed divergent state before any repair, and 112186e8b9544b51b4f7818a04c78a84 is the further revision of the same harness that adds the repair phase and records the post-install state. They are compatible because both observe the same cluster identity, configuration contents and conflict index (fixture event index 0 in each, conflict index 11, term 3), and the repair receipt's fixture and healed events carry the same values as the earlier receipt's healed event; each outcome is read from its own receipt and no value is combined across them."
+    },
+    {
+      "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-staging",
+        "s-dupskip",
+        "s-installsnap"
+      ],
+      "executions": {
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4
+        ],
+        "fa1f90c2eefd45e6af45d7593ac53205": [
+          3,
+          0
+        ],
+        "455e647ad0794a16903414b5a8846276": [
+          3,
+          2,
+          1,
+          0
+        ],
+        "b68f3d3a08b34cd6a27b76faeb0d2a3e": [
+          2,
+          1,
+          0
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Answer: yes, and the damage reaches applied state, where it lasts until the node is repaired individually. A node left with a stale configuration by the RestoreCommittedLogs replay wins an election with fewer votes than the configuration in its own committed log while the other voters elect their own leader; both sides commit at the same index and term, and after healing the FSMs stay different (receipt fa1f90c2eefd45e6af45d7593ac53205). The repair question now answers what ends it: receipt 112186e8b9544b51b4f7818a04c78a84 shows a snapshot install repairing that node's divergent entry, applied state and stale configuration once it falls behind a compacted leader, while a node that keeps up keeps its divergent state. Mechanism chain: the parent question's configuration scan defect gives the stale quorum, votes come from each voter's own view, AppendEntries cannot reconcile same-term entries, and only installSnapshot replaces a node's log, FSM and configuration. Scope and remaining uncertainty: the triggering lag was arranged by the harness, the repair was observed once, in-memory stores with TrailingLogs 0 were used, and the no-feature restart control inside the cluster is still unexecuted.",
+      "limitations": [
+        "The repair is per node and was triggered by harness-arranged lag; how often a divergent node would fall behind in operation is not established.",
+        "One cluster per run with a single partition window and short samples.",
+        "In-memory stores, scaled timeouts and a graceful shutdown rather than a crash.",
+        "The no-feature restart control inside the cluster remains unexecuted."
+      ],
+      "counterevidence": [
+        "The in-partition control C never leads, so the partition alone does not explain the election.",
+        "After healing, the cluster elected a node holding the current configuration, so the persistence claim concerns the restarted node's own view and applied state rather than its leadership.",
+        "The repair receipt shows the divergent state and the stale configuration are both removed by an installed snapshot, so the defect's consequences are bounded by when such an install happens rather than permanent."
+      ],
+      "joint_history": "Four receipts of three fixed experiments and one further revision over the same defect chain: b68f3d3a08b34cd6a27b76faeb0d2a3e observes the split, 455e647ad0794a16903414b5a8846276 adds the healing phase, fa1f90c2eefd45e6af45d7593ac53205 adds applied-state sampling, and 112186e8b9544b51b4f7818a04c78a84 - filed under the repair question - adds the repair phase to the same harness. Compatibility rests on the shared fixture in every receipt (fixture event index 0: snapshot index 6 with configuration {A,B,C}, a committed configuration entry with {A,B,C,D,E} above it, stored commit index 8) and on the restarted node reporting {A,B,C} in each; the conflict index, term and write payloads are identical across the receipts (index 11, term 3, minority-write against majority-write). Each comparison outcome is read from its own receipt, and the later receipts restricted their comparison sets to their new predicates, so they are not additive evidence for predicates already recorded."
+    },
+    {
+      "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-doc",
+        "s-cfgdoc",
+        "s-staging",
+        "s-dupskip",
+        "s-installsnap"
+      ],
+      "executions": {
+        "f4adc58c4125434eb91cacf438a6da50": [
+          3,
+          1,
+          5,
+          0,
+          2,
+          4
+        ],
+        "b68f3d3a08b34cd6a27b76faeb0d2a3e": [
+          1,
+          2,
+          0
+        ],
+        "455e647ad0794a16903414b5a8846276": [
+          1,
+          3,
+          0
+        ],
+        "fa1f90c2eefd45e6af45d7593ac53205": [
+          3
+        ],
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4
+        ]
+      },
+      "joint_history": "Five receipts of four fixed experiments over one defect chain. The first constructs the restart state in harness-supplied stores; the second produces that state through normal operations and observes the split; the third adds the healing phase; the fourth adds applied-state sampling; the fifth runs under the repair-path question and extends the same harness once more with a repair phase. The third, fourth and fifth share one scenario lineage, and each restricted its comparison set to its new predicates, so a later receipt is not additive evidence for predicates already recorded with an earlier one. All five share the same structural conditions - snapshot configuration {A,B,C}, a committed configuration entry with {A,B,C,D,E} above the snapshot, a persisted commit index covering it, and a restarted node reporting {A,B,C} (first receipt index 2, second index 0, third index 0, fourth index 0, fifth index 0). No value is combined across receipts; each comparison outcome is read from its own receipt.",
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Current account: with Config.RestoreCommittedLogs enabled and a CommitTrackingLogStore whose persisted commit index covers a committed configuration entry newer than the node's last snapshot, NewRaft never rebuilds the node's configuration from that entry, so the restarted node keeps the snapshot's membership for candidate admission and election quorum; that stale view lets it lead with two votes where the current configuration requires three, produces two concurrent leaders whose commits collide at the same index and term, and leaves both the entry and the applied state different across the cluster until the divergent node is repaired individually. Basis: restoreFromCommittedLogs reads the persisted commit index and calls processLogs(commitIndex, nil) (api.go 724-753); processLogs advances lastApplied to that index (raft.go 1361-1362); the configuration scan then starts at max(lastSnapshotIndex, lastApplied)+1 (api.go 610-620) above the committed configuration entry, which is never passed to processConfigurationLogEntry; quorum and voter admission come from configurations.latest (raft.go 313-320, 1085-1096, 1660-1680); duplicates are skipped so neither the configuration entry nor the conflicting command is ever reprocessed (raft.go 1526-1553); the persisted commit index exists only because the node ran with the feature enabled (raft.go 1393-1403); and the only repair observed is an installed snapshot, which replaces the node's log, FSM and configuration (raft.go 1935-1972). Witnesses: receipt f4adc58c4125434eb91cacf438a6da50 for the configuration and quorum state, b68f3d3a08b34cd6a27b76faeb0d2a3e for the split and conflicting commits, 455e647ad0794a16903414b5a8846276 for the healed log state, fa1f90c2eefd45e6af45d7593ac53205 for the healed applied state, and 112186e8b9544b51b4f7818a04c78a84 for the per-node repair. Remaining limits: the repair required harness-arranged lag and a snapshot on the leader, so when a real divergent node would fall behind is unknown; no user Restore or term-changing truncation was exercised; persistence is otherwise observed only across short windows; the restart is graceful with in-memory stores and scaled timeouts; and no no-feature restart control was run inside the cluster. The earlier receipt 99718ab469974eb1ad40516efe7c999e remains a retained channel failure with no evaluated comparison.",
+      "limitations": [
+        "The repair is per node and needed harness-arranged lag plus a leader snapshot; the operational frequency of such a fall-behind is not established.",
+        "No user Restore and no truncation by a different term were exercised.",
+        "Persistence is otherwise observed only across short windows with in-memory stores, scaled timeouts and a graceful shutdown.",
+        "No no-feature restart control was executed inside the cluster."
+      ],
+      "counterevidence": [
+        "An installed snapshot removes both the divergent entry and the stale configuration on that node, so neither is permanent once the node falls behind a compacted leader.",
+        "A deployment that never ran with RestoreCommittedLogs enabled stores commit index 0, in which case the scan covers the entry and no divergence occurs.",
+        "The in-partition control C never leads in any receipt, and after healing the cluster elected a node holding the current configuration, so the defect explains a minority leader plus persistent divergence on participating nodes rather than permanent stale leadership."
+      ]
+    }
+  ],
+  "investigations": [
+    {
+      "id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+      "disposition": "explained"
+    }
+  ]
+}

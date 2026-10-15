@@ -20,10 +20,8 @@ def execution_summary(check):
     return execution_cost(check)
 
 
-def interpretation_rows(value, conclusions, label):
-    heading = f'{label} interpretation `{value.id}` · {conclusions[value.conclusion]}'
-    if label == 'Historical':
-        heading += '; model defect claim: ' + DEFECT_LABELS[value.defect_claim]
+def interpretation_rows(value, conclusions):
+    heading = f'Current interpretation `{value.id}` · {conclusions[value.conclusion]}'
     sources = ', '.join(f'[{id}](state.json)' for id in value.source_ids)
     executions = '; '.join(f'[{id}](logs/{id}/check.json) ([observations](logs/{id}/observations.json), event indices {indices})'
         for id,indices in value.executions.items()) or 'No execution receipt explicitly cited by this interpretation'
@@ -71,7 +69,7 @@ def render_report(state, root):
                      f'Question `{q.id}` v{q.version}; sources: {", ".join(q.source_ids)} ([full references](state.json)).'])
         rows.append('Current model defect claim: ' + DEFECT_LABELS[opinions[-1].defect_claim if opinions else None] + '.')
         if opinions:
-            rows.extend(interpretation_rows(opinions[-1], conclusions, 'Current'))
+            rows.extend(interpretation_rows(opinions[-1], conclusions))
         if q.parent_id:
             rows.append(f'Parent question: `{q.parent_id}`; this result does not automatically close its parent.')
         if q.hypothesis:
@@ -142,8 +140,14 @@ def render_report(state, root):
                         rows.append('Observation gaps: ' + '; '.join(comparison['limitations']))
         if len(opinions) > 1:
             rows.extend(['', 'Interpretation history:', ''])
-            for i in opinions[:-1]:
-                rows.extend(interpretation_rows(i, conclusions, 'Historical'))
+            for prior, current in zip(opinions, opinions[1:]):
+                current_fields = current.model_dump()
+                changed = [key for key,value in prior.model_dump(exclude={'id','operation_id'}).items()
+                    if value != current_fields[key]]
+                rows.append(f'- [{prior.id}](state.json) → [{current.id}](state.json): '
+                    f'{prior.conclusion} → {current.conclusion}; model claim '
+                    f'{prior.defect_claim or "none"} → {current.defect_claim or "none"}; '
+                    f'changed fields: {", ".join(changed)}. Full accounts, evidence and boundaries remain in state.json.')
     rows.extend(['', '## Shared understanding and revisions', ''])
     for e in state.knowledge:
         rows.append(f'- `{e.id}` r{e.revision} · {e.kind}: {e.statement}; conditions: {e.conditions}.')

@@ -1,0 +1,201 @@
+{
+  "rationale": "Built and filed the real-cluster witness for the stale-configuration consequence, and corrected the parent account's supplied-fixture premise. The experiment grows a genuine 5-node in-memory cluster: {A,B,C} is bootstrapped from A, entries are committed, A takes a user snapshot recording {A,B,C}, D and E are added through AddVoter with the configuration entry committed at index 8 while A's snapshot stays at index 6, A is shut down, the {A,C} vs {B,D,E} partition is cut, and A is restarted with Config.RestoreCommittedLogs from its own stores. The harness also records who writes the persisted commit index that RestoreCommittedLogs reads, because a first local variant showed that a node that never ran with the feature enabled stores commit index 0 and therefore does not reproduce the defect: tryStageCommitIndex returns immediately unless r.RestoreCommittedLogs is set. The parent question's interpretation is updated so that the restart-shaped state is no longer described as merely supplied, since this experiment produces it through normal initialization, election, membership change, snapshot and restart, and the election consequence now has its own filed experiment instead of an open limitation.",
+  "sources": [
+    {
+      "id": "s-staging",
+      "file": "raft.go",
+      "start_line": 1393,
+      "end_line": 1403,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s-stage-dispatch",
+      "file": "raft.go",
+      "start_line": 1262,
+      "end_line": 1268,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s-stage-follower",
+      "file": "raft.go",
+      "start_line": 1555,
+      "end_line": 1560,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@commit_index_staging",
+      "kind": "behavior",
+      "statement": "The persisted commit index that RestoreCommittedLogs later reads is written only by tryStageCommitIndex, which returns immediately unless r.RestoreCommittedLogs is true; its callers are dispatchLogs on a leader (staging the commit index as of before the new entries are stored) and the AppendEntries path on a follower (staging min(LeaderCommitIndex, last new entry index)). A node that committed entries while the feature was disabled leaves a stored commit index of 0, so a later restart with the feature enabled replays nothing even though its log is long.",
+      "conditions": "Requires a log store implementing CommitTrackingLogStore; the guard is on the running instance's RestoreCommittedLogs value, so mixed deployments (feature off, then on) do not have a persisted commit index to replay.",
+      "source_ids": [
+        "s-staging",
+        "s-stage-dispatch",
+        "s-stage-follower"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+    "harness_path": "assurance_stale_election_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "s-scan",
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-confentry",
+      "s-quorumsize",
+      "s-votesneeded",
+      "s-votegrant",
+      "s-staging"
+    ],
+    "scope": {
+      "description": "Real 5-node in-memory cluster (A..E, ProtocolVersion 3, default timeouts scaled to 50ms) whose node A is restarted with Config.RestoreCommittedLogs after a committed configuration change that is newer than A's last snapshot, then partitioned into {A,C} and {B,D,E}; every node of this deployment runs with Config.RestoreCommittedLogs enabled so the commit index that the restart reads is the one the running protocol staged.",
+      "assumptions": [
+        "Cluster state is produced through normal operations: BootstrapCluster({A,B,C}) from A, election, three committed applies, a user-triggered Snapshot on A, AddVoter(D) and AddVoter(E), and one further committed apply; no log entry, snapshot or index is written by the harness.",
+        "A is shut down (graceful Shutdown) rather than crashed, and its store objects (log store, stable store, snapshot store) are reused for the restart; the in-memory transports are reconnected so that the restarted A can reach only C.",
+        "The partition is expressed only by transport disconnection in both directions; the Raft fault model, RPC lifecycles and election timing are untouched.",
+        "All five nodes run with RestoreCommittedLogs enabled from the start, which is the deployment mode whose restart behaviour is under test; the harness also records that disabling it during the first life leaves the stored commit index at 0.",
+        "The cluster is stopped at the end of the test; the observation window uses the nodes' own election timeouts plus a bounded wait for both partitions to elect."
+      ],
+      "excluded": [
+        "No process crash or storage fault is injected: A is shut down gracefully and its stores are reused intact.",
+        "No on-disk log store is exercised; only the in-memory CommitTrackingLogStore.",
+        "The conflicting commits are observed at the two leaders; the loss of the minority entry after healing is not executed.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C,D,E",
+        "initial_configuration": "A,B,C",
+        "added_voters": "D,E",
+        "snapshot_index_observed": 6,
+        "config_entry_index_observed": 8,
+        "stored_commit_index_observed": 8,
+        "partition": "A,C | B,D,E"
+      }
+    },
+    "prefix": "The harness creates five InmemTransports with addresses A..E, a full mesh of connections, and per node an InmemStore (stable), InmemCommitTrackingStore (logs) and InmemSnapshotStore (snapshots). It calls BootstrapCluster(confA, logsA, stableA, snapsA, transA, {A,B,C}), then NewRaft for A, B and C with MockFSM and Config.RestoreCommittedLogs=true; it waits for a leader, transfers leadership to A if another node won, applies three commands, waits on a Barrier and takes a user snapshot on A (snapshot index 6, configuration {A,B,C}). It then starts D and E with empty stores and calls AddVoter on the leader for each of them, followed by one more applied command so every follower stages a commit index at or above the new configuration entry (index 8). It emits a 'fixture' event with the snapshot index, the newest configuration entry index and membership, the stored commit index, the pre-restart configuration A reports and the derived operands commit_covers_config_entry and snapshot_before_config_entry. It shuts A down, cuts the transports so that {A,C} cannot reach {B,D,E}, creates a fresh transport for A connected only to C, and restarts A from its own stores with Config.RestoreCommittedLogs=true, emitting a 'restart' event with A's state, last applied index and reported configuration. It then waits for a leader in each partition and emits an 'outcome' event with the leaders and terms per partition, the leader count, whether each node in the minority partition is leader, the configurations reported by the restarted A, by C and by the majority leader, the result of an Apply submitted to each leader, the index and term each committed at, the two committed payloads and a derived conflicting_commits operand. Event order: fixture, restart, outcome.",
+    "responsibility": "hashicorp/raft NewRaft configuration scan combined with the RestoreCommittedLogs replay: the restarted node is responsible for deriving candidate admission and election quorum from the latest configuration entry in its own log, and voters are responsible for granting at most the votes their own view of the configuration requires.",
+    "knowledge": [
+      {"entry_id": "@commit_index_staging", "revision": 1, "assertion": "the persisted commit index exists only when the node ran with RestoreCommittedLogs enabled"}
+    ],
+    "prerequisites": [
+      {
+        "alias": "adm_defect",
+        "event": "fixture",
+        "conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"},
+          {"field": "snapshot_config_ids", "op": "eq", "value": "A,B,C"},
+          {"field": "config_entry_ids", "op": "eq", "value": "A,B,C,D,E"},
+          {"field": "a_reported_config_ids", "op": "eq", "value": "A,B,C,D,E"},
+          {"field": "commit_covers_config_entry", "op": "eq", "value": true},
+          {"field": "snapshot_before_config_entry", "op": "eq", "value": true}
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "restart",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "reported_config_ids", "op": "eq", "value": "A,B,C,D,E"},
+        "description": "The restarted node's live configuration should be the membership of the committed configuration entry in its own log; this is the same predicate the earlier supplied-fixture experiment declared, here with stores produced by real operations."
+      },
+      {
+        "event": "outcome",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "stale_config_node_is_leader", "op": "eq", "value": false},
+        "description": "A node whose effective configuration holds two of the five voters of the configuration recorded in its own committed log must not reach Leader while it can reach only one of those voters."
+      },
+      {
+        "event": "outcome",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "leader_count", "op": "eq", "value": 1},
+        "description": "The cluster should have at most one leader; both partitions observed here are disjoint halves of one cluster."
+      },
+      {
+        "event": "outcome",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "conflicting_commits", "op": "eq", "value": false},
+        "description": "Two leaders must not commit different entries at the same index and term."
+      },
+      {
+        "event": "outcome",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "minority_write_committed", "op": "eq", "value": false},
+        "description": "A leader holding only a minority of the current voter set must not be able to commit an entry."
+      },
+      {
+        "event": "outcome",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "correct_config_node_is_leader", "op": "eq", "value": false},
+        "description": "In-partition control: node C, whose configuration is the current one, must not become leader in the same two-voter partition."
+      },
+      {
+        "event": "outcome",
+        "identity_fields": ["local_id", "mode"],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {"field": "mode", "op": "eq", "value": "defect_restart"}
+        ],
+        "assertion": {"field": "majority_config_ids", "op": "eq", "value": "A,B,C,D,E"},
+        "description": "The rest of the cluster still reports the current five-voter configuration, so the two sides disagree about membership while both lead."
+      }
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-doc",
+        "s-cfgdoc",
+        "s-staging"
+      ],
+      "executions": {
+        "f4adc58c4125434eb91cacf438a6da50": [3, 1, 5, 0, 2, 4]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Current account: with Config.RestoreCommittedLogs enabled and a CommitTrackingLogStore whose persisted commit index covers a committed configuration entry newer than the node's last snapshot, NewRaft does not rebuild the node's configuration from that entry, so the restarted node keeps the snapshot's membership for candidate admission and election quorum. Basis: restoreFromCommittedLogs reads the persisted commit index and calls processLogs(commitIndex, nil) (api.go 724-753); processLogs advances lastApplied to that index (raft.go 1361-1362); the configuration scan then starts at max(lastSnapshotIndex, lastApplied)+1 (api.go 610-620), above the committed configuration entry, which is therefore never passed to processConfigurationLogEntry. Receipt f4adc58c4125434eb91cacf438a6da50 confirms it on a harness-supplied store (feature on: lastApplied 7, latest configuration index 1 with {A,B,C}, quorum 2, and the running node reporting {A,B,C}; feature off: latest configuration index 6 with {A,B,C,D,E}, quorum 3; indices 3 and 5 against 1). The premise that such a restart can occur under permitted use is now supplied by construction rather than by argument: the experiment filed for the child question produces the same state in a live five-node cluster through bootstrap, election, membership change, user snapshot and restart, and it also records that the persisted commit index exists only because the deployment ran with RestoreCommittedLogs enabled (tryStageCommitIndex returns early otherwise), so the replay that causes the divergence is exactly the feature's intended effect. Consistency check between the two receipts: both show the restart using the older membership for quorum, and the receipt cited here remains the comparison-level evidence for the parent predicate; the child experiment's receipt is pending. Limits retained: the child receipt must still decide whether the stale view wins an election, so the safety consequence is not yet evidenced at comparison level; the crash-free restart schedule and in-memory stores remain, as do the un-observed healing behaviour of two conflicting leaders. The earlier receipt 99718ab469974eb1ad40516efe7c999e stays a retained channel failure with no evaluated comparison.",
+      "limitations": [
+        "A restart-free observation of the stale membership persisting for a long time under an active leader is still missing; persistence rests on the duplicate-skip in AppendEntries and the absence of another refresh path.",
+        "The election consequence is filed as a child experiment whose receipt is pending; until then the parent account establishes the configuration and quorum state, not the election outcome.",
+        "Only in-memory stores, graceful shutdown, and default configuration with scaled timeouts were used."
+      ],
+      "counterevidence": [
+        "The node stores the newer committed configuration entry and replays it to the FSM, so repair through a later configuration entry or an installed snapshot remains possible.",
+        "A deployment that never ran with RestoreCommittedLogs enabled has no persisted commit index to replay, in which case the configuration scan covers the entry and no divergence occurs; the defect therefore requires the feature to have been enabled on the node before its restart."
+      ]
+    }
+  ]
+}

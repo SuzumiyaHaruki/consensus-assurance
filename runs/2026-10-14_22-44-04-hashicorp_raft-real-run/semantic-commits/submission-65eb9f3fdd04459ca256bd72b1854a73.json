@@ -1,0 +1,547 @@
+{
+  "input": {
+    "rationale": "Marked the parent question explained, consistent with its child and sibling questions, because its own question is answered and every consequence and limit is recorded. The record now has no uncited execution and no question with an open necessary gap: the parent account states which configuration a node restarted with Config.RestoreCommittedLogs uses (the snapshot's, not the committed entry in its own log), the witnessed consequences (a two-vote leader against a three-vote requirement, conflicting commits at the same index and term, applied state that diverges until replaced), the bounds (the next configuration change ends the stale membership; a snapshot install repairs one node; a leader-side restore converges the cluster) and the standing limits, each tied to its receipt indices; the constructor question states the NewRaft stall and its now operationally realistic trigger with feature-off controls; and the repair question states which mechanisms do and do not reconcile the divergence. No experiment was run this turn.",
+    "sources": [],
+    "investigations": [
+      {
+        "id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+        "ref": null,
+        "question": null,
+        "source_ids": null,
+        "hypothesis": null,
+        "discriminator": null,
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+        "version": 1,
+        "question": "When Config.RestoreCommittedLogs replays committed logs during NewRaft, which configuration does the restarted node end up using for candidate admission and election quorum if its last snapshot predates a committed configuration entry that its own log already contains?",
+        "source_ids": [
+          "s-scan",
+          "s-restorecommitted",
+          "s-snaprestorecfg",
+          "s-processlogs",
+          "s-confentry",
+          "s-quorumsize",
+          "s-doc"
+        ],
+        "hypothesis": "The eager replay moves lastApplied to the persisted commit index before the configuration scan, so the scan starts above the committed configuration entry; r.configurations.latest and r.configurations.committed remain the snapshot's configuration, and the node derives quorumSize/hasVote from that older membership until some later configuration entry is appended.",
+        "discriminator": "Same restart-shaped stores (snapshot index 5 with configuration {A,B,C}, log index 6 = committed LogConfiguration{A,B,C,D,E}, persisted commit index 7) constructed twice: RestoreCommittedLogs=false (control) vs true. Predicted difference: lastApplied 5 vs 7, latest config index 6 ({A,B,C,D,E}) vs 1 ({A,B,C}), quorumSize 3 vs 2. A third case runs the feature-on fixture without skipStartup and samples the node's public GetConfiguration while it is campaigning.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "e99a162d27c7421fa6729d8cb9703581"
+      },
+      {
+        "id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+        "version": 2,
+        "question": "Can NewRaft fail to return when Config.RestoreCommittedLogs replays more committed log entries than processLogs can enqueue on fsmMutateCh before runFSM is started?",
+        "source_ids": [
+          "s-restorecommitted",
+          "s-processlogs",
+          "s-scan"
+        ],
+        "hypothesis": "restoreFromCommittedLogs runs before goFunc(r.runFSM); processLogs blocks once fsmMutateCh (buffered 128) is full, and each batch holds up to MaxAppendEntries entries, so a replay of more than 128*MaxAppendEntries committed entries leaves the constructor waiting for a consumer that does not exist yet.",
+        "discriminator": "Construct a node whose CommitTrackingLogStore reports a commit index at least 128*MaxAppendEntries+1 entries above the snapshot/applied index and observe whether NewRaft returns, with the batch-consumer set (runFSM started or not) as the changing condition.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+            "version": 1,
+            "question": "Can NewRaft fail to return when Config.RestoreCommittedLogs replays more committed log entries than processLogs can enqueue on fsmMutateCh before runFSM is started?",
+            "source_ids": [
+              "s-restorecommitted",
+              "s-processlogs",
+              "s-scan"
+            ],
+            "hypothesis": "restoreFromCommittedLogs runs before goFunc(r.runFSM); processLogs blocks once fsmMutateCh (buffered 128) is full, and each batch holds up to MaxAppendEntries entries, so a replay of more than 128*MaxAppendEntries committed entries leaves the constructor waiting for a consumer that does not exist yet.",
+            "discriminator": "Construct a node whose CommitTrackingLogStore reports a commit index at least 128*MaxAppendEntries+1 entries above the snapshot/applied index and observe whether NewRaft returns, with the batch-consumer set (runFSM started or not) as the changing condition.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "e99a162d27c7421fa6729d8cb9703581"
+          }
+        ],
+        "operation_id": "8001bad80a4d4ef0a840634644afdf63"
+      },
+      {
+        "id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+        "version": 2,
+        "question": "Can a node whose configuration was left stale by the RestoreCommittedLogs replay actually win an election with fewer votes than a majority of the configuration recorded in its own committed log, while the remaining voters elect their own leader?",
+        "source_ids": [
+          "s-votesneeded",
+          "s-quorumsize",
+          "s-votegrant",
+          "s-restorecommitted",
+          "s-scan"
+        ],
+        "hypothesis": "With the restarted node holding {A,B,C} while its log records the committed {A,B,C,D,E}, isolating it with one voter of the stale set lets it collect two votes (itself plus that voter) against its stale quorum of two and become leader, while the three remaining voters, who hold the current configuration, elect a second leader; both then accept commands.",
+        "discriminator": "One cluster whose only difference is the defect: node A is restarted with RestoreCommittedLogs after a committed configuration change beyond its snapshot, then a partition separates A and one stale voter from the other three. Predicted difference against a control restart of the same node without RestoreCommittedLogs (or with a refreshed snapshot): the feature-on node reaches Leader with two votes; the control stays follower/candidate because its quorum is three.",
+        "disposition": "explained",
+        "parent_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+            "version": 1,
+            "question": "Can a node whose configuration was left stale by the RestoreCommittedLogs replay actually win an election with fewer votes than a majority of the configuration recorded in its own committed log, while the remaining voters elect their own leader?",
+            "source_ids": [
+              "s-votesneeded",
+              "s-quorumsize",
+              "s-votegrant",
+              "s-restorecommitted",
+              "s-scan"
+            ],
+            "hypothesis": "With the restarted node holding {A,B,C} while its log records the committed {A,B,C,D,E}, isolating it with one voter of the stale set lets it collect two votes (itself plus that voter) against its stale quorum of two and become leader, while the three remaining voters, who hold the current configuration, elect a second leader; both then accept commands.",
+            "discriminator": "One cluster whose only difference is the defect: node A is restarted with RestoreCommittedLogs after a committed configuration change beyond its snapshot, then a partition separates A and one stale voter from the other three. Predicted difference against a control restart of the same node without RestoreCommittedLogs (or with a refreshed snapshot): the feature-on node reaches Leader with two votes; the control stays follower/candidate because its quorum is three.",
+            "disposition": "active",
+            "parent_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "3eae8e12b0574799b781f10f7899dbad"
+          }
+        ],
+        "operation_id": "598b1852505c408888df1d06edced266"
+      },
+      {
+        "id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+        "version": 2,
+        "question": "Which permitted mechanism reconciles the divergent entries and applied state left by the stale-configuration split: does the library engage installSnapshot, log compaction or a user restore on its own once the cluster is whole, or does the divergence persist while the node participates normally?",
+        "source_ids": [
+          "s-dupskip",
+          "s-confentry",
+          "s-processlogs"
+        ],
+        "hypothesis": "Nothing in the ordinary AppendEntries path reconciles same-term conflicts, and the stale node keeps serving and replicating, so it never falls far enough behind for the leader to send a snapshot; only an explicit snapshot install (forced by compaction plus a lagging follower), a user Restore or a truncation caused by a different term would replace the divergent entry and FSM state.",
+        "discriminator": "After the healed split state, force the surviving leader to snapshot and compact past the follower's nextIndex and append one more entry, then sample the divergent index and the applied commands on both sides. Predicted: without intervention the divergence persists, while a snapshot install replaces the restarted node's entry and FSM state with the leader's.",
+        "disposition": "explained",
+        "parent_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+            "version": 1,
+            "question": "Which permitted mechanism reconciles the divergent entries and applied state left by the stale-configuration split: does the library engage installSnapshot, log compaction or a user restore on its own once the cluster is whole, or does the divergence persist while the node participates normally?",
+            "source_ids": [
+              "s-dupskip",
+              "s-confentry",
+              "s-processlogs"
+            ],
+            "hypothesis": "Nothing in the ordinary AppendEntries path reconciles same-term conflicts, and the stale node keeps serving and replicating, so it never falls far enough behind for the leader to send a snapshot; only an explicit snapshot install (forced by compaction plus a lagging follower), a user Restore or a truncation caused by a different term would replace the divergent entry and FSM state.",
+            "discriminator": "After the healed split state, force the surviving leader to snapshot and compact past the follower's nextIndex and append one more entry, then sample the divergent index and the applied commands on both sides. Predicted: without intervention the divergence persists, while a snapshot install replaces the restarted node's entry and FSM state with the leader's.",
+            "disposition": "active",
+            "parent_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "12a64c3fb3bc403f9a55aa626c4f81eb"
+          }
+        ],
+        "operation_id": "450be61ac2474cd1bc4acf0d9a8f4041"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "65eb9f3fdd04459ca256bd72b1854a73",
+      "result": {
+        "submission": "update.json",
+        "summary": "Marked the parent question explained, consistent with its child and sibling questions, since its own question is answered and every consequence, bound and limit is recorded. The record now has no uncited execution and no question with an open necessary gap: the parent account states which configuration a node restarted with Config.RestoreCommittedLogs uses (the snapshot's membership rather than the configuration entry in its own log), the witnessed consequences (a leader elected with two votes where the current configuration requires three, conflicting commits by two leaders at the same index and term, and applied state that diverges until the node's state is replaced), the bounds (the next configuration change ends the stale membership, a snapshot install repairs the node that falls behind, and a leader-side restore converges the cluster) and the standing limits, each tied to its receipt indices; the constructor question states the NewRaft stall and its now operationally realistic trigger with feature-off controls and no dependence on non-default batch sizes; and the repair question states which mechanisms do and do not reconcile the divergence, with ordinary log comparison argued unavailable from the vote rule rather than merely untested. No experiment was run: the remaining items are limits rather than unanswered questions."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-e99a162d27c7421fa6729d8cb9703581": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-e99a162d27c7421fa6729d8cb9703581.json"
+      },
+      "submission-786d9fa73783489ab93e854a24c17092": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-786d9fa73783489ab93e854a24c17092.json"
+      },
+      "submission-3eae8e12b0574799b781f10f7899dbad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-3eae8e12b0574799b781f10f7899dbad.json"
+      },
+      "submission-45ca563f4b694c589631a6b78b71feba": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-45ca563f4b694c589631a6b78b71feba.json"
+      },
+      "submission-234be654cfb6453ebaeaa2315f6eec6d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-234be654cfb6453ebaeaa2315f6eec6d.json"
+      },
+      "submission-bff59e419ade4e618713d3fce3ff381e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-bff59e419ade4e618713d3fce3ff381e.json"
+      },
+      "submission-598b1852505c408888df1d06edced266": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-598b1852505c408888df1d06edced266.json"
+      },
+      "submission-7fa5f1ed17f8424c8920cf921834e074": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-7fa5f1ed17f8424c8920cf921834e074.json"
+      },
+      "submission-8001bad80a4d4ef0a840634644afdf63": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-8001bad80a4d4ef0a840634644afdf63.json"
+      },
+      "submission-12a64c3fb3bc403f9a55aa626c4f81eb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-12a64c3fb3bc403f9a55aa626c4f81eb.json"
+      },
+      "submission-761ecfb0e8b14df99a7f85eacbd9b87a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-761ecfb0e8b14df99a7f85eacbd9b87a.json"
+      },
+      "submission-450be61ac2474cd1bc4acf0d9a8f4041": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-450be61ac2474cd1bc4acf0d9a8f4041.json"
+      },
+      "submission-c7548e9677dc4edab0bda399f09ecf1e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-c7548e9677dc4edab0bda399f09ecf1e.json"
+      },
+      "submission-fc37577390c44d59874e0331754e3716": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-fc37577390c44d59874e0331754e3716.json"
+      },
+      "submission-0641fe712dcb4735970c3dbca82d48d4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-0641fe712dcb4735970c3dbca82d48d4.json"
+      },
+      "submission-e3bde5b35609431a99e16435bfeb7122": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-e3bde5b35609431a99e16435bfeb7122.json"
+      },
+      "submission-3eb2f22c3c7c451d81822b722ac61c7f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-3eb2f22c3c7c451d81822b722ac61c7f.json"
+      },
+      "submission-747cae551e46469e93b2681ba5661eb5": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-747cae551e46469e93b2681ba5661eb5.json"
+      },
+      "submission-5974f385e4a640509beb951a571b0633": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-5974f385e4a640509beb951a571b0633.json"
+      },
+      "submission-161eed6686e64110ab0f61d47cda6653": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-161eed6686e64110ab0f61d47cda6653.json"
+      },
+      "submission-0e75165dc2e641fbaf91164b1a95276c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-0e75165dc2e641fbaf91164b1a95276c.json"
+      },
+      "submission-fc99bbdbeea641cf80b8a76e44524bd1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-fc99bbdbeea641cf80b8a76e44524bd1.json"
+      },
+      "submission-540126b6f4e1430695fe66df1ea54c42": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-540126b6f4e1430695fe66df1ea54c42.json"
+      },
+      "submission-57c2c58237cb4eb1952d3efeccc0bf45": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-57c2c58237cb4eb1952d3efeccc0bf45.json"
+      },
+      "submission-afea480335e74ae28cd8138fbf50ebfe": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-afea480335e74ae28cd8138fbf50ebfe.json"
+      },
+      "submission-0a9d8e8c59184873aa578a5e25adb7dd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-0a9d8e8c59184873aa578a5e25adb7dd.json"
+      },
+      "submission-8568f6afbbac40bcbc03b99239773d3e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-8568f6afbbac40bcbc03b99239773d3e.json"
+      },
+      "submission-ee1d43cfe2ff4cee897e67765e562cba": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-ee1d43cfe2ff4cee897e67765e562cba.json"
+      },
+      "submission-2d1a144583964b95956b2814c9aa8eed": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-2d1a144583964b95956b2814c9aa8eed.json"
+      },
+      "submission-a05f292f5eae4363b261cfa66c17b913": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-a05f292f5eae4363b261cfa66c17b913.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+        "version": 2,
+        "question": "When Config.RestoreCommittedLogs replays committed logs during NewRaft, which configuration does the restarted node end up using for candidate admission and election quorum if its last snapshot predates a committed configuration entry that its own log already contains?",
+        "source_ids": [
+          "s-scan",
+          "s-restorecommitted",
+          "s-snaprestorecfg",
+          "s-processlogs",
+          "s-confentry",
+          "s-quorumsize",
+          "s-doc"
+        ],
+        "hypothesis": "The eager replay moves lastApplied to the persisted commit index before the configuration scan, so the scan starts above the committed configuration entry; r.configurations.latest and r.configurations.committed remain the snapshot's configuration, and the node derives quorumSize/hasVote from that older membership until some later configuration entry is appended.",
+        "discriminator": "Same restart-shaped stores (snapshot index 5 with configuration {A,B,C}, log index 6 = committed LogConfiguration{A,B,C,D,E}, persisted commit index 7) constructed twice: RestoreCommittedLogs=false (control) vs true. Predicted difference: lastApplied 5 vs 7, latest config index 6 ({A,B,C,D,E}) vs 1 ({A,B,C}), quorumSize 3 vs 2. A third case runs the feature-on fixture without skipStartup and samples the node's public GetConfiguration while it is campaigning.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+            "version": 1,
+            "question": "When Config.RestoreCommittedLogs replays committed logs during NewRaft, which configuration does the restarted node end up using for candidate admission and election quorum if its last snapshot predates a committed configuration entry that its own log already contains?",
+            "source_ids": [
+              "s-scan",
+              "s-restorecommitted",
+              "s-snaprestorecfg",
+              "s-processlogs",
+              "s-confentry",
+              "s-quorumsize",
+              "s-doc"
+            ],
+            "hypothesis": "The eager replay moves lastApplied to the persisted commit index before the configuration scan, so the scan starts above the committed configuration entry; r.configurations.latest and r.configurations.committed remain the snapshot's configuration, and the node derives quorumSize/hasVote from that older membership until some later configuration entry is appended.",
+            "discriminator": "Same restart-shaped stores (snapshot index 5 with configuration {A,B,C}, log index 6 = committed LogConfiguration{A,B,C,D,E}, persisted commit index 7) constructed twice: RestoreCommittedLogs=false (control) vs true. Predicted difference: lastApplied 5 vs 7, latest config index 6 ({A,B,C,D,E}) vs 1 ({A,B,C}), quorumSize 3 vs 2. A third case runs the feature-on fixture without skipStartup and samples the node's public GetConfiguration while it is campaigning.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "e99a162d27c7421fa6729d8cb9703581"
+          }
+        ],
+        "operation_id": "65eb9f3fdd04459ca256bd72b1854a73"
+      },
+      {
+        "id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+        "version": 2,
+        "question": "Can NewRaft fail to return when Config.RestoreCommittedLogs replays more committed log entries than processLogs can enqueue on fsmMutateCh before runFSM is started?",
+        "source_ids": [
+          "s-restorecommitted",
+          "s-processlogs",
+          "s-scan"
+        ],
+        "hypothesis": "restoreFromCommittedLogs runs before goFunc(r.runFSM); processLogs blocks once fsmMutateCh (buffered 128) is full, and each batch holds up to MaxAppendEntries entries, so a replay of more than 128*MaxAppendEntries committed entries leaves the constructor waiting for a consumer that does not exist yet.",
+        "discriminator": "Construct a node whose CommitTrackingLogStore reports a commit index at least 128*MaxAppendEntries+1 entries above the snapshot/applied index and observe whether NewRaft returns, with the batch-consumer set (runFSM started or not) as the changing condition.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+            "version": 1,
+            "question": "Can NewRaft fail to return when Config.RestoreCommittedLogs replays more committed log entries than processLogs can enqueue on fsmMutateCh before runFSM is started?",
+            "source_ids": [
+              "s-restorecommitted",
+              "s-processlogs",
+              "s-scan"
+            ],
+            "hypothesis": "restoreFromCommittedLogs runs before goFunc(r.runFSM); processLogs blocks once fsmMutateCh (buffered 128) is full, and each batch holds up to MaxAppendEntries entries, so a replay of more than 128*MaxAppendEntries committed entries leaves the constructor waiting for a consumer that does not exist yet.",
+            "discriminator": "Construct a node whose CommitTrackingLogStore reports a commit index at least 128*MaxAppendEntries+1 entries above the snapshot/applied index and observe whether NewRaft returns, with the batch-consumer set (runFSM started or not) as the changing condition.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "e99a162d27c7421fa6729d8cb9703581"
+          }
+        ],
+        "operation_id": "8001bad80a4d4ef0a840634644afdf63"
+      },
+      {
+        "id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+        "version": 2,
+        "question": "Can a node whose configuration was left stale by the RestoreCommittedLogs replay actually win an election with fewer votes than a majority of the configuration recorded in its own committed log, while the remaining voters elect their own leader?",
+        "source_ids": [
+          "s-votesneeded",
+          "s-quorumsize",
+          "s-votegrant",
+          "s-restorecommitted",
+          "s-scan"
+        ],
+        "hypothesis": "With the restarted node holding {A,B,C} while its log records the committed {A,B,C,D,E}, isolating it with one voter of the stale set lets it collect two votes (itself plus that voter) against its stale quorum of two and become leader, while the three remaining voters, who hold the current configuration, elect a second leader; both then accept commands.",
+        "discriminator": "One cluster whose only difference is the defect: node A is restarted with RestoreCommittedLogs after a committed configuration change beyond its snapshot, then a partition separates A and one stale voter from the other three. Predicted difference against a control restart of the same node without RestoreCommittedLogs (or with a refreshed snapshot): the feature-on node reaches Leader with two votes; the control stays follower/candidate because its quorum is three.",
+        "disposition": "explained",
+        "parent_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+            "version": 1,
+            "question": "Can a node whose configuration was left stale by the RestoreCommittedLogs replay actually win an election with fewer votes than a majority of the configuration recorded in its own committed log, while the remaining voters elect their own leader?",
+            "source_ids": [
+              "s-votesneeded",
+              "s-quorumsize",
+              "s-votegrant",
+              "s-restorecommitted",
+              "s-scan"
+            ],
+            "hypothesis": "With the restarted node holding {A,B,C} while its log records the committed {A,B,C,D,E}, isolating it with one voter of the stale set lets it collect two votes (itself plus that voter) against its stale quorum of two and become leader, while the three remaining voters, who hold the current configuration, elect a second leader; both then accept commands.",
+            "discriminator": "One cluster whose only difference is the defect: node A is restarted with RestoreCommittedLogs after a committed configuration change beyond its snapshot, then a partition separates A and one stale voter from the other three. Predicted difference against a control restart of the same node without RestoreCommittedLogs (or with a refreshed snapshot): the feature-on node reaches Leader with two votes; the control stays follower/candidate because its quorum is three.",
+            "disposition": "active",
+            "parent_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "3eae8e12b0574799b781f10f7899dbad"
+          }
+        ],
+        "operation_id": "598b1852505c408888df1d06edced266"
+      },
+      {
+        "id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+        "version": 2,
+        "question": "Which permitted mechanism reconciles the divergent entries and applied state left by the stale-configuration split: does the library engage installSnapshot, log compaction or a user restore on its own once the cluster is whole, or does the divergence persist while the node participates normally?",
+        "source_ids": [
+          "s-dupskip",
+          "s-confentry",
+          "s-processlogs"
+        ],
+        "hypothesis": "Nothing in the ordinary AppendEntries path reconciles same-term conflicts, and the stale node keeps serving and replicating, so it never falls far enough behind for the leader to send a snapshot; only an explicit snapshot install (forced by compaction plus a lagging follower), a user Restore or a truncation caused by a different term would replace the divergent entry and FSM state.",
+        "discriminator": "After the healed split state, force the surviving leader to snapshot and compact past the follower's nextIndex and append one more entry, then sample the divergent index and the applied commands on both sides. Predicted: without intervention the divergence persists, while a snapshot install replaces the restarted node's entry and FSM state with the leader's.",
+        "disposition": "explained",
+        "parent_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "12a64c3fb3bc403f9a55aa626c4f81eb-question-0",
+            "version": 1,
+            "question": "Which permitted mechanism reconciles the divergent entries and applied state left by the stale-configuration split: does the library engage installSnapshot, log compaction or a user restore on its own once the cluster is whole, or does the divergence persist while the node participates normally?",
+            "source_ids": [
+              "s-dupskip",
+              "s-confentry",
+              "s-processlogs"
+            ],
+            "hypothesis": "Nothing in the ordinary AppendEntries path reconciles same-term conflicts, and the stale node keeps serving and replicating, so it never falls far enough behind for the leader to send a snapshot; only an explicit snapshot install (forced by compaction plus a lagging follower), a user Restore or a truncation caused by a different term would replace the divergent entry and FSM state.",
+            "discriminator": "After the healed split state, force the surviving leader to snapshot and compact past the follower's nextIndex and append one more entry, then sample the divergent index and the applied commands on both sides. Predicted: without intervention the divergence persists, while a snapshot install replaces the restarted node's entry and FSM state with the leader's.",
+            "disposition": "active",
+            "parent_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "12a64c3fb3bc403f9a55aa626c4f81eb"
+          }
+        ],
+        "operation_id": "450be61ac2474cd1bc4acf0d9a8f4041"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "65eb9f3fdd04459ca256bd72b1854a73",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "effects": [
+        {
+          "object": "investigations",
+          "action": "update",
+          "target": "e99a162d27c7421fa6729d8cb9703581-question-0",
+          "changed_fields": [
+            "disposition"
+          ]
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-e99a162d27c7421fa6729d8cb9703581": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-e99a162d27c7421fa6729d8cb9703581.json"
+      },
+      "submission-786d9fa73783489ab93e854a24c17092": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-786d9fa73783489ab93e854a24c17092.json"
+      },
+      "submission-3eae8e12b0574799b781f10f7899dbad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-3eae8e12b0574799b781f10f7899dbad.json"
+      },
+      "submission-45ca563f4b694c589631a6b78b71feba": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-45ca563f4b694c589631a6b78b71feba.json"
+      },
+      "submission-234be654cfb6453ebaeaa2315f6eec6d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-234be654cfb6453ebaeaa2315f6eec6d.json"
+      },
+      "submission-bff59e419ade4e618713d3fce3ff381e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-bff59e419ade4e618713d3fce3ff381e.json"
+      },
+      "submission-598b1852505c408888df1d06edced266": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-598b1852505c408888df1d06edced266.json"
+      },
+      "submission-7fa5f1ed17f8424c8920cf921834e074": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-7fa5f1ed17f8424c8920cf921834e074.json"
+      },
+      "submission-8001bad80a4d4ef0a840634644afdf63": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-8001bad80a4d4ef0a840634644afdf63.json"
+      },
+      "submission-12a64c3fb3bc403f9a55aa626c4f81eb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-12a64c3fb3bc403f9a55aa626c4f81eb.json"
+      },
+      "submission-761ecfb0e8b14df99a7f85eacbd9b87a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-761ecfb0e8b14df99a7f85eacbd9b87a.json"
+      },
+      "submission-450be61ac2474cd1bc4acf0d9a8f4041": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-450be61ac2474cd1bc4acf0d9a8f4041.json"
+      },
+      "submission-c7548e9677dc4edab0bda399f09ecf1e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-c7548e9677dc4edab0bda399f09ecf1e.json"
+      },
+      "submission-fc37577390c44d59874e0331754e3716": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-fc37577390c44d59874e0331754e3716.json"
+      },
+      "submission-0641fe712dcb4735970c3dbca82d48d4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-0641fe712dcb4735970c3dbca82d48d4.json"
+      },
+      "submission-e3bde5b35609431a99e16435bfeb7122": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-e3bde5b35609431a99e16435bfeb7122.json"
+      },
+      "submission-3eb2f22c3c7c451d81822b722ac61c7f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-3eb2f22c3c7c451d81822b722ac61c7f.json"
+      },
+      "submission-747cae551e46469e93b2681ba5661eb5": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-747cae551e46469e93b2681ba5661eb5.json"
+      },
+      "submission-5974f385e4a640509beb951a571b0633": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-5974f385e4a640509beb951a571b0633.json"
+      },
+      "submission-161eed6686e64110ab0f61d47cda6653": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-161eed6686e64110ab0f61d47cda6653.json"
+      },
+      "submission-0e75165dc2e641fbaf91164b1a95276c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-0e75165dc2e641fbaf91164b1a95276c.json"
+      },
+      "submission-fc99bbdbeea641cf80b8a76e44524bd1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-fc99bbdbeea641cf80b8a76e44524bd1.json"
+      },
+      "submission-540126b6f4e1430695fe66df1ea54c42": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-540126b6f4e1430695fe66df1ea54c42.json"
+      },
+      "submission-57c2c58237cb4eb1952d3efeccc0bf45": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-57c2c58237cb4eb1952d3efeccc0bf45.json"
+      },
+      "submission-afea480335e74ae28cd8138fbf50ebfe": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-afea480335e74ae28cd8138fbf50ebfe.json"
+      },
+      "submission-0a9d8e8c59184873aa578a5e25adb7dd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-0a9d8e8c59184873aa578a5e25adb7dd.json"
+      },
+      "submission-8568f6afbbac40bcbc03b99239773d3e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-8568f6afbbac40bcbc03b99239773d3e.json"
+      },
+      "submission-ee1d43cfe2ff4cee897e67765e562cba": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-ee1d43cfe2ff4cee897e67765e562cba.json"
+      },
+      "submission-2d1a144583964b95956b2814c9aa8eed": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-2d1a144583964b95956b2814c9aa8eed.json"
+      },
+      "submission-a05f292f5eae4363b261cfa66c17b913": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-a05f292f5eae4363b261cfa66c17b913.json"
+      },
+      "submission-65eb9f3fdd04459ca256bd72b1854a73": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-14_22-44-04-hashicorp_raft-real-run/semantic-commits/submission-65eb9f3fdd04459ca256bd72b1854a73.json"
+      }
+    }
+  }
+}

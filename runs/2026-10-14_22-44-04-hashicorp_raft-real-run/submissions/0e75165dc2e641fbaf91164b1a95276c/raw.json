@@ -1,0 +1,132 @@
+{
+  "rationale": "Interpreted the reconfiguration receipt and bounded the stale-membership half of the account. Receipt 182740a6d29f4af9a99cf83c49f2e857 evaluated all five comparisons: in the feature-on run the new configuration entry reached the restarted node, whose view became {A,B,C,D,E,F} (holds, index 4), while the entries at the conflict index remained different across nodes (violated, index 4) and the restarted node's FSM still held the write only its own side had accepted (holds, index 4); the feature-off control reflected the same configuration change and stayed consistent (holds, index 10). So the stale membership lasts until the next configuration change, while the entry and applied divergence is untouched by it — which also matches the source, since new configuration entries are processed on AppendEntries whatever the restart's scan did. The child and parent accounts, plus the configuration-update knowledge entry, were updated accordingly.",
+  "knowledge": [
+    {
+      "id": "e99a162d27c7421fa6729d8cb9703581-knowledge-2",
+      "kind": "behavior",
+      "statement": "Outside NewRaft, r.configurations is updated only by the AppendEntries path for entries that are not already present as duplicates with the same term, by processConfigurationLogEntry for those new entries, and by installSnapshot (which sets both latest and committed from the snapshot request); processLogs and the FSM apply path never update the configuration.",
+      "conditions": "Running follower/leader loops on the main thread; duplicate entries (index at or below lastLogIdx with matching term) are skipped before processConfigurationLogEntry is reached.",
+      "source_ids": [
+        "s-dupskip",
+        "s-confapply",
+        "s-confentry",
+        "s-installsnapcfg"
+      ],
+      "executions": {
+        "182740a6d29f4af9a99cf83c49f2e857": [4]
+      },
+      "changed_premise": ""
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+      "experiment_id": "161eed6686e64110ab0f61d47cda6653-experiment",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-confentry",
+        "s-processlogs",
+        "s-dupskip",
+        "s-quorumsize"
+      ],
+      "executions": {
+        "182740a6d29f4af9a99cf83c49f2e857": [4, 10, 0, 6]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "This receipt separates the two consequences of the defect after a real configuration change. Admissions index 0 and index 6 record the same structural fixture in both modes. After the long run, a current-configuration leader adds voter F: in the feature-on run the restarted node processes that new entry, so its configuration becomes {A,B,C,D,E,F} (comparison 0 holds at index 4), which ends the stale membership; at the same event the entries at the conflict index still disagree (comparison 1 violated, witness index 4) and the restarted node's applied write list still contains only minority-write (comparison 2 holds), so the entry and applied divergence survives a configuration change. The feature-off control processes the same change and stays consistent (comparisons 3 and 4 hold at index 10). Mechanism: a configuration entry the node has never seen is handled by processConfigurationLogEntry on AppendEntries, independently of the log scan NewRaft skipped, while same-term duplicates at an existing index are skipped before any processing, so nothing in that path touches the conflicting entry. Limits: one AddVoter, issued by the harness, with no removal, demotion or second change; the change happened after a long run but not after any repair; the environment remains in-memory stores with scaled timeouts and a graceful restart.",
+      "limitations": [
+        "The configuration change is a single AddVoter issued by the harness; no removal, demotion or repeated change is covered.",
+        "In-memory stores, scaled timeouts and a graceful shutdown of the restarted node.",
+        "The repair phase that follows still uses harness-arranged lag."
+      ],
+      "counterevidence": [
+        "The feature-off control processes the same change and remains consistent, so the persistence of the entry divergence is not an artifact of the configuration change itself.",
+        "The refreshed configuration in the feature-on run shows the stale view is not permanent, which limits the membership consequence to the interval before the next configuration change."
+      ]
+    },
+    {
+      "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-staging",
+        "s-dupskip",
+        "s-installsnap"
+      ],
+      "executions": {
+        "182740a6d29f4af9a99cf83c49f2e857": [4, 10],
+        "861a2b3c62bb44d7aed2eee9b95aa15f": [3, 8],
+        "531b0a48500843228e26623ce7333943": [1, 2, 3, 6, 7, 8],
+        "112186e8b9544b51b4f7818a04c78a84": [4],
+        "fa1f90c2eefd45e6af45d7593ac53205": [3, 0],
+        "455e647ad0794a16903414b5a8846276": [3, 2, 1, 0],
+        "b68f3d3a08b34cd6a27b76faeb0d2a3e": [2, 1, 0]
+      },
+      "joint_history": "Seven receipts of six fixed experiments over one defect chain: b68f3d3a08b34cd6a27b76faeb0d2a3e observes the split, 455e647ad0794a16903414b5a8846276 adds the healing phase, fa1f90c2eefd45e6af45d7593ac53205 adds applied-state sampling, 112186e8b9544b51b4f7818a04c78a84 (filed under the repair question) adds the repair phase, 531b0a48500843228e26623ce7333943 runs the scenario in both restart modes, 861a2b3c62bb44d7aed2eee9b95aa15f extends the healed phase into a long run, and 182740a6d29f4af9a99cf83c49f2e857 adds a configuration change after the long run. Compatibility rests on the shared structural fixture in every receipt (snapshot configuration {A,B,C}, a committed configuration entry with {A,B,C,D,E} above it, a persisted commit index covering it, and the feature-on restarted node reporting {A,B,C}), on the identical conflict index 11 at term 3 with minority-write against majority-write in the feature-on receipts, and on the control run reporting {A,B,C,D,E}. Each comparison outcome is read from its own receipt, and each revision restricted its comparison set to new predicates.",
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Answer, now with both consequences bounded: yes. A node left with a stale configuration by the RestoreCommittedLogs replay wins an election with fewer votes than the configuration recorded in its own committed log while the other voters elect their own leader, both sides commit at the same index and term, and after healing the entry and applied divergence survives a long run and a configuration change, while the stale membership itself ends at the next configuration change (receipt 182740a6d29f4af9a99cf83c49f2e857 index 4: the restarted node's view becomes {A,B,C,D,E,F} but the conflict index still disagrees and its FSM still holds minority-write). The entry divergence is removed only by the repair path the repair question observed: an installed snapshot, which replaces the node's log, FSM and configuration. Remaining limits: the configuration change was a single harness-issued AddVoter with no removal or demotion; the long run is entry-count based with no snapshot install during it; the repair needs harness-arranged lag; the user Restore and term-changing truncation paths are unexercised; and in-memory stores with scaled timeouts and a graceful restart were used.",
+      "limitations": [
+        "The configuration change is a single harness-issued AddVoter; no removal, demotion or repeated change, and no membership change during the long run itself.",
+        "The long run is ~200 entries within one execution and contains no snapshot install.",
+        "The repair is per node and needed harness-arranged lag plus a leader snapshot.",
+        "The user Restore path and truncation by a different term are not exercised.",
+        "In-memory stores, scaled timeouts and a graceful shutdown rather than a crash."
+      ],
+      "counterevidence": [
+        "The feature-off control run over the identical scenario, long run and configuration change shows no stale membership, no minority leader and no self-applied write.",
+        "The refreshed configuration in the feature-on run shows the membership consequence is bounded by the next configuration change.",
+        "The installed-snapshot receipt shows the divergent entry and applied state are removed once the node falls behind a compacted leader."
+      ]
+    },
+    {
+      "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-doc",
+        "s-cfgdoc",
+        "s-staging",
+        "s-dupskip",
+        "s-installsnap"
+      ],
+      "executions": {
+        "f4adc58c4125434eb91cacf438a6da50": [3, 1, 5, 0, 2, 4],
+        "b68f3d3a08b34cd6a27b76faeb0d2a3e": [1, 2, 0],
+        "455e647ad0794a16903414b5a8846276": [1, 3, 0],
+        "fa1f90c2eefd45e6af45d7593ac53205": [3],
+        "112186e8b9544b51b4f7818a04c78a84": [4],
+        "531b0a48500843228e26623ce7333943": [1, 6],
+        "861a2b3c62bb44d7aed2eee9b95aa15f": [3, 8],
+        "182740a6d29f4af9a99cf83c49f2e857": [4, 10]
+      },
+      "joint_history": "Eight receipts of seven fixed experiments over one defect chain, all sharing the structural fixture (snapshot configuration {A,B,C}, a committed configuration entry with {A,B,C,D,E} above the snapshot, a persisted commit index covering it) and the feature-on restart reporting {A,B,C}, with the control run reporting {A,B,C,D,E}. They successively construct the restart state, observe the split, add healing, applied-state sampling, the repair phase, the feature-off control, a long run and a configuration change. No value is combined across receipts; each comparison outcome is read from its own receipt, and later revisions restricted their comparison sets to new predicates.",
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Current account: with Config.RestoreCommittedLogs enabled and a CommitTrackingLogStore whose persisted commit index covers a committed configuration entry newer than the node's last snapshot, NewRaft never rebuilds the node's configuration from that entry, so the restarted node keeps the snapshot's membership for candidate admission and election quorum; that stale view lets it lead with two votes where the current configuration requires three, produces two concurrent leaders whose commits collide at the same index and term, and leaves the entry and applied state different across the cluster, surviving a long run and a configuration change; the stale membership itself ends at the next configuration change, and the entry divergence is removed only by an installed snapshot. Basis: restoreFromCommittedLogs reads the persisted commit index and calls processLogs(commitIndex, nil) (api.go 724-753); processLogs advances lastApplied (raft.go 1361-1362); the configuration scan starts at max(lastSnapshotIndex, lastApplied)+1 (api.go 610-620) above the committed entry, whereas a restart without the replay scans from the snapshot index and processes it (receipt 531b0a48500843228e26623ce7333943 index 6) and a later configuration entry is processed normally by any node (receipt 182740a6d29f4af9a99cf83c49f2e857 index 4); quorum and voter admission come from configurations.latest (raft.go 313-320, 1085-1096, 1660-1680); duplicates are skipped so neither the configuration entry the restart missed nor the conflicting command is ever reprocessed (raft.go 1526-1553) as the long-run receipt shows; the persisted commit index exists only because the node ran with the feature enabled (raft.go 1393-1403); and installing a snapshot replaces log, FSM and configuration (raft.go 1935-1972). Remaining limits: the membership change was a single harness-issued AddVoter; the long run has no snapshot install; the repair needs harness-arranged lag; the user Restore and term-changing truncation paths are unexercised; and in-memory stores with scaled timeouts and a graceful shutdown were used. The first filed experiment's receipt 99718ab469974eb1ad40516efe7c999e remains a retained channel failure with no evaluated comparison.",
+      "limitations": [
+        "The configuration change is a single harness-issued AddVoter; no removal, demotion, repeated change or configuration change during the long run.",
+        "The long run is ~200 entries within one execution and contains no snapshot install.",
+        "The repair is per node and needed harness-arranged lag plus a leader snapshot.",
+        "The user Restore path and truncation by a different term are not exercised.",
+        "In-memory stores, scaled timeouts and a graceful shutdown rather than a crash."
+      ],
+      "counterevidence": [
+        "The feature-off restart control over the identical cluster scenario, long run and configuration change produces no stale membership, no minority leader and no self-applied write.",
+        "A later configuration entry ends the stale membership, so that consequence is bounded by the next membership change.",
+        "An installed snapshot removes both the divergent entry and the applied state on that node, so the divergence is not permanent either.",
+        "A deployment that never ran with RestoreCommittedLogs enabled stores commit index 0, in which case the scan covers the entry and no divergence occurs."
+      ]
+    }
+  ]
+}

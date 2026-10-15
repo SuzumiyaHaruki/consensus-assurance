@@ -1,0 +1,200 @@
+{
+  "rationale": "Interpreted the control receipt and closed the child question's last stated gap. Receipt 531b0a48500843228e26623ce7333943 ran the same cluster scenario twice in one execution with the restart's Config.RestoreCommittedLogs setting as the only difference, and all seven mode-conditioned comparisons behaved as declared: in the feature-on run the restarted node reports the stale {A,B,C} (violated, index 1), the two-voter partition elects its leader (violated, index 2) and the restarted node applies a write of its own (violated, index 3); in the feature-off run the same restart reports {A,B,C,D,E} (holds, index 6), the same partition elects no leader (holds, index 7), the cluster has exactly one leader (holds, index 7) and the restarted node applies nothing of its own (holds, index 8). The account is updated so the no-feature restart control is evidence rather than an open limitation, and the scan behaviour knowledge gains the control restart event as a direct use.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "e99a162d27c7421fa6729d8cb9703581-knowledge-0",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "NewRaft's post-restore configuration scan iterates index from max(lastSnapshotIndex, lastApplied)+1 up to the last log index and calls processConfigurationLogEntry for every entry in that range, so configuration entries at or below the scan start are never processed into r.configurations during construction.",
+      "conditions": "Construction of a Raft instance from retained log/stable/snapshot state; the scan runs after restoreSnapshot and after restoreFromCommittedLogs, and before skipStartup returns control to the caller.",
+      "source_ids": [
+        "s-scan",
+        "s-confentry"
+      ],
+      "executions": {
+        "531b0a48500843228e26623ce7333943": [
+          6
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+      "experiment_id": "c7548e9677dc4edab0bda399f09ecf1e-experiment",
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-staging",
+        "s-dupskip"
+      ],
+      "executions": {
+        "531b0a48500843228e26623ce7333943": [
+          1,
+          2,
+          3,
+          6,
+          7,
+          8,
+          0,
+          5
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "The two runs in this receipt differ only in the restart's Config.RestoreCommittedLogs setting, and the comparison outcomes separate cleanly by mode. Admissions index 0 (feature-on run) and index 5 (feature-off run) record identical fixture operands - snapshot index 6 with configuration {A,B,C}, the committed configuration entry with {A,B,C,D,E}, stored commit index 8 covering it - and both runs had the same first life with the feature enabled, so the persisted commit index exists in both. At index 1 the feature-on restart reports {A,B,C}, contradicting the assertion that the restarted node uses the committed configuration (violated); at index 6 the control restart reports {A,B,C,D,E} (holds). In the partition, the feature-on run elects A in the two-voter partition (index 2, violated) while the control elects no leader there (index 7, holds) and has exactly one leader overall (index 7, holds). After healing, the feature-on node has applied its own minority write (index 3, violated) while the control node has applied nothing of its own (index 8, holds). Mechanism: the feature-on restart replays committed logs before the configuration scan and therefore skips the committed configuration entry (api.go 724-753, 610-620), so quorum and voter admission come from {A,B,C} (raft.go 313-320, 1085-1096, 1660-1680); the control restart does not replay, so its scan covers the entry and its quorum stays three. Limits: one run of each mode with short samples, in-memory stores, scaled timeouts, a graceful restart and TrailingLogs 0; the metric for cluster-wide applied writes is only meaningful in the feature-on run because the control never commits a second write, which is why the control comparisons use the restarted node's own applied writes.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The control run's applied-write lists still differ across nodes because only the majority side committed a write, which shows the metric must be scoped to the run rather than compared across modes.",
+        "In the control run the restarted node still gets a snapshot install during the repair phase, so the repair phase is not specific to the defect."
+      ],
+      "limitations": [
+        "One run per mode with short sampling windows; no repetition of the control across schedules.",
+        "In-memory stores, scaled timeouts, a graceful shutdown of the restarted node and TrailingLogs 0.",
+        "The control run has no conflicting commit, so cluster-wide applied-write consistency is not a meaningful predicate there."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-staging",
+        "s-dupskip",
+        "s-installsnap"
+      ],
+      "executions": {
+        "531b0a48500843228e26623ce7333943": [
+          1,
+          2,
+          3,
+          6,
+          7,
+          8
+        ],
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4
+        ],
+        "fa1f90c2eefd45e6af45d7593ac53205": [
+          3,
+          0
+        ],
+        "455e647ad0794a16903414b5a8846276": [
+          3,
+          2,
+          1,
+          0
+        ],
+        "b68f3d3a08b34cd6a27b76faeb0d2a3e": [
+          2,
+          1,
+          0
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Answer, now with the control in place: yes. A node left with a stale configuration by the RestoreCommittedLogs replay wins an election with fewer votes than the configuration recorded in its own committed log while the other voters elect their own leader, both sides commit at the same index and term, and the applied states stay different until the node is repaired individually. The control receipt 531b0a48500843228e26623ce7333943 runs the identical scenario with the restart's feature setting as the only difference: with the feature on the restarted node reports {A,B,C}, leads the two-voter partition and applies its own write (indices 1, 2 and 3), while with the feature off the same restart reports {A,B,C,D,E}, no leader emerges in that partition, the cluster has one leader and the restarted node applies nothing (indices 6, 7 and 8). Together with the receipt chain - split b68f3d3a08b34cd6a27b76faeb0d2a3e, healed log state 455e647ad0794a16903414b5a8846276, healed applied state fa1f90c2eefd45e6af45d7593ac53205, per-node repair 112186e8b9544b51b4f7818a04c78a84 - the account is that the replay skips the committed configuration entry, the resulting quorum lets the node lead a minority, the collision is never reconciled by AppendEntries, and an installed snapshot is the observed repair. Remaining limits: the samples are short in every receipt, the repair needed harness-arranged lag, the user Restore and term-changing truncation paths are unexercised, and in-memory stores with scaled timeouts were used throughout.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The feature-off control run over the identical scenario shows no stale membership, no minority leader and no self-applied write, so the partition schedule alone does not produce these outcomes.",
+        "An installed snapshot removes both the divergent entry and the stale configuration on that node, so neither is permanent once the node falls behind a compacted leader.",
+        "After healing in the defect runs the cluster elected a node holding the current configuration, so the persistence claim concerns the restarted node's own view and applied state rather than its leadership."
+      ],
+      "limitations": [
+        "All receipts use short sampling windows; no long run over the divergent state is covered.",
+        "The repair is per node and needed harness-arranged lag plus a leader snapshot; the operational frequency of such a fall-behind is not established.",
+        "The user Restore path and truncation by a different term are not exercised.",
+        "In-memory stores, scaled timeouts and a graceful shutdown rather than a crash."
+      ],
+      "joint_history": "Five receipts of four fixed experiments and two further revisions over the same defect chain: b68f3d3a08b34cd6a27b76faeb0d2a3e observes the split, 455e647ad0794a16903414b5a8846276 adds the healing phase, fa1f90c2eefd45e6af45d7593ac53205 adds applied-state sampling, 112186e8b9544b51b4f7818a04c78a84 (filed under the repair question) adds the repair phase, and 531b0a48500843228e26623ce7333943 runs the scenario in both restart modes. Compatibility rests on the shared fixture in every receipt (fixture event index 0: snapshot index 6 with configuration {A,B,C}, a committed configuration entry with {A,B,C,D,E} above it, stored commit index 8) and on the restarted node reporting {A,B,C} in the feature-on runs, with the control run reporting {A,B,C,D,E} at its restart event; the conflict index, term and write payloads are identical across the feature-on receipts (index 11, term 3, minority-write against majority-write). Each comparison outcome is read from its own receipt, and the later receipts restricted their comparison sets to their new predicates, so they are not additive evidence for predicates already recorded.",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-doc",
+        "s-cfgdoc",
+        "s-staging",
+        "s-dupskip",
+        "s-installsnap"
+      ],
+      "executions": {
+        "f4adc58c4125434eb91cacf438a6da50": [
+          3,
+          1,
+          5,
+          0,
+          2,
+          4
+        ],
+        "b68f3d3a08b34cd6a27b76faeb0d2a3e": [
+          1,
+          2,
+          0
+        ],
+        "455e647ad0794a16903414b5a8846276": [
+          1,
+          3,
+          0
+        ],
+        "fa1f90c2eefd45e6af45d7593ac53205": [
+          3
+        ],
+        "112186e8b9544b51b4f7818a04c78a84": [
+          4
+        ],
+        "531b0a48500843228e26623ce7333943": [
+          1,
+          6
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Current account: with Config.RestoreCommittedLogs enabled and a CommitTrackingLogStore whose persisted commit index covers a committed configuration entry newer than the node's last snapshot, NewRaft never rebuilds the node's configuration from that entry, so the restarted node keeps the snapshot's membership for candidate admission and election quorum; that stale view lets it lead with two votes where the current configuration requires three, produces two concurrent leaders whose commits collide at the same index and term, leaves both the entry and the applied state different across the cluster, and is removed only when the node installs a snapshot. Basis: restoreFromCommittedLogs reads the persisted commit index and calls processLogs(commitIndex, nil) (api.go 724-753); processLogs advances lastApplied to that index (raft.go 1361-1362); the configuration scan then starts at max(lastSnapshotIndex, lastApplied)+1 (api.go 610-620) above the committed configuration entry, which is never passed to processConfigurationLogEntry, whereas a restart without the replay scans from the snapshot index and does process it (receipt 531b0a48500843228e26623ce7333943 index 6); quorum and voter admission come from configurations.latest (raft.go 313-320, 1085-1096, 1660-1680); duplicates are skipped so neither the configuration entry nor the conflicting command is reprocessed (raft.go 1526-1553); the persisted commit index exists only because the node ran with the feature enabled (raft.go 1393-1403); and an installed snapshot replaces the node's log, FSM and configuration (raft.go 1935-1972). Remaining limits: all samples are short; the repair needed harness-arranged lag; the user Restore and term-changing truncation paths are unexercised; in-memory stores and scaled timeouts were used; and the earlier receipt 99718ab469974eb1ad40516efe7c999e remains a retained channel failure with no evaluated comparison.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The feature-off restart control over the identical cluster scenario produces no stale membership, no minority leader and no self-applied write, so the partition schedule alone does not explain the outcomes.",
+        "An installed snapshot removes both the divergent entry and the stale configuration on that node, so neither is permanent once the node falls behind a compacted leader.",
+        "A deployment that never ran with RestoreCommittedLogs enabled stores commit index 0, in which case the scan covers the entry and no divergence occurs."
+      ],
+      "limitations": [
+        "All receipts sample short windows; no long run over the divergent state is covered.",
+        "The repair is per node and needed harness-arranged lag plus a leader snapshot; its operational frequency is not established.",
+        "The user Restore path and truncation by a different term are not exercised.",
+        "In-memory stores, scaled timeouts and a graceful shutdown rather than a crash."
+      ],
+      "joint_history": "Six receipts of five fixed experiments over one defect chain. The first constructs the restart state in harness-supplied stores; the second produces that state through normal operations and observes the split; the third adds the healing phase; the fourth adds applied-state sampling; the fifth (repair question) adds the repair phase; the sixth adds the feature-off restart control run inside the same execution as the feature-on run. The third to sixth share one scenario lineage and each restricted its comparison set to its new predicates, so a later receipt is not additive evidence for predicates already recorded. All six share the same structural conditions - snapshot configuration {A,B,C}, a committed configuration entry with {A,B,C,D,E} above the snapshot, a persisted commit index covering it, and (in the feature-on runs) a restarted node reporting {A,B,C} (first receipt index 2, second index 0, third index 0, fourth index 0, fifth index 0, sixth index 1), with the sixth receipt's control reporting {A,B,C,D,E} at index 6. No value is combined across receipts; each comparison outcome is read from its own receipt.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

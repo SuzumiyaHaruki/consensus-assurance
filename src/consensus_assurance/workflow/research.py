@@ -62,8 +62,9 @@ def record_preview(value, collection):
         'record':{'path':'state.json', 'collection':collection, 'id':value['id']}}
 
 
-def interpretation_view(opinion):
-    return record_preview(opinion.model_dump(mode='json'), 'interpretations') if opinion else None
+def interpretation_view(opinion, *, compact=False):
+    fields = {'id','conclusion','defect_claim','rationale','counterevidence','limitations'} if compact else None
+    return record_preview(opinion.model_dump(mode='json', include=fields), 'interpretations') if opinion else None
 
 
 def knowledge_view(state, entry):
@@ -91,9 +92,9 @@ def reselection_view(state):
     for q in state.investigations:
         opinion = latest.get(q.id)
         questions.append(record_preview({'id':q.id, 'question':q.question, 'disposition':q.disposition,
+            'discriminator':q.discriminator, 'resume_conditions':q.resume_conditions,
             'open_gap_count':len(open_gaps(state,q.id)),
-            'latest_interpretation':{'id':opinion.id, 'conclusion':opinion.conclusion,
-                'defect_claim':opinion.defect_claim} if opinion else None}, 'investigations'))
+            'latest_interpretation':interpretation_view(opinion, compact=True)}, 'investigations'))
     return {'investigation_axes':['Decision formation and progress',
                                 'Context validity and authority transitions'],
         'target':{'repo':state.snapshot.repo, 'snapshot_id':state.snapshot.id},
@@ -206,12 +207,77 @@ def execution_feedback(state, root, fixed, check):
     return value
 
 
+def cited_execution_feedback(root, check, fixed, prior, opinion, remaining):
+    """Show explicit citations, never select observations by their apparent outcome."""
+    from .audit import draft_bytes
+    previous = prior.executions.get(check.id, []) if prior else []
+    current = opinion.executions.get(check.id, [])
+    indices = sorted(set(previous + current))
+    value = {**execution_locator(check, fixed), 'event_indices':indices,
+        'previous_event_indices':previous, 'current_event_indices':current,
+        'selection':'Explicitly cited subset, not the complete receipt or an applicability judgment. '
+            'Inline limits are shared across the update. Changed receipts are listed first within each interpretation; '
+            'added or removed event indices are shown first within each receipt.'}
+    try:
+        raw = json.loads(draft_bytes(root, value['observations']))
+    except (OSError, ValueError) as exc:
+        return {**value, 'observation_error':str(exc)}
+    shown = []
+    changed = set(previous) ^ set(current)
+    for index in sorted(indices, key=lambda i: i not in changed):
+        event = {'event_index':index, 'observation':raw['events'][index]}
+        size = len(json.dumps(event, ensure_ascii=False))
+        if remaining['events'] == 0 or size > remaining['chars']:
+            break
+        shown.append(event)
+        remaining['events'] -= 1
+        remaining['chars'] -= size
+    return {**value, 'cited_events':shown, 'event_count':len(raw['events']),
+        'omitted_cited_indices':sorted(set(indices) - {e['event_index'] for e in shown}),
+        'parsing_error_count':len(raw['parsing_errors']), 'prerequisites':raw['prerequisites'],
+        'comparisons':[{'comparison_index':i, 'outcome':r['outcome'], 'comparison_complete':r['comparison_complete'],
+            'missing_indices':r['missing_indices'], 'diagnostic_count':len(r['diagnostics']),
+            'limitation_count':len(r['limitations'])} for i,r in enumerate(raw['comparisons'])]}
+
+
+def interpretation_knowledge(state, prior, opinion):
+    """Old and new explicit reasons, including removed citations; association is not invalidation."""
+    latest = {i.investigation_id:i.id for i in state.interpretations}
+    locations = {item.id:{'path':'state.json','collection':collection,'id':item.id,
+        **({'current':latest[item.investigation_id] == item.id} if collection == 'interpretations' else {})}
+        for collection in ('investigations','experiments','interpretations') for item in getattr(state,collection)}
+    references = {}
+    for side, account in (('previous',prior), ('current',opinion)):
+        for use in account.knowledge if account else []:
+            key = (use.entry_id, use.revision)
+            if key not in references:
+                entry = next(e for e in state.knowledge if e.id == use.entry_id)
+                basis = next(r for r in [*entry.history,entry.model_dump(exclude={'history'})]
+                    if r['revision'] == use.revision)
+                paths = use_paths(state,entry.id,use.revision)
+                references[key] = {'entry_id':entry.id, 'revision':use.revision,
+                    'statement':excerpt(basis['statement']), 'conditions':excerpt(basis['conditions']),
+                    'source_ids':basis['source_ids'], 'executions':basis['executions'],
+                    'record':{'path':'state.json','collection':'knowledge','id':entry.id,'revision':use.revision},
+                    'previous_assertions':[], 'current_assertions':[],
+                    'recorded_uses':[{'record':locations[id],
+                        **({'knowledge_path':preview(path)} if len(path)>1 else {})}
+                        for id,path in paths.items() if locations[id].get('current',True)],
+                    'historical_interpretations':{'path':'state.json','collection':'interpretations',
+                        'ids':[id for id in paths if not locations[id].get('current',True)]}}
+            references[key][side + '_assertions'].append(excerpt(use.assertion))
+    return list(references.values())
+
+
 def operation_summary(state, root):
     current = state.current_submission
+    executed = bool(current.get('experiment_id') and current.get('phase') == 'executed' and not current.get('execution_gap'))
     summary = {k:current[k] for k in ('phase','operation_id','experiment_id','no_change','references','effects','execution_gap') if k in current}
     summary['allocation'] = available(state)
     summary['open_work_index'] = 'research.json'
     summary['diagnostics'] = current.get('rejected',{})
+    if not executed:
+        summary['reselection'] = reselection_view(state)
     turn = next((c for c in reversed(state.checks) if c.action == 'agent_turn'), None)
     if not current and turn and turn.status.value == 'timeout':
         summary['interrupted_turn'] = {'id':turn.id, 'reason':turn.reason,
@@ -272,30 +338,43 @@ def operation_summary(state, root):
         'discriminator':q.discriminator, 'knowledge':[u.model_dump() for u in q.knowledge],
         'latest_interpretation':interpretation_view(latest.get(q.id))}, 'investigations')
         for q in state.investigations if q.id in owners]
-    if (fixed and current.get('experiment_id') == fixed.id and current.get('phase') == 'executed'
-            and not current.get('execution_gap')):
+    if fixed and current.get('experiment_id') == fixed.id and executed:
         question = next(q for q in summary['questions'] if q['id'] == fixed.investigation_id)
         question['execution'] = execution_feedback(state, root, fixed, check)
-    previous, changes = {}, []
+    previous, updates, changes = {}, {}, []
     fixed_by_id = {a.id:a for a in state.experiments}
+    remaining = {'events':8, 'chars':6000}  # One inline observation budget for the entire update.
     for opinion in state.interpretations:
         prior = previous.get(opinion.investigation_id)
         if opinion.operation_id == current.get('operation_id') and not current.get('no_change'):
+            batch = updates.setdefault(opinion.investigation_id, [])
+            batch.append(opinion.id)
+            if opinion.id != latest[opinion.investigation_id].id:
+                continue
+            receipts = sorted((c for c in state.checks if c.id in opinion.executions or (prior and c.id in prior.executions)),
+                key=lambda c: opinion.executions.get(c.id) == (prior.executions.get(c.id) if prior else None))
             changes.append({'investigation_id':opinion.investigation_id,
                 'previous':{'id':prior.id, 'conclusion':prior.conclusion, 'defect_claim':prior.defect_claim} if prior else None,
                 'current':{'id':opinion.id, 'conclusion':opinion.conclusion, 'defect_claim':opinion.defect_claim},
                 'record':{'path':'state.json', 'collection':'interpretations'},
-                'executions':[{**execution_locator(c, fixed_by_id.get(c.experiment_id)),
-                               'event_indices':opinion.executions[c.id]}
-                              for c in state.checks if c.id in opinion.executions]})
-        previous[opinion.investigation_id] = opinion
+                'intermediate_interpretation_ids':batch[:-1],
+                'knowledge_references':interpretation_knowledge(state, prior, opinion),
+                'executions':[cited_execution_feedback(root,c,fixed_by_id.get(c.experiment_id),prior,opinion,remaining)
+                              for c in receipts]})
+        else:
+            previous[opinion.investigation_id] = opinion
     if changes:
         summary['interpretation_changes'] = changes
+        summary['interpretation_guidance'] = (
+            'Old and new explicit reasons are shown, including removed citations. Recorded uses are review candidates, '
+            'not automatically affected conclusions. Correct identified premises and their uses through existing updates; '
+            'withdrawing a witness does not by itself refute the question. Unrecorded semantic dependencies remain for investigation.')
     cited = {id for i in state.interpretations for id in i.executions}
     summary['uncited_executions'] = [{'id':c.id, 'experiment_id':c.experiment_id, 'status':c.status.value,
         'record':f'logs/{c.id}/check.json', 'observations':f'logs/{c.id}/observations.json'}
         for c in state.checks if c.action == 'experiment' and c.id not in cited]
-    summary['reselection'] = reselection_view(state)
+    if 'reselection' not in summary:
+        summary['reselection'] = reselection_view(state)
     summary['next'] = (
         'The unchanged submission is already retained; this call still consumed time and a model turn. '
         if current.get('no_change') else '') + (
@@ -305,7 +384,7 @@ def operation_summary(state, root):
         'an explicit citation alone does not resolve its applicability or gaps. After a local answer, reconsider '
         'the available directions rather than inherit the last experiment. No separate selection submission is needed; '
         'do not repeat closing submissions.')
-    if check:
+    if check and (check.id not in cited or current.get('experiment_id') == check.experiment_id):
         summary['latest_actual_execution'] = execution_locator(check, fixed)
     return summary
 

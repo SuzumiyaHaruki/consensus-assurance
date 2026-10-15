@@ -1,0 +1,886 @@
+{
+  "id": "747cae551e46469e93b2681ba5661eb5-experiment",
+  "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+  "version": 5,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sort\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\ntype staleElectNode struct {\n\tid     ServerID\n\ttrans  *InmemTransport\n\tlogs   *InmemCommitTrackingStore\n\tstable *InmemStore\n\tsnaps  *InmemSnapshotStore\n\traft   *Raft\n}\n\nfunc staleElectEmit(fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc staleElectIDs(c Configuration) string {\n\tids := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tids = append(ids, string(s.ID))\n\t}\n\tsort.Strings(ids)\n\treturn strings.Join(ids, \",\")\n}\n\nfunc staleElectStates(nodes map[ServerID]*staleElectNode, ids []ServerID) (string, []string) {\n\tleaders := []string{}\n\tterms := []string{}\n\tfor _, id := range ids {\n\t\tr := nodes[id].raft\n\t\tif r == nil {\n\t\t\tcontinue\n\t\t}\n\t\tif r.State() == Leader {\n\t\t\tleaders = append(leaders, string(id))\n\t\t}\n\t\tterms = append(terms, fmt.Sprintf(\"%s:%d\", id, r.getCurrentTerm()))\n\t}\n\tsort.Strings(leaders)\n\treturn strings.Join(leaders, \",\"), terms\n}\n\nfunc staleElectConfigIDs(r *Raft) string {\n\tif r == nil {\n\t\treturn \"\"\n\t}\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn \"\"\n\t}\n\treturn staleElectIDs(f.Configuration())\n}\n\n// TestAssuranceStaleConfigElectionWitness grows a real 5-node in-memory cluster,\n// leaves node A's snapshot behind a committed configuration change, restarts A with\n// RestoreCommittedLogs, partitions {A,C} from {B,D,E} and observes whether the\n// stale-configured node becomes leader with fewer votes than the current\n// configuration requires while the other partition elects its own leader.\n// TestAssuranceStaleConfigElectionWitness runs the split scenario twice: once with\n// the restarted node using Config.RestoreCommittedLogs and once as a control with\n// the feature off at restart, so the feature is the only difference between runs.\nfunc TestAssuranceStaleConfigElectionWitness(t *testing.T) {\n\tfor _, c := range []struct {\n\t\tmode           string\n\t\trestartFeature bool\n\t}{\n\t\t{\"defect_restart\", true},\n\t\t{\"control_no_restore\", false},\n\t} {\n\t\tstaleElectScenario(t, c.mode, c.restartFeature)\n\t}\n}\n\nfunc staleElectScenario(t *testing.T, mode string, restartCommitted bool) {\n\tids := []ServerID{\"A\", \"B\", \"C\", \"D\", \"E\"}\n\n\tnewConf := func(id ServerID, restoreCommitted bool) *Config {\n\t\tc := DefaultConfig()\n\t\tc.LocalID = id\n\t\tc.HeartbeatTimeout = 50 * time.Millisecond\n\t\tc.ElectionTimeout = 50 * time.Millisecond\n\t\tc.LeaderLeaseTimeout = 50 * time.Millisecond\n\t\tc.CommitTimeout = 5 * time.Millisecond\n\t\tc.SnapshotInterval = 10 * time.Minute\n\t\tc.TrailingLogs = 0\n\t\tc.Logger = hclog.NewNullLogger()\n\t\tc.RestoreCommittedLogs = restoreCommitted\n\t\treturn c\n\t}\n\n\tnodes := map[ServerID]*staleElectNode{}\n\tfor _, id := range ids {\n\t\t_, tr := NewInmemTransport(ServerAddress(id))\n\t\tnodes[id] = &staleElectNode{\n\t\t\tid:     id,\n\t\t\ttrans:  tr,\n\t\t\tlogs:   NewInmemCommitTrackingStore(),\n\t\t\tstable: NewInmemStore(),\n\t\t\tsnaps:  NewInmemSnapshotStore(),\n\t\t}\n\t}\n\tconnect := func(a, b ServerID) {\n\t\tnodes[a].trans.Connect(ServerAddress(b), nodes[b].trans)\n\t\tnodes[b].trans.Connect(ServerAddress(a), nodes[a].trans)\n\t}\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tcut := func(a, b ServerID) {\n\t\tnodes[a].trans.Disconnect(ServerAddress(b))\n\t\tnodes[b].trans.Disconnect(ServerAddress(a))\n\t}\n\n\tstart := func(id ServerID, restoreCommitted bool) *Raft {\n\t\tn := nodes[id]\n\t\tr, err := NewRaft(newConf(id, restoreCommitted), new(MockFSM), n.logs, n.stable, n.snaps, n.trans)\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"%s: NewRaft: %v\", id, err)\n\t\t}\n\t\tn.raft = r\n\t\treturn r\n\t}\n\n\t// Cluster starts as {A,B,C} bootstrapped from A.\n\tcfgABC := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t\t{Suffrage: Voter, ID: \"C\", Address: \"C\"},\n\t}}\n\tbootConf := newConf(\"A\", false)\n\tif err := BootstrapCluster(bootConf, nodes[\"A\"].logs, nodes[\"A\"].stable, nodes[\"A\"].snaps, nodes[\"A\"].trans, cfgABC); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tstart(\"A\", true)\n\tstart(\"B\", true)\n\tstart(\"C\", true)\n\n\twaitLeader := func(candidates []ServerID, d time.Duration) ServerID {\n\t\tdeadline := time.Now().Add(d)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tfor _, id := range candidates {\n\t\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\t\treturn id\n\t\t\t\t}\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t\treturn \"\"\n\t}\n\n\tif first := waitLeader([]ServerID{\"A\", \"B\", \"C\"}, 10*time.Second); first == \"\" {\n\t\tt.Fatalf(\"no initial leader\")\n\t}\n\trA := nodes[\"A\"].raft\n\tif rA.State() != Leader {\n\t\t// Transfer leadership to A so that the snapshot and the stale restart are A's.\n\t\tlid := waitLeader([]ServerID{\"B\", \"C\"}, 10*time.Second)\n\t\tif lid != \"\" {\n\t\t\tf := nodes[lid].raft.LeadershipTransferToServer(\"A\", \"A\")\n\t\t\t_ = f.Error()\n\t\t}\n\t\tif deadline := time.Now().Add(10 * time.Second); !time.Now().After(deadline) {\n\t\t\tfor time.Now().Before(deadline) && rA.State() != Leader {\n\t\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t\t}\n\t\t}\n\t}\n\n\t// Commit a few entries, then snapshot A so that A's snapshot records {A,B,C}.\n\tfor i := 0; i < 3; i++ {\n\t\tf := rA.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 3*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"pre apply: %v\", err)\n\t\t}\n\t}\n\t// Wait for the followers to have applied the entries.\n\tbarrier := rA.Barrier(3 * time.Second)\n\tif err := barrier.Error(); err != nil {\n\t\tt.Fatalf(\"barrier: %v\", err)\n\t}\n\tsnapF := rA.Snapshot()\n\tif err := snapF.Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnapList, _ := nodes[\"A\"].snaps.List()\n\tif len(snapList) == 0 {\n\t\tt.Fatalf(\"no snapshot on A\")\n\t}\n\tsnapIdx := snapList[0].Index\n\tsnapCfg := staleElectIDs(snapList[0].Configuration)\n\n\t// Bring D and E up as empty followers and add them as voters through the leader.\n\tstart(\"D\", true)\n\tstart(\"E\", true)\n\tfor _, id := range []ServerID{\"D\", \"E\"} {\n\t\tf := rA.AddVoter(id, ServerAddress(id), 0, 5*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"AddVoter %s: %v\", id, err)\n\t\t}\n\t}\n\t// One more committed entry so that every follower stages a commit index at or\n\t// above the new configuration entry.\n\tf := rA.Apply([]byte(\"after-config\"), 3*time.Second)\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"after-config apply: %v\", err)\n\t}\n\n\t// Locate the newest configuration entry in A's log.\n\tlastLogIdx, _ := nodes[\"A\"].logs.LastIndex()\n\tvar cfgEntryIdx uint64\n\tvar cfgEntryIDs string\n\tfor i := uint64(1); i <= lastLogIdx; i++ {\n\t\tvar l Log\n\t\tif err := nodes[\"A\"].logs.GetLog(i, &l); err != nil || l.Type != LogConfiguration {\n\t\t\tcontinue\n\t\t}\n\t\tcfgEntryIdx = i\n\t\tcfgEntryIDs = staleElectIDs(DecodeConfiguration(l.Data))\n\t}\n\tstoredCommit, _ := nodes[\"A\"].logs.GetCommitIndex()\n\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                        \"fixture\",\n\t\t\"mode\":                         mode,\n\t\t\"local_id\":                     \"A\",\n\t\t\"snapshot_index\":               snapIdx,\n\t\t\"snapshot_config_ids\":          snapCfg,\n\t\t\"config_entry_index\":           cfgEntryIdx,\n\t\t\"config_entry_ids\":             cfgEntryIDs,\n\t\t\"stored_commit_index\":          storedCommit,\n\t\t\"log_last_index\":               lastLogIdx,\n\t\t\"a_reported_config_ids\":        staleElectConfigIDs(rA),\n\t\t\"cluster_voter_ids\":            \"A,B,C,D,E\",\n\t\t\"commit_covers_config_entry\":   storedCommit >= cfgEntryIdx,\n\t\t\"snapshot_before_config_entry\": cfgEntryIdx > snapIdx,\n\t})\n\n\t// A goes down; the partition is cut while it is down, then A is restarted with\n\t// RestoreCommittedLogs and only its link to C restored.\n\tif sf := rA.Shutdown(); sf != nil {\n\t\t_ = sf.Error()\n\t}\n\tfor _, p := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\tcut(\"A\", p)\n\t\tcut(\"C\", p)\n\t}\n\t_, newTransA := NewInmemTransport(ServerAddress(\"A\"))\n\tnodes[\"A\"].trans = newTransA\n\tconnect(\"A\", \"C\")\n\t// A's links to the majority partition stay closed: connect only A and C.\n\tnewTransA.Disconnect(\"B\")\n\tnewTransA.Disconnect(\"D\")\n\tnewTransA.Disconnect(\"E\")\n\n\trestarted := start(\"A\", restartCommitted)\n\trestartCfg := staleElectConfigIDs(restarted)\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":               \"restart\",\n\t\t\"mode\":                mode,\n\t\t\"local_id\":            \"A\",\n\t\t\"state\":               restarted.State().String(),\n\t\t\"reported_config_ids\": restartCfg,\n\t\t\"last_applied\":        restarted.getLastApplied(),\n\t\t\"config_entry_ids\":    cfgEntryIDs,\n\t\t\"stored_commit_index\": storedCommit,\n\t})\n\n\t// Both partitions try to elect.\n\tminorityLeader := waitLeader([]ServerID{\"A\", \"C\"}, 15*time.Second)\n\tmajorityLeader := waitLeader([]ServerID{\"B\", \"D\", \"E\"}, 15*time.Second)\n\ttime.Sleep(500 * time.Millisecond)\n\n\tminorityLeaders, minorityTerms := staleElectStates(nodes, []ServerID{\"A\", \"C\"})\n\tmajorityLeaders, majorityTerms := staleElectStates(nodes, []ServerID{\"B\", \"D\", \"E\"})\n\n\t// What each side reports as its configuration, and whether writes commit.\n\trestartCfg = staleElectConfigIDs(restarted)\n\tcCfg := staleElectConfigIDs(nodes[\"C\"].raft)\n\tmajorityCfg := staleElectConfigIDs(nodes[majorityLeader].raft)\n\tminorityWriteErr := \"none\"\n\tvar minorityWriteIndex, majorityWriteIndex uint64\n\tvar minorityWriteTerm, majorityWriteTerm uint64\n\tif minorityLeader != \"\" {\n\t\twf := nodes[minorityLeader].raft.Apply([]byte(\"minority-write\"), 3*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tminorityWriteErr = err.Error()\n\t\t} else {\n\t\t\tminorityWriteIndex = wf.Index()\n\t\t\tminorityWriteTerm = nodes[minorityLeader].raft.getCurrentTerm()\n\t\t}\n\t}\n\tmajorityWriteErr := \"none\"\n\tif majorityLeader != \"\" {\n\t\twf := nodes[majorityLeader].raft.Apply([]byte(\"majority-write\"), 3*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tmajorityWriteErr = err.Error()\n\t\t} else {\n\t\t\tmajorityWriteIndex = wf.Index()\n\t\t\tmajorityWriteTerm = nodes[majorityLeader].raft.getCurrentTerm()\n\t\t}\n\t}\n\n\t// Compare the entries both leaders committed at that index.\n\tconflicting := false\n\tvar minorityData, majorityData string\n\tif minorityWriteIndex > 0 && majorityWriteIndex > 0 {\n\t\tvar ml, jl Log\n\t\terrM := nodes[minorityLeader].logs.GetLog(minorityWriteIndex, &ml)\n\t\terrJ := nodes[majorityLeader].logs.GetLog(majorityWriteIndex, &jl)\n\t\tif errM == nil && errJ == nil {\n\t\t\tminorityData = string(ml.Data)\n\t\t\tmajorityData = string(jl.Data)\n\t\t\tconflicting = minorityWriteIndex == majorityWriteIndex && minorityWriteTerm == majorityWriteTerm &&\n\t\t\t\tminorityData != majorityData\n\t\t}\n\t}\n\tleaderCount := 0\n\tif minorityLeaders != \"\" {\n\t\tleaderCount += len(strings.Split(minorityLeaders, \",\"))\n\t}\n\tif majorityLeaders != \"\" {\n\t\tleaderCount += len(strings.Split(majorityLeaders, \",\"))\n\t}\n\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                         \"outcome\",\n\t\t\"mode\":                          mode,\n\t\t\"local_id\":                      \"A\",\n\t\t\"minority_partition\":            \"A,C\",\n\t\t\"minority_leaders\":              minorityLeaders,\n\t\t\"minority_terms\":                strings.Join(minorityTerms, \",\"),\n\t\t\"majority_leaders\":              majorityLeaders,\n\t\t\"majority_terms\":                strings.Join(majorityTerms, \",\"),\n\t\t\"leader_count\":                  leaderCount,\n\t\t\"stale_config_node_is_leader\":   minorityLeader == \"A\",\n\t\t\"correct_config_node_is_leader\": minorityLeader == \"C\",\n\t\t\"restart_config_ids\":            restartCfg,\n\t\t\"c_config_ids\":                  cCfg,\n\t\t\"majority_config_ids\":           majorityCfg,\n\t\t\"minority_write_error\":          minorityWriteErr,\n\t\t\"majority_write_error\":          majorityWriteErr,\n\t\t\"minority_write_committed\":      minorityWriteErr == \"none\",\n\t\t\"minority_write_index\":          minorityWriteIndex,\n\t\t\"majority_write_index\":          majorityWriteIndex,\n\t\t\"minority_write_term\":           minorityWriteTerm,\n\t\t\"majority_write_term\":           majorityWriteTerm,\n\t\t\"minority_write_data\":           minorityData,\n\t\t\"majority_write_data\":           majorityData,\n\t\t\"conflicting_commits\":           conflicting,\n\t})\n\n\t// Heal the partition: restore the full mesh and let the cluster run on.\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tvar loneLeader ServerID\n\thealDeadline := time.Now().Add(15 * time.Second)\n\tfor time.Now().Before(healDeadline) {\n\t\tfound := []ServerID{}\n\t\tfor _, id := range ids {\n\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\tfound = append(found, id)\n\t\t\t}\n\t\t}\n\t\tif len(found) == 1 {\n\t\t\tloneLeader = found[0]\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tpostHealErr := \"none\"\n\tif loneLeader != \"\" {\n\t\twf := nodes[loneLeader].raft.Apply([]byte(\"post-heal\"), 5*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tpostHealErr = err.Error()\n\t\t}\n\t}\n\t// Long run: commit many further entries on the healed leader so the sample is\n\t// taken after substantial progress rather than one entry.\n\tlongRunErr := \"none\"\n\tentriesAfterHeal := uint64(0)\n\tif loneLeader != \"\" {\n\t\tfor i := 0; i < 200; i++ {\n\t\t\twf := nodes[loneLeader].raft.Apply([]byte(fmt.Sprintf(\"long-run-%d\", i)), 3*time.Second)\n\t\t\tif err := wf.Error(); err != nil {\n\t\t\t\tlongRunErr = err.Error()\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tdeadline := time.Now().Add(15 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tidx, _ := nodes[loneLeader].logs.LastIndex()\n\t\t\tif idx > minorityWriteIndex {\n\t\t\t\tentriesAfterHeal = idx - minorityWriteIndex\n\t\t\t}\n\t\t\tif entriesAfterHeal >= 150 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// What each node now holds at the index both leaders committed at, and which\n\t// configuration the restarted node uses while the cluster runs on.\n\tconflictIndex := minorityWriteIndex\n\tpayloads := []string{}\n\tentryTerms := []string{}\n\tconsistent := true\n\tvar firstPayload string\n\tlastIndexes := []string{}\n\tfor _, id := range ids {\n\t\tn := nodes[id]\n\t\tvar l Log\n\t\tif err := n.logs.GetLog(conflictIndex, &l); err == nil {\n\t\t\tp := string(l.Data)\n\t\t\tif firstPayload == \"\" {\n\t\t\t\tfirstPayload = p\n\t\t\t} else if p != firstPayload {\n\t\t\t\tconsistent = false\n\t\t\t}\n\t\t\tpayloads = append(payloads, fmt.Sprintf(\"%s:%s\", id, p))\n\t\t\tentryTerms = append(entryTerms, fmt.Sprintf(\"%s:%d\", id, l.Term))\n\t\t}\n\t\tli, _ := n.logs.LastIndex()\n\t\tlastIndexes = append(lastIndexes, fmt.Sprintf(\"%s:%d\", id, li))\n\t}\n\tvar aLastIndex uint64\n\tif idx, err := nodes[\"A\"].logs.LastIndex(); err == nil {\n\t\taLastIndex = idx\n\t}\n\thealedStates, _ := staleElectStates(nodes, ids)\n\tallTermsEqual := len(entryTerms) > 0\n\tfor _, t := range entryTerms {\n\t\tif !strings.HasSuffix(t, fmt.Sprintf(\":%d\", minorityWriteTerm)) {\n\t\t\tallTermsEqual = false\n\t\t}\n\t}\n\tleaderCfg := \"\"\n\tleaderLastIndex := uint64(0)\n\tif loneLeader != \"\" {\n\t\tleaderCfg = staleElectConfigIDs(nodes[loneLeader].raft)\n\t\tif idx, err := nodes[loneLeader].logs.LastIndex(); err == nil {\n\t\t\tleaderLastIndex = idx\n\t\t}\n\t}\n\tbehind := 0\n\tfor _, id := range ids {\n\t\tif idx, err := nodes[id].logs.LastIndex(); err == nil && idx < leaderLastIndex {\n\t\t\tbehind++\n\t\t}\n\t}\n\t// What each node's FSM actually applied for the two conflicting writes.\n\tappliedWrites := func(r *Raft) string {\n\t\tfsm := getMockFSM(r.fsm)\n\t\tif fsm == nil {\n\t\t\treturn \"\"\n\t\t}\n\t\tfound := []string{}\n\t\tfor _, l := range fsm.Logs() {\n\t\t\tswitch string(l) {\n\t\t\tcase \"minority-write\", \"majority-write\":\n\t\t\t\tfound = append(found, string(l))\n\t\t\t}\n\t\t}\n\t\tsort.Strings(found)\n\t\treturn strings.Join(found, \"+\")\n\t}\n\tapplied := []string{}\n\tappliedConsistent := true\n\tfirstApplied := \"\"\n\tfor _, id := range ids {\n\t\tw := appliedWrites(nodes[id].raft)\n\t\tif firstApplied == \"\" {\n\t\t\tfirstApplied = w\n\t\t} else if w != firstApplied {\n\t\t\tappliedConsistent = false\n\t\t}\n\t\tapplied = append(applied, fmt.Sprintf(\"%s:%s\", id, w))\n\t}\n\taApplied := appliedWrites(nodes[\"A\"].raft)\n\tbApplied := appliedWrites(nodes[\"B\"].raft)\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                              \"healed\",\n\t\t\"mode\":                               mode,\n\t\t\"local_id\":                           \"A\",\n\t\t\"healed_leaders\":                     healedStates,\n\t\t\"lone_leader\":                        string(loneLeader),\n\t\t\"conflict_index\":                     conflictIndex,\n\t\t\"entry_payloads_at_conflict_index\":   strings.Join(payloads, \",\"),\n\t\t\"entry_terms_at_conflict_index\":      strings.Join(entryTerms, \",\"),\n\t\t\"entry_consistent_at_conflict_index\": consistent,\n\t\t\"same_term_conflicting_payload\":      !consistent && allTermsEqual,\n\t\t\"log_last_indexes\":                   strings.Join(lastIndexes, \",\"),\n\t\t\"a_log_last_index\":                   aLastIndex,\n\t\t\"a_log_advanced_after_heal\":          aLastIndex > conflictIndex,\n\t\t\"a_config_ids_after_heal\":            staleElectConfigIDs(nodes[\"A\"].raft),\n\t\t\"b_config_ids_after_heal\":            staleElectConfigIDs(nodes[\"B\"].raft),\n\t\t\"leader_config_ids_after_heal\":       leaderCfg,\n\t\t\"leader_log_last_index\":              leaderLastIndex,\n\t\t\"nodes_with_log_behind_leader\":       behind,\n\t\t\"fsm_applied_writes\":                 strings.Join(applied, \",\"),\n\t\t\"fsm_applied_consistent\":             appliedConsistent,\n\t\t\"a_fsm_applied_writes\":               aApplied,\n\t\t\"b_fsm_applied_writes\":               bApplied,\n\t\t\"post_heal_apply_error\":              postHealErr,\n\t\t\"long_run_error\":                     longRunErr,\n\t\t\"entries_after_heal\":                 entriesAfterHeal,\n\t\t\"long_run_exercised\":                 entriesAfterHeal >= 150,\n\t})\n\n\t// Repair phase: put a node holding the current configuration in charge, take a\n\t// snapshot on it while A is unreachable so its log is compacted past A, then\n\t// reconnect A and see whether a snapshot install replaces the divergent entry\n\t// and applied state.\n\trepairLeader := ServerID(\"\")\n\tfor _, id := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\trepairLeader = id\n\t\t\tbreak\n\t\t}\n\t}\n\ttransferred := false\n\tif repairLeader == \"\" {\n\t\tfor _, id := range ids {\n\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\tif f := r.LeadershipTransferToServer(\"B\", \"B\"); f != nil {\n\t\t\t\t\t_ = f.Error()\n\t\t\t\t}\n\t\t\t\ttransferred = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tdl := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(dl) {\n\t\t\tfor _, id := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\t\trepairLeader = id\n\t\t\t\t}\n\t\t\t}\n\t\t\tif repairLeader != \"\" {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t}\n\trepairApplies := 0\n\tsnapshotIndex := uint64(0)\n\tsnapshotErr := \"none\"\n\tif repairLeader != \"\" {\n\t\tfor _, p := range ids {\n\t\t\tif p != \"A\" {\n\t\t\t\tcut(\"A\", p)\n\t\t\t}\n\t\t}\n\t\tfor i := 0; i < 10; i++ {\n\t\t\twf := nodes[repairLeader].raft.Apply([]byte(fmt.Sprintf(\"repair-%d\", i)), 3*time.Second)\n\t\t\tif err := wf.Error(); err != nil {\n\t\t\t\tsnapshotErr = err.Error()\n\t\t\t\tbreak\n\t\t\t}\n\t\t\trepairApplies++\n\t\t}\n\t\tif sf := nodes[repairLeader].raft.Snapshot(); sf != nil {\n\t\t\tif err := sf.Error(); err != nil {\n\t\t\t\tsnapshotErr = err.Error()\n\t\t\t}\n\t\t}\n\t\tif l, err := nodes[repairLeader].snaps.List(); err == nil && len(l) > 0 {\n\t\t\tsnapshotIndex = l[0].Index\n\t\t}\n\t\tfor _, p := range ids {\n\t\t\tif p != \"A\" {\n\t\t\t\tconnect(\"A\", p)\n\t\t\t}\n\t\t}\n\t\t// Wait for A to install the snapshot the leader can no longer serve as logs.\n\t\tdl := time.Now().Add(15 * time.Second)\n\t\tfor time.Now().Before(dl) {\n\t\t\tif idx, _ := nodes[\"A\"].raft.getLastSnapshot(); idx >= snapshotIndex && snapshotIndex > 0 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\taSnapshotIdx, _ := nodes[\"A\"].raft.getLastSnapshot()\n\taAppliedAfter := appliedWrites(nodes[\"A\"].raft)\n\trepairWrites := []string{}\n\trepairConsistent := true\n\tfirstRepair := \"\"\n\tfor _, id := range ids {\n\t\tw := appliedWrites(nodes[id].raft)\n\t\tif firstRepair == \"\" {\n\t\t\tfirstRepair = w\n\t\t} else if w != firstRepair {\n\t\t\trepairConsistent = false\n\t\t}\n\t\trepairWrites = append(repairWrites, fmt.Sprintf(\"%s:%s\", id, w))\n\t}\n\t_, aEntryErr := func() (Log, error) {\n\t\tvar l Log\n\t\terr := nodes[\"A\"].logs.GetLog(conflictIndex, &l)\n\t\treturn l, err\n\t}()\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                               \"repaired\",\n\t\t\"mode\":                                mode,\n\t\t\"local_id\":                            \"A\",\n\t\t\"repair_leader\":                       string(repairLeader),\n\t\t\"leadership_transferred\":              transferred,\n\t\t\"repair_applies\":                      repairApplies,\n\t\t\"repair_snapshot_index\":               snapshotIndex,\n\t\t\"repair_snapshot_error\":               snapshotErr,\n\t\t\"a_last_snapshot_index\":               aSnapshotIdx,\n\t\t\"snapshot_installed_on_a\":             snapshotIndex > 0 && aSnapshotIdx >= snapshotIndex,\n\t\t\"a_fsm_applied_writes_after_snapshot\": aAppliedAfter,\n\t\t\"minority_write_present_on_a_after_snapshot\": strings.Contains(aAppliedAfter, \"minority-write\"),\n\t\t\"a_config_ids_after_snapshot\":                staleElectConfigIDs(nodes[\"A\"].raft),\n\t\t\"a_conflict_index_entry_missing\":             aEntryErr != nil,\n\t\t\"fsm_applied_writes_after_snapshot\":          strings.Join(repairWrites, \",\"),\n\t\t\"fsm_applied_consistent_after_snapshot\":      repairConsistent,\n\t})\n\tfor _, id := range ids {\n\t\tif r := nodes[id].raft; r != nil {\n\t\t\tif sf := r.Shutdown(); sf != nil {\n\t\t\t\t_ = sf.Error()\n\t\t\t}\n\t\t}\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [
+        "After the mesh is reconnected and one entry is committed, the harness applies 200 further entries on the healed leader, waits until the leader's log has advanced at least 150 entries past the conflict index, and then samples.",
+        "The healed event reports long_run_error, entries_after_heal and the derived long_run_exercised operand."
+      ],
+      "prerequisites": [
+        {
+          "alias": "adm_defect",
+          "event": "fixture",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            },
+            {
+              "field": "snapshot_config_ids",
+              "op": "eq",
+              "value": "A,B,C",
+              "reference": null
+            },
+            {
+              "field": "config_entry_ids",
+              "op": "eq",
+              "value": "A,B,C,D,E",
+              "reference": null
+            },
+            {
+              "field": "commit_covers_config_entry",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "snapshot_before_config_entry",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "adm_control",
+          "event": "fixture",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            },
+            {
+              "field": "snapshot_config_ids",
+              "op": "eq",
+              "value": "A,B,C",
+              "reference": null
+            },
+            {
+              "field": "config_entry_ids",
+              "op": "eq",
+              "value": "A,B,C,D,E",
+              "reference": null
+            },
+            {
+              "field": "commit_covers_config_entry",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "snapshot_before_config_entry",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s-scan",
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-confentry",
+      "s-quorumsize",
+      "s-votegrant",
+      "s-staging",
+      "s-dupskip"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "The two-mode five-node restart scenario (feature-on restart and feature-off control in one execution) with the healed phase extended into a long run of 200 further committed entries before the sample.",
+      "assumptions": [
+        "All state is produced by normal operations: bootstrap {A,B,C}, election, committed applies, a user snapshot on A, AddVoter D and E, graceful restart of A with and without the feature, transport partition, healing and further committed entries.",
+        "The long run is applied on the healed leader whichever node it is; in the feature-on run that leader may be the stale node, in which case its own configuration decides which peers receive the entries, which is recorded through the per-node log indexes.",
+        "The sample is taken after the leader's log has advanced at least 150 entries past the conflict index, with a 15s bound; the derived long_run_exercised operand states whether that happened.",
+        "Exact indexes are not asserted; the comparisons use the mode-conditioned structural operands."
+      ],
+      "excluded": [
+        "No crash, on-disk store or user Restore is exercised.",
+        "The long run commits ordinary command entries only; no further membership change is made during it.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C,D,E",
+        "initial_configuration": "A,B,C",
+        "added_voters": "D,E",
+        "partition": "A,C | B,D,E",
+        "modes": [
+          "defect_restart",
+          "control_no_restore"
+        ],
+        "long_run_entries": 200,
+        "minimum_entries_after_conflict": 150
+      }
+    },
+    "prefix": "The helper builds five InmemTransports in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore and Config with TrailingLogs 0, bootstraps {A,B,C} from A, starts A, B and C with MockFSM and the feature enabled, elects a leader, transfers leadership to A if needed, applies three commands, waits for A to apply, takes a user snapshot on A, starts D and E, adds each as voter, applies one further command and emits 'fixture'. It shuts A down, cuts {A,C} from {B,D,E}, reconnects A to C only, restarts A with the mode's feature setting and emits 'restart'. It waits for a leader in each partition, applies one write on each leader, reads the entries at the shared index and emits 'outcome'. It reconnects the mesh, waits for one leader, applies one more entry, then applies 200 further entries on that leader and waits (bounded by 15s) until the leader's log has advanced at least 150 entries past the conflict index; only then does it sample payloads and terms at the conflict index, differences in the applied write lists, each node's configuration and the long-run operands, and emit 'healed'. A repair phase follows as before: choose a current-configuration leader, cut A off, apply ten commands, snapshot the leader, reconnect A, wait for the snapshot install and emit 'repaired'. The test runs mode defect_restart first and control_no_restore second. Event order: fixture, restart, outcome, healed, repaired, fixture, restart, outcome, healed, repaired.",
+    "requirement": null,
+    "responsibility": "hashicorp/raft configuration scan with the RestoreCommittedLogs replay, and the AppendEntries duplicate-skip that prevents later replication from repairing the divergent entry or refreshing the configuration.",
+    "comparisons": [
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "assertion": {
+          "field": "entry_consistent_at_conflict_index",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart",
+            "reference": null
+          }
+        ],
+        "description": "Feature on, after ~200 further committed entries: all nodes should hold the same entry at the conflict index."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "assertion": {
+          "field": "a_config_ids_after_heal",
+          "op": "eq",
+          "value": "A,B,C,D,E",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart",
+            "reference": null
+          }
+        ],
+        "description": "Feature on, after the long run: the restarted node should use the committed configuration."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "assertion": {
+          "field": "long_run_exercised",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart",
+            "reference": null
+          }
+        ],
+        "description": "Operand: the sample really was taken after at least 150 entries past the conflict index."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "assertion": {
+          "field": "a_log_advanced_after_heal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart",
+            "reference": null
+          }
+        ],
+        "description": "Operand: the restarted node kept receiving entries, so the persistence is not a stalled node."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_control",
+        "assertion": {
+          "field": "entry_consistent_at_conflict_index",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "control_no_restore",
+            "reference": null
+          }
+        ],
+        "description": "Feature off control after the same long run: entries should be consistent."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_control",
+        "assertion": {
+          "field": "a_config_ids_after_heal",
+          "op": "eq",
+          "value": "A,B,C,D,E",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "control_no_restore",
+            "reference": null
+          }
+        ],
+        "description": "Feature off control after the long run: the restarted node should use the committed configuration."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "4dd382e5677a42a0b3560f38acbbd7db",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "747cae551e46469e93b2681ba5661eb5",
+  "previous_id": "c7548e9677dc4edab0bda399f09ecf1e-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sort\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\ntype staleElectNode struct {\n\tid     ServerID\n\ttrans  *InmemTransport\n\tlogs   *InmemCommitTrackingStore\n\tstable *InmemStore\n\tsnaps  *InmemSnapshotStore\n\traft   *Raft\n}\n\nfunc staleElectEmit(fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc staleElectIDs(c Configuration) string {\n\tids := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tids = append(ids, string(s.ID))\n\t}\n\tsort.Strings(ids)\n\treturn strings.Join(ids, \",\")\n}\n\nfunc staleElectStates(nodes map[ServerID]*staleElectNode, ids []ServerID) (string, []string) {\n\tleaders := []string{}\n\tterms := []string{}\n\tfor _, id := range ids {\n\t\tr := nodes[id].raft\n\t\tif r == nil {\n\t\t\tcontinue\n\t\t}\n\t\tif r.State() == Leader {\n\t\t\tleaders = append(leaders, string(id))\n\t\t}\n\t\tterms = append(terms, fmt.Sprintf(\"%s:%d\", id, r.getCurrentTerm()))\n\t}\n\tsort.Strings(leaders)\n\treturn strings.Join(leaders, \",\"), terms\n}\n\nfunc staleElectConfigIDs(r *Raft) string {\n\tif r == nil {\n\t\treturn \"\"\n\t}\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn \"\"\n\t}\n\treturn staleElectIDs(f.Configuration())\n}\n\n// TestAssuranceStaleConfigElectionWitness grows a real 5-node in-memory cluster,\n// leaves node A's snapshot behind a committed configuration change, restarts A with\n// RestoreCommittedLogs, partitions {A,C} from {B,D,E} and observes whether the\n// stale-configured node becomes leader with fewer votes than the current\n// configuration requires while the other partition elects its own leader.\n// TestAssuranceStaleConfigElectionWitness runs the split scenario twice: once with\n// the restarted node using Config.RestoreCommittedLogs and once as a control with\n// the feature off at restart, so the feature is the only difference between runs.\nfunc TestAssuranceStaleConfigElectionWitness(t *testing.T) {\n\tfor _, c := range []struct {\n\t\tmode           string\n\t\trestartFeature bool\n\t}{\n\t\t{\"defect_restart\", true},\n\t\t{\"control_no_restore\", false},\n\t} {\n\t\tstaleElectScenario(t, c.mode, c.restartFeature)\n\t}\n}\n\nfunc staleElectScenario(t *testing.T, mode string, restartCommitted bool) {\n\tids := []ServerID{\"A\", \"B\", \"C\", \"D\", \"E\"}\n\n\tnewConf := func(id ServerID, restoreCommitted bool) *Config {\n\t\tc := DefaultConfig()\n\t\tc.LocalID = id\n\t\tc.HeartbeatTimeout = 50 * time.Millisecond\n\t\tc.ElectionTimeout = 50 * time.Millisecond\n\t\tc.LeaderLeaseTimeout = 50 * time.Millisecond\n\t\tc.CommitTimeout = 5 * time.Millisecond\n\t\tc.SnapshotInterval = 10 * time.Minute\n\t\tc.TrailingLogs = 0\n\t\tc.Logger = hclog.NewNullLogger()\n\t\tc.RestoreCommittedLogs = restoreCommitted\n\t\treturn c\n\t}\n\n\tnodes := map[ServerID]*staleElectNode{}\n\tfor _, id := range ids {\n\t\t_, tr := NewInmemTransport(ServerAddress(id))\n\t\tnodes[id] = &staleElectNode{\n\t\t\tid:     id,\n\t\t\ttrans:  tr,\n\t\t\tlogs:   NewInmemCommitTrackingStore(),\n\t\t\tstable: NewInmemStore(),\n\t\t\tsnaps:  NewInmemSnapshotStore(),\n\t\t}\n\t}\n\tconnect := func(a, b ServerID) {\n\t\tnodes[a].trans.Connect(ServerAddress(b), nodes[b].trans)\n\t\tnodes[b].trans.Connect(ServerAddress(a), nodes[a].trans)\n\t}\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tcut := func(a, b ServerID) {\n\t\tnodes[a].trans.Disconnect(ServerAddress(b))\n\t\tnodes[b].trans.Disconnect(ServerAddress(a))\n\t}\n\n\tstart := func(id ServerID, restoreCommitted bool) *Raft {\n\t\tn := nodes[id]\n\t\tr, err := NewRaft(newConf(id, restoreCommitted), new(MockFSM), n.logs, n.stable, n.snaps, n.trans)\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"%s: NewRaft: %v\", id, err)\n\t\t}\n\t\tn.raft = r\n\t\treturn r\n\t}\n\n\t// Cluster starts as {A,B,C} bootstrapped from A.\n\tcfgABC := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t\t{Suffrage: Voter, ID: \"C\", Address: \"C\"},\n\t}}\n\tbootConf := newConf(\"A\", false)\n\tif err := BootstrapCluster(bootConf, nodes[\"A\"].logs, nodes[\"A\"].stable, nodes[\"A\"].snaps, nodes[\"A\"].trans, cfgABC); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tstart(\"A\", true)\n\tstart(\"B\", true)\n\tstart(\"C\", true)\n\n\twaitLeader := func(candidates []ServerID, d time.Duration) ServerID {\n\t\tdeadline := time.Now().Add(d)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tfor _, id := range candidates {\n\t\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\t\treturn id\n\t\t\t\t}\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t\treturn \"\"\n\t}\n\n\tif first := waitLeader([]ServerID{\"A\", \"B\", \"C\"}, 10*time.Second); first == \"\" {\n\t\tt.Fatalf(\"no initial leader\")\n\t}\n\trA := nodes[\"A\"].raft\n\tif rA.State() != Leader {\n\t\t// Transfer leadership to A so that the snapshot and the stale restart are A's.\n\t\tlid := waitLeader([]ServerID{\"B\", \"C\"}, 10*time.Second)\n\t\tif lid != \"\" {\n\t\t\tf := nodes[lid].raft.LeadershipTransferToServer(\"A\", \"A\")\n\t\t\t_ = f.Error()\n\t\t}\n\t\tif deadline := time.Now().Add(10 * time.Second); !time.Now().After(deadline) {\n\t\t\tfor time.Now().Before(deadline) && rA.State() != Leader {\n\t\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t\t}\n\t\t}\n\t}\n\n\t// Commit a few entries, then snapshot A so that A's snapshot records {A,B,C}.\n\tfor i := 0; i < 3; i++ {\n\t\tf := rA.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 3*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"pre apply: %v\", err)\n\t\t}\n\t}\n\t// Wait for the followers to have applied the entries.\n\tbarrier := rA.Barrier(3 * time.Second)\n\tif err := barrier.Error(); err != nil {\n\t\tt.Fatalf(\"barrier: %v\", err)\n\t}\n\tsnapF := rA.Snapshot()\n\tif err := snapF.Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnapList, _ := nodes[\"A\"].snaps.List()\n\tif len(snapList) == 0 {\n\t\tt.Fatalf(\"no snapshot on A\")\n\t}\n\tsnapIdx := snapList[0].Index\n\tsnapCfg := staleElectIDs(snapList[0].Configuration)\n\n\t// Bring D and E up as empty followers and add them as voters through the leader.\n\tstart(\"D\", true)\n\tstart(\"E\", true)\n\tfor _, id := range []ServerID{\"D\", \"E\"} {\n\t\tf := rA.AddVoter(id, ServerAddress(id), 0, 5*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"AddVoter %s: %v\", id, err)\n\t\t}\n\t}\n\t// One more committed entry so that every follower stages a commit index at or\n\t// above the new configuration entry.\n\tf := rA.Apply([]byte(\"after-config\"), 3*time.Second)\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"after-config apply: %v\", err)\n\t}\n\n\t// Locate the newest configuration entry in A's log.\n\tlastLogIdx, _ := nodes[\"A\"].logs.LastIndex()\n\tvar cfgEntryIdx uint64\n\tvar cfgEntryIDs string\n\tfor i := uint64(1); i <= lastLogIdx; i++ {\n\t\tvar l Log\n\t\tif err := nodes[\"A\"].logs.GetLog(i, &l); err != nil || l.Type != LogConfiguration {\n\t\t\tcontinue\n\t\t}\n\t\tcfgEntryIdx = i\n\t\tcfgEntryIDs = staleElectIDs(DecodeConfiguration(l.Data))\n\t}\n\tstoredCommit, _ := nodes[\"A\"].logs.GetCommitIndex()\n\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                        \"fixture\",\n\t\t\"mode\":                         mode,\n\t\t\"local_id\":                     \"A\",\n\t\t\"snapshot_index\":               snapIdx,\n\t\t\"snapshot_config_ids\":          snapCfg,\n\t\t\"config_entry_index\":           cfgEntryIdx,\n\t\t\"config_entry_ids\":             cfgEntryIDs,\n\t\t\"stored_commit_index\":          storedCommit,\n\t\t\"log_last_index\":               lastLogIdx,\n\t\t\"a_reported_config_ids\":        staleElectConfigIDs(rA),\n\t\t\"cluster_voter_ids\":            \"A,B,C,D,E\",\n\t\t\"commit_covers_config_entry\":   storedCommit >= cfgEntryIdx,\n\t\t\"snapshot_before_config_entry\": cfgEntryIdx > snapIdx,\n\t})\n\n\t// A goes down; the partition is cut while it is down, then A is restarted with\n\t// RestoreCommittedLogs and only its link to C restored.\n\tif sf := rA.Shutdown(); sf != nil {\n\t\t_ = sf.Error()\n\t}\n\tfor _, p := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\tcut(\"A\", p)\n\t\tcut(\"C\", p)\n\t}\n\t_, newTransA := NewInmemTransport(ServerAddress(\"A\"))\n\tnodes[\"A\"].trans = newTransA\n\tconnect(\"A\", \"C\")\n\t// A's links to the majority partition stay closed: connect only A and C.\n\tnewTransA.Disconnect(\"B\")\n\tnewTransA.Disconnect(\"D\")\n\tnewTransA.Disconnect(\"E\")\n\n\trestarted := start(\"A\", restartCommitted)\n\trestartCfg := staleElectConfigIDs(restarted)\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":               \"restart\",\n\t\t\"mode\":                mode,\n\t\t\"local_id\":            \"A\",\n\t\t\"state\":               restarted.State().String(),\n\t\t\"reported_config_ids\": restartCfg,\n\t\t\"last_applied\":        restarted.getLastApplied(),\n\t\t\"config_entry_ids\":    cfgEntryIDs,\n\t\t\"stored_commit_index\": storedCommit,\n\t})\n\n\t// Both partitions try to elect.\n\tminorityLeader := waitLeader([]ServerID{\"A\", \"C\"}, 15*time.Second)\n\tmajorityLeader := waitLeader([]ServerID{\"B\", \"D\", \"E\"}, 15*time.Second)\n\ttime.Sleep(500 * time.Millisecond)\n\n\tminorityLeaders, minorityTerms := staleElectStates(nodes, []ServerID{\"A\", \"C\"})\n\tmajorityLeaders, majorityTerms := staleElectStates(nodes, []ServerID{\"B\", \"D\", \"E\"})\n\n\t// What each side reports as its configuration, and whether writes commit.\n\trestartCfg = staleElectConfigIDs(restarted)\n\tcCfg := staleElectConfigIDs(nodes[\"C\"].raft)\n\tmajorityCfg := staleElectConfigIDs(nodes[majorityLeader].raft)\n\tminorityWriteErr := \"none\"\n\tvar minorityWriteIndex, majorityWriteIndex uint64\n\tvar minorityWriteTerm, majorityWriteTerm uint64\n\tif minorityLeader != \"\" {\n\t\twf := nodes[minorityLeader].raft.Apply([]byte(\"minority-write\"), 3*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tminorityWriteErr = err.Error()\n\t\t} else {\n\t\t\tminorityWriteIndex = wf.Index()\n\t\t\tminorityWriteTerm = nodes[minorityLeader].raft.getCurrentTerm()\n\t\t}\n\t}\n\tmajorityWriteErr := \"none\"\n\tif majorityLeader != \"\" {\n\t\twf := nodes[majorityLeader].raft.Apply([]byte(\"majority-write\"), 3*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tmajorityWriteErr = err.Error()\n\t\t} else {\n\t\t\tmajorityWriteIndex = wf.Index()\n\t\t\tmajorityWriteTerm = nodes[majorityLeader].raft.getCurrentTerm()\n\t\t}\n\t}\n\n\t// Compare the entries both leaders committed at that index.\n\tconflicting := false\n\tvar minorityData, majorityData string\n\tif minorityWriteIndex > 0 && majorityWriteIndex > 0 {\n\t\tvar ml, jl Log\n\t\terrM := nodes[minorityLeader].logs.GetLog(minorityWriteIndex, &ml)\n\t\terrJ := nodes[majorityLeader].logs.GetLog(majorityWriteIndex, &jl)\n\t\tif errM == nil && errJ == nil {\n\t\t\tminorityData = string(ml.Data)\n\t\t\tmajorityData = string(jl.Data)\n\t\t\tconflicting = minorityWriteIndex == majorityWriteIndex && minorityWriteTerm == majorityWriteTerm &&\n\t\t\t\tminorityData != majorityData\n\t\t}\n\t}\n\tleaderCount := 0\n\tif minorityLeaders != \"\" {\n\t\tleaderCount += len(strings.Split(minorityLeaders, \",\"))\n\t}\n\tif majorityLeaders != \"\" {\n\t\tleaderCount += len(strings.Split(majorityLeaders, \",\"))\n\t}\n\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                         \"outcome\",\n\t\t\"mode\":                          mode,\n\t\t\"local_id\":                      \"A\",\n\t\t\"minority_partition\":            \"A,C\",\n\t\t\"minority_leaders\":              minorityLeaders,\n\t\t\"minority_terms\":                strings.Join(minorityTerms, \",\"),\n\t\t\"majority_leaders\":              majorityLeaders,\n\t\t\"majority_terms\":                strings.Join(majorityTerms, \",\"),\n\t\t\"leader_count\":                  leaderCount,\n\t\t\"stale_config_node_is_leader\":   minorityLeader == \"A\",\n\t\t\"correct_config_node_is_leader\": minorityLeader == \"C\",\n\t\t\"restart_config_ids\":            restartCfg,\n\t\t\"c_config_ids\":                  cCfg,\n\t\t\"majority_config_ids\":           majorityCfg,\n\t\t\"minority_write_error\":          minorityWriteErr,\n\t\t\"majority_write_error\":          majorityWriteErr,\n\t\t\"minority_write_committed\":      minorityWriteErr == \"none\",\n\t\t\"minority_write_index\":          minorityWriteIndex,\n\t\t\"majority_write_index\":          majorityWriteIndex,\n\t\t\"minority_write_term\":           minorityWriteTerm,\n\t\t\"majority_write_term\":           majorityWriteTerm,\n\t\t\"minority_write_data\":           minorityData,\n\t\t\"majority_write_data\":           majorityData,\n\t\t\"conflicting_commits\":           conflicting,\n\t})\n\n\t// Heal the partition: restore the full mesh and let the cluster run on.\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tvar loneLeader ServerID\n\thealDeadline := time.Now().Add(15 * time.Second)\n\tfor time.Now().Before(healDeadline) {\n\t\tfound := []ServerID{}\n\t\tfor _, id := range ids {\n\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\tfound = append(found, id)\n\t\t\t}\n\t\t}\n\t\tif len(found) == 1 {\n\t\t\tloneLeader = found[0]\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tpostHealErr := \"none\"\n\tif loneLeader != \"\" {\n\t\twf := nodes[loneLeader].raft.Apply([]byte(\"post-heal\"), 5*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tpostHealErr = err.Error()\n\t\t}\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// What each node now holds at the index both leaders committed at, and which\n\t// configuration the restarted node uses while the cluster runs on.\n\tconflictIndex := minorityWriteIndex\n\tpayloads := []string{}\n\tentryTerms := []string{}\n\tconsistent := true\n\tvar firstPayload string\n\tlastIndexes := []string{}\n\tfor _, id := range ids {\n\t\tn := nodes[id]\n\t\tvar l Log\n\t\tif err := n.logs.GetLog(conflictIndex, &l); err == nil {\n\t\t\tp := string(l.Data)\n\t\t\tif firstPayload == \"\" {\n\t\t\t\tfirstPayload = p\n\t\t\t} else if p != firstPayload {\n\t\t\t\tconsistent = false\n\t\t\t}\n\t\t\tpayloads = append(payloads, fmt.Sprintf(\"%s:%s\", id, p))\n\t\t\tentryTerms = append(entryTerms, fmt.Sprintf(\"%s:%d\", id, l.Term))\n\t\t}\n\t\tli, _ := n.logs.LastIndex()\n\t\tlastIndexes = append(lastIndexes, fmt.Sprintf(\"%s:%d\", id, li))\n\t}\n\tvar aLastIndex uint64\n\tif idx, err := nodes[\"A\"].logs.LastIndex(); err == nil {\n\t\taLastIndex = idx\n\t}\n\thealedStates, _ := staleElectStates(nodes, ids)\n\tallTermsEqual := len(entryTerms) > 0\n\tfor _, t := range entryTerms {\n\t\tif !strings.HasSuffix(t, fmt.Sprintf(\":%d\", minorityWriteTerm)) {\n\t\t\tallTermsEqual = false\n\t\t}\n\t}\n\tleaderCfg := \"\"\n\tleaderLastIndex := uint64(0)\n\tif loneLeader != \"\" {\n\t\tleaderCfg = staleElectConfigIDs(nodes[loneLeader].raft)\n\t\tif idx, err := nodes[loneLeader].logs.LastIndex(); err == nil {\n\t\t\tleaderLastIndex = idx\n\t\t}\n\t}\n\tbehind := 0\n\tfor _, id := range ids {\n\t\tif idx, err := nodes[id].logs.LastIndex(); err == nil && idx < leaderLastIndex {\n\t\t\tbehind++\n\t\t}\n\t}\n\t// What each node's FSM actually applied for the two conflicting writes.\n\tappliedWrites := func(r *Raft) string {\n\t\tfsm := getMockFSM(r.fsm)\n\t\tif fsm == nil {\n\t\t\treturn \"\"\n\t\t}\n\t\tfound := []string{}\n\t\tfor _, l := range fsm.Logs() {\n\t\t\tswitch string(l) {\n\t\t\tcase \"minority-write\", \"majority-write\":\n\t\t\t\tfound = append(found, string(l))\n\t\t\t}\n\t\t}\n\t\tsort.Strings(found)\n\t\treturn strings.Join(found, \"+\")\n\t}\n\tapplied := []string{}\n\tappliedConsistent := true\n\tfirstApplied := \"\"\n\tfor _, id := range ids {\n\t\tw := appliedWrites(nodes[id].raft)\n\t\tif firstApplied == \"\" {\n\t\t\tfirstApplied = w\n\t\t} else if w != firstApplied {\n\t\t\tappliedConsistent = false\n\t\t}\n\t\tapplied = append(applied, fmt.Sprintf(\"%s:%s\", id, w))\n\t}\n\taApplied := appliedWrites(nodes[\"A\"].raft)\n\tbApplied := appliedWrites(nodes[\"B\"].raft)\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                              \"healed\",\n\t\t\"mode\":                               mode,\n\t\t\"local_id\":                           \"A\",\n\t\t\"healed_leaders\":                     healedStates,\n\t\t\"lone_leader\":                        string(loneLeader),\n\t\t\"conflict_index\":                     conflictIndex,\n\t\t\"entry_payloads_at_conflict_index\":   strings.Join(payloads, \",\"),\n\t\t\"entry_terms_at_conflict_index\":      strings.Join(entryTerms, \",\"),\n\t\t\"entry_consistent_at_conflict_index\": consistent,\n\t\t\"same_term_conflicting_payload\":      !consistent && allTermsEqual,\n\t\t\"log_last_indexes\":                   strings.Join(lastIndexes, \",\"),\n\t\t\"a_log_last_index\":                   aLastIndex,\n\t\t\"a_log_advanced_after_heal\":          aLastIndex > conflictIndex,\n\t\t\"a_config_ids_after_heal\":            staleElectConfigIDs(nodes[\"A\"].raft),\n\t\t\"b_config_ids_after_heal\":            staleElectConfigIDs(nodes[\"B\"].raft),\n\t\t\"leader_config_ids_after_heal\":       leaderCfg,\n\t\t\"leader_log_last_index\":              leaderLastIndex,\n\t\t\"nodes_with_log_behind_leader\":       behind,\n\t\t\"fsm_applied_writes\":                 strings.Join(applied, \",\"),\n\t\t\"fsm_applied_consistent\":             appliedConsistent,\n\t\t\"a_fsm_applied_writes\":               aApplied,\n\t\t\"b_fsm_applied_writes\":               bApplied,\n\t\t\"post_heal_apply_error\":              postHealErr,\n\t})\n\n\t// Repair phase: put a node holding the current configuration in charge, take a\n\t// snapshot on it while A is unreachable so its log is compacted past A, then\n\t// reconnect A and see whether a snapshot install replaces the divergent entry\n\t// and applied state.\n\trepairLeader := ServerID(\"\")\n\tfor _, id := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\trepairLeader = id\n\t\t\tbreak\n\t\t}\n\t}\n\ttransferred := false\n\tif repairLeader == \"\" {\n\t\tfor _, id := range ids {\n\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\tif f := r.LeadershipTransferToServer(\"B\", \"B\"); f != nil {\n\t\t\t\t\t_ = f.Error()\n\t\t\t\t}\n\t\t\t\ttransferred = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tdl := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(dl) {\n\t\t\tfor _, id := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\t\trepairLeader = id\n\t\t\t\t}\n\t\t\t}\n\t\t\tif repairLeader != \"\" {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t}\n\trepairApplies := 0\n\tsnapshotIndex := uint64(0)\n\tsnapshotErr := \"none\"\n\tif repairLeader != \"\" {\n\t\tfor _, p := range ids {\n\t\t\tif p != \"A\" {\n\t\t\t\tcut(\"A\", p)\n\t\t\t}\n\t\t}\n\t\tfor i := 0; i < 10; i++ {\n\t\t\twf := nodes[repairLeader].raft.Apply([]byte(fmt.Sprintf(\"repair-%d\", i)), 3*time.Second)\n\t\t\tif err := wf.Error(); err != nil {\n\t\t\t\tsnapshotErr = err.Error()\n\t\t\t\tbreak\n\t\t\t}\n\t\t\trepairApplies++\n\t\t}\n\t\tif sf := nodes[repairLeader].raft.Snapshot(); sf != nil {\n\t\t\tif err := sf.Error(); err != nil {\n\t\t\t\tsnapshotErr = err.Error()\n\t\t\t}\n\t\t}\n\t\tif l, err := nodes[repairLeader].snaps.List(); err == nil && len(l) > 0 {\n\t\t\tsnapshotIndex = l[0].Index\n\t\t}\n\t\tfor _, p := range ids {\n\t\t\tif p != \"A\" {\n\t\t\t\tconnect(\"A\", p)\n\t\t\t}\n\t\t}\n\t\t// Wait for A to install the snapshot the leader can no longer serve as logs.\n\t\tdl := time.Now().Add(15 * time.Second)\n\t\tfor time.Now().Before(dl) {\n\t\t\tif idx, _ := nodes[\"A\"].raft.getLastSnapshot(); idx >= snapshotIndex && snapshotIndex > 0 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\taSnapshotIdx, _ := nodes[\"A\"].raft.getLastSnapshot()\n\taAppliedAfter := appliedWrites(nodes[\"A\"].raft)\n\trepairWrites := []string{}\n\trepairConsistent := true\n\tfirstRepair := \"\"\n\tfor _, id := range ids {\n\t\tw := appliedWrites(nodes[id].raft)\n\t\tif firstRepair == \"\" {\n\t\t\tfirstRepair = w\n\t\t} else if w != firstRepair {\n\t\t\trepairConsistent = false\n\t\t}\n\t\trepairWrites = append(repairWrites, fmt.Sprintf(\"%s:%s\", id, w))\n\t}\n\t_, aEntryErr := func() (Log, error) {\n\t\tvar l Log\n\t\terr := nodes[\"A\"].logs.GetLog(conflictIndex, &l)\n\t\treturn l, err\n\t}()\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                               \"repaired\",\n\t\t\"mode\":                                mode,\n\t\t\"local_id\":                            \"A\",\n\t\t\"repair_leader\":                       string(repairLeader),\n\t\t\"leadership_transferred\":              transferred,\n\t\t\"repair_applies\":                      repairApplies,\n\t\t\"repair_snapshot_index\":               snapshotIndex,\n\t\t\"repair_snapshot_error\":               snapshotErr,\n\t\t\"a_last_snapshot_index\":               aSnapshotIdx,\n\t\t\"snapshot_installed_on_a\":             snapshotIndex > 0 && aSnapshotIdx >= snapshotIndex,\n\t\t\"a_fsm_applied_writes_after_snapshot\": aAppliedAfter,\n\t\t\"minority_write_present_on_a_after_snapshot\": strings.Contains(aAppliedAfter, \"minority-write\"),\n\t\t\"a_config_ids_after_snapshot\":                staleElectConfigIDs(nodes[\"A\"].raft),\n\t\t\"a_conflict_index_entry_missing\":             aEntryErr != nil,\n\t\t\"fsm_applied_writes_after_snapshot\":          strings.Join(repairWrites, \",\"),\n\t\t\"fsm_applied_consistent_after_snapshot\":      repairConsistent,\n\t})\n\tfor _, id := range ids {\n\t\tif r := nodes[id].raft; r != nil {\n\t\t\tif sf := r.Shutdown(); sf != nil {\n\t\t\t\t_ = sf.Error()\n\t\t\t}\n\t\t}\n\t}\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [
+          "The scenario body moved into a helper that takes the mode and the restart feature flag; the test now runs defect_restart (restart with the feature) and control_no_restore (restart without it) in one execution, emitting the same five events per mode.",
+          "Admissions and comparisons are declared per mode so the receipt shows the feature-on and feature-off runs side by side."
+        ],
+        "prerequisites": [
+          {
+            "alias": "adm_defect",
+            "event": "fixture",
+            "conditions": [
+              {
+                "field": "mode",
+                "op": "eq",
+                "value": "defect_restart",
+                "reference": null
+              },
+              {
+                "field": "snapshot_config_ids",
+                "op": "eq",
+                "value": "A,B,C",
+                "reference": null
+              },
+              {
+                "field": "config_entry_ids",
+                "op": "eq",
+                "value": "A,B,C,D,E",
+                "reference": null
+              },
+              {
+                "field": "a_reported_config_ids",
+                "op": "eq",
+                "value": "A,B,C,D,E",
+                "reference": null
+              },
+              {
+                "field": "commit_covers_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "snapshot_before_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "adm_control",
+            "event": "fixture",
+            "conditions": [
+              {
+                "field": "mode",
+                "op": "eq",
+                "value": "control_no_restore",
+                "reference": null
+              },
+              {
+                "field": "snapshot_config_ids",
+                "op": "eq",
+                "value": "A,B,C",
+                "reference": null
+              },
+              {
+                "field": "config_entry_ids",
+                "op": "eq",
+                "value": "A,B,C,D,E",
+                "reference": null
+              },
+              {
+                "field": "a_reported_config_ids",
+                "op": "eq",
+                "value": "A,B,C,D,E",
+                "reference": null
+              },
+              {
+                "field": "commit_covers_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "snapshot_before_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sort\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\ntype staleElectNode struct {\n\tid     ServerID\n\ttrans  *InmemTransport\n\tlogs   *InmemCommitTrackingStore\n\tstable *InmemStore\n\tsnaps  *InmemSnapshotStore\n\traft   *Raft\n}\n\nfunc staleElectEmit(fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc staleElectIDs(c Configuration) string {\n\tids := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tids = append(ids, string(s.ID))\n\t}\n\tsort.Strings(ids)\n\treturn strings.Join(ids, \",\")\n}\n\nfunc staleElectStates(nodes map[ServerID]*staleElectNode, ids []ServerID) (string, []string) {\n\tleaders := []string{}\n\tterms := []string{}\n\tfor _, id := range ids {\n\t\tr := nodes[id].raft\n\t\tif r == nil {\n\t\t\tcontinue\n\t\t}\n\t\tif r.State() == Leader {\n\t\t\tleaders = append(leaders, string(id))\n\t\t}\n\t\tterms = append(terms, fmt.Sprintf(\"%s:%d\", id, r.getCurrentTerm()))\n\t}\n\tsort.Strings(leaders)\n\treturn strings.Join(leaders, \",\"), terms\n}\n\nfunc staleElectConfigIDs(r *Raft) string {\n\tif r == nil {\n\t\treturn \"\"\n\t}\n\tf := r.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn \"\"\n\t}\n\treturn staleElectIDs(f.Configuration())\n}\n\n// TestAssuranceStaleConfigElectionWitness grows a real 5-node in-memory cluster,\n// leaves node A's snapshot behind a committed configuration change, restarts A with\n// RestoreCommittedLogs, partitions {A,C} from {B,D,E} and observes whether the\n// stale-configured node becomes leader with fewer votes than the current\n// configuration requires while the other partition elects its own leader.\n// TestAssuranceStaleConfigElectionWitness runs the split scenario twice: once with\n// the restarted node using Config.RestoreCommittedLogs and once as a control with\n// the feature off at restart, so the feature is the only difference between runs.\nfunc TestAssuranceStaleConfigElectionWitness(t *testing.T) {\n\tfor _, c := range []struct {\n\t\tmode           string\n\t\trestartFeature bool\n\t}{\n\t\t{\"defect_restart\", true},\n\t\t{\"control_no_restore\", false},\n\t} {\n\t\tstaleElectScenario(t, c.mode, c.restartFeature)\n\t}\n}\n\nfunc staleElectScenario(t *testing.T, mode string, restartCommitted bool) {\n\tids := []ServerID{\"A\", \"B\", \"C\", \"D\", \"E\"}\n\n\tnewConf := func(id ServerID, restoreCommitted bool) *Config {\n\t\tc := DefaultConfig()\n\t\tc.LocalID = id\n\t\tc.HeartbeatTimeout = 50 * time.Millisecond\n\t\tc.ElectionTimeout = 50 * time.Millisecond\n\t\tc.LeaderLeaseTimeout = 50 * time.Millisecond\n\t\tc.CommitTimeout = 5 * time.Millisecond\n\t\tc.SnapshotInterval = 10 * time.Minute\n\t\tc.TrailingLogs = 0\n\t\tc.Logger = hclog.NewNullLogger()\n\t\tc.RestoreCommittedLogs = restoreCommitted\n\t\treturn c\n\t}\n\n\tnodes := map[ServerID]*staleElectNode{}\n\tfor _, id := range ids {\n\t\t_, tr := NewInmemTransport(ServerAddress(id))\n\t\tnodes[id] = &staleElectNode{\n\t\t\tid:     id,\n\t\t\ttrans:  tr,\n\t\t\tlogs:   NewInmemCommitTrackingStore(),\n\t\t\tstable: NewInmemStore(),\n\t\t\tsnaps:  NewInmemSnapshotStore(),\n\t\t}\n\t}\n\tconnect := func(a, b ServerID) {\n\t\tnodes[a].trans.Connect(ServerAddress(b), nodes[b].trans)\n\t\tnodes[b].trans.Connect(ServerAddress(a), nodes[a].trans)\n\t}\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tcut := func(a, b ServerID) {\n\t\tnodes[a].trans.Disconnect(ServerAddress(b))\n\t\tnodes[b].trans.Disconnect(ServerAddress(a))\n\t}\n\n\tstart := func(id ServerID, restoreCommitted bool) *Raft {\n\t\tn := nodes[id]\n\t\tr, err := NewRaft(newConf(id, restoreCommitted), new(MockFSM), n.logs, n.stable, n.snaps, n.trans)\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"%s: NewRaft: %v\", id, err)\n\t\t}\n\t\tn.raft = r\n\t\treturn r\n\t}\n\n\t// Cluster starts as {A,B,C} bootstrapped from A.\n\tcfgABC := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t\t{Suffrage: Voter, ID: \"C\", Address: \"C\"},\n\t}}\n\tbootConf := newConf(\"A\", false)\n\tif err := BootstrapCluster(bootConf, nodes[\"A\"].logs, nodes[\"A\"].stable, nodes[\"A\"].snaps, nodes[\"A\"].trans, cfgABC); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tstart(\"A\", true)\n\tstart(\"B\", true)\n\tstart(\"C\", true)\n\n\twaitLeader := func(candidates []ServerID, d time.Duration) ServerID {\n\t\tdeadline := time.Now().Add(d)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tfor _, id := range candidates {\n\t\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\t\treturn id\n\t\t\t\t}\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t\treturn \"\"\n\t}\n\n\tif first := waitLeader([]ServerID{\"A\", \"B\", \"C\"}, 10*time.Second); first == \"\" {\n\t\tt.Fatalf(\"no initial leader\")\n\t}\n\trA := nodes[\"A\"].raft\n\tif rA.State() != Leader {\n\t\t// Transfer leadership to A so that the snapshot and the stale restart are A's.\n\t\tlid := waitLeader([]ServerID{\"B\", \"C\"}, 10*time.Second)\n\t\tif lid != \"\" {\n\t\t\tf := nodes[lid].raft.LeadershipTransferToServer(\"A\", \"A\")\n\t\t\t_ = f.Error()\n\t\t}\n\t\tif deadline := time.Now().Add(10 * time.Second); !time.Now().After(deadline) {\n\t\t\tfor time.Now().Before(deadline) && rA.State() != Leader {\n\t\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t\t}\n\t\t}\n\t}\n\n\t// Commit a few entries, then snapshot A so that A's snapshot records {A,B,C}.\n\tfor i := 0; i < 3; i++ {\n\t\tf := rA.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 3*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"pre apply: %v\", err)\n\t\t}\n\t}\n\t// Wait for the followers to have applied the entries.\n\tbarrier := rA.Barrier(3 * time.Second)\n\tif err := barrier.Error(); err != nil {\n\t\tt.Fatalf(\"barrier: %v\", err)\n\t}\n\tsnapF := rA.Snapshot()\n\tif err := snapF.Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnapList, _ := nodes[\"A\"].snaps.List()\n\tif len(snapList) == 0 {\n\t\tt.Fatalf(\"no snapshot on A\")\n\t}\n\tsnapIdx := snapList[0].Index\n\tsnapCfg := staleElectIDs(snapList[0].Configuration)\n\n\t// Bring D and E up as empty followers and add them as voters through the leader.\n\tstart(\"D\", true)\n\tstart(\"E\", true)\n\tfor _, id := range []ServerID{\"D\", \"E\"} {\n\t\tf := rA.AddVoter(id, ServerAddress(id), 0, 5*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"AddVoter %s: %v\", id, err)\n\t\t}\n\t}\n\t// One more committed entry so that every follower stages a commit index at or\n\t// above the new configuration entry.\n\tf := rA.Apply([]byte(\"after-config\"), 3*time.Second)\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"after-config apply: %v\", err)\n\t}\n\n\t// Locate the newest configuration entry in A's log.\n\tlastLogIdx, _ := nodes[\"A\"].logs.LastIndex()\n\tvar cfgEntryIdx uint64\n\tvar cfgEntryIDs string\n\tfor i := uint64(1); i <= lastLogIdx; i++ {\n\t\tvar l Log\n\t\tif err := nodes[\"A\"].logs.GetLog(i, &l); err != nil || l.Type != LogConfiguration {\n\t\t\tcontinue\n\t\t}\n\t\tcfgEntryIdx = i\n\t\tcfgEntryIDs = staleElectIDs(DecodeConfiguration(l.Data))\n\t}\n\tstoredCommit, _ := nodes[\"A\"].logs.GetCommitIndex()\n\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                        \"fixture\",\n\t\t\"mode\":                         mode,\n\t\t\"local_id\":                     \"A\",\n\t\t\"snapshot_index\":               snapIdx,\n\t\t\"snapshot_config_ids\":          snapCfg,\n\t\t\"config_entry_index\":           cfgEntryIdx,\n\t\t\"config_entry_ids\":             cfgEntryIDs,\n\t\t\"stored_commit_index\":          storedCommit,\n\t\t\"log_last_index\":               lastLogIdx,\n\t\t\"a_reported_config_ids\":        staleElectConfigIDs(rA),\n\t\t\"cluster_voter_ids\":            \"A,B,C,D,E\",\n\t\t\"commit_covers_config_entry\":   storedCommit >= cfgEntryIdx,\n\t\t\"snapshot_before_config_entry\": cfgEntryIdx > snapIdx,\n\t})\n\n\t// A goes down; the partition is cut while it is down, then A is restarted with\n\t// RestoreCommittedLogs and only its link to C restored.\n\tif sf := rA.Shutdown(); sf != nil {\n\t\t_ = sf.Error()\n\t}\n\tfor _, p := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\tcut(\"A\", p)\n\t\tcut(\"C\", p)\n\t}\n\t_, newTransA := NewInmemTransport(ServerAddress(\"A\"))\n\tnodes[\"A\"].trans = newTransA\n\tconnect(\"A\", \"C\")\n\t// A's links to the majority partition stay closed: connect only A and C.\n\tnewTransA.Disconnect(\"B\")\n\tnewTransA.Disconnect(\"D\")\n\tnewTransA.Disconnect(\"E\")\n\n\trestarted := start(\"A\", restartCommitted)\n\trestartCfg := staleElectConfigIDs(restarted)\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":               \"restart\",\n\t\t\"mode\":                mode,\n\t\t\"local_id\":            \"A\",\n\t\t\"state\":               restarted.State().String(),\n\t\t\"reported_config_ids\": restartCfg,\n\t\t\"last_applied\":        restarted.getLastApplied(),\n\t\t\"config_entry_ids\":    cfgEntryIDs,\n\t\t\"stored_commit_index\": storedCommit,\n\t})\n\n\t// Both partitions try to elect.\n\tminorityLeader := waitLeader([]ServerID{\"A\", \"C\"}, 15*time.Second)\n\tmajorityLeader := waitLeader([]ServerID{\"B\", \"D\", \"E\"}, 15*time.Second)\n\ttime.Sleep(500 * time.Millisecond)\n\n\tminorityLeaders, minorityTerms := staleElectStates(nodes, []ServerID{\"A\", \"C\"})\n\tmajorityLeaders, majorityTerms := staleElectStates(nodes, []ServerID{\"B\", \"D\", \"E\"})\n\n\t// What each side reports as its configuration, and whether writes commit.\n\trestartCfg = staleElectConfigIDs(restarted)\n\tcCfg := staleElectConfigIDs(nodes[\"C\"].raft)\n\tmajorityCfg := staleElectConfigIDs(nodes[majorityLeader].raft)\n\tminorityWriteErr := \"none\"\n\tvar minorityWriteIndex, majorityWriteIndex uint64\n\tvar minorityWriteTerm, majorityWriteTerm uint64\n\tif minorityLeader != \"\" {\n\t\twf := nodes[minorityLeader].raft.Apply([]byte(\"minority-write\"), 3*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tminorityWriteErr = err.Error()\n\t\t} else {\n\t\t\tminorityWriteIndex = wf.Index()\n\t\t\tminorityWriteTerm = nodes[minorityLeader].raft.getCurrentTerm()\n\t\t}\n\t}\n\tmajorityWriteErr := \"none\"\n\tif majorityLeader != \"\" {\n\t\twf := nodes[majorityLeader].raft.Apply([]byte(\"majority-write\"), 3*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tmajorityWriteErr = err.Error()\n\t\t} else {\n\t\t\tmajorityWriteIndex = wf.Index()\n\t\t\tmajorityWriteTerm = nodes[majorityLeader].raft.getCurrentTerm()\n\t\t}\n\t}\n\n\t// Compare the entries both leaders committed at that index.\n\tconflicting := false\n\tvar minorityData, majorityData string\n\tif minorityWriteIndex > 0 && majorityWriteIndex > 0 {\n\t\tvar ml, jl Log\n\t\terrM := nodes[minorityLeader].logs.GetLog(minorityWriteIndex, &ml)\n\t\terrJ := nodes[majorityLeader].logs.GetLog(majorityWriteIndex, &jl)\n\t\tif errM == nil && errJ == nil {\n\t\t\tminorityData = string(ml.Data)\n\t\t\tmajorityData = string(jl.Data)\n\t\t\tconflicting = minorityWriteIndex == majorityWriteIndex && minorityWriteTerm == majorityWriteTerm &&\n\t\t\t\tminorityData != majorityData\n\t\t}\n\t}\n\tleaderCount := 0\n\tif minorityLeaders != \"\" {\n\t\tleaderCount += len(strings.Split(minorityLeaders, \",\"))\n\t}\n\tif majorityLeaders != \"\" {\n\t\tleaderCount += len(strings.Split(majorityLeaders, \",\"))\n\t}\n\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                         \"outcome\",\n\t\t\"mode\":                          mode,\n\t\t\"local_id\":                      \"A\",\n\t\t\"minority_partition\":            \"A,C\",\n\t\t\"minority_leaders\":              minorityLeaders,\n\t\t\"minority_terms\":                strings.Join(minorityTerms, \",\"),\n\t\t\"majority_leaders\":              majorityLeaders,\n\t\t\"majority_terms\":                strings.Join(majorityTerms, \",\"),\n\t\t\"leader_count\":                  leaderCount,\n\t\t\"stale_config_node_is_leader\":   minorityLeader == \"A\",\n\t\t\"correct_config_node_is_leader\": minorityLeader == \"C\",\n\t\t\"restart_config_ids\":            restartCfg,\n\t\t\"c_config_ids\":                  cCfg,\n\t\t\"majority_config_ids\":           majorityCfg,\n\t\t\"minority_write_error\":          minorityWriteErr,\n\t\t\"majority_write_error\":          majorityWriteErr,\n\t\t\"minority_write_committed\":      minorityWriteErr == \"none\",\n\t\t\"minority_write_index\":          minorityWriteIndex,\n\t\t\"majority_write_index\":          majorityWriteIndex,\n\t\t\"minority_write_term\":           minorityWriteTerm,\n\t\t\"majority_write_term\":           majorityWriteTerm,\n\t\t\"minority_write_data\":           minorityData,\n\t\t\"majority_write_data\":           majorityData,\n\t\t\"conflicting_commits\":           conflicting,\n\t})\n\n\t// Heal the partition: restore the full mesh and let the cluster run on.\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tvar loneLeader ServerID\n\thealDeadline := time.Now().Add(15 * time.Second)\n\tfor time.Now().Before(healDeadline) {\n\t\tfound := []ServerID{}\n\t\tfor _, id := range ids {\n\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\tfound = append(found, id)\n\t\t\t}\n\t\t}\n\t\tif len(found) == 1 {\n\t\t\tloneLeader = found[0]\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tpostHealErr := \"none\"\n\tif loneLeader != \"\" {\n\t\twf := nodes[loneLeader].raft.Apply([]byte(\"post-heal\"), 5*time.Second)\n\t\tif err := wf.Error(); err != nil {\n\t\t\tpostHealErr = err.Error()\n\t\t}\n\t}\n\t// Long run: commit many further entries on the healed leader so the sample is\n\t// taken after substantial progress rather than one entry.\n\tlongRunErr := \"none\"\n\tentriesAfterHeal := uint64(0)\n\tif loneLeader != \"\" {\n\t\tfor i := 0; i < 200; i++ {\n\t\t\twf := nodes[loneLeader].raft.Apply([]byte(fmt.Sprintf(\"long-run-%d\", i)), 3*time.Second)\n\t\t\tif err := wf.Error(); err != nil {\n\t\t\t\tlongRunErr = err.Error()\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tdeadline := time.Now().Add(15 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tidx, _ := nodes[loneLeader].logs.LastIndex()\n\t\t\tif idx > minorityWriteIndex {\n\t\t\t\tentriesAfterHeal = idx - minorityWriteIndex\n\t\t\t}\n\t\t\tif entriesAfterHeal >= 150 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// What each node now holds at the index both leaders committed at, and which\n\t// configuration the restarted node uses while the cluster runs on.\n\tconflictIndex := minorityWriteIndex\n\tpayloads := []string{}\n\tentryTerms := []string{}\n\tconsistent := true\n\tvar firstPayload string\n\tlastIndexes := []string{}\n\tfor _, id := range ids {\n\t\tn := nodes[id]\n\t\tvar l Log\n\t\tif err := n.logs.GetLog(conflictIndex, &l); err == nil {\n\t\t\tp := string(l.Data)\n\t\t\tif firstPayload == \"\" {\n\t\t\t\tfirstPayload = p\n\t\t\t} else if p != firstPayload {\n\t\t\t\tconsistent = false\n\t\t\t}\n\t\t\tpayloads = append(payloads, fmt.Sprintf(\"%s:%s\", id, p))\n\t\t\tentryTerms = append(entryTerms, fmt.Sprintf(\"%s:%d\", id, l.Term))\n\t\t}\n\t\tli, _ := n.logs.LastIndex()\n\t\tlastIndexes = append(lastIndexes, fmt.Sprintf(\"%s:%d\", id, li))\n\t}\n\tvar aLastIndex uint64\n\tif idx, err := nodes[\"A\"].logs.LastIndex(); err == nil {\n\t\taLastIndex = idx\n\t}\n\thealedStates, _ := staleElectStates(nodes, ids)\n\tallTermsEqual := len(entryTerms) > 0\n\tfor _, t := range entryTerms {\n\t\tif !strings.HasSuffix(t, fmt.Sprintf(\":%d\", minorityWriteTerm)) {\n\t\t\tallTermsEqual = false\n\t\t}\n\t}\n\tleaderCfg := \"\"\n\tleaderLastIndex := uint64(0)\n\tif loneLeader != \"\" {\n\t\tleaderCfg = staleElectConfigIDs(nodes[loneLeader].raft)\n\t\tif idx, err := nodes[loneLeader].logs.LastIndex(); err == nil {\n\t\t\tleaderLastIndex = idx\n\t\t}\n\t}\n\tbehind := 0\n\tfor _, id := range ids {\n\t\tif idx, err := nodes[id].logs.LastIndex(); err == nil && idx < leaderLastIndex {\n\t\t\tbehind++\n\t\t}\n\t}\n\t// What each node's FSM actually applied for the two conflicting writes.\n\tappliedWrites := func(r *Raft) string {\n\t\tfsm := getMockFSM(r.fsm)\n\t\tif fsm == nil {\n\t\t\treturn \"\"\n\t\t}\n\t\tfound := []string{}\n\t\tfor _, l := range fsm.Logs() {\n\t\t\tswitch string(l) {\n\t\t\tcase \"minority-write\", \"majority-write\":\n\t\t\t\tfound = append(found, string(l))\n\t\t\t}\n\t\t}\n\t\tsort.Strings(found)\n\t\treturn strings.Join(found, \"+\")\n\t}\n\tapplied := []string{}\n\tappliedConsistent := true\n\tfirstApplied := \"\"\n\tfor _, id := range ids {\n\t\tw := appliedWrites(nodes[id].raft)\n\t\tif firstApplied == \"\" {\n\t\t\tfirstApplied = w\n\t\t} else if w != firstApplied {\n\t\t\tappliedConsistent = false\n\t\t}\n\t\tapplied = append(applied, fmt.Sprintf(\"%s:%s\", id, w))\n\t}\n\taApplied := appliedWrites(nodes[\"A\"].raft)\n\tbApplied := appliedWrites(nodes[\"B\"].raft)\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                              \"healed\",\n\t\t\"mode\":                               mode,\n\t\t\"local_id\":                           \"A\",\n\t\t\"healed_leaders\":                     healedStates,\n\t\t\"lone_leader\":                        string(loneLeader),\n\t\t\"conflict_index\":                     conflictIndex,\n\t\t\"entry_payloads_at_conflict_index\":   strings.Join(payloads, \",\"),\n\t\t\"entry_terms_at_conflict_index\":      strings.Join(entryTerms, \",\"),\n\t\t\"entry_consistent_at_conflict_index\": consistent,\n\t\t\"same_term_conflicting_payload\":      !consistent && allTermsEqual,\n\t\t\"log_last_indexes\":                   strings.Join(lastIndexes, \",\"),\n\t\t\"a_log_last_index\":                   aLastIndex,\n\t\t\"a_log_advanced_after_heal\":          aLastIndex > conflictIndex,\n\t\t\"a_config_ids_after_heal\":            staleElectConfigIDs(nodes[\"A\"].raft),\n\t\t\"b_config_ids_after_heal\":            staleElectConfigIDs(nodes[\"B\"].raft),\n\t\t\"leader_config_ids_after_heal\":       leaderCfg,\n\t\t\"leader_log_last_index\":              leaderLastIndex,\n\t\t\"nodes_with_log_behind_leader\":       behind,\n\t\t\"fsm_applied_writes\":                 strings.Join(applied, \",\"),\n\t\t\"fsm_applied_consistent\":             appliedConsistent,\n\t\t\"a_fsm_applied_writes\":               aApplied,\n\t\t\"b_fsm_applied_writes\":               bApplied,\n\t\t\"post_heal_apply_error\":              postHealErr,\n\t\t\"long_run_error\":                     longRunErr,\n\t\t\"entries_after_heal\":                 entriesAfterHeal,\n\t\t\"long_run_exercised\":                 entriesAfterHeal >= 150,\n\t})\n\n\t// Repair phase: put a node holding the current configuration in charge, take a\n\t// snapshot on it while A is unreachable so its log is compacted past A, then\n\t// reconnect A and see whether a snapshot install replaces the divergent entry\n\t// and applied state.\n\trepairLeader := ServerID(\"\")\n\tfor _, id := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\trepairLeader = id\n\t\t\tbreak\n\t\t}\n\t}\n\ttransferred := false\n\tif repairLeader == \"\" {\n\t\tfor _, id := range ids {\n\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\tif f := r.LeadershipTransferToServer(\"B\", \"B\"); f != nil {\n\t\t\t\t\t_ = f.Error()\n\t\t\t\t}\n\t\t\t\ttransferred = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tdl := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(dl) {\n\t\t\tfor _, id := range []ServerID{\"B\", \"D\", \"E\"} {\n\t\t\t\tif r := nodes[id].raft; r != nil && r.State() == Leader {\n\t\t\t\t\trepairLeader = id\n\t\t\t\t}\n\t\t\t}\n\t\t\tif repairLeader != \"\" {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t}\n\trepairApplies := 0\n\tsnapshotIndex := uint64(0)\n\tsnapshotErr := \"none\"\n\tif repairLeader != \"\" {\n\t\tfor _, p := range ids {\n\t\t\tif p != \"A\" {\n\t\t\t\tcut(\"A\", p)\n\t\t\t}\n\t\t}\n\t\tfor i := 0; i < 10; i++ {\n\t\t\twf := nodes[repairLeader].raft.Apply([]byte(fmt.Sprintf(\"repair-%d\", i)), 3*time.Second)\n\t\t\tif err := wf.Error(); err != nil {\n\t\t\t\tsnapshotErr = err.Error()\n\t\t\t\tbreak\n\t\t\t}\n\t\t\trepairApplies++\n\t\t}\n\t\tif sf := nodes[repairLeader].raft.Snapshot(); sf != nil {\n\t\t\tif err := sf.Error(); err != nil {\n\t\t\t\tsnapshotErr = err.Error()\n\t\t\t}\n\t\t}\n\t\tif l, err := nodes[repairLeader].snaps.List(); err == nil && len(l) > 0 {\n\t\t\tsnapshotIndex = l[0].Index\n\t\t}\n\t\tfor _, p := range ids {\n\t\t\tif p != \"A\" {\n\t\t\t\tconnect(\"A\", p)\n\t\t\t}\n\t\t}\n\t\t// Wait for A to install the snapshot the leader can no longer serve as logs.\n\t\tdl := time.Now().Add(15 * time.Second)\n\t\tfor time.Now().Before(dl) {\n\t\t\tif idx, _ := nodes[\"A\"].raft.getLastSnapshot(); idx >= snapshotIndex && snapshotIndex > 0 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\taSnapshotIdx, _ := nodes[\"A\"].raft.getLastSnapshot()\n\taAppliedAfter := appliedWrites(nodes[\"A\"].raft)\n\trepairWrites := []string{}\n\trepairConsistent := true\n\tfirstRepair := \"\"\n\tfor _, id := range ids {\n\t\tw := appliedWrites(nodes[id].raft)\n\t\tif firstRepair == \"\" {\n\t\t\tfirstRepair = w\n\t\t} else if w != firstRepair {\n\t\t\trepairConsistent = false\n\t\t}\n\t\trepairWrites = append(repairWrites, fmt.Sprintf(\"%s:%s\", id, w))\n\t}\n\t_, aEntryErr := func() (Log, error) {\n\t\tvar l Log\n\t\terr := nodes[\"A\"].logs.GetLog(conflictIndex, &l)\n\t\treturn l, err\n\t}()\n\tstaleElectEmit(map[string]interface{}{\n\t\t\"event\":                               \"repaired\",\n\t\t\"mode\":                                mode,\n\t\t\"local_id\":                            \"A\",\n\t\t\"repair_leader\":                       string(repairLeader),\n\t\t\"leadership_transferred\":              transferred,\n\t\t\"repair_applies\":                      repairApplies,\n\t\t\"repair_snapshot_index\":               snapshotIndex,\n\t\t\"repair_snapshot_error\":               snapshotErr,\n\t\t\"a_last_snapshot_index\":               aSnapshotIdx,\n\t\t\"snapshot_installed_on_a\":             snapshotIndex > 0 && aSnapshotIdx >= snapshotIndex,\n\t\t\"a_fsm_applied_writes_after_snapshot\": aAppliedAfter,\n\t\t\"minority_write_present_on_a_after_snapshot\": strings.Contains(aAppliedAfter, \"minority-write\"),\n\t\t\"a_config_ids_after_snapshot\":                staleElectConfigIDs(nodes[\"A\"].raft),\n\t\t\"a_conflict_index_entry_missing\":             aEntryErr != nil,\n\t\t\"fsm_applied_writes_after_snapshot\":          strings.Join(repairWrites, \",\"),\n\t\t\"fsm_applied_consistent_after_snapshot\":      repairConsistent,\n\t})\n\tfor _, id := range ids {\n\t\tif r := nodes[id].raft; r != nil {\n\t\t\tif sf := r.Shutdown(); sf != nil {\n\t\t\t\t_ = sf.Error()\n\t\t\t}\n\t\t}\n\t}\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [
+          "After the mesh is reconnected and one entry is committed, the harness applies 200 further entries on the healed leader, waits until the leader's log has advanced at least 150 entries past the conflict index, and then samples.",
+          "The healed event reports long_run_error, entries_after_heal and the derived long_run_exercised operand."
+        ],
+        "prerequisites": [
+          {
+            "alias": "adm_defect",
+            "event": "fixture",
+            "conditions": [
+              {
+                "field": "mode",
+                "op": "eq",
+                "value": "defect_restart",
+                "reference": null
+              },
+              {
+                "field": "snapshot_config_ids",
+                "op": "eq",
+                "value": "A,B,C",
+                "reference": null
+              },
+              {
+                "field": "config_entry_ids",
+                "op": "eq",
+                "value": "A,B,C,D,E",
+                "reference": null
+              },
+              {
+                "field": "commit_covers_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "snapshot_before_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "adm_control",
+            "event": "fixture",
+            "conditions": [
+              {
+                "field": "mode",
+                "op": "eq",
+                "value": "control_no_restore",
+                "reference": null
+              },
+              {
+                "field": "snapshot_config_ids",
+                "op": "eq",
+                "value": "A,B,C",
+                "reference": null
+              },
+              {
+                "field": "config_entry_ids",
+                "op": "eq",
+                "value": "A,B,C,D,E",
+                "reference": null
+              },
+              {
+                "field": "commit_covers_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "snapshot_before_config_entry",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "source_ids": {
+      "before": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votesneeded",
+        "s-votegrant",
+        "s-staging",
+        "s-dupskip"
+      ],
+      "after": [
+        "s-scan",
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-confentry",
+        "s-quorumsize",
+        "s-votegrant",
+        "s-staging",
+        "s-dupskip"
+      ]
+    },
+    "scope": {
+      "before": {
+        "description": "The five-node restart scenario (bootstrap {A,B,C}, committed applies, user snapshot on A, AddVoter D and E, graceful shutdown of A, partition {A,C} | {B,D,E}, restart of A, healing, repair by snapshot install) executed twice in one run: once restarting A with Config.RestoreCommittedLogs and once restarting it with the feature off, everything else identical, including that both runs stage the commit index during the first life by running with the feature enabled before the restart.",
+        "assumptions": [
+          "Both runs use freshly created stores and transports; the mode is the only intended difference, and in both runs A's first life runs with the feature enabled so a persisted commit index exists.",
+          "The partition, healing and repair phases run identically in both modes; the repair phase triggers a snapshot install in both runs because the leader compacts while the restarted node is cut off.",
+          "Recorded rather than asserted: the applied-write metric across nodes is only meaningful when both sides committed a write, so the control comparisons use the restarted node's own applied writes and the leader counts instead of cluster-wide consistency."
+        ],
+        "excluded": [
+          "No crash, on-disk store or user Restore is exercised.",
+          "The control reproduces the same first-life and partition schedule; it is a control for the restart mode, not for the scenario.",
+          "No repository test was executed."
+        ],
+        "parameters": {
+          "cluster_ids": "A,B,C,D,E",
+          "initial_configuration": "A,B,C",
+          "added_voters": "D,E",
+          "partition": "A,C | B,D,E",
+          "modes": [
+            "defect_restart",
+            "control_no_restore"
+          ],
+          "trailing_logs": 0
+        }
+      },
+      "after": {
+        "description": "The two-mode five-node restart scenario (feature-on restart and feature-off control in one execution) with the healed phase extended into a long run of 200 further committed entries before the sample.",
+        "assumptions": [
+          "All state is produced by normal operations: bootstrap {A,B,C}, election, committed applies, a user snapshot on A, AddVoter D and E, graceful restart of A with and without the feature, transport partition, healing and further committed entries.",
+          "The long run is applied on the healed leader whichever node it is; in the feature-on run that leader may be the stale node, in which case its own configuration decides which peers receive the entries, which is recorded through the per-node log indexes.",
+          "The sample is taken after the leader's log has advanced at least 150 entries past the conflict index, with a 15s bound; the derived long_run_exercised operand states whether that happened.",
+          "Exact indexes are not asserted; the comparisons use the mode-conditioned structural operands."
+        ],
+        "excluded": [
+          "No crash, on-disk store or user Restore is exercised.",
+          "The long run commits ordinary command entries only; no further membership change is made during it.",
+          "No repository test was executed."
+        ],
+        "parameters": {
+          "cluster_ids": "A,B,C,D,E",
+          "initial_configuration": "A,B,C",
+          "added_voters": "D,E",
+          "partition": "A,C | B,D,E",
+          "modes": [
+            "defect_restart",
+            "control_no_restore"
+          ],
+          "long_run_entries": 200,
+          "minimum_entries_after_conflict": 150
+        }
+      }
+    },
+    "prefix": {
+      "before": "The helper builds five InmemTransports in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore and Config with TrailingLogs 0, bootstraps {A,B,C} from A, starts A, B and C with MockFSM and the feature enabled, waits for a leader, transfers leadership to A if needed, applies three commands, waits on a Barrier and takes a user snapshot on A; it starts D and E, adds each as voter, applies one further command and emits 'fixture' (snapshot index and membership, newest configuration entry index and membership, stored commit index, pre-restart configuration and the derived operands). It shuts A down, cuts {A,C} from {B,D,E}, reconnects A to C only, restarts A from the same stores with the mode's restart feature setting and emits 'restart'. It waits for a leader in each partition, submits one Apply to each leader, reads both leaders' entries at the shared index and emits 'outcome' (leaders, terms, leader count, per-node leader booleans, reported configurations, write errors and indexes, payloads, conflicting_commits). It reconnects the mesh, waits for one leader, applies one more entry, waits 300ms and emits 'healed' (payloads and terms at the conflict index, applied write lists, configurations). It then runs the repair phase: choose a current-configuration leader, cut A off, apply ten commands, snapshot the leader, reconnect A, wait for the snapshot install, wait 300ms and emit 'repaired'. The test runs mode defect_restart first and control_no_restore second, so the event order is fixture, restart, outcome, healed, repaired, fixture, restart, outcome, healed, repaired.",
+      "after": "The helper builds five InmemTransports in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore and Config with TrailingLogs 0, bootstraps {A,B,C} from A, starts A, B and C with MockFSM and the feature enabled, elects a leader, transfers leadership to A if needed, applies three commands, waits for A to apply, takes a user snapshot on A, starts D and E, adds each as voter, applies one further command and emits 'fixture'. It shuts A down, cuts {A,C} from {B,D,E}, reconnects A to C only, restarts A with the mode's feature setting and emits 'restart'. It waits for a leader in each partition, applies one write on each leader, reads the entries at the shared index and emits 'outcome'. It reconnects the mesh, waits for one leader, applies one more entry, then applies 200 further entries on that leader and waits (bounded by 15s) until the leader's log has advanced at least 150 entries past the conflict index; only then does it sample payloads and terms at the conflict index, differences in the applied write lists, each node's configuration and the long-run operands, and emit 'healed'. A repair phase follows as before: choose a current-configuration leader, cut A off, apply ten commands, snapshot the leader, reconnect A, wait for the snapshot install and emit 'repaired'. The test runs mode defect_restart first and control_no_restore second. Event order: fixture, restart, outcome, healed, repaired, fixture, restart, outcome, healed, repaired."
+    },
+    "responsibility": {
+      "before": "hashicorp/raft NewRaft configuration scan plus the RestoreCommittedLogs replay: this control isolates the restart's feature setting as the cause of the stale membership and the minority election, since everything else about the two runs is identical.",
+      "after": "hashicorp/raft configuration scan with the RestoreCommittedLogs replay, and the AppendEntries duplicate-skip that prevents later replication from repairing the divergent entry or refreshing the configuration."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "restart",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "reported_config_ids",
+            "op": "eq",
+            "value": "A,B,C,D,E",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Feature on: the restarted node should use the committed configuration entry in its own log."
+        },
+        {
+          "event": "restart",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_control",
+          "assertion": {
+            "field": "reported_config_ids",
+            "op": "eq",
+            "value": "A,B,C,D,E",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            }
+          ],
+          "description": "Feature off control: the same restart without the replay should use the committed configuration."
+        },
+        {
+          "event": "outcome",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "minority_leaders",
+            "op": "eq",
+            "value": "",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Feature on: the two-voter partition should not be able to elect a leader."
+        },
+        {
+          "event": "outcome",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_control",
+          "assertion": {
+            "field": "minority_leaders",
+            "op": "eq",
+            "value": "",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            }
+          ],
+          "description": "Feature off control: the same partition should not elect a leader."
+        },
+        {
+          "event": "outcome",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_control",
+          "assertion": {
+            "field": "leader_count",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            }
+          ],
+          "description": "Feature off control: the cluster should have exactly one leader."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "a_fsm_applied_writes",
+            "op": "eq",
+            "value": "",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Feature on: the restarted node should not have applied a write of its own that the current configuration never accepted."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_control",
+          "assertion": {
+            "field": "a_fsm_applied_writes",
+            "op": "eq",
+            "value": "",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            }
+          ],
+          "description": "Feature off control: the restarted node should have applied nothing of its own."
+        }
+      ],
+      "after": [
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "entry_consistent_at_conflict_index",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Feature on, after ~200 further committed entries: all nodes should hold the same entry at the conflict index."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "a_config_ids_after_heal",
+            "op": "eq",
+            "value": "A,B,C,D,E",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Feature on, after the long run: the restarted node should use the committed configuration."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "long_run_exercised",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Operand: the sample really was taken after at least 150 entries past the conflict index."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_defect",
+          "assertion": {
+            "field": "a_log_advanced_after_heal",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "defect_restart",
+              "reference": null
+            }
+          ],
+          "description": "Operand: the restarted node kept receiving entries, so the persistence is not a stalled node."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_control",
+          "assertion": {
+            "field": "entry_consistent_at_conflict_index",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            }
+          ],
+          "description": "Feature off control after the same long run: entries should be consistent."
+        },
+        {
+          "event": "healed",
+          "identity_fields": [
+            "local_id",
+            "mode"
+          ],
+          "admission_alias": "adm_control",
+          "assertion": {
+            "field": "a_config_ids_after_heal",
+            "op": "eq",
+            "value": "A,B,C,D,E",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "control_no_restore",
+              "reference": null
+            }
+          ],
+          "description": "Feature off control after the long run: the restarted node should use the committed configuration."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Adds a long run of 200 further committed entries before the healed sample and reports the number of entries after the conflict index, so the persistence of the stale configuration and of the divergent entry and applied state is observed after substantial progress rather than after one entry; the scenario phases and the earlier comparisons are otherwise unchanged."
+}

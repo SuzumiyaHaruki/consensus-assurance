@@ -1,0 +1,256 @@
+{
+  "rationale": "Interpreted the constructor-replay receipt and closed the account for that question. Receipt 00386ad8ea534d91a0ef7506fabc9527 parsed all eight events and evaluated all five comparisons: with the replay enabled the constructor did not return within the window in both scales (violated at witness index 3 for 141 batches and index 7 for 200 batches, the latter with only 200 committed entries above the snapshot at MaxAppendEntries 1), while both feature-off controls over the identical fixtures returned with lastApplied still at the snapshot index (holds at indices 1 and 5, and the control operand at index 1). The question is therefore answered at comparison level with a bounded-progress defect, and the fact is recorded as reusable knowledge with the trigger bounds. A successor experiment for the healed-state FSM divergence is filed in the same update so the remaining consequence question moves forward while the budget allows. The filed successor extends the live-cluster harness with FSM applied-state sampling at the healed phase: local feedback is deterministic across runs (A and C applied minority-write while B, D and E applied majority-write, with every node at log index 13 after healing), so the damage is in the applied state and not only in the stored entry bytes. Its three comparisons cover that observation; the ten earlier comparisons and their receipt remain with the previous experiment rather than being re-declared.",
+  "knowledge": [
+    {
+      "ref": "@replay_stall_bound",
+      "kind": "fact",
+      "statement": "With Config.RestoreCommittedLogs enabled and a CommitTrackingLogStore, NewRaft cannot return when the replay must hand more batches to fsmMutateCh than that channel's 128-slot buffer holds, because the only consumer of the channel is runFSM, which NewRaft starts after the replay returns; the number of batches is ceil(committed-but-unapplied entries / MaxAppendEntries), so 129 entries above the last applied index stall the constructor with MaxAppendEntries 1 and 8193 entries do so with the default 64. Entries that never reach the FSM commit path (LogNoop) are skipped by prepareLog and do not create batches.",
+      "conditions": "Construction of a node whose log store reports a commit index above its snapshot/applied index while the feature is enabled; observed with in-memory stores and a 5s observation window, and derived for larger windows from the absence of any consumer before NewRaft returns.",
+      "source_ids": [
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-fsmch",
+        "s-startup-order"
+      ],
+      "executions": {
+        "00386ad8ea534d91a0ef7506fabc9527": [
+          3,
+          7,
+          1,
+          5
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+      "experiment_id": "7fa5f1ed17f8424c8920cf921834e074-experiment",
+      "source_ids": [
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-fsmch",
+        "s-startup-order",
+        "s-staging"
+      ],
+      "executions": {
+        "00386ad8ea534d91a0ef7506fabc9527": [
+          3,
+          7,
+          1,
+          5,
+          2,
+          4
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The declared predicate is that construction returns within the observation window; it is contradicted in both feature-on cases and satisfied in both controls. Admission index 2 requires 141 batches (9000 committed entries above the snapshot at MaxAppendEntries 64) and the corresponding construct event at index 3 records newraft_returned false after the 5s window; admission index 6 requires 200 batches from only 200 entries above the snapshot at MaxAppendEntries 1 and its construct event at index 7 also records newraft_returned false. The controls at the same scales (admissions 0 and 4, construct events 1 and 5) return with lastApplied 1000, i.e. still at the snapshot index, and index 1 reports the observed channel capacity 128 with an empty queue, so fixture size, store speed and FSM speed do not explain the difference. Mechanism: restoreFromCommittedLogs calls processLogs(commitIndex, nil) (api.go 724-754) before NewRaft starts any background goroutine (api.go 600-640); processLogs batches committed entries by MaxAppendEntries (raft.go 1320, 1345) and sends each batch to fsmMutateCh, whose buffer NewRaft creates with 128 slots (api.go 560); the only consumer is runFSM, started after the constructor finishes, so once the buffer is full the send can never complete and NewRaft cannot return. Bounds: the fixture is supplied by the harness rather than produced by a live node, the stalled constructor is abandoned rather than resumed, the observation window is 5s while the source argument (no consumer exists before NewRaft returns) explains why it cannot return later, and only in-memory stores were used. Reachability under permitted configuration is argued rather than observed in a cluster: MaxAppendEntries is configurable from 1 (ValidateConfig allows it; the small-batch case shows 200 entries suffice) and a larger gap follows from a delayed snapshot.",
+      "limitations": [
+        "The fixture is supplied by the harness; no live node produced the committed-but-unapplied gap.",
+        "Non-return is observed over a 5s window; permanence rests on the source argument that no consumer of fsmMutateCh exists before NewRaft returns.",
+        "Only in-memory stores were used and the stalled constructor was abandoned rather than resumed.",
+        "Does not establish how often such a gap arises in a running deployment or whether snapshots normally keep the gap below the bound."
+      ],
+      "counterevidence": [
+        "With the feature off, the identical fixtures construct normally, so the fixture's size alone does not explain the stall.",
+        "A fixture of no-op entries constructs in both modes because prepareLog never sends no-ops to the FSM, so the stall is specific to entries on the FSM commit path."
+      ]
+    },
+    {
+      "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+      "source_ids": [
+        "s-restorecommitted",
+        "s-processlogs",
+        "s-fsmch",
+        "s-startup-order",
+        "s-staging"
+      ],
+      "executions": {
+        "00386ad8ea534d91a0ef7506fabc9527": [
+          3,
+          7,
+          1,
+          5,
+          2,
+          4
+        ],
+        "2d92d633d32a4a7c9e204b7dc5c8828b": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Answer: yes. A node whose log store reports a commit index that requires more batches than the 128-slot fsmMutateCh buffer cannot finish NewRaft, because the replay runs before the only consumer of that channel is started. Receipt 00386ad8ea534d91a0ef7506fabc9527 witnesses it twice: 141 batches from 9000 committed entries at the default MaxAppendEntries 64, and 200 batches from only 200 committed entries at MaxAppendEntries 1 (indices 3 and 7, both not returning within 5s), with the two feature-off controls returning with lastApplied still at the snapshot index (indices 1 and 5) and the observed channel capacity of 128 recorded at index 1. The source basis is restoreFromCommittedLogs -> processLogs -> fsmMutateCh (api.go 724-754, raft.go 1296-1363, api.go 560) with runFSM started only after the constructor returns (api.go 600-640). The earlier receipt 2d92d633d32a4a7c9e204b7dc5c8828b is retained as an identity failure: its construct events omitted local_id, so no comparison was evaluated there and nothing is claimed from it. Remaining limits: the restart-shaped fixture is supplied rather than produced by a live deployment, the reachability of the entry gap rests on configurable MaxAppendEntries and snapshot delay rather than an observed run, and the stalled constructor is abandoned rather than resumed, so no recovery path is exhibited.",
+      "limitations": [
+        "The restart-shaped fixture is supplied by the harness; no live node produced the gap that triggers the stall.",
+        "Reachability in a real deployment rests on configurable MaxAppendEntries and delayed snapshots rather than an observed run.",
+        "Only in-memory stores and a 5s observation window were used; the stalled constructor is not resumed.",
+        "The earlier receipt for this question establishes nothing because its result events lacked the identity field."
+      ],
+      "counterevidence": [
+        "Feature-off controls over identical fixtures construct normally in both receipts, so the stall is not a property of the fixture.",
+        "No-op entries do not reach the FSM commit path and therefore do not stall construction, which scopes the defect to command or barrier entries."
+      ]
+    }
+  ],
+  "investigations": [
+    {
+      "id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+      "disposition": "explained"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "3eae8e12b0574799b781f10f7899dbad-question-0",
+    "harness_path": "assurance_stale_election_test.go",
+    "execution_package": ".",
+    "previous_id": "bff59e419ade4e618713d3fce3ff381e-experiment",
+    "revision_reason": "Adds FSM applied-state sampling at the healed phase and three comparisons over it; the cluster scenario, the admission and the ten earlier comparisons are unchanged and remain recorded with the previous experiment and its receipt.",
+    "semantic_changes": [
+      "The healed event now also reports each node's applied command list (MockFSM applied data filtered to the two conflicting write payloads), whether those lists agree, and the restarted and majority nodes' applied writes.",
+      "Three comparisons are added over the healed event: the applied writes must agree across nodes, and the two operand comparisons confirming which write each side applied."
+    ],
+    "source_ids": [
+      "s-scan",
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-confentry",
+      "s-quorumsize",
+      "s-votegrant",
+      "s-staging",
+      "s-dupskip"
+    ],
+    "scope": {
+      "description": "Real 5-node in-memory cluster whose node A restarts with Config.RestoreCommittedLogs after a committed configuration change newer than its snapshot, splits {A,C} from {B,D,E} long enough for both sides to elect and commit a different entry at the same index and term, and is then healed; this revision samples each node's applied FSM commands after healing in addition to the log payloads.",
+      "assumptions": [
+        "Cluster state is produced through normal operations only: BootstrapCluster({A,B,C}) from A, election, committed applies, a user snapshot on A, AddVoter(D), AddVoter(E) and a further apply.",
+        "A is shut down gracefully and restarted from its own store objects; all five nodes run with Config.RestoreCommittedLogs enabled so the persisted commit index the restart reads is the one the running protocol staged.",
+        "The partition and the healing are expressed only by transport disconnection and reconnection; timings, RPC lifecycles and election rules are untouched.",
+        "Applied state is read from the MockFSM that each node runs with, filtered to the two write payloads, after the partition is healed, one further entry is committed and 300 ms have passed."
+      ],
+      "excluded": [
+        "No crash, storage fault, snapshot install or log compaction is exercised.",
+        "The no-feature restart control inside the cluster remains unexecuted.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C,D,E",
+        "initial_configuration": "A,B,C",
+        "added_voters": "D,E",
+        "partition": "A,C | B,D,E",
+        "conflict_index": 11,
+        "conflict_term": 3,
+        "minority_write": "minority-write",
+        "majority_write": "majority-write"
+      }
+    },
+    "prefix": "The harness builds five InmemTransports (A..E) in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore, bootstraps {A,B,C} from A, starts A, B and C with MockFSM and Config.RestoreCommittedLogs=true, waits for a leader, transfers leadership to A if needed, applies three commands, waits on a Barrier and takes a user snapshot on A. It starts D and E, adds each as voter through the leader, applies one further command and emits 'fixture'. It shuts A down, cuts {A,C} from {B,D,E}, reconnects A to C only, restarts A from the same stores and emits 'restart'. It waits for a leader in each partition, submits one Apply to each leader, reads both leaders' entries at the shared index and emits 'outcome'. It then reconnects the full mesh, waits for exactly one leader, applies one further entry, waits 300ms and emits 'healed' with the payloads and terms at the conflict index, payload consistency, same_term_conflicting_payload, log last indexes, the restarted node's and B's configurations, the leader's configuration, the number of nodes behind the leader, each node's applied write list, whether those lists agree, and post_heal_apply_error. All nodes are shut down afterwards. Event order: fixture, restart, outcome, healed.",
+    "responsibility": "hashicorp/raft AppendEntries log-matching and the FSM apply path: same-term duplicates are skipped, so the FSM state on the two sides keeps the entries their own leader committed.",
+    "prerequisites": [
+      {
+        "alias": "adm_defect",
+        "event": "fixture",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart"
+          },
+          {
+            "field": "snapshot_config_ids",
+            "op": "eq",
+            "value": "A,B,C"
+          },
+          {
+            "field": "config_entry_ids",
+            "op": "eq",
+            "value": "A,B,C,D,E"
+          },
+          {
+            "field": "a_reported_config_ids",
+            "op": "eq",
+            "value": "A,B,C,D,E"
+          },
+          {
+            "field": "commit_covers_config_entry",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "snapshot_before_config_entry",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart"
+          }
+        ],
+        "assertion": {
+          "field": "fsm_applied_consistent",
+          "op": "eq",
+          "value": true
+        },
+        "description": "After the partition is healed, every node's FSM should have applied the same commands at the index both leaders used."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart"
+          }
+        ],
+        "assertion": {
+          "field": "a_fsm_applied_writes",
+          "op": "eq",
+          "value": "minority-write"
+        },
+        "description": "Operand: the restarted node's FSM applied the minority write, which the current configuration's quorum never accepted."
+      },
+      {
+        "event": "healed",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_defect",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "defect_restart"
+          }
+        ],
+        "assertion": {
+          "field": "b_fsm_applied_writes",
+          "op": "eq",
+          "value": "majority-write"
+        },
+        "description": "Operand: a node on the majority side applied the majority write at the same index."
+      }
+    ]
+  }
+}

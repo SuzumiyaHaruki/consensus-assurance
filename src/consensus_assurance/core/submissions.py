@@ -54,7 +54,7 @@ class InterpretationUpdate(Record):
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
     defect_claim: Literal["asserted", "refuted", "unresolved"] | None = Field(
         description="Explicit current scoped model defect judgment, independent of execution and comparison results; null means no current claim, never inheritance")
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(min_length=1, description="Current explanation of the whole question, starting with the present conclusion and basis. Integrate still-applicable limits; do not prepend a revision log. Put this update's change explanation in AuditSubmission.rationale.")
     answers: dict[str, GapAnswer] = Field(default_factory=dict,
         description="Registered gap ID to an explanation and explicit model resolution judgment; resolved=false retains or reopens the gap; omitted IDs keep prior responses")
     knowledge: list[KnowledgeUse] = []
@@ -89,7 +89,7 @@ class StopRequest(Record):
 
 
 class AuditSubmission(Record):
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(min_length=1, description="This update's research action, reason and actual change; current question explanations belong in Interpretation.rationale.")
     sources: list[SourceRange] = []
     investigations: list[QuestionUpdate] = []
     knowledge: list[KnowledgeUpdate] = []

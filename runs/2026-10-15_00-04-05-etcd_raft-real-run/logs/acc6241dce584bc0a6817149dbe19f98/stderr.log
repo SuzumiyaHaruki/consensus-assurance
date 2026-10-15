@@ -1,0 +1,138 @@
+2026-10-14T16:14:40.736932Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to find expected lines in /home/nitro/Desktop/consensus-assurance/runs/2026-10-15_00-04-05-etcd_raft-real-run/draft/assurance_generated_test.go:
+func TestAssuranceInboundForgetLeader(t *testing.T) {
+	emit := func(ev map[string]any) {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatalf("marshal event: %v", err)
+		}
+		fmt.Println("CA_EVENT " + string(b))
+	}
+	errString := func(err error) string {
+		if err == nil {
+			return ""
+		}
+		return err.Error()
+	}
+	drain := func(rn *raft.RawNode) raft.Ready {
+		rd := rn.Ready()
+		rn.Advance(rd)
+		return rd
+	}
+	lead := func(rn *raft.RawNode) uint64 { return rn.BasicStatus().SoftState.Lead }
+	find := func(rd raft.Ready, typ pb.MessageType, to uint64) []*pb.Message {
+		var out []*pb.Message
+		for _, m := range rd.Messages {
+			if m.GetType() == typ && m.GetTo() == to {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	// All three voters share the same log prefix (index=10, term=1), so a
+	// campaign by node 3 is log-up-to-date with respect to node 2: the only
+	// reason for node 2 to withhold support is the lease it holds after hearing
+	// from the live leader 1.
+	newNode := func(id uint64) *raft.RawNode {
+		ms := raft.NewMemoryStorage()
+		snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
+			Index:     new(uint64(10)),
+			Term:      new(uint64(1)),
+			ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
+		}}
+		if err := ms.ApplySnapshot(snap); err != nil {
+			t.Fatalf("apply snapshot: %v", err)
+		}
+		if err := ms.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(uint64(10))}); err != nil {
+			t.Fatalf("set hard state: %v", err)
+		}
+		rn, err := raft.NewRawNode(&raft.Config{
+			ID:              id,
+			ElectionTick:    10,
+			HeartbeatTick:   1,
+			Storage:         ms,
+			MaxSizePerMsg:   1 << 20,
+			MaxInflightMsgs: 256,
+			CheckQuorum:     true,
+			PreVote:         true,
+		})
+		if err != nil {
+			t.Fatalf("new raw node %d: %v", id, err)
+		}
+		return rn
+	}
+
+	leader, follower, other := newNode(1), newNode(2), newNode(3)
+
+	// Produce a real election: node 1 campaigns, voters 2 and 3 answer, and the
+	// resulting messages travel through the documented inbound path.
+	if err := leader.Campaign(); err != nil {
+		t.Fatalf("campaign: %v", err)
+	}
+	for _, m := range drain(leader).Messages {
+		switch m.GetTo() {
+		case 2:
+			if err := follower.Step(m); err != nil {
+				t.Fatalf("step vote request on 2: %v", err)
+			}
+		case 3:
+			if err := other.Step(m); err != nil {
+				t.Fatalf("step vote request on 3: %v", err)
+			}
+		}
+	}
+	for _, rn := range []*raft.RawNode{follower, other} {
+		for _, m := range drain(rn).Messages {
+			if err := leader.Step(m); err != nil {
+				t.Fatalf("step vote response on 1: %v", err)
+			}
+		}
+	}
+	// Replicate node 1's term-2 entry and feed the acknowledgements back, so the
+	// leader is established from the followers' point of view.
+	for _, m := range drain(leader).Messages {
+		switch m.GetTo() {
+		case 2:
+			if err := follower.Step(m); err != nil {
+				t.Fatalf("step append on 2: %v", err)
+			}
+		case 3:
+			if err := other.Step(m); err != nil {
+				t.Fatalf("step append on 3: %v", err)
+			}
+		}
+	}
+	for _, rn := range []*raft.RawNode{follower, other} {
+		for _, m := range drain(rn).Messages {
+			if err := leader.Step(m); err != nil {
+				t.Fatalf("step append response on 1: %v", err)
+			}
+		}
+	}
+	drain(leader)
+
+	// One heartbeat tick makes the live leader 1 produce a real heartbeat, which
+	// is delivered to follower 2 exactly once. This establishes 2's leader
+	// context (lead=1) and its election-timeout lease.
+	leader.Tick()
+	tick := drain(leader)
+	heartbeats := find(tick, pb.MsgHeartbeat, 2)
+	if len(heartbeats) != 1 {
+		t.Fatalf("expected one heartbeat for node 2, got %d", len(heartbeats))
+	}
+	// Node 3 hears the same heartbeat, but its delivery is not part of the
+	// comparison below; it only gives node 3 a live leader context of its own.
+	otherHeartbeats := find(tick, pb.MsgHeartbeat, 3)
+	if len(otherHeartbeats) != 1 {
+		t.Fatalf("expected one heartbeat for node 3, got %d", len(otherHeartbeats))
+	}
+	if err := other.Step(otherHeartbeats[0]); err != nil {
+		t.Fatalf("step heartbeat on 3: %v", err)
+	}
+	hb := heartbeats[0]
+	if err := follower.Step(hb); err != nil {
+		t.Fatalf("step heartbeat on 2: %v", err)
+	}
+	emit(map[string]any{
+		"event": "heartbeat_delivered", "to": 2, "sender": 1,
+		"term": hb.GetTerm(), "commit": hb.GetCommit(), "lead_after": lead(follower),
+	})

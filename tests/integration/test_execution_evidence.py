@@ -255,7 +255,8 @@ def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path
     assert 'Current model defect claim: defect claim refuted within the stated scope' in other and report.count('### ')==1
     assert 'historical interpretation; the question has a later account' in other
     assert limitation in other
-    assert all(i.rationale in report for i in state.interpretations)
+    assert state.interpretations[-1].rationale in report and state.interpretations[0].rationale not in report
+    assert all(i.id in report for i in state.interpretations)
     assert state.interpretations[-1].counterevidence[0] in report
     assert (repo/'README.md').read_text()==contract
 

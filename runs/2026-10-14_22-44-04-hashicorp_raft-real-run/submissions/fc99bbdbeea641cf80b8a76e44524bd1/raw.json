@@ -1,0 +1,186 @@
+{
+  "rationale": "Answered the last reachability limit of the constructor question: the stall occurs with MaxAppendEntries at its default 64. The live harness now leaves the batch size at the default and lets the follower accumulate a gap beyond 128*64 entries (its snapshots are delayed because the harness configures a ten-minute SnapshotInterval and takes none), and reports the expected batch count against the observed channel capacity. Local construction feedback: 8303 entries to replay, 130 batches against a 128-slot channel, the feature-on restart never returning, the cluster alive without it, and the same stores without the feature constructing and staying at the snapshot index.",
+  "experiment": {
+    "investigation_id": "e99a162d27c7421fa6729d8cb9703581-question-1",
+    "harness_path": "assurance_live_replay_stall_test.go",
+    "execution_package": ".",
+    "previous_id": "e3bde5b35609431a99e16435bfeb7122-experiment",
+    "revision_reason": "Repeats the live reproduction with MaxAppendEntries left at its default 64 and a gap beyond 128*64 entries, so the fixture's batch size is no longer a non-default setting; the scenario, event names and comparisons are otherwise the same.",
+    "semantic_changes": [
+      "The follower accumulates 8300 further committed entries instead of 250, and both restart attempts use the default MaxAppendEntries.",
+      "The fixture now reports max_append_entries and expected_batches (ceil(entries to replay / MaxAppendEntries)) so the batch demand can be compared with the observed channel capacity."
+    ],
+    "source_ids": [
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-fsmch",
+      "s-startup-order",
+      "s-staging"
+    ],
+    "scope": {
+      "description": "Live three-node cluster (A, B, C; in-memory transports and stores; timeouts scaled to 50ms) in which node A runs with Config.RestoreCommittedLogs enabled, is snapshotted early, receives 8300 further committed entries so its staged commit index is more than 128*64 above that snapshot, is shut down while B and C retain a quorum, and is restarted from its own stores twice with the default MaxAppendEntries: once with the feature, once without it.",
+      "assumptions": [
+        "All state comes from normal operations: bootstrap {A,B,C} from A, election with leadership moved to B if needed, committed applies, a user Snapshot on A, further committed applies and a graceful Shutdown of A.",
+        "The snapshot stays where the harness took it because SnapshotInterval is ten minutes and no automatic snapshot is taken; this is the delayed-snapshot condition that lets the gap exceed the default SnapshotThreshold.",
+        "The feature is enabled on all nodes during the first life, which leaves a persisted commit index in A's log store.",
+        "Non-return is evaluated by constructing in a goroutine and waiting 5s; the control uses the same stores with the feature off.",
+        "Exact entry counts vary with scheduling, so the admission asserts only mode, cluster ids, leader, the default batch size and the derived gap flag."
+      ],
+      "excluded": [
+        "No crash, process kill or on-disk store is exercised.",
+        "Snapshots are not failed explicitly; the harness simply takes none after the early one, which models delayed snapshotting rather than a specific failure mode.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C",
+        "entries_to_replay_observed": 8303,
+        "expected_batches_observed": 130,
+        "max_append_entries": 64,
+        "channel_capacity_observed": 128,
+        "observation_window_seconds": 5
+      }
+    },
+    "prefix": "The harness builds three InmemTransports (A, B, C) in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore, bootstraps {A,B,C} from A with Config.RestoreCommittedLogs enabled, starts A, B and C with MockFSM and the default MaxAppendEntries, waits for a leader and transfers leadership to B if another node won. It applies five commands, waits until A has applied at least four entries, takes a user snapshot on A, applies 8300 further commands and waits until A's staged commit index is at least 8200 above that snapshot, then emits 'fixture' with the snapshot index, staged commit index, A's log last index, the entries the replay would cover, the expected batch count, the configured MaxAppendEntries, whether the expected batches exceed 128, the cluster ids and the leader. It shuts A down, confirms a leader survives, and emits 'cluster_status'. Each restart attempt creates a fresh transport for A, reconnects peers and calls NewRaft in a goroutine with a bounded window: 'stalled_restart' with the feature, then 'control_restart' without it, whose event reports newraft_returned, state, last_applied, applied_at_snapshot, the observed channel capacity and whether the replay demand exceeds that capacity, followed by 'control_restart_summary'. Event order: fixture, stalled_restart, cluster_status, control_restart, control_restart_summary.",
+    "responsibility": "hashicorp/raft NewRaft startup path: restoreFromCommittedLogs replays committed entries through processLogs into fsmMutateCh before the constructor starts the only consumer, runFSM.",
+    "prerequisites": [
+      {
+        "alias": "adm_live",
+        "event": "fixture",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          },
+          {
+            "field": "cluster_ids",
+            "op": "eq",
+            "value": "A,B,C"
+          },
+          {
+            "field": "leader",
+            "op": "eq",
+            "value": "B"
+          },
+          {
+            "field": "max_append_entries",
+            "op": "eq",
+            "value": 64
+          },
+          {
+            "field": "gap_over_channel",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "stalled_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "newraft_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "A follower restarted with the feature and the default batch size over more committed entries than the channel can hold should finish NewRaft within the window."
+      },
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "newraft_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Control: the same stores restarted without the feature should construct normally."
+      },
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "applied_at_snapshot",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Control operand: without the replay the FSM stays at the snapshot index."
+      },
+      {
+        "event": "control_restart",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "replay_exceeds_channel",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Mechanism operand: the fixture's batch demand exceeds the capacity observed on the same node in the control run."
+      },
+      {
+        "event": "cluster_status",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_live",
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "live_restart_after_long_gap"
+          }
+        ],
+        "assertion": {
+          "field": "cluster_alive_without_a",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The remaining two voters keep a quorum while the restarted node cannot start."
+      }
+    ]
+  }
+}

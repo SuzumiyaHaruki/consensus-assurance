@@ -1,0 +1,206 @@
+{
+  "id": "16929a65990d446dad09fb1f6c9fe1a2-experiment",
+  "investigation_id": "16929a65990d446dad09fb1f6c9fe1a2-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sort\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nfunc noSnapEmit(fields map[string]interface{}) {\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc noSnapIDs(c Configuration) string {\n\tids := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tids = append(ids, string(s.ID))\n\t}\n\tsort.Strings(ids)\n\treturn strings.Join(ids, \",\")\n}\n\n// TestAssuranceNoSnapshotRestartConfiguration asks what configuration a node ends\n// up with when it is restarted with Config.RestoreCommittedLogs while it has no\n// snapshot at all, so the only record of its membership besides the log is\n// nothing, and the log scan is what would normally rebuild it.\nfunc TestAssuranceNoSnapshotRestartConfiguration(t *testing.T) {\n\tconst mode = \"no_snapshot_restart\"\n\tids := []ServerID{\"A\", \"B\", \"C\"}\n\n\tnewConf := func(id ServerID, restoreCommitted bool) *Config {\n\t\tc := DefaultConfig()\n\t\tc.LocalID = id\n\t\tc.HeartbeatTimeout = 50 * time.Millisecond\n\t\tc.ElectionTimeout = 50 * time.Millisecond\n\t\tc.LeaderLeaseTimeout = 50 * time.Millisecond\n\t\tc.CommitTimeout = 5 * time.Millisecond\n\t\tc.SnapshotInterval = 10 * time.Minute\n\t\tc.Logger = hclog.NewNullLogger()\n\t\tc.RestoreCommittedLogs = restoreCommitted\n\t\treturn c\n\t}\n\n\ttrans := map[ServerID]*InmemTransport{}\n\tlogs := map[ServerID]*InmemCommitTrackingStore{}\n\tstable := map[ServerID]*InmemStore{}\n\tsnaps := map[ServerID]*InmemSnapshotStore{}\n\trafts := map[ServerID]*Raft{}\n\tfor _, id := range ids {\n\t\t_, tr := NewInmemTransport(ServerAddress(id))\n\t\ttrans[id] = tr\n\t\tlogs[id] = NewInmemCommitTrackingStore()\n\t\tstable[id] = NewInmemStore()\n\t\tsnaps[id] = NewInmemSnapshotStore()\n\t}\n\tconnect := func(a, b ServerID) {\n\t\ttrans[a].Connect(ServerAddress(b), trans[b])\n\t\ttrans[b].Connect(ServerAddress(a), trans[a])\n\t}\n\tfor i := range ids {\n\t\tfor j := range ids {\n\t\t\tif i != j {\n\t\t\t\tconnect(ids[i], ids[j])\n\t\t\t}\n\t\t}\n\t}\n\tstart := func(id ServerID, restoreCommitted bool) *Raft {\n\t\tr, err := NewRaft(newConf(id, restoreCommitted), new(MockFSM), logs[id], stable[id], snaps[id], trans[id])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"%s: NewRaft: %v\", id, err)\n\t\t}\n\t\trafts[id] = r\n\t\treturn r\n\t}\n\n\tcfg := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t\t{Suffrage: Voter, ID: \"C\", Address: \"C\"},\n\t}}\n\tif err := BootstrapCluster(newConf(\"A\", true), logs[\"A\"], stable[\"A\"], snaps[\"A\"], trans[\"A\"], cfg); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\ta := start(\"A\", true)\n\tstart(\"B\", true)\n\tstart(\"C\", true)\n\n\twaitLeader := func(candidates []ServerID, d time.Duration) ServerID {\n\t\tdeadline := time.Now().Add(d)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tfor _, id := range candidates {\n\t\t\t\tif r := rafts[id]; r != nil && r.State() == Leader {\n\t\t\t\t\treturn id\n\t\t\t\t}\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t\treturn \"\"\n\t}\n\tleaderID := waitLeader(ids, 10*time.Second)\n\tif leaderID == \"\" {\n\t\tt.Fatalf(\"no leader\")\n\t}\n\t// Keep A as a follower so that the restart under test is a follower restart.\n\tif leaderID == \"A\" {\n\t\tif f := a.LeadershipTransferToServer(\"B\", \"B\"); f != nil {\n\t\t\t_ = f.Error()\n\t\t}\n\t\tdeadline := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(deadline) && rafts[\"B\"].State() != Leader {\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t}\n\tif rafts[\"B\"].State() != Leader {\n\t\tt.Fatalf(\"B is not leader\")\n\t}\n\n\t// Commit entries, including the configuration entry, but take no snapshot on A.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := rafts[\"B\"].Apply([]byte(fmt.Sprintf(\"cmd-%d\", i)), 3*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\tdeadline := time.Now().Add(10 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif idx, err := logs[\"A\"].GetCommitIndex(); err == nil && idx > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\tsnapList, _ := snaps[\"A\"].List()\n\tstagedCommit, _ := logs[\"A\"].GetCommitIndex()\n\tlastLog, _ := logs[\"A\"].LastIndex()\n\tconfigBefore := noSnapIDs(a.getLatestConfiguration())\n\n\tnoSnapEmit(map[string]interface{}{\n\t\t\"event\":              \"fixture\",\n\t\t\"mode\":               mode,\n\t\t\"local_id\":           \"A\",\n\t\t\"a_snapshots\":        len(snapList),\n\t\t\"a_staged_commit\":    stagedCommit,\n\t\t\"a_log_last_index\":   lastLog,\n\t\t\"a_config_before\":    configBefore,\n\t\t\"a_reported_config\":  noSnapIDs(a.getLatestConfiguration()),\n\t\t\"leader\":             \"B\",\n\t\t\"committed_commands\": 10,\n\t})\n\n\t// Restart A from its own stores, once with the feature and once without it.\n\tattempt := func(name string, restoreCommitted bool, window time.Duration) {\n\t\tif sf := rafts[\"A\"].Shutdown(); sf != nil {\n\t\t\t_ = sf.Error()\n\t\t}\n\t\t_, newTrans := NewInmemTransport(ServerAddress(\"A\"))\n\t\ttrans[\"A\"] = newTrans\n\t\tfor _, id := range ids {\n\t\t\tif id != \"A\" {\n\t\t\t\ttrans[id].Disconnect(\"A\")\n\t\t\t\tconnect(\"A\", id)\n\t\t\t}\n\t\t}\n\t\tdone := make(chan *Raft, 1)\n\t\tgo func() {\n\t\t\tr, err := NewRaft(newConf(\"A\", restoreCommitted), new(MockFSM), logs[\"A\"], stable[\"A\"], snaps[\"A\"], newTrans)\n\t\t\tif err != nil {\n\t\t\t\tdone <- nil\n\t\t\t\treturn\n\t\t\t}\n\t\t\tdone <- r\n\t\t}()\n\t\tselect {\n\t\tcase r := <-done:\n\t\t\tif r == nil {\n\t\t\t\tnoSnapEmit(map[string]interface{}{\"event\": name, \"mode\": mode, \"local_id\": \"A\", \"newraft_returned\": true, \"error\": \"NewRaft returned an error\"})\n\t\t\t\treturn\n\t\t\t}\n\t\t\trafts[\"A\"] = r\n\t\t\ttime.Sleep(300 * time.Millisecond)\n\t\t\tnoSnapEmit(map[string]interface{}{\n\t\t\t\t\"event\":                      name,\n\t\t\t\t\"mode\":                       mode,\n\t\t\t\t\"local_id\":                   \"A\",\n\t\t\t\t\"newraft_returned\":           true,\n\t\t\t\t\"state\":                      r.State().String(),\n\t\t\t\t\"last_applied\":               r.getLastApplied(),\n\t\t\t\t\"reported_config_ids\":        noSnapIDs(r.getLatestConfiguration()),\n\t\t\t\t\"reported_config_list_len\":   len(r.getLatestConfiguration().Servers),\n\t\t\t\t\"total_voters_in_log_config\": len(cfg.Servers),\n\t\t\t})\n\t\tcase <-time.After(window):\n\t\t\tnoSnapEmit(map[string]interface{}{\"event\": name, \"mode\": mode, \"local_id\": \"A\", \"newraft_returned\": false, \"window_ms\": window.Milliseconds()})\n\t\t}\n\t}\n\n\tattempt(\"restart_with_feature\", true, 10*time.Second)\n\tattempt(\"restart_without_feature\", false, 10*time.Second)\n\n\tfor _, id := range ids {\n\t\tif r := rafts[id]; r != nil {\n\t\t\tif sf := r.Shutdown(); sf != nil {\n\t\t\t\t_ = sf.Error()\n\t\t\t}\n\t\t}\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "adm_fixture",
+          "event": "fixture",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "no_snapshot_restart",
+              "reference": null
+            },
+            {
+              "field": "local_id",
+              "op": "eq",
+              "value": "A",
+              "reference": null
+            },
+            {
+              "field": "a_snapshots",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            },
+            {
+              "field": "a_reported_config",
+              "op": "eq",
+              "value": "A,B,C",
+              "reference": null
+            },
+            {
+              "field": "committed_commands",
+              "op": "eq",
+              "value": 10,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s-scan",
+      "s-restorecommitted",
+      "s-processlogs",
+      "s-confentry",
+      "s-quorumsize"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Live three-node cluster {A,B,C} in which node A runs with Config.RestoreCommittedLogs enabled, receives ten committed commands plus the bootstrap configuration entry and takes no snapshot at all, is shut down and then restarted twice from its own stores: once with the feature enabled and once without it.",
+      "assumptions": [
+        "All state comes from normal operations: bootstrap {A,B,C} from A, election with leadership moved to B so A is a follower, ten committed applies and a graceful shutdown of A.",
+        "A takes no snapshot because the harness never snapshots it and SnapshotInterval is ten minutes, so A's snapshot store is empty at the restart.",
+        "A's log store implements CommitTrackingLogStore and stages a commit index while O is running with the feature enabled, so the replay has entries to cover.",
+        "The reported configuration is read through the node's atomic latest-configuration copy after each restart, with a 300ms settle.",
+        "Exact indexes are reported as operands but not asserted; the admission pins the absence of snapshots, the running node's configuration and the number of committed commands."
+      ],
+      "excluded": [
+        "No crash, on-disk store, or snapshot failure is injected; the node simply has no snapshot.",
+        "An election by the restarted node is not attempted, so the source-derived consequence that it will not campaign is not executed.",
+        "No repository test was executed."
+      ],
+      "parameters": {
+        "cluster_ids": "A,B,C",
+        "a_snapshots": 0,
+        "a_staged_commit_observed": 12,
+        "a_log_last_index_observed": 13,
+        "committed_commands": 10
+      }
+    },
+    "prefix": "The harness builds three InmemTransports (A, B, C) in a full mesh with per-node InmemStore, InmemCommitTrackingStore and InmemSnapshotStore, bootstraps {A,B,C} from A with Config.RestoreCommittedLogs enabled, starts A, B and C with MockFSM, waits for a leader and transfers leadership to B so A stays a follower. It applies ten commands on B, waits until A's log store reports a staged commit index, takes no snapshot on A, and emits a 'fixture' event with the number of snapshots A holds, A's staged commit index, its log last index, the configuration A reports while running, the leader and the number of committed commands. It then shuts A down and restarts it in a goroutine from its own stores with a fresh transport, twice in sequence: 'restart_with_feature' with Config.RestoreCommittedLogs enabled and 'restart_without_feature' with it disabled, each emitting newraft_returned, the node state, last applied index, the reported configuration id list and its length, and the number of voters in the log's configuration entry. All nodes are shut down afterwards. Event order: fixture, restart_with_feature, restart_without_feature.",
+    "requirement": null,
+    "responsibility": "hashicorp/raft NewRaft startup path: the post-restore configuration scan rebuilds r.configurations from the log only above max(lastSnapshotIndex, lastApplied), and the eager replay raises lastApplied to the persisted commit index.",
+    "comparisons": [
+      {
+        "event": "restart_with_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "reported_config_ids",
+          "op": "eq",
+          "value": "A,B,C",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart",
+            "reference": null
+          }
+        ],
+        "description": "With the feature enabled and no snapshot, the restarted node should rebuild its membership from the configuration entry in its log."
+      },
+      {
+        "event": "restart_with_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "reported_config_list_len",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart",
+            "reference": null
+          }
+        ],
+        "description": "Same predicate as the previous comparison expressed as the number of configured servers."
+      },
+      {
+        "event": "restart_without_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "reported_config_ids",
+          "op": "eq",
+          "value": "A,B,C",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart",
+            "reference": null
+          }
+        ],
+        "description": "Control: without the replay the same restart should rebuild the membership from the log."
+      },
+      {
+        "event": "restart_without_feature",
+        "identity_fields": [
+          "local_id",
+          "mode"
+        ],
+        "admission_alias": "adm_fixture",
+        "assertion": {
+          "field": "reported_config_list_len",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "no_snapshot_restart",
+            "reference": null
+          }
+        ],
+        "description": "Control expressed as the number of configured servers."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "4dd382e5677a42a0b3560f38acbbd7db",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "16929a65990d446dad09fb1f6c9fe1a2",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}
