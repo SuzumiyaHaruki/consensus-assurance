@@ -1,0 +1,137 @@
+{
+  "rationale": "Built and locally verified the harness for the stale-configuration safety question and queued it. The harness reproduces the whole chain on a five-voter commit-tracking cluster: remove two voters, snapshot the node under test while that smaller configuration is in force, re-add the two voters, commit later traffic, restart the node (its live configuration is the snapshot's three-voter set while the recommitted entry sits in its log), transfer leadership to it, and observe a write it acknowledges while only two of the five voters hold it, followed by a leader elected from the configuration in force that does not have that write. Local construction feedback showed the chain end to end; the retained receipt of this experiment is what the account will be raised on.",
+  "sources": [
+    {
+      "id": "s-commitment",
+      "file": "commitment.go",
+      "start_line": 1,
+      "end_line": 104,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s-quorum",
+      "file": "raft.go",
+      "start_line": 1080,
+      "end_line": 1100,
+      "kind": "code_observation"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "a867b593d52841198a36a897ae6a8f0a-question-1",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "s-scan",
+      "s-restore-committed",
+      "s-commitment",
+      "s-quorum"
+    ],
+    "scope": {
+      "description": "One five-voter in-memory cluster with commit-tracking stores and RestoreCommittedLogs enabled. Two voters are removed so the configuration in force is a three-voter set, the node under test snapshots in that state, the two voters are re-added, later traffic is committed, and the node is restarted from its retained stores. Its stub configuration and the peers it replicates to are recorded, leadership is transferred to it, the write it acknowledges is recorded together with the nodes that hold it, every holder is shut down, and the leader elected afterwards is checked for the acknowledged write.",
+      "assumptions": [
+        "Transports are the repository's InmemTransport, log stores the repository's InmemCommitTrackingStore, the FSM is the repository's MockFSM, and configuration changes use the public AddVoter/RemoveServer APIs.",
+        "ShutdownOnRemove is false so that removing a voter that happens to be the leader does not terminate the process under test.",
+        "Only transport-level disconnection is used to isolate a peer; no fault is injected into any node's logic.",
+        "The payload check reads each node's log store for the exact byte payload."
+      ]
+    },
+    "prefix": "Bootstrap five voters with commit-tracking stores and RestoreCommittedLogs=true; RemoveServer the two voters that will later be re-added; apply a few commands so the FSM can snapshot; take a user snapshot on the node under test while the three-voter configuration is committed; AddVoter both nodes again; apply twenty traffic commands so the node's staged commit index passes the recommitted entries; capture its configuration, shut it down, restart it with NewRaft on a fresh transport and rewire the transports; record the live configuration, staged commit index, last applied, and whether the log still holds a configuration entry beyond the snapshot; transfer leadership to the restarted node and wait until it reports Leader; disconnect it from one voter; apply the payload; record each node's possession of the payload, the derived quorums and whether the write was backed by a true majority; shut down every holder; wait for a leader among the survivors and record whether it holds the acknowledged payload.",
+    "requirement": "An entry that a leader acknowledges to a client must be stored by a majority of the configuration in force at the time, and must be present in the log of any leader later elected from that configuration.",
+    "responsibility": "Raft itself: the leader's commit rule and quorum accounting use the configuration the node recovered, and the node's own recovery path is what leaves that configuration behind the log's committed history.",
+    "anchors": [
+      {
+        "material_id": "s-commitment",
+        "symbol": "recalculate",
+        "start_line": 88,
+        "end_line": 88
+      },
+      {
+        "material_id": "s-quorum",
+        "symbol": "quorumSize",
+        "start_line": 1087,
+        "end_line": 1087
+      },
+      {
+        "material_id": "s-scan",
+        "symbol": "NewRaft",
+        "start_line": 508,
+        "end_line": 508
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "stale-restart",
+        "event": "stale_config_restart",
+        "conditions": [
+          {
+            "field": "live_voters_after_restart",
+            "op": "eq",
+            "value": 3
+          },
+          {
+            "field": "log_has_config_entry_beyond_snapshot",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "true_quorum",
+            "op": "eq",
+            "value": 3
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "stale_config_write",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "stale-restart",
+        "assertion": {
+          "field": "write_backed_by_true_quorum",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The write the stale-configuration leader acknowledges is held by at least a majority of the five-voter configuration in force."
+      },
+      {
+        "event": "stale_config_loss",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "stale-restart",
+        "assertion": {
+          "field": "acknowledged_write_absent_from_new_leader",
+          "op": "eq",
+          "value": false
+        },
+        "description": "The acknowledged write survives in the leader elected from the configuration in force."
+      }
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "a867b593d52841198a36a897ae6a8f0a-question-1",
+      "source_ids": [
+        "s-scan",
+        "s-restore-committed",
+        "s-commitment",
+        "s-quorum",
+        "s-runfollower-gate"
+      ],
+      "rationale": "Current account (source-derived, measurement pending): a leader's commit rule is computed from r.configurations.latest, which commitment.setConfiguration and quorumSize consume; when a restart leaves that configuration behind the log's committed history, a node that then leads uses the smaller voter set for both its quorum and its replication set, so it can acknowledge a write that a majority of the configuration in force never stores, and a leader elected from that configuration can be elected without the entry. Source side: restoreFromCommittedLogs applies logs up to the recovered commit index and the configuration scan then starts after it, so the recommitted configuration entry is never loaded even though the entry recording the change remains in the log; quorumSize and commitment both count voters from the recovered configuration, and commitment.recalculate commits the (n-1)/2-th match index of that set. The discrimination is the queued experiment: it restarts the node under test from a snapshot that records a three-voter configuration while the configuration in force has five voters, transfers leadership to it, and checks whether the acknowledged write is backed by a true majority and whether it survives in a leader elected from the configuration in force. Local construction feedback of these harness bytes showed the chain end to end, including acknowledged apply error nil with only two holders out of five voters and a later leader without the payload; those local numbers are construction feedback only and are not retained evidence, so the conclusion stays conditional until the receipt is read.",
+      "conclusion": "conditional",
+      "defect_claim": "unresolved",
+      "counterevidence": [
+        "The configuration gap needs a snapshot taken while a smaller configuration was committed plus later entries that advance the recovered commit index past the recommitting entry; a cluster that snapshots after every configuration change may not reach that state.",
+        "A later configuration entry or an installed snapshot repairs the recovered configuration, and the experiment deliberately prevents repair by isolating one voter and keeping the configuration stable.",
+        "The local construction run is not retained evidence; the phase ordering it exercises (transfer, disconnection, shutdown of holders) could behave differently under the controller's execution."
+      ],
+      "limitations": [
+        "Applies to nodes with RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore.",
+        "The measured history is a single in-memory five-voter cluster with authored commands and the repository's in-memory stores; production stores, multi-datacenter latencies and concurrent client traffic are not covered.",
+        "The acknowledgement is observed through the Apply future of the node under test; the loss is observed as absence of the payload from the later leader's log store, which does not by itself prove that no other surviving node could later resurrect the entry."
+      ]
+    }
+  ]
+}

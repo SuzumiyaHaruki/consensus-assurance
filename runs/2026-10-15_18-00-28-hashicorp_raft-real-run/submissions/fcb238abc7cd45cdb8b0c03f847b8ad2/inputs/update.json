@@ -1,0 +1,130 @@
+{
+  "rationale": "Opened an independent lead in the client-contract mechanism: the public configuration future and the documented latest_configuration_index stat both appear pinned to zero. Source reading shows GetConfiguration builds a local configurationsFuture with only the latest configuration set, so Index() returns the zero latestIndex, and Stats copies that value into a documented key; a small probe now measures the committed configuration entry's real index against both endpoints and is queued for execution.",
+  "sources": [
+    {
+      "id": "s-getconfig",
+      "file": "api.go",
+      "start_line": 943,
+      "end_line": 951,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s-stats",
+      "file": "api.go",
+      "start_line": 1208,
+      "end_line": 1240,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@config-index-contract",
+      "question": "Does the public configuration future report the log index of the configuration entry in force, as the IndexFuture contract and the documented latest_configuration_index stat key imply, once a configuration change has been committed?",
+      "source_ids": [
+        "s-getconfig",
+        "s-stats"
+      ],
+      "hypothesis": "GetConfiguration builds a fresh configurationsFuture whose configurations value carries only the latest Configuration, so its latestIndex stays zero: ConfigurationFuture.Index() always returns 0 and Stats copies that 0 into latest_configuration_index even though the node has a committed configuration entry with a real index.",
+      "discriminator": "After committing a configuration change, compare the index reported by the change's own future with GetConfiguration().Index() and with Stats()[\"latest_configuration_index\"], and confirm from the log store that the entry at that index is a configuration entry while the live configuration already contains the changed server set."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@config-index-contract",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "s-getconfig",
+      "s-stats"
+    ],
+    "scope": {
+      "description": "A two-voter in-memory cluster applies three commands, commits an AddNonvoter configuration change, and then reports that change's own index, the index from the public configuration future, the documented stats key, and the live configuration, together with the log entry type at the change's index.",
+      "assumptions": [
+        "The cluster, transports and FSM are the repository's own test facilities (MakeClusterCustom with InmemTransport and MockFSM).",
+        "The configuration change is committed because its future returned without error, which is the premise for the index comparison.",
+        "No internal state is required for the comparison: the change index comes from its public future, the endpoints come from public methods, and the log entry type comes from the log store."
+      ]
+    },
+    "prefix": "Start a two-peer cluster, apply three commands to completion, commit AddNonvoter for a new server, emit the setup event with the change index, the entry type at that index and the peer count, then call GetConfiguration() and Stats() and emit the future index, the stats value, both derived match booleans and the live configuration.",
+    "requirement": "The configuration future returned to a client, and the documented latest_configuration_index stat, must report the index of the configuration entry in force rather than a constant.",
+    "responsibility": "Raft itself: both endpoints are produced inside the library from the configuration it already tracks.",
+    "anchors": [
+      {
+        "material_id": "s-getconfig",
+        "symbol": "GetConfiguration",
+        "start_line": 945,
+        "end_line": 945
+      },
+      {
+        "material_id": "s-stats",
+        "symbol": "Stats",
+        "start_line": 1208,
+        "end_line": 1208
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "committed-config-change",
+        "event": "configuration_future_setup",
+        "conditions": [
+          {
+            "field": "log_entry_type",
+            "op": "eq",
+            "value": "LogConfiguration"
+          },
+          {
+            "field": "configuration_entry_index",
+            "op": "ne",
+            "value": 0
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "configuration_future_index",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "committed-config-change",
+        "assertion": {
+          "field": "future_index_matches_entry",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The index reported by the public configuration future equals the committed configuration entry's index."
+      },
+      {
+        "event": "configuration_future_index",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "committed-config-change",
+        "assertion": {
+          "field": "stats_index_matches_entry",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The documented latest_configuration_index stat equals the committed configuration entry's index."
+      }
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "@config-index-contract",
+      "source_ids": [
+        "s-getconfig",
+        "s-stats"
+      ],
+      "rationale": "Current account (source-derived, probe queued): both public endpoints are pinned to zero. GetConfiguration constructs a local configurationsFuture and assigns configurations{latest: r.getLatestConfiguration()}, leaving committed, committedIndex and latestIndex at their zero values, so ConfigurationFuture.Index() returns 0 although the IndexFuture contract says Index holds the index of the applied log entry; Stats then reports s[\"latest_configuration_index\"] = future.Index(), so the documented stat key is always \"0\" even while s[\"latest_configuration\"] shows the current server set. The captured tests never assert a non-zero index from this future (the only Index() assertion in the captured suite belongs to an Apply result), so nothing contradicts the reading. Local construction feedback of the queued harness reported the committed configuration entry at index 6 with future_index 0 and stats value \"0\" while the live configuration already contained the nonvoter; that local run is construction feedback only and is not retained evidence, so the account stays conditional until the receipt is read.",
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "counterevidence": [
+        "A zero index is harmless for callers that only read Configuration(), and GetConfiguration is documented as returning the latest configuration, which may be uncommitted; the contract violation is in the Index the future exposes and in the stat key, not in the configuration content.",
+        "The main loop still answers configurationsCh with the full configurations struct, so internal consumers such as snapshotting do see the real indices; only the client-facing future is flattened."
+      ],
+      "limitations": [
+        "Observability-only impact: no consensus decision, election, or client write outcome is affected by this reading.",
+        "Measured on the captured test facilities with a two-peer cluster; the same construction is used for every GetConfiguration call, so the endpoint does not depend on cluster size, which the probe does not vary."
+      ]
+    }
+  ]
+}

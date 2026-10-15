@@ -75,6 +75,15 @@ def knowledge_view(state, entry):
             if entry.history else None}, 'knowledge')
 
 
+def knowledge_revision_view(record):
+    if record is None:
+        return None
+    value = record_preview({k:record[k] for k in
+        ('id','revision','kind','statement','conditions','source_ids','executions','knowledge')}, 'knowledge')
+    value['record']['revision'] = record['revision']
+    return value
+
+
 def open_gap_view(state, investigation_id):
     answers = gap_answers(state, investigation_id)
     owners = {gap:i.id for i in state.interpretations if i.investigation_id == investigation_id for gap in i.answers}
@@ -105,7 +114,7 @@ def reselection_view(state):
         'directed_question':state.config.get('directed_question'),
         'questions':questions,
         'knowledge':[record_preview({'id':e.id, 'revision':e.revision, 'kind':e.kind,
-            'statement':e.statement}, 'knowledge') for e in state.knowledge],
+            'statement':e.statement, 'conditions':e.conditions}, 'knowledge') for e in state.knowledge],
         'index':'research.json contains current previews; full records and history: state.json; captured tree: agent-source/',
         'scope':'All registered questions and knowledge, not an exhaustive source frontier or a priority order. '
             'Parent links are recorded relationships, not root-cause groups. Accounts are navigation previews; '
@@ -216,42 +225,57 @@ def execution_feedback(state, root, fixed, check):
     return value
 
 
-def cited_execution_feedback(state, root, check, fixed, prior, opinion, remaining):
+def cited_execution_feedback(state, root, check, fixed, previous, current, owner_id, remaining, path):
     """Show explicit citations, never select observations by their apparent outcome."""
     from .audit import draft_bytes
-    previous = prior.executions.get(check.id, []) if prior else []
-    current = opinion.executions.get(check.id, [])
     indices = sorted(set(previous + current))
     references = receipt_references(state, check.id)
-    references['current'] = [r for r in references['current'] if r['id'] != opinion.id]
+    for collection in ('current','knowledge'):
+        references[collection] = [r for r in references[collection] if r['id'] != owner_id]
     for r in [*references['current'], *references['knowledge']]:
         r['overlapping_event_indices'] = sorted(set(indices) & set(r['event_indices']))
     value = {**execution_locator(check, fixed), 'event_indices':indices,
         'previous_event_indices':previous, 'current_event_indices':current,
         'references':references,
         'selection':'Explicitly cited subset, not the complete receipt or an applicability judgment. '
-            'Inline limits are shared across the update. Changed receipts are listed first within each interpretation; '
+            'Inline limits are shared across account changes. Shared event paths locate earlier content in this update. '
+            'Changed receipts are listed first within each account; '
             'added or removed event indices are shown first within each receipt.'}
     try:
         raw = json.loads(draft_bytes(root, value['observations']))
     except (OSError, ValueError) as exc:
         return {**value, 'observation_error':str(exc)}
-    shown = []
+    shown, shared = [], []
     changed = set(previous) ^ set(current)
     for index in sorted(indices, key=lambda i: i not in changed):
+        key = (check.id, index)
+        if key in remaining['shown']:
+            shared.append({'event_index':index, 'path':remaining['shown'][key]})
+            continue
         event = {'event_index':index, 'observation':raw['events'][index]}
         size = len(json.dumps(event, ensure_ascii=False))
         if remaining['events'] == 0 or size > remaining['chars']:
-            break
+            continue
+        remaining['shown'][key] = f'{path}/cited_events/{len(shown)}'
         shown.append(event)
         remaining['events'] -= 1
         remaining['chars'] -= size
     return {**value, 'cited_events':shown, 'event_count':len(raw['events']),
-        'omitted_cited_indices':sorted(set(indices) - {e['event_index'] for e in shown}),
+        'shared_cited_events':shared,
+        'omitted_cited_indices':sorted(set(indices) - {e['event_index'] for e in [*shown,*shared]}),
         'parsing_error_count':len(raw['parsing_errors']), 'prerequisites':raw['prerequisites'],
         'comparisons':[{'comparison_index':i, 'outcome':r['outcome'], 'comparison_complete':r['comparison_complete'],
             'missing_indices':r['missing_indices'], 'diagnostic_count':len(r['diagnostics']),
             'limitation_count':len(r['limitations'])} for i,r in enumerate(raw['comparisons'])]}
+
+
+def cited_executions(state, root, previous, current, owner_id, remaining, path):
+    fixed = {a.id:a for a in state.experiments}
+    receipts = sorted((c for c in state.checks if c.id in previous or c.id in current),
+        key=lambda c: previous.get(c.id) == current.get(c.id))
+    return [cited_execution_feedback(state,root,c,fixed.get(c.experiment_id),
+        previous.get(c.id,[]),current.get(c.id,[]),owner_id,remaining,f'{path}/{index}')
+        for index,c in enumerate(receipts)]
 
 
 def interpretation_knowledge(state, prior, opinion):
@@ -317,7 +341,7 @@ def operation_summary(state, root):
     use_owners.update((i.id,i.investigation_id) for i in state.interpretations)
     corrections = []
     for entry in state.knowledge:
-        if entry.operation_id != current.get('operation_id') or not entry.history:
+        if entry.operation_id != current.get('operation_id') or not entry.history or current.get('no_change'):
             continue
         revisions = [*entry.history, {'operation_id':entry.operation_id}]
         for prior, successor in zip(revisions, revisions[1:]):
@@ -354,8 +378,7 @@ def operation_summary(state, root):
         question = next(q for q in summary['questions'] if q['id'] == fixed.investigation_id)
         question['execution'] = execution_feedback(state, root, fixed, check)
     previous, updates, changes = {}, {}, []
-    fixed_by_id = {a.id:a for a in state.experiments}
-    remaining = {'events':8, 'chars':6000}  # One inline observation budget for the entire update.
+    remaining = {'events':8, 'chars':6000, 'shown':{}}  # Shared by interpretation and knowledge citations.
     for opinion in state.interpretations:
         prior = previous.get(opinion.investigation_id)
         if opinion.operation_id == current.get('operation_id') and not current.get('no_change'):
@@ -363,8 +386,6 @@ def operation_summary(state, root):
             batch.append(opinion.id)
             if opinion.id != latest[opinion.investigation_id].id:
                 continue
-            receipts = sorted((c for c in state.checks if c.id in opinion.executions or (prior and c.id in prior.executions)),
-                key=lambda c: opinion.executions.get(c.id) == (prior.executions.get(c.id) if prior else None))
             changes.append({'investigation_id':opinion.investigation_id,
                 'previous':interpretation_view(prior, compact=True),
                 'current':{'id':opinion.id, 'conclusion':opinion.conclusion, 'defect_claim':opinion.defect_claim},
@@ -373,24 +394,40 @@ def operation_summary(state, root):
                 'sources':source_locations(state, set(opinion.source_ids) | (set(prior.source_ids) if prior else set())),
                 'intermediate_interpretation_ids':batch[:-1],
                 'knowledge_references':interpretation_knowledge(state, prior, opinion),
-                'executions':[cited_execution_feedback(state,root,c,fixed_by_id.get(c.experiment_id),prior,opinion,remaining)
-                              for c in receipts]})
+                'executions':cited_executions(state,root,prior.executions if prior else {},opinion.executions,
+                    opinion.id,remaining,f'/interpretation_changes/{len(changes)}/executions')})
         else:
             previous[opinion.investigation_id] = opinion
     if changes:
         summary['interpretation_changes'] = changes
-        summary['interpretation_guidance'] = (
-            'Relate the changed account to its original question: what did the cited observations establish, '
-            'which consequential conditions were supplied, and what could still change the judgment? '
+    knowledge_changes = []
+    for entry in state.knowledge:
+        if entry.operation_id != current.get('operation_id') or current.get('no_change'):
+            continue
+        prior = next((r for r in reversed(entry.history) if r['operation_id'] != entry.operation_id), None)
+        knowledge_changes.append({'id':entry.id, 'previous':knowledge_revision_view(prior),
+            'current':knowledge_revision_view(entry.model_dump(exclude={'history'})),
+            'intermediate_revisions':[r['revision'] for r in entry.history if r['operation_id'] == entry.operation_id],
+            'sources':source_locations(state,set(entry.source_ids) | (set(prior['source_ids']) if prior else set())),
+            'executions':cited_executions(state,root,prior['executions'] if prior else {},entry.executions,
+                entry.id,remaining,f'/knowledge_changes/{len(knowledge_changes)}/executions')})
+    if knowledge_changes:
+        summary['knowledge_changes'] = knowledge_changes
+    if changes or knowledge_changes:
+        summary['account_guidance'] = (
+            'Relate changed explanations and knowledge to their cited basis and conditions. '
+            'Saving knowledge does not strengthen its evidence. '
             'Old and new reasons include removed citations. Other current citations and historical locators are '
             'review candidates, not automatically affected conclusions; event overlap alone does not establish impact. '
             'Correct identified premises and uses, preserving independent support. Withdrawing a witness does not '
             'refute the question. Unrecorded code reuse remains for investigation. No separate confirmation is required.')
     summary['necessary_gaps'] = necessary_gaps
     summary['reselection'] = reselection_view(state)
-    action = ('Interpret the new execution against the question and its necessary conditions, including any changed premises. '
-        if executed else 'Use the changed accounts and their cited basis to decide what still needs investigation. '
-        if changes or corrections else '')
+    action = ('Check the proposed inference against its cited basis and conditions. For execution-based claims, '
+        'do fixed operations, actual operands and consumers, order and raw observations establish it, '
+        'or also fit a concrete permitted explanation? Use available evidence or inspect the decisive location '
+        'where needed; correct identified errors in explanations and knowledge, preserving independent support. '
+        if executed or changes or knowledge_changes or corrections else '')
     summary['next'] = (
         'The unchanged submission is already retained; this call still consumed time and a model turn. '
         if current.get('no_change') else '') + action + (

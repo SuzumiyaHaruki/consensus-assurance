@@ -136,7 +136,8 @@ def resolved_uses(uses, aliases):
     return [u.model_copy(update={'entry_id': resolve(u.entry_id, aliases)}) for u in uses]
 
 
-def target_receipts(state, root, executions, *, owner_id=None, experiment_id=None, joint_history='', failure=None, support=True):
+def target_receipts(state, root, executions, *, owner_id=None, experiment_id=None, joint_history='', failure=None, support=True,
+                    path='/executions'):
     from .experiments import artifact, observed, validate_failure, fixed_files
     from consensus_assurance.core.types import ExecutionStatus
     for id, indices in executions.items():
@@ -150,8 +151,19 @@ def target_receipts(state, root, executions, *, owner_id=None, experiment_id=Non
             raise ValueError('A separate producer receipt needs explicit joint-history compatibility reasoning')
         measured = observed(a, c, root)
         events = measured['events']
-        if len(set(indices)) != len(indices) or any(type(i) is not int or not 0 <= i < len(events) for i in indices):
-            raise ValueError('Cite valid decisive parsed event indices, never raw line numbers')
+        invalid = list(dict.fromkeys(i for i in indices if type(i) is not int or not 0 <= i < len(events)))
+        duplicates = [i for i in dict.fromkeys(indices) if indices.count(i) > 1]
+        if invalid or duplicates:
+            field = path + '/' + id.replace('~', '~0').replace('/', '~1')
+            observations = f'logs/{id}/observations.json'
+            valid_range = [0, len(events) - 1] if events else None
+            raise DiagnosticError([Diagnostic(code='event_indices', category='association', object_ids=[id], paths=[field],
+                details={'invalid_indices':invalid, 'duplicate_indices':duplicates, 'event_count':len(events),
+                    'valid_range':valid_range, 'observations':observations, 'stdout':c.stdout},
+                message=f'Fix the citation array at {field} for receipt {id}: invalid indices {invalid}; '
+                    f'duplicate indices {duplicates}; valid parsed event indices '
+                    f'{"0 through " + str(len(events) - 1) if events else "none (no parsed events)"}. '
+                    f'Inspect {observations}. Cite each selected parsed event index once, not raw output line numbers.')])
         if not support:
             continue
         fixed_files(root, a)
@@ -170,7 +182,7 @@ def target_receipts(state, root, executions, *, owner_id=None, experiment_id=Non
 def update_knowledge(state, root, changes, operation, aliases):
     for number, change in enumerate(changes):
         require_sources(state, change.source_ids)
-        target_receipts(state, root, change.executions)
+        target_receipts(state, root, change.executions, path=f'/knowledge/{number}/executions')
         old = next((k for k in state.knowledge if k.id == change.id), None)
         if change.id and old is None:
             raise ValueError('Unknown knowledge entry')
@@ -270,7 +282,7 @@ def interpret(state, root, changes, operation, aliases):
                     'omit it for a question-level explained/conditional/unresolved account reusing applicable receipts')
         target_receipts(state, root, change.executions, owner_id=owner.id, experiment_id=change.experiment_id,
                         joint_history=change.joint_history, failure=change.failure_attribution,
-                        support=change.conclusion in {'violated', 'holds'})
+                        support=change.conclusion in {'violated', 'holds'}, path=f'/interpretations/{number}/executions')
         gaps = {g.id: g for g in owner.gaps}
         if not set(change.answers) <= gaps.keys() or any(not v.explanation.strip() for v in change.answers.values()):
             raise ValueError('Respond to this investigation\'s exact registered gaps with a substantive explanation and explicit resolved judgment')

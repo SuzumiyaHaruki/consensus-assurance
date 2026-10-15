@@ -148,6 +148,67 @@ def test_changed_citation_remains_visible_when_unchanged_citations_fill_inline_l
     e.start(repo)
 
 
+def test_knowledge_and_interpretation_changes_share_observations_without_losing_old_basis(tmp_path):
+    retained={}
+    def start(state):
+        sub,files=combined(state)
+        files['check.py'] += "for i in range(9): print('CA_EVENT '+json.dumps(dict(event='extra',operation=str(i))))\n"
+        return sub,files
+    def seed(state):
+        receipt=next(c['id'] for c in state['checks'] if c.get('experiment_id'))
+        retained['receipt']=receipt
+        retained['files']={p:p.read_bytes() for folder in ('fixed-experiments','logs')
+            for p in (e.root/folder).rglob('*') if p.is_file()}
+        sub,files=opinion(state,conclusion='conditional',executions={receipt:[0,1]})
+        sub['knowledge']=[dict(kind='behavior',statement='The boundary invocation returns zero',
+            conditions='At the selected capacity',source_ids=['code'],executions={receipt:[0,1]})]
+        return sub,files
+    def revise(state):
+        summary=operation_summary(e.state,e.root)
+        new,=summary['knowledge_changes']
+        assert new['previous'] is None and not new['intermediate_revisions']
+        assert new['current']['conditions']=='At the selected capacity'
+        assert not new['executions'][0]['cited_events'] and len(new['executions'][0]['shared_cited_events'])==2
+        entry=state['knowledge'][0]
+        change={key:entry[key] for key in ('id','kind','statement','conditions','source_ids')}
+        change['executions']={retained['receipt']:list(range(1,11))}
+        retained['change']={**change,'conditions':'One invocation under the documented capacity contract','source_ids':['doc']}
+        sub,files=opinion(state,conclusion='conditional',executions={retained['receipt']:list(range(1,9))})
+        sub['knowledge']=[change,retained['change']]
+        return sub,files
+    def duplicate(state):
+        before=e.state.model_dump(mode='json')
+        summary=operation_summary(e.state,e.root)
+        change,=summary['knowledge_changes']
+        assert (change['previous']['revision'],change['current']['revision'])==(1,3)
+        assert change['intermediate_revisions']==[2]
+        assert change['previous']['source_ids']==['code'] and change['current']['source_ids']==['doc']
+        assert {s['id'] for s in change['sources']}=={'code','doc'}
+        assert change['previous']['record']['revision']==1 and change['current']['record']['revision']==3
+        receipt,=change['executions']
+        assert receipt['previous_event_indices']==[0,1] and receipt['current_event_indices']==list(range(1,11))
+        assert receipt['event_indices']==list(range(11)) and not receipt['cited_events']
+        assert receipt['omitted_cited_indices']==[1,9,10] and len(receipt['shared_cited_events'])==8
+        for event in receipt['shared_cited_events']:
+            located=summary
+            for part in event['path'].strip('/').split('/'):
+                located=located[int(part)] if isinstance(located,list) else located[part]
+            assert located['event_index']==event['event_index']
+        assert receipt['references']['knowledge']==[]
+        assert len(summary['interpretation_changes'][0]['executions'][0]['cited_events'])==8
+        assert not any(q['gaps'] for q in state['investigations']) and 'knowledge_corrections' not in summary
+        assert e.state.model_dump(mode='json')==before
+        assert all(p.read_bytes()==data for p,data in retained['files'].items())
+        return {'rationale':'Keep the identical effective knowledge','knowledge':[retained['change']]},{}
+    def finish(state):
+        summary=operation_summary(e.state,e.root)
+        assert summary['no_change'] and 'knowledge_changes' not in summary and 'interpretation_changes' not in summary
+        assert state['knowledge'][0]['revision']==3 and state['usage']['experiments']==1
+        return stop(state)
+    e,repo=engine_for(tmp_path,[start,seed,revise,duplicate,finish])
+    e.start(repo)
+
+
 def test_interpretation_feedback_uses_its_own_receipts_after_another_question_executes(tmp_path):
     def start(state):
         sub,files=combined(state)
@@ -680,7 +741,7 @@ def test_conditional_probe_real_history_knowledge_correction_and_reuse(tmp_path)
     def global_choice(state):
         assert state['current_submission']['no_change']
         summary=operation_summary(e.state,e.root)
-        assert 'knowledge_corrections' not in summary
+        assert 'knowledge_corrections' not in summary and 'knowledge_changes' not in summary
         assert summary['reselection']['target']['repo']==str(repo)
         assert {q['id'] for q in summary['reselection']['questions']}=={q['id'] for q in state['investigations']}
         assert summary['open_work_index']=='research.json' and summary['allocation']['agent_calls']>0
@@ -787,7 +848,12 @@ def test_evidence_enrichment_preserves_used_premise_and_exploratory_results(tmp_
                 knowledge=[dict(entry_id='@behavior',revision=1)])]}, {}
 
     def finish(state):
-        assert 'knowledge_corrections' not in operation_summary(engine.state,engine.root)
+        summary=operation_summary(engine.state,engine.root)
+        assert 'knowledge_corrections' not in summary
+        change,=summary['knowledge_changes']
+        assert (change['previous']['revision'],change['current']['revision'])==(1,2)
+        assert change['previous']['statement']==change['current']['statement']==state['knowledge'][0]['statement']
+        assert len(change['executions'])==2 and all(r['cited_events'] for r in change['executions'])
         return stop(state)
     engine, repo = engine_for(tmp_path, [probe, knowledge, probe, knowledge, finish])
     state = engine.start(repo)
@@ -848,7 +914,12 @@ def test_knowledge_correction_without_uses_does_not_infer_dependencies(tmp_path)
             conditions='Capacity input',source_ids=['code'])]
         return sub,files
     def correct(state):
-        assert 'knowledge_corrections' not in operation_summary(e.state,e.root)
+        summary=operation_summary(e.state,e.root)
+        assert 'knowledge_corrections' not in summary
+        change,=summary['knowledge_changes']
+        assert change['previous'] is None and change['executions']==[]
+        assert change['sources'][0]['path']=='agent-source/target.py'
+        assert change['current']['conditions']==summary['reselection']['knowledge'][0]['conditions']=='Capacity input'
         change=dict(id=state['knowledge'][0]['id'],kind='behavior',statement='The boundary returns zero',
             conditions='Capacity input',source_ids=['code'],changed_premise='Returning zero does not preserve capacity input')
         return {'rationale':'Correct a behavior then clarify wording in the same operation',
@@ -983,6 +1054,7 @@ def test_navigation_keeps_evidence_references_and_marks_long_prose_without_mutat
     assert '[preview:' in item['conditions'] and 'characters omitted; see full record]' in item['conditions']
     assert item['conditions'].count('[preview:')==1 and preview(item)==item
     for item in (item,current['reselection']['knowledge'][0],summary['reselection']['knowledge'][0]):
+        assert item['conditions']==excerpt(entry.conditions)
         locator=item['record']
         complete=json.loads((engine.root/locator['path']).read_text())[locator['collection']]
         assert item['view']=='preview'

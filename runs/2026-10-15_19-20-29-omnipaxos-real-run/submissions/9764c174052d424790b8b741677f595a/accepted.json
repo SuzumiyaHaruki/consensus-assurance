@@ -1,0 +1,66 @@
+{
+  "rationale": "Tenth turn: CheckRun 5ffdf2f10d3943d39f56133f08c42a6e (completed, exit_code 0) evaluates all three declared comparisons completely - non-snapshot with the in-memory backend violated (witness index 2), snapshot-enabled holds (index 5), non-snapshot with the persistent backend violated (witness index 8) - so the current account is updated with the measured bounding of the failure and the registered applicability gap is answered in both halves.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+      "experiment_id": "8fa16297ae994c0c8f9127fd2c6af430-experiment",
+      "source_ids": [
+        "follower_prepare",
+        "logsync",
+        "memstorage_suffix",
+        "storage_get_suffix_contract",
+        "sync_log"
+      ],
+      "executions": {
+        "5ffdf2f10d3943d39f56133f08c42a6e": [
+          2,
+          8
+        ],
+        "18e0d44919ed4eb786f1231efbab552c": [
+          4
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current account: a node whose decided index lags its accepted index (crash-recovered before the later decisions reached it, having accepted far enough for every peer to pass the trim bound) can prepare against a peer that has already compacted past that decided index. The peer then builds its log update from the preparing node's decided index - 3, below its own compacted index 6 - and for an Entry type without snapshots that request goes to the storage as get_suffix(3) with no comparison against the peer's compacted index. Measured outcome: the peer aborts. In the cluster run (CheckRun 18e0d44919ed4eb786f1231efbab552c, event 4) the abort was 'attempt to subtract with overflow' raised inside MemoryStorage::get_suffix while the responder still held accepted 6 / decided 6 / compacted 6 and the preparing node reported decided 3 / accepted 6. The contrast run (CheckRun 5ffdf2f10d3943d39f56133f08c42a6e) reproduces that with witness index 2 and, holding every input equal apart from the Entry type, shows the same request completing when snapshots are enabled (comparison 1 holds at index 5), because then the snapshot branch runs and the suffix is read at the responder's own decided index. The persistent backend case is also violated (witness index 8): there the storage returns an error instead of the empty suffix its trait specifies, and the abort is raised by the core crate itself at create_log_sync's expect(READ_ERROR_MSG) (omnipaxos/src/sequence_paxos/mod.rs:428, message 'Error reading from storage.: ErrHelper'), so the failure is not an artifact of the in-memory backend. Consequence bound by these runs: on a legal crash-recovery plus compaction plus election sequence, a healthy replica that must answer an ordinary Prepare is destroyed instead of producing log support, which removes the participant needed to restore eligible participation; the defect is asserted for entries without snapshots (or any configuration where the selected branch reads a suffix below the responder's compacted index) and is not claimed for the snapshot-enabled in-memory combination, which completed.",
+      "answers": {
+        "a6e1fe52471c4864a0b3042da04de8e0-gap-0": {
+          "explanation": "Both halves are now measured in CheckRun 5ffdf2f10d3943d39f56133f08c42a6e: a snapshot-capable Entry type does not reach the failing request on this path (comparison 1 holds at event index 5, outcome 'completed' with compacted_idx 6), while the captured persistent RocksDB backend does fail for the request that the in-memory backend fails on (comparison 2 violated at event index 8, outcome 'aborted_panic', panic_message 'Error reading from storage.: ErrHelper'). The persistent variant aborts at a different site: its get_suffix returns an error rather than the empty vector the Storage trait specifies, and the core's expect in create_log_sync raises the abort, so the defect is not specific to MemoryStorage.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "b2606c6f3c1148c5af396ef701166e6f-knowledge-0",
+          "revision": 1,
+          "assertion": "the snapshot branch is taken only when use_snapshots() is true and decided_idx > common_prefix_idx; otherwise get_suffix(common_prefix_idx) is used with no comparison against the responder's compacted index"
+        },
+        {
+          "entry_id": "b2606c6f3c1148c5af396ef701166e6f-knowledge-1",
+          "revision": 1,
+          "assertion": "MemoryStorage::get_suffix(from) subtracts trimmed_idx unchecked and panics with overflow checks enabled for from < trimmed_idx"
+        }
+      ],
+      "counterevidence": [
+        "Backend attribution is not uniform: with the in-memory backend the aborting arithmetic is inside the captured MemoryStorage implementation while the core's call is legal per the Storage::get_suffix contract, but with the persistent backend the captured storage returns an error for that legal call and the abort is raised by the core's own expect, so the core participates decisively in the persistent case.",
+        "Measured confinement: with snapshots enabled and the in-memory backend the identical request completes (comparison 1 holds), so the account does not extend to the snapshot-enabled configuration; the deciding condition is the branch selection, not the storage alone.",
+        "The stale state is reached in the cluster harness by dropping whole messages of one kind addressed to one node (decisions while it must stay at decided 3, then AcceptSync after it must promise without accepting); that is ordinary message loss under the target's fault model, and the resulting state (accepted 6 / decided 3 / older accepted round, durable log intact) is what a crash-recovered node legitimately holds, but the drops are part of the harness's construction."
+      ],
+      "limitations": [
+        "Only the dev profile was measured (overflow checks enabled, as in the controller's cargo test invocation); no claim is made about a configuration without overflow checks.",
+        "The contrast harness supplies the leader prefix (Prepare, AcceptSync, forwarded Compaction::Trim, later Prepare) directly rather than producing it through a second running cluster; the cluster experiment establishes that the same state and failure arise from real multi-node interaction, and the contrast isolates the branch-selection variable.",
+        "The cluster witness is one deterministic schedule of one configuration (three nodes, majority quorum, batch_size 3, trim index 6); broader cluster sizes, quorums and trim points were not exercised.",
+        "The abort is the measured endpoint; consequences after an abort (a stalled or inconsistent surviving log) were not measured in this run."
+      ],
+      "joint_history": "Both cited receipts come from the same captured snapshot and the same package (omnipaxos) with the same test target and feature set, and they describe the same endpoint on the same request. CheckRun 18e0d44919ed4eb786f1231efbab552c builds the responder state through real multi-node message exchange (three nodes, batch_size 3, non-snapshot entries, forwarded trim, crash and takeover) and reaches it with accepted_idx 6, decided_idx 3 at the preparing node and compacted_idx 6 at the responder, aborting with the in-memory arithmetic panic. The contrast experiment 8fa16297ae994c0c8f9127fd2c6af430 (CheckRun 5ffdf2f10d3943d39f56133f08c42a6e) delivers the same prefix messages directly to a single responder in the same state and reproduces the same abort for the same non-snapshot case (index 2) while adding the snapshot-enabled (holds) and persistent-backend (violated, different abort site) cases. The two receipts are compatible: neither modifies target sources, both use the captured crate's public API, and the contrast case that answers the gap is the one whose construction the cluster receipt independently reached through real traffic; the earlier receipt remains the evidence that the state arises naturally, while the contrast receipt is the basis for the bounding claims.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

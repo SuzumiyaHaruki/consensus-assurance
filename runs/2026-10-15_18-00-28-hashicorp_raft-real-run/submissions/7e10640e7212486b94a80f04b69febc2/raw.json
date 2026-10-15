@@ -1,0 +1,178 @@
+{
+  "rationale": "Read the retained receipt of experiment 680bc27c9c50448a8b63097d98091061-experiment (CheckRun 5e1ce9aa430842d5a9325cfecbc885f6) and replaced the conditional account of the configuration-scan question with the record-backed one: both parsed events (indices 0 and 1) contradict the assertion that the committed configuration entries are inside the restart scan. Also built and queued a bounded probe for the second registered question: whether NewRaft can return at all when the recovered committed range needs more FSM batches than the fsmMutateCh buffer. Local construction feedback for the new harness showed the control range (94 batches) returning in 2 ms while the 141-batch range never returned within 20 s and left raft.processLogs frames blocked; the retained receipt is requested to establish that.",
+  "investigations": [
+    {
+      "id": "680bc27c9c50448a8b63097d98091061-question-0",
+      "discriminator": "Whether a later configuration entry or an installed snapshot repairs the restarted node's configuration at runtime, and which requests the empty/stale configuration admits (vote and pre-vote membership checks, quorum size, election gating)."
+    },
+    {
+      "ref": "@empty-config-admission",
+      "parent_id": "680bc27c9c50448a8b63097d98091061-question-0",
+      "question": "With an empty or stale configuration after a RestoreCommittedLogs restart, which admission checks does the node still apply to RequestVote/RequestPreVote, and what quorum and election gating follow from that state?",
+      "source_ids": [
+        "s-runfollower-gate",
+        "s-commit-tracking-contract"
+      ],
+      "hypothesis": "requestVote and requestPreVote skip the membership check when the candidate configuration is empty, so the restarted node grants votes to any candidate, and quorumSize() derived from an empty voter list is 1.",
+      "discriminator": "Drive the restarted node's vote and pre-vote handlers with a candidate that is absent from its log-recorded configuration and observe granted versus rejected responses."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k-scan-gap",
+      "kind": "behavior",
+      "statement": "With RestoreCommittedLogs enabled, NewRaft's configuration scan starts at max(lastSnapshotIndex, lastApplied)+1 after restoreFromCommittedLogs has set lastApplied to the recovered commit index; committed LogConfiguration entries at or below that index are therefore never passed to processConfigurationLogEntry, so r.configurations keeps the snapshot configuration or stays empty when no snapshot exists.",
+      "conditions": "Config.RestoreCommittedLogs=true with a LogStore implementing CommitTrackingLogStore; the node restarts from its retained log, stable store and snapshots; the configuration entry index is at or below the commit index reported by GetCommitIndex.",
+      "source_ids": [
+        "s-scan",
+        "s-restore-committed",
+        "s-dispatch-stage",
+        "s-appendentries-stage"
+      ],
+      "executions": {
+        "5e1ce9aa430842d5a9325cfecbc885f6": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "ref": "@k-fsm-block",
+      "kind": "behavior",
+      "statement": "processLogs feeds r.fsmMutateCh in batches of MaxAppendEntries, while runFSM (its only consumer) is only started after restoreSnapshot/restoreFromCommittedLogs; a recovered committed range needing more batches than the 128-slot buffer makes NewRaft block in the send.",
+      "conditions": "Config.RestoreCommittedLogs=true, a commit-tracking store whose recovered commit index spans more than 128 batches of authored entries, and no consumer started yet inside NewRaft.",
+      "source_ids": [
+        "s-restore-committed",
+        "s-fsm-ch",
+        "s-goroutines"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "680bc27c9c50448a8b63097d98091061-question-1",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "s-restore-committed",
+      "s-fsm-ch",
+      "s-goroutines"
+    ],
+    "scope": {
+      "description": "Two single-node in-memory clusters (repository MakeClusterCustom, CommitTrackingLogStore, RestoreCommittedLogs=true, snapshotting disabled) commit different amounts of authored history, then restart via NewRaft in a goroutine with a bounded wait: 6000 commands as a control (94 batches of 64) and 9000 commands (141 batches). Each case emits a setup event and one result event stating whether NewRaft returned, and, if not, the blocked goroutine frames captured with runtime.Stack.",
+      "assumptions": [
+        "The log store is the repository's InmemCommitTrackingStore and the transport the repository's InmemTransport.",
+        "Snapshotting is disabled by configuration so the recovered range starts at index 0 with no snapshot.",
+        "Only the amount of committed history differs between the two cases; the same harness, helper and configuration are used.",
+        "No test is expected to block the whole package run: the restart is wrapped in a bounded select."
+      ]
+    },
+    "prefix": "For each case: bootstrap a one-node cluster with CommitTrackingLogs and RestoreCommittedLogs, apply N commands to completion, record the staged commit index and the derived batch count, Shutdown, restart with NewRaft from the same stores inside a goroutine and wait up to 20 seconds; on return report lastApplied, commit index and configuration length after restart, otherwise report the observed wait and the frames of every goroutine containing github.com/hashicorp/raft plus chan-send/select markers.",
+    "requirement": "NewRaft must complete its startup recovery for any legal retained state; RestoreCommittedLogs must not leave the node unable to finish construction when the recovered committed range is large.",
+    "responsibility": "Raft itself: NewRaft owns recovery ordering, including when the FSM consumer goroutine starts relative to the recovery work it feeds.",
+    "anchors": [
+      {
+        "material_id": "s-restore-committed",
+        "symbol": "restoreFromCommittedLogs",
+        "start_line": 724,
+        "end_line": 724
+      },
+      {
+        "material_id": "s-fsm-ch",
+        "symbol": "NewRaft",
+        "start_line": 560,
+        "end_line": 560
+      },
+      {
+        "material_id": "s-goroutines",
+        "symbol": "NewRaft",
+        "start_line": 637,
+        "end_line": 637
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "control-setup",
+        "event": "large_committed_range_setup",
+        "conditions": [
+          {
+            "field": "applied_commands",
+            "op": "eq",
+            "value": 6000
+          }
+        ]
+      },
+      {
+        "alias": "above-threshold-setup",
+        "event": "large_committed_range_setup",
+        "conditions": [
+          {
+            "field": "applied_commands",
+            "op": "eq",
+            "value": 9000
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "restart_newraft_completed",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "control-setup",
+        "assertion": {
+          "field": "newraft_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The control range (fewer batches than the fsmMutateCh capacity) completes startup recovery."
+      },
+      {
+        "event": "restart_newraft_completed",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "above-threshold-setup",
+        "assertion": {
+          "field": "newraft_returned",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The range exceeding the fsmMutateCh batch capacity also completes startup recovery."
+      }
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+      "source_ids": [
+        "s-scan",
+        "s-restore-committed",
+        "s-dispatch-stage",
+        "s-appendentries-stage",
+        "s-runfollower-gate",
+        "s-config-doc",
+        "s-commit-tracking-contract"
+      ],
+      "executions": {
+        "5e1ce9aa430842d5a9325cfecbc885f6": [
+          0,
+          1
+        ]
+      },
+      "rationale": "Current account: with RestoreCommittedLogs enabled, NewRaft's configuration scan excludes committed configuration entries, and the retained execution shows it. restoreFromCommittedLogs clamps the store's commit index, applies the recovered range through processLogs (which ends with setLastApplied(index)), and the following scan loop starts at max(lastSnapshotIndex, lastApplied)+1, so a configuration entry at or below the recovered commit index is never passed to processConfigurationLogEntry. Staging producers cap the staged value at entries already stored, so the recovered commit index reaches a configuration entry whenever later entries were written after it committed. Parsed event 0 (event restore_committed_logs_no_snapshot, receipt 5e1ce9aa430842d5a9325cfecbc885f6): staged commit index 11 equals lastApplied 11, scan start 12, the committed LogConfiguration at index 1 is outside the scan, and the node's latest configuration after restart is empty (length 0) although before restart it held one voter and the FSM had been fed up to index 11. Parsed event 1 (restore_committed_logs_snapshot_and_config_change, same receipt): snapshot index 22 with configuration index 1, committed LogConfiguration at index 23 adding nonvoter-B, staged commit index 32 equals lastApplied 32, scan start 33, the entry is outside the scan, and the post-restart configuration is again only the snapshot's single voter, so the committed nonvoter is absent. Requirement contradicted by both witnesses: the restarted node's configuration state does not include every committed configuration entry. Source-derived consequences, not measured here: runFollower aborts elections when the configuration is empty (raft.go:232), quorumSize() returns 1 for an empty voter list, and requestVote/requestPreVote skip the membership rejection when the candidate configuration has no servers.",
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "counterevidence": [
+        "The recovered committed entries are still applied to the FSM, and any later configuration entry or an installed snapshot restores the node's configuration, so the omission is repaired by normal traffic in a healthy cluster.",
+        "Snapshot configuration is loaded correctly by restoreSnapshot, so the defect needs a committed configuration entry between the last snapshot (or index 0) and the recovered commit index.",
+        "No captured test asserts configuration state after a RestoreCommittedLogs restart, so the captured suite neither contradicts nor covers this path."
+      ],
+      "limitations": [
+        "The account applies to nodes configured with RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; with the flag off lastApplied equals the snapshot index and the scan range is unchanged.",
+        "The executed cases used a single-node in-memory cluster with authored commands and the repository's InmemCommitTrackingStore; behaviour for multi-node clusters, monotonic stores and production stores is not measured.",
+        "Which requests the empty/stale configuration actually admits, and whether the cluster loses progress before a later entry repairs it, remain unmeasured (registered as a child question)."
+      ],
+      "experiment_id": "680bc27c9c50448a8b63097d98091061-experiment"
+    }
+  ]
+}

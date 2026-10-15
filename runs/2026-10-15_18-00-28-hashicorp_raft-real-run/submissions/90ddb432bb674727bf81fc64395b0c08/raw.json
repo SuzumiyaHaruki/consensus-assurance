@@ -1,0 +1,115 @@
+{
+  "rationale": "Read the retained receipt of experiment fcb238abc7cd45cdb8b0c03f847b8ad2-experiment (CheckRun 39131804298e4de2bfb8bbb0ccfaf00b, events 13 and 14): the committed configuration entry sits at index 6 while the public configuration future reports index 0 and the documented stat reports \"0\", so the endpoint question becomes a witnessed violation with a behavior entry. In the same update a repair probe is queued for the parent configuration question: whether an ordinary later configuration entry restores the restarted node's configuration, which bounds how long the empty or stale configuration can persist.",
+  "knowledge": [
+    {
+      "ref": "@k-config-index-pinned",
+      "kind": "behavior",
+      "statement": "The public configuration future reports index 0 and Stats reports latest_configuration_index \"0\" regardless of the committed configuration entry's index, because the future is built with only the latest configuration set and its latestIndex stays at the zero value.",
+      "conditions": "Any node state; measured after a committed LogConfiguration entry with the live configuration already containing the changed server set.",
+      "source_ids": [
+        "s-getconfig",
+        "s-stats"
+      ],
+      "executions": {
+        "39131804298e4de2bfb8bbb0ccfaf00b": [
+          14
+        ]
+      }
+    }
+  ],
+  "experiment": {
+    "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "s-scan",
+      "s-appendentries-stage"
+    ],
+    "scope": {
+      "description": "A two-voter in-memory cluster with commit-tracking stores and RestoreCommittedLogs enabled: the follower is restarted from its own stores so its configuration is empty, then the serving leader commits a new configuration entry (AddNonvoter) and the restarted node's configuration is read before and after that entry arrives.",
+      "assumptions": [
+        "Transports, log stores and FSM are the repository's own InmemTransport, InmemCommitTrackingStore and MockFSM.",
+        "Snapshotting is disabled by configuration, so the restarted node has no snapshot and its configuration is empty rather than stale.",
+        "The restarted node remains in the serving leader's configuration, so the new configuration entry is replicated to it as a new entry."
+      ]
+    },
+    "prefix": "Start a two-peer cluster with RestoreCommittedLogs and commit-tracking stores; apply five commands; record the follower's configuration and the configuration entry recorded in its log at index 1; shut the follower down and restart it with NewRaft on a fresh transport, then rewire all transports; emit the setup event with the configuration before the restart, the log-recorded configuration and the live configuration length after the restart; commit AddNonvoter on the serving leader; wait until the restarted node reports a non-empty configuration and emit the result event with the change index and type and the repaired configuration.",
+    "requirement": "A node that restarted with an empty or stale configuration must regain the configuration in force once the cluster replicates a configuration entry to it.",
+    "responsibility": "Raft itself: the node's configuration is loaded by its own recovery and updated by the entries it receives.",
+    "anchors": [
+      {
+        "material_id": "s-appendentries-stage",
+        "symbol": "appendEntries",
+        "start_line": 1458,
+        "end_line": 1458
+      },
+      {
+        "material_id": "s-scan",
+        "symbol": "NewRaft",
+        "start_line": 508,
+        "end_line": 508
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "empty-config-restart",
+        "event": "empty_config_repair_setup",
+        "conditions": [
+          {
+            "field": "live_config_len_after_restart",
+            "op": "eq",
+            "value": 0
+          },
+          {
+            "field": "config_before_restart_len",
+            "op": "eq",
+            "value": 2
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "empty_config_repair_result",
+        "identity_fields": [
+          "variant"
+        ],
+        "admission_alias": "empty-config-restart",
+        "assertion": {
+          "field": "config_repaired_by_later_entry",
+          "op": "eq",
+          "value": true
+        },
+        "description": "A configuration entry committed after the restart restores the node's configuration to the configuration in force."
+      }
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "fcb238abc7cd45cdb8b0c03f847b8ad2-question-0",
+      "experiment_id": "fcb238abc7cd45cdb8b0c03f847b8ad2-experiment",
+      "source_ids": [
+        "s-getconfig",
+        "s-stats"
+      ],
+      "executions": {
+        "39131804298e4de2bfb8bbb0ccfaf00b": [
+          13,
+          14
+        ]
+      },
+      "rationale": "Current account: both client-facing endpoints are pinned to zero, and the retained execution shows it. Parsed event 13 records a committed LogConfiguration entry at index 6 in a two-peer cluster; parsed event 14, taken in the same state, records future_index 0 with future_index_matches_entry false, stats_latest_configuration_index \"0\" with stats_index_matches_entry false, and a live configuration that already contains the changed server set (three servers: two voters plus the added nonvoter). Both declared comparisons are violated at index 14. Mechanism from source: GetConfiguration constructs a local configurationsFuture and assigns configurations{latest: r.getLatestConfiguration()}, so committed, committedIndex and latestIndex keep their zero values and ConfigurationFuture.Index() returns 0 even though the IndexFuture contract states that Index holds the index of the applied log entry; Stats maps future.Index() into the documented key latest_configuration_index, so that key is a constant while the neighbouring latest_configuration key shows the real server set. The captured suite only asserts a non-zero Index for an Apply result, so nothing in the snapshot contradicts the reading.",
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "counterevidence": [
+        "Callers that read only Configuration() are unaffected, and GetConfiguration is documented as returning the latest configuration, which may be uncommitted; the violated contract is the Index exposed by the future and the stat key that copies it.",
+        "Internal consumers are unaffected: the main loop still answers configurationsCh with the full configurations struct carrying the real indices, which is what snapshotting uses.",
+        "No consensus decision, election, quorum or write outcome depends on this value, so the impact is confined to client-visible reporting."
+      ],
+      "limitations": [
+        "Observability-only impact; this is not a safety or liveness defect.",
+        "Measured on a two-peer in-memory cluster with the captured test facilities; the same construction is used on every call, so the value does not vary with cluster size, which the probe did not vary.",
+        "The comparison uses the configuration entry's own future index as the expected reference; that index is itself produced by the library, and the log-store read of the entry type at that index corroborates it."
+      ]
+    }
+  ]
+}

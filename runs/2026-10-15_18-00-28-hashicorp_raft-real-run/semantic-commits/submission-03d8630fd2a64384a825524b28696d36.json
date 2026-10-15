@@ -1,0 +1,1239 @@
+{
+  "input": {
+    "rationale": "Read the retained receipt of experiment 7e10640e7212486b94a80f04b69febc2-experiment (CheckRun 8e041cda11284c539f23fc87e776a4d2). Parsed event 5 (9000-command case) reports newraft_returned=false after 20000 ms and its blocked_frames capture the blocked goroutine inside processLogs' batch send with no runFSM consumer, while parsed event 3 (6000-command control, 94 batches) returned in 6 ms; so the second question moves from hypothesis to a witnessed violation with the mechanism observed rather than inferred. The k-fsm-block behavior entry now carries that receipt. A follow-on probe for the child question about admission checks under an empty configuration was built and queued: local construction feedback shows a restarted node with an empty configuration granting both RequestVote and RequestPreVote to a server absent from its log-recorded configuration, with a derived quorum size of 1.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-knowledge-1",
+        "ref": null,
+        "kind": "behavior",
+        "statement": "processLogs feeds r.fsmMutateCh in batches of MaxAppendEntries, while runFSM (its only consumer) is started only after restoreSnapshot/restoreFromCommittedLogs inside NewRaft; a recovered committed range needing more batches than the 128-slot buffer leaves NewRaft blocked in that batch send, and the blocked goroutine is visible as processLogs.func1 under restoreFromCommittedLogs under NewRaft.",
+        "conditions": "Config.RestoreCommittedLogs=true with a commit-tracking store whose recovered commit index spans more than 128 batches of authored entries, and no consumer started yet inside NewRaft.",
+        "source_ids": [
+          "s-restore-committed",
+          "s-fsm-ch",
+          "s-goroutines"
+        ],
+        "executions": {
+          "8e041cda11284c539f23fc87e776a4d2": [
+            3,
+            5
+          ]
+        },
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-1",
+        "experiment_id": "7e10640e7212486b94a80f04b69febc2-experiment",
+        "source_ids": [
+          "s-restore-committed",
+          "s-fsm-ch",
+          "s-goroutines"
+        ],
+        "executions": {
+          "8e041cda11284c539f23fc87e776a4d2": [
+            3,
+            5
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Current account: a RestoreCommittedLogs restart cannot complete startup recovery once the recovered committed range needs more FSM batches than the 128-slot fsmMutateCh, because runFSM is only started after the recovery work that feeds it. The receipt shows both the boundary and the mechanism. Parsed event 3 (variant committed-range-entries-6001, 94 batches): NewRaft returned in 6 ms with lastApplied 6001, i.e. the same code path completes when the range fits the buffer, and that node's configuration after restart was empty (length 0), matching the separate configuration-scan account. Parsed event 5 (variant committed-range-entries-9001, 141 batches): no return within the 20000 ms bound, and the frames captured at that moment are goroutine 10 [select] github.com/hashicorp/raft.(*Raft).processLogs.func1 -> (*Raft).processLogs(index 0x2329 = 9001) -> (*Raft).restoreFromCommittedLogs -> NewRaft, created by the harness restart goroutine. No runFSM goroutine exists for that instance, so no consumer can drain the buffer and no repair is enabled by time alone; the only escape in that select is the instance's own shutdown channel, which nothing closes during construction. Conditions: RestoreCommittedLogs enabled with a commit-tracking store, and a recovered commit index whose distance from the last applied/snapshot index exceeds 8192 authored entries (128 batches of 64) - for example a snapshot gap larger than 8192 entries on a node that crashed before the next snapshot, or a node with snapshotting disabled. Fault assumptions: none injected; the block follows from the retained history produced by the node's own commit path.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The observation is a 20000 ms bounded wait, so the account claims a blocked startup under the stated conditions, not an infinite block proven for all time; a caller that closes the instance's shutdown channel could release the select.",
+          "The two cases differ only in the amount of authored history (6000 versus 9000 commands) and used a single-node in-memory cluster with an InmemCommitTrackingStore and snapshotting disabled, so the boundary is a batch-capacity property of NewRaft rather than a measured property of production stores.",
+          "The blocked range here was recovered from the same node's own log without any snapshot; whether a production restart reaches a range above 8192 entries depends on snapshot cadence and crash timing, which were not measured."
+        ],
+        "limitations": [
+          "Applies only when Config.RestoreCommittedLogs=true with a LogStore implementing CommitTrackingLogStore; with the flag off, NewRaft never calls processLogs before starting runFSM.",
+          "The threshold is expressed in MaxAppendEntries-sized batches against the 128-slot buffer, so a configuration with a different MaxAppendEntries moves the boundary proportionally.",
+          "Interaction with the configuration-scan gap (both appear in the same recovery sequence) is not separated by this experiment; each is independently witnessed."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "7e10640e7212486b94a80f04b69febc2-question-1",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "source_ids": [
+        "s-runfollower-gate",
+        "s-commit-tracking-contract"
+      ],
+      "anchors": [
+        {
+          "material_id": "s-commit-tracking-contract",
+          "symbol": "CommitTrackingLogStore",
+          "start_line": 194,
+          "end_line": 194,
+          "anchor": null
+        }
+      ],
+      "scope": {
+        "description": "One single-node in-memory cluster (repository MakeClusterCustom, CommitTrackingLogStore, RestoreCommittedLogs=true, snapshotting disabled) commits ten commands, restarts via NewRaft so its configuration is empty, and then receives a RequestVote and a RequestPreVote over a real in-memory transport from a candidate whose ID appears in no configuration. The harness emits one setup event with the log-recorded and live configuration sizes and one result event with the two responses, the derived quorum size and the candidate's membership.",
+        "assumptions": [
+          "The log store is the repository's InmemCommitTrackingStore; the candidate transport is the repository's InmemTransport wired to the restarted node's transport.",
+          "The candidate's log is up to date and its term is higher than the restarted node's term, so no log-recency or term rule rejects it by itself.",
+          "The node's log-recorded configuration (the bootstrapped LogConfiguration at index 1) is the cluster membership in force; the empty live configuration comes from the node's own recovery path."
+        ],
+        "excluded": [],
+        "parameters": {}
+      },
+      "prefix": "Bootstrap a one-node cluster with CommitTrackingLogs and RestoreCommittedLogs, apply ten commands, record the log-recorded configuration, Shutdown, restart with NewRaft from the same stores, emit the setup event (log_recorded_config_len, live_config_len, live_voters, derived_quorum_size), then send RequestVote and RequestPreVote through the transport path with candidate ID 'outsider-not-in-log' and emit the responses.",
+      "semantic_changes": [],
+      "requirement": "A node whose configuration is in force (recorded in its own log) must treat vote and pre-vote requests from servers outside that configuration as non-members, and its quorum accounting must follow that configuration.",
+      "responsibility": "Raft itself: the node's configuration state is produced by its own restart recovery, and the admission rules in requestVote/requestPreVote rely on it being populated.",
+      "prerequisites": [
+        {
+          "alias": "empty-config-setup",
+          "event": "empty_config_restart_setup",
+          "conditions": [
+            {
+              "field": "live_config_len",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            },
+            {
+              "field": "log_recorded_config_len",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "empty_config_vote_admission",
+          "identity_fields": [
+            "variant"
+          ],
+          "admission_alias": "empty-config-setup",
+          "assertion": {
+            "field": "request_vote_granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "A candidate that is not in the configuration recorded in the node's log is not granted a vote."
+        },
+        {
+          "event": "empty_config_vote_admission",
+          "identity_fields": [
+            "variant"
+          ],
+          "admission_alias": "empty-config-setup",
+          "assertion": {
+            "field": "request_prevote_granted",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "The same candidate is not granted a pre-vote."
+        }
+      ],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "knowledge": [
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "With RestoreCommittedLogs enabled, NewRaft's configuration scan starts at max(lastSnapshotIndex, lastApplied)+1 after restoreFromCommittedLogs has set lastApplied to the recovered commit index; committed LogConfiguration entries at or below that index are therefore never passed to processConfigurationLogEntry, so r.configurations keeps the snapshot configuration or stays empty when no snapshot exists.",
+        "conditions": "Config.RestoreCommittedLogs=true with a LogStore implementing CommitTrackingLogStore; the node restarts from its retained log, stable store and snapshots; the configuration entry index is at or below the commit index reported by GetCommitIndex.",
+        "source_ids": [
+          "s-scan",
+          "s-restore-committed",
+          "s-dispatch-stage",
+          "s-appendentries-stage"
+        ],
+        "executions": {
+          "5e1ce9aa430842d5a9325cfecbc885f6": [
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7e10640e7212486b94a80f04b69febc2"
+      },
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "processLogs feeds r.fsmMutateCh in batches of MaxAppendEntries, while runFSM (its only consumer) is only started after restoreSnapshot/restoreFromCommittedLogs; a recovered committed range needing more batches than the 128-slot buffer makes NewRaft block in the send.",
+        "conditions": "Config.RestoreCommittedLogs=true, a commit-tracking store whose recovered commit index spans more than 128 batches of authored entries, and no consumer started yet inside NewRaft.",
+        "source_ids": [
+          "s-restore-committed",
+          "s-fsm-ch",
+          "s-goroutines"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7e10640e7212486b94a80f04b69febc2"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "680bc27c9c50448a8b63097d98091061-experiment",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Printf(\"CA_EVENT %s\\n\", buf)\n}\n\nfunc caServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s\", s.ID, s.Suffrage))\n\t}\n\treturn out\n}\n\n// caRestartShutdownAndRestart restarts a single-node cluster from its own\n// retained stores (log, stable, snapshots) with a fresh in-memory transport,\n// exactly like the repository's own restart tests do.\nfunc caRestart(t *testing.T, old *Raft) *Raft {\n\tt.Helper()\n\tif err := old.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\t_, trans := NewInmemTransport(old.localAddr)\n\tcfg := old.config()\n\tn, err := NewRaft(&cfg, old.fsm, old.logs, old.stable, old.snapshots, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"restart NewRaft: %v\", err)\n\t}\n\treturn n\n}\n\nfunc caConf(t *testing.T) *Config {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 20 // keep automatic snapshotting out of the way\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\treturn conf\n}\n\n// TestAssurance_RestoreCommittedLogs_NoSnapshot probes the documented\n// RestoreCommittedLogs startup path on a node that has committed log entries but\n// no snapshot: which configuration does the node hold after NewRaft returns, and\n// where does the NewRaft configuration scan start relative to the committed\n// index?\nfunc TestAssurance_RestoreCommittedLogs_NoSnapshot(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tlastIdx, err := leader.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\t// The first log entry of a bootstrapped cluster is the configuration entry.\n\tvar entry Log\n\tif err := leader.logs.GetLog(1, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(1): %v\", err)\n\t}\n\tvar entryConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tentryConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tstoreAfter := n.logs.(CommitTrackingLogStore)\n\tstagedAfter, err := storeAfter.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex after restart: %v\", err)\n\t}\n\tlastApplied := n.getLastApplied()\n\tsnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(snapIdx, lastApplied) + 1\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"restore_committed_logs_no_snapshot\",\n\t\t\"variant\":                \"no-snapshot\",\n\t\t\"bootstrap_config_index\": entry.Index,\n\t\t\"bootstrap_config_type\":  entry.Type.String(),\n\t\t\"bootstrap_config_servers\": caServers(entryConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  stagedAfter,\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"last_snapshot_index_after_restart\":  snapIdx,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       entry.Index >= scanStart,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\n// TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange probes a restart\n// where a configuration entry was committed after the node's last snapshot.\nfunc TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 20; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\tif len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot taken\")\n\t}\n\tsnapIdx := snaps[0].Index\n\tsnapConfIdx := snaps[0].ConfigurationIndex\n\tsnapConf := snaps[0].Configuration\n\n\t// Commit a configuration change after the snapshot.\n\tchange := leader.AddNonvoter(ServerID(\"nonvoter-B\"), ServerAddress(\"addr-B\"), 0, 0)\n\tif err := change.Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter: %v\", err)\n\t}\n\tchangeIdx := change.Index()\n\n\t// Write more entries so the commit-tracking store stages a commit index at\n\t// or beyond the configuration entry.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\tvar entry Log\n\tif err := leader.logs.GetLog(changeIdx, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(%d): %v\", changeIdx, err)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tlastApplied := n.getLastApplied()\n\tafterSnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(afterSnapIdx, lastApplied) + 1\n\n\tvar loggedConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tloggedConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restore_committed_logs_snapshot_and_config_change\",\n\t\t\"variant\":                  \"snapshot+config-change\",\n\t\t\"snapshot_index\":           snapIdx,\n\t\t\"snapshot_config_index\":    snapConfIdx,\n\t\t\"snapshot_config\":          caServers(snapConf),\n\t\t\"config_entry_index\":       changeIdx,\n\t\t\"config_entry_type\":        entry.Type.String(),\n\t\t\"config_entry_servers\":     caServers(loggedConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  mustCommitIndex(t, n),\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       changeIdx >= scanStart,\n\t\t\"config_entry_committed_at_restart\":  mustCommitIndex(t, n) >= changeIdx,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\nfunc mustCommitIndex(t *testing.T, n *Raft) uint64 {\n\tt.Helper()\n\tstore := n.logs.(CommitTrackingLogStore)\n\tidx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex: %v\", err)\n\t}\n\treturn idx\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "s-scan",
+            "s-restore-committed",
+            "s-dispatch-stage",
+            "s-appendentries-stage"
+          ],
+          "anchors": [
+            {
+              "material_id": "s-scan",
+              "symbol": "NewRaft",
+              "start_line": 508,
+              "end_line": 508,
+              "anchor": {
+                "source_ids": [
+                  "s-scan"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-scan",
+                "start_line": 508,
+                "end_line": 508,
+                "symbol": "NewRaft"
+              }
+            },
+            {
+              "material_id": "s-restore-committed",
+              "symbol": "restoreFromCommittedLogs",
+              "start_line": 724,
+              "end_line": 724,
+              "anchor": {
+                "source_ids": [
+                  "s-restore-committed"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-restore-committed",
+                "start_line": 724,
+                "end_line": 724,
+                "symbol": "restoreFromCommittedLogs"
+              }
+            },
+            {
+              "material_id": "s-dispatch-stage",
+              "symbol": "dispatchLogs",
+              "start_line": 1245,
+              "end_line": 1245,
+              "anchor": {
+                "source_ids": [
+                  "s-dispatch-stage"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-dispatch-stage",
+                "start_line": 1245,
+                "end_line": 1245,
+                "symbol": "dispatchLogs"
+              }
+            },
+            {
+              "material_id": "s-appendentries-stage",
+              "symbol": "appendEntries",
+              "start_line": 1458,
+              "end_line": 1458,
+              "anchor": {
+                "source_ids": [
+                  "s-appendentries-stage"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-appendentries-stage",
+                "start_line": 1458,
+                "end_line": 1458,
+                "symbol": "appendEntries"
+              }
+            }
+          ],
+          "scope": {
+            "description": "Two restart scenarios on a single-node in-memory cluster created by the repository's own MakeClusterCustom helper, whose log store implements CommitTrackingLogStore and whose Config sets RestoreCommittedLogs=true. Each scenario commits entries, restarts the node from its retained log/stable/snapshot stores with a fresh in-memory transport via NewRaft, and reports the recovered commit index, lastApplied, the scan start index, whether a committed configuration entry is inside the scanned range, and the node's latest configuration before and after restart.",
+            "assumptions": [
+              "The CommitTrackingLogStore implementation is the repository's InmemCommitTrackingStore.",
+              "The transport is the repository's InmemTransport and the FSM is the repository's MockFSM.",
+              "RestoreCommittedLogs=true with a CommitTrackingLogStore, as documented in config.go.",
+              "No fault injection, no artificial delays and no modification of production logic."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "Scenario A (event restore_committed_logs_no_snapshot): bootstrap a one-node cluster whose first log entry is a committed LogConfiguration, apply ten commands (all committed, no snapshot exists), sample the store's GetCommitIndex and the latest configuration, then Shutdown and restart with NewRaft from the same stores. Scenario B (event restore_committed_logs_snapshot_and_config_change): apply twenty commands, take a user snapshot, commit AddNonvoter(nonvoter-B), apply ten more commands so the commit-tracking store stages a commit index beyond the configuration entry, then Shutdown and restart the same way.",
+          "requirement": "On restart, a node's configuration state (used for participant eligibility, election gating and quorum) must include every configuration entry its log store reports as committed, including entries at or below the recovered commit index.",
+          "responsibility": "Raft itself: NewRaft owns loading the node's configuration from its log and snapshot history, and the RestoreCommittedLogs option must not leave that state behind the committed history.",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "73c89897147e4f31b4f841da8b88836a",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "680bc27c9c50448a8b63097d98091061",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      },
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-experiment",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-1",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"runtime\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Printf(\"CA_EVENT %s\\n\", buf)\n}\n\nfunc caServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s\", s.ID, s.Suffrage))\n\t}\n\treturn out\n}\n\n// caRestartShutdownAndRestart restarts a single-node cluster from its own\n// retained stores (log, stable, snapshots) with a fresh in-memory transport,\n// exactly like the repository's own restart tests do.\nfunc caRestart(t *testing.T, old *Raft) *Raft {\n\tt.Helper()\n\tif err := old.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\t_, trans := NewInmemTransport(old.localAddr)\n\tcfg := old.config()\n\tn, err := NewRaft(&cfg, old.fsm, old.logs, old.stable, old.snapshots, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"restart NewRaft: %v\", err)\n\t}\n\treturn n\n}\n\nfunc caConf(t *testing.T) *Config {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 20 // keep automatic snapshotting out of the way\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\treturn conf\n}\n\n// TestAssurance_RestoreCommittedLogs_NoSnapshot probes the documented\n// RestoreCommittedLogs startup path on a node that has committed log entries but\n// no snapshot: which configuration does the node hold after NewRaft returns, and\n// where does the NewRaft configuration scan start relative to the committed\n// index?\nfunc TestAssurance_RestoreCommittedLogs_NoSnapshot(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tlastIdx, err := leader.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\t// The first log entry of a bootstrapped cluster is the configuration entry.\n\tvar entry Log\n\tif err := leader.logs.GetLog(1, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(1): %v\", err)\n\t}\n\tvar entryConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tentryConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tstoreAfter := n.logs.(CommitTrackingLogStore)\n\tstagedAfter, err := storeAfter.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex after restart: %v\", err)\n\t}\n\tlastApplied := n.getLastApplied()\n\tsnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(snapIdx, lastApplied) + 1\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"restore_committed_logs_no_snapshot\",\n\t\t\"variant\":                \"no-snapshot\",\n\t\t\"bootstrap_config_index\": entry.Index,\n\t\t\"bootstrap_config_type\":  entry.Type.String(),\n\t\t\"bootstrap_config_servers\": caServers(entryConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  stagedAfter,\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"last_snapshot_index_after_restart\":  snapIdx,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       entry.Index >= scanStart,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\n// TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange probes a restart\n// where a configuration entry was committed after the node's last snapshot.\nfunc TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 20; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\tif len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot taken\")\n\t}\n\tsnapIdx := snaps[0].Index\n\tsnapConfIdx := snaps[0].ConfigurationIndex\n\tsnapConf := snaps[0].Configuration\n\n\t// Commit a configuration change after the snapshot.\n\tchange := leader.AddNonvoter(ServerID(\"nonvoter-B\"), ServerAddress(\"addr-B\"), 0, 0)\n\tif err := change.Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter: %v\", err)\n\t}\n\tchangeIdx := change.Index()\n\n\t// Write more entries so the commit-tracking store stages a commit index at\n\t// or beyond the configuration entry.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\tvar entry Log\n\tif err := leader.logs.GetLog(changeIdx, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(%d): %v\", changeIdx, err)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tlastApplied := n.getLastApplied()\n\tafterSnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(afterSnapIdx, lastApplied) + 1\n\n\tvar loggedConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tloggedConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restore_committed_logs_snapshot_and_config_change\",\n\t\t\"variant\":                  \"snapshot+config-change\",\n\t\t\"snapshot_index\":           snapIdx,\n\t\t\"snapshot_config_index\":    snapConfIdx,\n\t\t\"snapshot_config\":          caServers(snapConf),\n\t\t\"config_entry_index\":       changeIdx,\n\t\t\"config_entry_type\":        entry.Type.String(),\n\t\t\"config_entry_servers\":     caServers(loggedConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  mustCommitIndex(t, n),\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       changeIdx >= scanStart,\n\t\t\"config_entry_committed_at_restart\":  mustCommitIndex(t, n) >= changeIdx,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\nfunc mustCommitIndex(t *testing.T, n *Raft) uint64 {\n\tt.Helper()\n\tstore := n.logs.(CommitTrackingLogStore)\n\tidx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex: %v\", err)\n\t}\n\treturn idx\n}\n\n// caBlockedFrames returns the stack frames of every goroutine that is currently\n// blocked, so that a restart that never returns can be attributed to an actual\n// call site instead of being attributed by inference.\nfunc caBlockedFrames() []string {\n\tbuf := make([]byte, 1<<20)\n\tn := runtime.Stack(buf, true)\n\tvar out []string\n\tfor _, line := range strings.Split(string(buf[:n]), \"\\n\") {\n\t\ttrimmed := strings.TrimSpace(line)\n\t\tif strings.Contains(trimmed, \"github.com/hashicorp/raft.\") ||\n\t\t\tstrings.Contains(trimmed, \"[chan send]\") ||\n\t\t\tstrings.Contains(trimmed, \"[select]\") {\n\t\t\tif len(out) < 40 {\n\t\t\t\tout = append(out, trimmed)\n\t\t\t}\n\t\t}\n\t}\n\treturn out\n}\n\n// caLargeRangeCase commits one kind of history and measures whether the\n// RestoreCommittedLogs restart returns within the given bound.\nfunc caLargeRangeCase(t *testing.T, applied int, wait time.Duration) {\n\tt.Helper()\n\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 30 // no automatic snapshot at all\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < applied; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"cmd-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %d: %v\", i, err)\n\t\t}\n\t}\n\n\tstaged := mustCommitIndex(t, leader)\n\tlastIdx, _ := leader.logs.LastIndex()\n\tfirstIdx, _ := leader.logs.FirstIndex()\n\tsnapIdx, _ := leader.getLastSnapshot()\n\tbatches := (staged + uint64(conf.MaxAppendEntries) - 1) / uint64(conf.MaxAppendEntries)\n\tvariant := fmt.Sprintf(\"committed-range-entries-%d\", staged)\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                              \"large_committed_range_setup\",\n\t\t\"variant\":                            variant,\n\t\t\"applied_commands\":                   applied,\n\t\t\"first_log_index\":                    firstIdx,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"last_snapshot_index\":                snapIdx,\n\t\t\"staged_commit_index_before_restart\": staged,\n\t\t\"recovery_range_entries\":             staged,\n\t\t\"recovery_range_batches\":             batches,\n\t\t\"fsm_mutate_ch_capacity\":             128,\n\t})\n\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\n\t_, trans := NewInmemTransport(leader.localAddr)\n\tcfg := leader.config()\n\ttype restartResult struct {\n\t\traft *Raft\n\t\terr  error\n\t}\n\tdone := make(chan restartResult, 1)\n\tstart := time.Now()\n\tgo func() {\n\t\tn, err := NewRaft(&cfg, leader.fsm, leader.logs, leader.stable, leader.snapshots, trans)\n\t\tdone <- restartResult{raft: n, err: err}\n\t}()\n\n\tselect {\n\tcase res := <-done:\n\t\tlastApplied, commitIdx := uint64(0), uint64(0)\n\t\tcfgLen := 0\n\t\tif res.raft != nil {\n\t\t\tlastApplied = res.raft.getLastApplied()\n\t\t\tcommitIdx = mustCommitIndex(t, res.raft)\n\t\t\tcfgLen = len(res.raft.getLatestConfiguration().Servers)\n\t\t\t_ = res.raft.Shutdown()\n\t\t}\n\t\tcaEmit(t, map[string]interface{}{\n\t\t\t\"event\":                             \"restart_newraft_completed\",\n\t\t\t\"variant\":                           variant,\n\t\t\t\"newraft_returned\":                  true,\n\t\t\t\"elapsed_ms\":                        time.Since(start).Milliseconds(),\n\t\t\t\"error\":                             fmt.Sprint(res.err),\n\t\t\t\"last_applied_after_restart\":        lastApplied,\n\t\t\t\"staged_commit_index_after_restart\": commitIdx,\n\t\t\t\"latest_config_after_restart_len\":   cfgLen,\n\t\t\t\"blocked_frames\":                    []string{},\n\t\t})\n\tcase <-time.After(wait):\n\t\tcaEmit(t, map[string]interface{}{\n\t\t\t\"event\":             \"restart_newraft_completed\",\n\t\t\t\"variant\":           variant,\n\t\t\t\"newraft_returned\":  false,\n\t\t\t\"observed_after_ms\": wait.Milliseconds(),\n\t\t\t\"blocked_frames\":    caBlockedFrames(),\n\t\t})\n\t}\n}\n\n// TestAssurance_RestoreCommittedLogs_LargeCommittedRange probes whether the\n// RestoreCommittedLogs startup path can return at all when the recovered\n// committed range needs more FSM batches than the fsmMutateCh buffer, with a\n// smaller range as a control.\nfunc TestAssurance_RestoreCommittedLogs_LargeCommittedRange(t *testing.T) {\n\tcaLargeRangeCase(t, 6000, 20*time.Second)\n\tcaLargeRangeCase(t, 9000, 20*time.Second)\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "control-setup",
+                "event": "large_committed_range_setup",
+                "conditions": [
+                  {
+                    "field": "applied_commands",
+                    "op": "eq",
+                    "value": 6000,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "above-threshold-setup",
+                "event": "large_committed_range_setup",
+                "conditions": [
+                  {
+                    "field": "applied_commands",
+                    "op": "eq",
+                    "value": 9000,
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "s-restore-committed",
+            "s-fsm-ch",
+            "s-goroutines"
+          ],
+          "anchors": [
+            {
+              "material_id": "s-restore-committed",
+              "symbol": "restoreFromCommittedLogs",
+              "start_line": 724,
+              "end_line": 724,
+              "anchor": {
+                "source_ids": [
+                  "s-restore-committed"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-restore-committed",
+                "start_line": 724,
+                "end_line": 724,
+                "symbol": "restoreFromCommittedLogs"
+              }
+            },
+            {
+              "material_id": "s-fsm-ch",
+              "symbol": "NewRaft",
+              "start_line": 560,
+              "end_line": 560,
+              "anchor": {
+                "source_ids": [
+                  "s-fsm-ch",
+                  "s-scan"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-scan",
+                "start_line": 508,
+                "end_line": 508,
+                "symbol": "NewRaft"
+              }
+            },
+            {
+              "material_id": "s-goroutines",
+              "symbol": "NewRaft",
+              "start_line": 637,
+              "end_line": 637,
+              "anchor": {
+                "source_ids": [
+                  "s-fsm-ch",
+                  "s-goroutines",
+                  "s-scan"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-scan",
+                "start_line": 508,
+                "end_line": 508,
+                "symbol": "NewRaft"
+              }
+            }
+          ],
+          "scope": {
+            "description": "Two single-node in-memory clusters (repository MakeClusterCustom, CommitTrackingLogStore, RestoreCommittedLogs=true, snapshotting disabled) commit different amounts of authored history, then restart via NewRaft in a goroutine with a bounded wait: 6000 commands as a control (94 batches of 64) and 9000 commands (141 batches). Each case emits a setup event and one result event stating whether NewRaft returned, and, if not, the blocked goroutine frames captured with runtime.Stack.",
+            "assumptions": [
+              "The log store is the repository's InmemCommitTrackingStore and the transport the repository's InmemTransport.",
+              "Snapshotting is disabled by configuration so the recovered range starts at index 0 with no snapshot.",
+              "Only the amount of committed history differs between the two cases; the same harness, helper and configuration are used.",
+              "No test is expected to block the whole package run: the restart is wrapped in a bounded select."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "For each case: bootstrap a one-node cluster with CommitTrackingLogs and RestoreCommittedLogs, apply N commands to completion, record the staged commit index and the derived batch count, Shutdown, restart with NewRaft from the same stores inside a goroutine and wait up to 20 seconds; on return report lastApplied, commit index and configuration length after restart, otherwise report the observed wait and the frames of every goroutine containing github.com/hashicorp/raft plus chan-send/select markers.",
+          "requirement": "NewRaft must complete its startup recovery for any legal retained state; RestoreCommittedLogs must not leave the node unable to finish construction when the recovered committed range is large.",
+          "responsibility": "Raft itself: NewRaft owns recovery ordering, including when the FSM consumer goroutine starts relative to the recovery work it feeds.",
+          "comparisons": [
+            {
+              "event": "restart_newraft_completed",
+              "identity_fields": [
+                "variant"
+              ],
+              "admission_alias": "control-setup",
+              "assertion": {
+                "field": "newraft_returned",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "The control range (fewer batches than the fsmMutateCh capacity) completes startup recovery."
+            },
+            {
+              "event": "restart_newraft_completed",
+              "identity_fields": [
+                "variant"
+              ],
+              "admission_alias": "above-threshold-setup",
+              "assertion": {
+                "field": "newraft_returned",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "The range exceeding the fsmMutateCh batch capacity also completes startup recovery."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "73c89897147e4f31b4f841da8b88836a",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "7e10640e7212486b94a80f04b69febc2",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "680bc27c9c50448a8b63097d98091061-interpretation-0",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "s-scan",
+          "s-restore-committed",
+          "s-dispatch-stage",
+          "s-appendentries-stage",
+          "s-runfollower-gate",
+          "s-config-doc",
+          "s-commit-tracking-contract"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Current account: with RestoreCommittedLogs enabled, NewRaft's configuration scan excludes committed configuration entries. restoreFromCommittedLogs clamps the store's commit index and calls processLogs, which ends with setLastApplied(index); the following scan loop iterates from max(snapshotIndex, lastApplied)+1 up to the last log index, so any configuration entry with index at or below the recovered commit index is never passed to processConfigurationLogEntry. Both staging producers cap the staged value at entries already stored (raft.go:1266 for the leader, raft.go:1558 for followers), so the recovered commit index reaches a configuration entry whenever later entries were stored after it was committed. Consequence: the restarted node's r.configurations is the snapshot's configuration or, with no snapshot, empty, while its log reports that configuration entry as committed; an empty configuration makes runFollower abort elections (raft.go:232) and leaves the node's participant eligibility wrong until a later configuration entry or installed snapshot repairs it. Construction feedback: local, non-retained runs of these harness bytes reported variant A with last_applied_after_restart=11, config_scan_start_index=12, the bootstrap LogConfiguration at index 1 not covered and latest_config_after_restart_len=0; variant B reported the committed LogConfiguration at index 23 (adding nonvoter-B) not covered with the post-restart configuration reduced to the snapshot's single voter. Those local numbers are construction feedback only, so the conclusion stays conditional until the retained receipt of the queued experiment is read.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The recovered committed entries are still applied to the FSM (processLogs), and a node can still learn the current configuration from any later configuration entry or installed snapshot, so the omission can be repaired and does not by itself corrupt the FSM.",
+          "Snapshot-level configuration is loaded correctly by restoreSnapshot, so the omission only appears for configuration entries that sit between the last snapshot (or index 0) and the recovered commit index.",
+          "No captured test asserts configuration state after a RestoreCommittedLogs restart, so the captured suite neither confirms nor contradicts the omission."
+        ],
+        "limitations": [
+          "The account applies only to nodes configured with RestoreCommittedLogs=true and a log store implementing CommitTrackingLogStore; with the flag off, lastApplied equals the snapshot index and the scan range is unchanged.",
+          "The consequences on elections, quorum and participant eligibility are currently source-derived (hasVote and the runFollower election gate), not measured.",
+          "The exact reported field values and the runtime confirmation depend on the queued experiment's retained receipt."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "680bc27c9c50448a8b63097d98091061"
+      },
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-interpretation-0",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+        "experiment_id": "680bc27c9c50448a8b63097d98091061-experiment",
+        "source_ids": [
+          "s-scan",
+          "s-restore-committed",
+          "s-dispatch-stage",
+          "s-appendentries-stage",
+          "s-runfollower-gate",
+          "s-config-doc",
+          "s-commit-tracking-contract"
+        ],
+        "executions": {
+          "5e1ce9aa430842d5a9325cfecbc885f6": [
+            0,
+            1
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Current account: with RestoreCommittedLogs enabled, NewRaft's configuration scan excludes committed configuration entries, and the retained execution shows it. restoreFromCommittedLogs clamps the store's commit index, applies the recovered range through processLogs (which ends with setLastApplied(index)), and the following scan loop starts at max(lastSnapshotIndex, lastApplied)+1, so a configuration entry at or below the recovered commit index is never passed to processConfigurationLogEntry. Staging producers cap the staged value at entries already stored, so the recovered commit index reaches a configuration entry whenever later entries were written after it committed. Parsed event 0 (event restore_committed_logs_no_snapshot, receipt 5e1ce9aa430842d5a9325cfecbc885f6): staged commit index 11 equals lastApplied 11, scan start 12, the committed LogConfiguration at index 1 is outside the scan, and the node's latest configuration after restart is empty (length 0) although before restart it held one voter and the FSM had been fed up to index 11. Parsed event 1 (restore_committed_logs_snapshot_and_config_change, same receipt): snapshot index 22 with configuration index 1, committed LogConfiguration at index 23 adding nonvoter-B, staged commit index 32 equals lastApplied 32, scan start 33, the entry is outside the scan, and the post-restart configuration is again only the snapshot's single voter, so the committed nonvoter is absent. Requirement contradicted by both witnesses: the restarted node's configuration state does not include every committed configuration entry. Source-derived consequences, not measured here: runFollower aborts elections when the configuration is empty (raft.go:232), quorumSize() returns 1 for an empty voter list, and requestVote/requestPreVote skip the membership rejection when the candidate configuration has no servers.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The recovered committed entries are still applied to the FSM, and any later configuration entry or an installed snapshot restores the node's configuration, so the omission is repaired by normal traffic in a healthy cluster.",
+          "Snapshot configuration is loaded correctly by restoreSnapshot, so the defect needs a committed configuration entry between the last snapshot (or index 0) and the recovered commit index.",
+          "No captured test asserts configuration state after a RestoreCommittedLogs restart, so the captured suite neither contradicts nor covers this path."
+        ],
+        "limitations": [
+          "The account applies to nodes configured with RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; with the flag off lastApplied equals the snapshot index and the scan range is unchanged.",
+          "The executed cases used a single-node in-memory cluster with authored commands and the repository's InmemCommitTrackingStore; behaviour for multi-node clusters, monotonic stores and production stores is not measured.",
+          "Which requests the empty/stale configuration actually admits, and whether the cluster loses progress before a later entry repairs it, remain unmeasured (registered as a child question)."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "7e10640e7212486b94a80f04b69febc2"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "03d8630fd2a64384a825524b28696d36",
+      "result": {
+        "submission": "update.json",
+        "summary": "Read the retained receipt for the blocking probe (CheckRun 8e041cda11284c539f23fc87e776a4d2): event 5 shows NewRaft not returning within 20 s with the blocked goroutine captured inside processLogs' batch send (index 9001) under restoreFromCommittedLogs with no runFSM consumer, while event 3 shows the same path returning in 6 ms for a 94-batch range (and an empty post-restart configuration). Recorded that as a witnessed violation for the second question with the mechanism observed, updated the fsm-block behavior entry with the receipt, and queued a follow-on probe for the child question on vote/pre-vote admission under an empty configuration; that probe has not yet been executed, so the child question stays open."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-680bc27c9c50448a8b63097d98091061": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_18-00-28-hashicorp_raft-real-run/semantic-commits/submission-680bc27c9c50448a8b63097d98091061.json"
+      },
+      "submission-7e10640e7212486b94a80f04b69febc2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_18-00-28-hashicorp_raft-real-run/semantic-commits/submission-7e10640e7212486b94a80f04b69febc2.json"
+      }
+    }
+  },
+  "after": {
+    "knowledge": [
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "With RestoreCommittedLogs enabled, NewRaft's configuration scan starts at max(lastSnapshotIndex, lastApplied)+1 after restoreFromCommittedLogs has set lastApplied to the recovered commit index; committed LogConfiguration entries at or below that index are therefore never passed to processConfigurationLogEntry, so r.configurations keeps the snapshot configuration or stays empty when no snapshot exists.",
+        "conditions": "Config.RestoreCommittedLogs=true with a LogStore implementing CommitTrackingLogStore; the node restarts from its retained log, stable store and snapshots; the configuration entry index is at or below the commit index reported by GetCommitIndex.",
+        "source_ids": [
+          "s-scan",
+          "s-restore-committed",
+          "s-dispatch-stage",
+          "s-appendentries-stage"
+        ],
+        "executions": {
+          "5e1ce9aa430842d5a9325cfecbc885f6": [
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7e10640e7212486b94a80f04b69febc2"
+      },
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-knowledge-1",
+        "revision": 2,
+        "kind": "behavior",
+        "statement": "processLogs feeds r.fsmMutateCh in batches of MaxAppendEntries, while runFSM (its only consumer) is started only after restoreSnapshot/restoreFromCommittedLogs inside NewRaft; a recovered committed range needing more batches than the 128-slot buffer leaves NewRaft blocked in that batch send, and the blocked goroutine is visible as processLogs.func1 under restoreFromCommittedLogs under NewRaft.",
+        "conditions": "Config.RestoreCommittedLogs=true with a commit-tracking store whose recovered commit index spans more than 128 batches of authored entries, and no consumer started yet inside NewRaft.",
+        "source_ids": [
+          "s-restore-committed",
+          "s-fsm-ch",
+          "s-goroutines"
+        ],
+        "executions": {
+          "8e041cda11284c539f23fc87e776a4d2": [
+            3,
+            5
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "7e10640e7212486b94a80f04b69febc2-knowledge-1",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "processLogs feeds r.fsmMutateCh in batches of MaxAppendEntries, while runFSM (its only consumer) is only started after restoreSnapshot/restoreFromCommittedLogs; a recovered committed range needing more batches than the 128-slot buffer makes NewRaft block in the send.",
+            "conditions": "Config.RestoreCommittedLogs=true, a commit-tracking store whose recovered commit index spans more than 128 batches of authored entries, and no consumer started yet inside NewRaft.",
+            "source_ids": [
+              "s-restore-committed",
+              "s-fsm-ch",
+              "s-goroutines"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "7e10640e7212486b94a80f04b69febc2",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "03d8630fd2a64384a825524b28696d36"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "680bc27c9c50448a8b63097d98091061-experiment",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Printf(\"CA_EVENT %s\\n\", buf)\n}\n\nfunc caServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s\", s.ID, s.Suffrage))\n\t}\n\treturn out\n}\n\n// caRestartShutdownAndRestart restarts a single-node cluster from its own\n// retained stores (log, stable, snapshots) with a fresh in-memory transport,\n// exactly like the repository's own restart tests do.\nfunc caRestart(t *testing.T, old *Raft) *Raft {\n\tt.Helper()\n\tif err := old.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\t_, trans := NewInmemTransport(old.localAddr)\n\tcfg := old.config()\n\tn, err := NewRaft(&cfg, old.fsm, old.logs, old.stable, old.snapshots, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"restart NewRaft: %v\", err)\n\t}\n\treturn n\n}\n\nfunc caConf(t *testing.T) *Config {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 20 // keep automatic snapshotting out of the way\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\treturn conf\n}\n\n// TestAssurance_RestoreCommittedLogs_NoSnapshot probes the documented\n// RestoreCommittedLogs startup path on a node that has committed log entries but\n// no snapshot: which configuration does the node hold after NewRaft returns, and\n// where does the NewRaft configuration scan start relative to the committed\n// index?\nfunc TestAssurance_RestoreCommittedLogs_NoSnapshot(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tlastIdx, err := leader.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\t// The first log entry of a bootstrapped cluster is the configuration entry.\n\tvar entry Log\n\tif err := leader.logs.GetLog(1, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(1): %v\", err)\n\t}\n\tvar entryConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tentryConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tstoreAfter := n.logs.(CommitTrackingLogStore)\n\tstagedAfter, err := storeAfter.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex after restart: %v\", err)\n\t}\n\tlastApplied := n.getLastApplied()\n\tsnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(snapIdx, lastApplied) + 1\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"restore_committed_logs_no_snapshot\",\n\t\t\"variant\":                \"no-snapshot\",\n\t\t\"bootstrap_config_index\": entry.Index,\n\t\t\"bootstrap_config_type\":  entry.Type.String(),\n\t\t\"bootstrap_config_servers\": caServers(entryConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  stagedAfter,\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"last_snapshot_index_after_restart\":  snapIdx,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       entry.Index >= scanStart,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\n// TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange probes a restart\n// where a configuration entry was committed after the node's last snapshot.\nfunc TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 20; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\tif len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot taken\")\n\t}\n\tsnapIdx := snaps[0].Index\n\tsnapConfIdx := snaps[0].ConfigurationIndex\n\tsnapConf := snaps[0].Configuration\n\n\t// Commit a configuration change after the snapshot.\n\tchange := leader.AddNonvoter(ServerID(\"nonvoter-B\"), ServerAddress(\"addr-B\"), 0, 0)\n\tif err := change.Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter: %v\", err)\n\t}\n\tchangeIdx := change.Index()\n\n\t// Write more entries so the commit-tracking store stages a commit index at\n\t// or beyond the configuration entry.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\tvar entry Log\n\tif err := leader.logs.GetLog(changeIdx, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(%d): %v\", changeIdx, err)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tlastApplied := n.getLastApplied()\n\tafterSnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(afterSnapIdx, lastApplied) + 1\n\n\tvar loggedConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tloggedConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restore_committed_logs_snapshot_and_config_change\",\n\t\t\"variant\":                  \"snapshot+config-change\",\n\t\t\"snapshot_index\":           snapIdx,\n\t\t\"snapshot_config_index\":    snapConfIdx,\n\t\t\"snapshot_config\":          caServers(snapConf),\n\t\t\"config_entry_index\":       changeIdx,\n\t\t\"config_entry_type\":        entry.Type.String(),\n\t\t\"config_entry_servers\":     caServers(loggedConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  mustCommitIndex(t, n),\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       changeIdx >= scanStart,\n\t\t\"config_entry_committed_at_restart\":  mustCommitIndex(t, n) >= changeIdx,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\nfunc mustCommitIndex(t *testing.T, n *Raft) uint64 {\n\tt.Helper()\n\tstore := n.logs.(CommitTrackingLogStore)\n\tidx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex: %v\", err)\n\t}\n\treturn idx\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "s-scan",
+            "s-restore-committed",
+            "s-dispatch-stage",
+            "s-appendentries-stage"
+          ],
+          "anchors": [
+            {
+              "material_id": "s-scan",
+              "symbol": "NewRaft",
+              "start_line": 508,
+              "end_line": 508,
+              "anchor": {
+                "source_ids": [
+                  "s-scan"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-scan",
+                "start_line": 508,
+                "end_line": 508,
+                "symbol": "NewRaft"
+              }
+            },
+            {
+              "material_id": "s-restore-committed",
+              "symbol": "restoreFromCommittedLogs",
+              "start_line": 724,
+              "end_line": 724,
+              "anchor": {
+                "source_ids": [
+                  "s-restore-committed"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-restore-committed",
+                "start_line": 724,
+                "end_line": 724,
+                "symbol": "restoreFromCommittedLogs"
+              }
+            },
+            {
+              "material_id": "s-dispatch-stage",
+              "symbol": "dispatchLogs",
+              "start_line": 1245,
+              "end_line": 1245,
+              "anchor": {
+                "source_ids": [
+                  "s-dispatch-stage"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-dispatch-stage",
+                "start_line": 1245,
+                "end_line": 1245,
+                "symbol": "dispatchLogs"
+              }
+            },
+            {
+              "material_id": "s-appendentries-stage",
+              "symbol": "appendEntries",
+              "start_line": 1458,
+              "end_line": 1458,
+              "anchor": {
+                "source_ids": [
+                  "s-appendentries-stage"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-appendentries-stage",
+                "start_line": 1458,
+                "end_line": 1458,
+                "symbol": "appendEntries"
+              }
+            }
+          ],
+          "scope": {
+            "description": "Two restart scenarios on a single-node in-memory cluster created by the repository's own MakeClusterCustom helper, whose log store implements CommitTrackingLogStore and whose Config sets RestoreCommittedLogs=true. Each scenario commits entries, restarts the node from its retained log/stable/snapshot stores with a fresh in-memory transport via NewRaft, and reports the recovered commit index, lastApplied, the scan start index, whether a committed configuration entry is inside the scanned range, and the node's latest configuration before and after restart.",
+            "assumptions": [
+              "The CommitTrackingLogStore implementation is the repository's InmemCommitTrackingStore.",
+              "The transport is the repository's InmemTransport and the FSM is the repository's MockFSM.",
+              "RestoreCommittedLogs=true with a CommitTrackingLogStore, as documented in config.go.",
+              "No fault injection, no artificial delays and no modification of production logic."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "Scenario A (event restore_committed_logs_no_snapshot): bootstrap a one-node cluster whose first log entry is a committed LogConfiguration, apply ten commands (all committed, no snapshot exists), sample the store's GetCommitIndex and the latest configuration, then Shutdown and restart with NewRaft from the same stores. Scenario B (event restore_committed_logs_snapshot_and_config_change): apply twenty commands, take a user snapshot, commit AddNonvoter(nonvoter-B), apply ten more commands so the commit-tracking store stages a commit index beyond the configuration entry, then Shutdown and restart the same way.",
+          "requirement": "On restart, a node's configuration state (used for participant eligibility, election gating and quorum) must include every configuration entry its log store reports as committed, including entries at or below the recovered commit index.",
+          "responsibility": "Raft itself: NewRaft owns loading the node's configuration from its log and snapshot history, and the RestoreCommittedLogs option must not leave that state behind the committed history.",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "73c89897147e4f31b4f841da8b88836a",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "680bc27c9c50448a8b63097d98091061",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      },
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-experiment",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-1",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"runtime\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Printf(\"CA_EVENT %s\\n\", buf)\n}\n\nfunc caServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s\", s.ID, s.Suffrage))\n\t}\n\treturn out\n}\n\n// caRestartShutdownAndRestart restarts a single-node cluster from its own\n// retained stores (log, stable, snapshots) with a fresh in-memory transport,\n// exactly like the repository's own restart tests do.\nfunc caRestart(t *testing.T, old *Raft) *Raft {\n\tt.Helper()\n\tif err := old.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\t_, trans := NewInmemTransport(old.localAddr)\n\tcfg := old.config()\n\tn, err := NewRaft(&cfg, old.fsm, old.logs, old.stable, old.snapshots, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"restart NewRaft: %v\", err)\n\t}\n\treturn n\n}\n\nfunc caConf(t *testing.T) *Config {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 20 // keep automatic snapshotting out of the way\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\treturn conf\n}\n\n// TestAssurance_RestoreCommittedLogs_NoSnapshot probes the documented\n// RestoreCommittedLogs startup path on a node that has committed log entries but\n// no snapshot: which configuration does the node hold after NewRaft returns, and\n// where does the NewRaft configuration scan start relative to the committed\n// index?\nfunc TestAssurance_RestoreCommittedLogs_NoSnapshot(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tlastIdx, err := leader.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\t// The first log entry of a bootstrapped cluster is the configuration entry.\n\tvar entry Log\n\tif err := leader.logs.GetLog(1, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(1): %v\", err)\n\t}\n\tvar entryConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tentryConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tstoreAfter := n.logs.(CommitTrackingLogStore)\n\tstagedAfter, err := storeAfter.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex after restart: %v\", err)\n\t}\n\tlastApplied := n.getLastApplied()\n\tsnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(snapIdx, lastApplied) + 1\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"restore_committed_logs_no_snapshot\",\n\t\t\"variant\":                \"no-snapshot\",\n\t\t\"bootstrap_config_index\": entry.Index,\n\t\t\"bootstrap_config_type\":  entry.Type.String(),\n\t\t\"bootstrap_config_servers\": caServers(entryConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  stagedAfter,\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"last_snapshot_index_after_restart\":  snapIdx,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       entry.Index >= scanStart,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\n// TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange probes a restart\n// where a configuration entry was committed after the node's last snapshot.\nfunc TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 20; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\tif len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot taken\")\n\t}\n\tsnapIdx := snaps[0].Index\n\tsnapConfIdx := snaps[0].ConfigurationIndex\n\tsnapConf := snaps[0].Configuration\n\n\t// Commit a configuration change after the snapshot.\n\tchange := leader.AddNonvoter(ServerID(\"nonvoter-B\"), ServerAddress(\"addr-B\"), 0, 0)\n\tif err := change.Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter: %v\", err)\n\t}\n\tchangeIdx := change.Index()\n\n\t// Write more entries so the commit-tracking store stages a commit index at\n\t// or beyond the configuration entry.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\tvar entry Log\n\tif err := leader.logs.GetLog(changeIdx, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(%d): %v\", changeIdx, err)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tlastApplied := n.getLastApplied()\n\tafterSnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(afterSnapIdx, lastApplied) + 1\n\n\tvar loggedConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tloggedConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restore_committed_logs_snapshot_and_config_change\",\n\t\t\"variant\":                  \"snapshot+config-change\",\n\t\t\"snapshot_index\":           snapIdx,\n\t\t\"snapshot_config_index\":    snapConfIdx,\n\t\t\"snapshot_config\":          caServers(snapConf),\n\t\t\"config_entry_index\":       changeIdx,\n\t\t\"config_entry_type\":        entry.Type.String(),\n\t\t\"config_entry_servers\":     caServers(loggedConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  mustCommitIndex(t, n),\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       changeIdx >= scanStart,\n\t\t\"config_entry_committed_at_restart\":  mustCommitIndex(t, n) >= changeIdx,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\nfunc mustCommitIndex(t *testing.T, n *Raft) uint64 {\n\tt.Helper()\n\tstore := n.logs.(CommitTrackingLogStore)\n\tidx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex: %v\", err)\n\t}\n\treturn idx\n}\n\n// caBlockedFrames returns the stack frames of every goroutine that is currently\n// blocked, so that a restart that never returns can be attributed to an actual\n// call site instead of being attributed by inference.\nfunc caBlockedFrames() []string {\n\tbuf := make([]byte, 1<<20)\n\tn := runtime.Stack(buf, true)\n\tvar out []string\n\tfor _, line := range strings.Split(string(buf[:n]), \"\\n\") {\n\t\ttrimmed := strings.TrimSpace(line)\n\t\tif strings.Contains(trimmed, \"github.com/hashicorp/raft.\") ||\n\t\t\tstrings.Contains(trimmed, \"[chan send]\") ||\n\t\t\tstrings.Contains(trimmed, \"[select]\") {\n\t\t\tif len(out) < 40 {\n\t\t\t\tout = append(out, trimmed)\n\t\t\t}\n\t\t}\n\t}\n\treturn out\n}\n\n// caLargeRangeCase commits one kind of history and measures whether the\n// RestoreCommittedLogs restart returns within the given bound.\nfunc caLargeRangeCase(t *testing.T, applied int, wait time.Duration) {\n\tt.Helper()\n\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 30 // no automatic snapshot at all\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < applied; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"cmd-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %d: %v\", i, err)\n\t\t}\n\t}\n\n\tstaged := mustCommitIndex(t, leader)\n\tlastIdx, _ := leader.logs.LastIndex()\n\tfirstIdx, _ := leader.logs.FirstIndex()\n\tsnapIdx, _ := leader.getLastSnapshot()\n\tbatches := (staged + uint64(conf.MaxAppendEntries) - 1) / uint64(conf.MaxAppendEntries)\n\tvariant := fmt.Sprintf(\"committed-range-entries-%d\", staged)\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                              \"large_committed_range_setup\",\n\t\t\"variant\":                            variant,\n\t\t\"applied_commands\":                   applied,\n\t\t\"first_log_index\":                    firstIdx,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"last_snapshot_index\":                snapIdx,\n\t\t\"staged_commit_index_before_restart\": staged,\n\t\t\"recovery_range_entries\":             staged,\n\t\t\"recovery_range_batches\":             batches,\n\t\t\"fsm_mutate_ch_capacity\":             128,\n\t})\n\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\n\t_, trans := NewInmemTransport(leader.localAddr)\n\tcfg := leader.config()\n\ttype restartResult struct {\n\t\traft *Raft\n\t\terr  error\n\t}\n\tdone := make(chan restartResult, 1)\n\tstart := time.Now()\n\tgo func() {\n\t\tn, err := NewRaft(&cfg, leader.fsm, leader.logs, leader.stable, leader.snapshots, trans)\n\t\tdone <- restartResult{raft: n, err: err}\n\t}()\n\n\tselect {\n\tcase res := <-done:\n\t\tlastApplied, commitIdx := uint64(0), uint64(0)\n\t\tcfgLen := 0\n\t\tif res.raft != nil {\n\t\t\tlastApplied = res.raft.getLastApplied()\n\t\t\tcommitIdx = mustCommitIndex(t, res.raft)\n\t\t\tcfgLen = len(res.raft.getLatestConfiguration().Servers)\n\t\t\t_ = res.raft.Shutdown()\n\t\t}\n\t\tcaEmit(t, map[string]interface{}{\n\t\t\t\"event\":                             \"restart_newraft_completed\",\n\t\t\t\"variant\":                           variant,\n\t\t\t\"newraft_returned\":                  true,\n\t\t\t\"elapsed_ms\":                        time.Since(start).Milliseconds(),\n\t\t\t\"error\":                             fmt.Sprint(res.err),\n\t\t\t\"last_applied_after_restart\":        lastApplied,\n\t\t\t\"staged_commit_index_after_restart\": commitIdx,\n\t\t\t\"latest_config_after_restart_len\":   cfgLen,\n\t\t\t\"blocked_frames\":                    []string{},\n\t\t})\n\tcase <-time.After(wait):\n\t\tcaEmit(t, map[string]interface{}{\n\t\t\t\"event\":             \"restart_newraft_completed\",\n\t\t\t\"variant\":           variant,\n\t\t\t\"newraft_returned\":  false,\n\t\t\t\"observed_after_ms\": wait.Milliseconds(),\n\t\t\t\"blocked_frames\":    caBlockedFrames(),\n\t\t})\n\t}\n}\n\n// TestAssurance_RestoreCommittedLogs_LargeCommittedRange probes whether the\n// RestoreCommittedLogs startup path can return at all when the recovered\n// committed range needs more FSM batches than the fsmMutateCh buffer, with a\n// smaller range as a control.\nfunc TestAssurance_RestoreCommittedLogs_LargeCommittedRange(t *testing.T) {\n\tcaLargeRangeCase(t, 6000, 20*time.Second)\n\tcaLargeRangeCase(t, 9000, 20*time.Second)\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "control-setup",
+                "event": "large_committed_range_setup",
+                "conditions": [
+                  {
+                    "field": "applied_commands",
+                    "op": "eq",
+                    "value": 6000,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "above-threshold-setup",
+                "event": "large_committed_range_setup",
+                "conditions": [
+                  {
+                    "field": "applied_commands",
+                    "op": "eq",
+                    "value": 9000,
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "s-restore-committed",
+            "s-fsm-ch",
+            "s-goroutines"
+          ],
+          "anchors": [
+            {
+              "material_id": "s-restore-committed",
+              "symbol": "restoreFromCommittedLogs",
+              "start_line": 724,
+              "end_line": 724,
+              "anchor": {
+                "source_ids": [
+                  "s-restore-committed"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-restore-committed",
+                "start_line": 724,
+                "end_line": 724,
+                "symbol": "restoreFromCommittedLogs"
+              }
+            },
+            {
+              "material_id": "s-fsm-ch",
+              "symbol": "NewRaft",
+              "start_line": 560,
+              "end_line": 560,
+              "anchor": {
+                "source_ids": [
+                  "s-fsm-ch",
+                  "s-scan"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-scan",
+                "start_line": 508,
+                "end_line": 508,
+                "symbol": "NewRaft"
+              }
+            },
+            {
+              "material_id": "s-goroutines",
+              "symbol": "NewRaft",
+              "start_line": 637,
+              "end_line": 637,
+              "anchor": {
+                "source_ids": [
+                  "s-fsm-ch",
+                  "s-goroutines",
+                  "s-scan"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-scan",
+                "start_line": 508,
+                "end_line": 508,
+                "symbol": "NewRaft"
+              }
+            }
+          ],
+          "scope": {
+            "description": "Two single-node in-memory clusters (repository MakeClusterCustom, CommitTrackingLogStore, RestoreCommittedLogs=true, snapshotting disabled) commit different amounts of authored history, then restart via NewRaft in a goroutine with a bounded wait: 6000 commands as a control (94 batches of 64) and 9000 commands (141 batches). Each case emits a setup event and one result event stating whether NewRaft returned, and, if not, the blocked goroutine frames captured with runtime.Stack.",
+            "assumptions": [
+              "The log store is the repository's InmemCommitTrackingStore and the transport the repository's InmemTransport.",
+              "Snapshotting is disabled by configuration so the recovered range starts at index 0 with no snapshot.",
+              "Only the amount of committed history differs between the two cases; the same harness, helper and configuration are used.",
+              "No test is expected to block the whole package run: the restart is wrapped in a bounded select."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "For each case: bootstrap a one-node cluster with CommitTrackingLogs and RestoreCommittedLogs, apply N commands to completion, record the staged commit index and the derived batch count, Shutdown, restart with NewRaft from the same stores inside a goroutine and wait up to 20 seconds; on return report lastApplied, commit index and configuration length after restart, otherwise report the observed wait and the frames of every goroutine containing github.com/hashicorp/raft plus chan-send/select markers.",
+          "requirement": "NewRaft must complete its startup recovery for any legal retained state; RestoreCommittedLogs must not leave the node unable to finish construction when the recovered committed range is large.",
+          "responsibility": "Raft itself: NewRaft owns recovery ordering, including when the FSM consumer goroutine starts relative to the recovery work it feeds.",
+          "comparisons": [
+            {
+              "event": "restart_newraft_completed",
+              "identity_fields": [
+                "variant"
+              ],
+              "admission_alias": "control-setup",
+              "assertion": {
+                "field": "newraft_returned",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "The control range (fewer batches than the fsmMutateCh capacity) completes startup recovery."
+            },
+            {
+              "event": "restart_newraft_completed",
+              "identity_fields": [
+                "variant"
+              ],
+              "admission_alias": "above-threshold-setup",
+              "assertion": {
+                "field": "newraft_returned",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "The range exceeding the fsmMutateCh batch capacity also completes startup recovery."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "73c89897147e4f31b4f841da8b88836a",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "7e10640e7212486b94a80f04b69febc2",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      },
+      {
+        "id": "03d8630fd2a64384a825524b28696d36-experiment",
+        "investigation_id": "7e10640e7212486b94a80f04b69febc2-question-1",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"runtime\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Printf(\"CA_EVENT %s\\n\", buf)\n}\n\nfunc caServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s\", s.ID, s.Suffrage))\n\t}\n\treturn out\n}\n\n// caRestartShutdownAndRestart restarts a single-node cluster from its own\n// retained stores (log, stable, snapshots) with a fresh in-memory transport,\n// exactly like the repository's own restart tests do.\nfunc caRestart(t *testing.T, old *Raft) *Raft {\n\tt.Helper()\n\tif err := old.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\t_, trans := NewInmemTransport(old.localAddr)\n\tcfg := old.config()\n\tn, err := NewRaft(&cfg, old.fsm, old.logs, old.stable, old.snapshots, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"restart NewRaft: %v\", err)\n\t}\n\treturn n\n}\n\nfunc caConf(t *testing.T) *Config {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 20 // keep automatic snapshotting out of the way\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\treturn conf\n}\n\n// TestAssurance_RestoreCommittedLogs_NoSnapshot probes the documented\n// RestoreCommittedLogs startup path on a node that has committed log entries but\n// no snapshot: which configuration does the node hold after NewRaft returns, and\n// where does the NewRaft configuration scan start relative to the committed\n// index?\nfunc TestAssurance_RestoreCommittedLogs_NoSnapshot(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tlastIdx, err := leader.logs.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"LastIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\t// The first log entry of a bootstrapped cluster is the configuration entry.\n\tvar entry Log\n\tif err := leader.logs.GetLog(1, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(1): %v\", err)\n\t}\n\tvar entryConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tentryConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tstoreAfter := n.logs.(CommitTrackingLogStore)\n\tstagedAfter, err := storeAfter.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex after restart: %v\", err)\n\t}\n\tlastApplied := n.getLastApplied()\n\tsnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(snapIdx, lastApplied) + 1\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"restore_committed_logs_no_snapshot\",\n\t\t\"variant\":                \"no-snapshot\",\n\t\t\"bootstrap_config_index\": entry.Index,\n\t\t\"bootstrap_config_type\":  entry.Type.String(),\n\t\t\"bootstrap_config_servers\": caServers(entryConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  stagedAfter,\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"last_snapshot_index_after_restart\":  snapIdx,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       entry.Index >= scanStart,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\n// TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange probes a restart\n// where a configuration entry was committed after the node's last snapshot.\nfunc TestAssurance_RestoreCommittedLogs_SnapshotAndConfigChange(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 20; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"pre-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\tif len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot taken\")\n\t}\n\tsnapIdx := snaps[0].Index\n\tsnapConfIdx := snaps[0].ConfigurationIndex\n\tsnapConf := snaps[0].Configuration\n\n\t// Commit a configuration change after the snapshot.\n\tchange := leader.AddNonvoter(ServerID(\"nonvoter-B\"), ServerAddress(\"addr-B\"), 0, 0)\n\tif err := change.Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter: %v\", err)\n\t}\n\tchangeIdx := change.Index()\n\n\t// Write more entries so the commit-tracking store stages a commit index at\n\t// or beyond the configuration entry.\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tstore := leader.logs.(CommitTrackingLogStore)\n\tstagedBefore, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex before restart: %v\", err)\n\t}\n\tbefore := leader.getLatestConfiguration()\n\n\tvar entry Log\n\tif err := leader.logs.GetLog(changeIdx, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(%d): %v\", changeIdx, err)\n\t}\n\n\tn := caRestart(t, leader)\n\tafter := n.getLatestConfiguration()\n\tlastApplied := n.getLastApplied()\n\tafterSnapIdx, _ := n.getLastSnapshot()\n\tscanStart := max(afterSnapIdx, lastApplied) + 1\n\n\tvar loggedConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tloggedConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restore_committed_logs_snapshot_and_config_change\",\n\t\t\"variant\":                  \"snapshot+config-change\",\n\t\t\"snapshot_index\":           snapIdx,\n\t\t\"snapshot_config_index\":    snapConfIdx,\n\t\t\"snapshot_config\":          caServers(snapConf),\n\t\t\"config_entry_index\":       changeIdx,\n\t\t\"config_entry_type\":        entry.Type.String(),\n\t\t\"config_entry_servers\":     caServers(loggedConf),\n\t\t\"staged_commit_index_before_restart\": stagedBefore,\n\t\t\"latest_config_before_restart\":       caServers(before),\n\t\t\"staged_commit_index_after_restart\":  mustCommitIndex(t, n),\n\t\t\"last_applied_after_restart\":         lastApplied,\n\t\t\"config_scan_start_index\":            scanStart,\n\t\t\"config_entry_covered_by_scan\":       changeIdx >= scanStart,\n\t\t\"config_entry_committed_at_restart\":  mustCommitIndex(t, n) >= changeIdx,\n\t\t\"latest_config_after_restart\":        caServers(after),\n\t\t\"latest_config_after_restart_len\":    len(after.Servers),\n\t})\n}\n\nfunc mustCommitIndex(t *testing.T, n *Raft) uint64 {\n\tt.Helper()\n\tstore := n.logs.(CommitTrackingLogStore)\n\tidx, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"GetCommitIndex: %v\", err)\n\t}\n\treturn idx\n}\n\n// caBlockedFrames returns the stack frames of every goroutine that is currently\n// blocked, so that a restart that never returns can be attributed to an actual\n// call site instead of being attributed by inference.\nfunc caBlockedFrames() []string {\n\tbuf := make([]byte, 1<<20)\n\tn := runtime.Stack(buf, true)\n\tvar out []string\n\tfor _, line := range strings.Split(string(buf[:n]), \"\\n\") {\n\t\ttrimmed := strings.TrimSpace(line)\n\t\tif strings.Contains(trimmed, \"github.com/hashicorp/raft.\") ||\n\t\t\tstrings.Contains(trimmed, \"[chan send]\") ||\n\t\t\tstrings.Contains(trimmed, \"[select]\") {\n\t\t\tif len(out) < 40 {\n\t\t\t\tout = append(out, trimmed)\n\t\t\t}\n\t\t}\n\t}\n\treturn out\n}\n\n// caLargeRangeCase commits one kind of history and measures whether the\n// RestoreCommittedLogs restart returns within the given bound.\nfunc caLargeRangeCase(t *testing.T, applied int, wait time.Duration) {\n\tt.Helper()\n\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 30 // no automatic snapshot at all\n\tconf.SnapshotInterval = time.Hour\n\tconf.RestoreCommittedLogs = true\n\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               conf,\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < applied; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"cmd-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %d: %v\", i, err)\n\t\t}\n\t}\n\n\tstaged := mustCommitIndex(t, leader)\n\tlastIdx, _ := leader.logs.LastIndex()\n\tfirstIdx, _ := leader.logs.FirstIndex()\n\tsnapIdx, _ := leader.getLastSnapshot()\n\tbatches := (staged + uint64(conf.MaxAppendEntries) - 1) / uint64(conf.MaxAppendEntries)\n\tvariant := fmt.Sprintf(\"committed-range-entries-%d\", staged)\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                              \"large_committed_range_setup\",\n\t\t\"variant\":                            variant,\n\t\t\"applied_commands\":                   applied,\n\t\t\"first_log_index\":                    firstIdx,\n\t\t\"last_log_index_before_restart\":      lastIdx,\n\t\t\"last_snapshot_index\":                snapIdx,\n\t\t\"staged_commit_index_before_restart\": staged,\n\t\t\"recovery_range_entries\":             staged,\n\t\t\"recovery_range_batches\":             batches,\n\t\t\"fsm_mutate_ch_capacity\":             128,\n\t})\n\n\tif err := leader.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\n\t_, trans := NewInmemTransport(leader.localAddr)\n\tcfg := leader.config()\n\ttype restartResult struct {\n\t\traft *Raft\n\t\terr  error\n\t}\n\tdone := make(chan restartResult, 1)\n\tstart := time.Now()\n\tgo func() {\n\t\tn, err := NewRaft(&cfg, leader.fsm, leader.logs, leader.stable, leader.snapshots, trans)\n\t\tdone <- restartResult{raft: n, err: err}\n\t}()\n\n\tselect {\n\tcase res := <-done:\n\t\tlastApplied, commitIdx := uint64(0), uint64(0)\n\t\tcfgLen := 0\n\t\tif res.raft != nil {\n\t\t\tlastApplied = res.raft.getLastApplied()\n\t\t\tcommitIdx = mustCommitIndex(t, res.raft)\n\t\t\tcfgLen = len(res.raft.getLatestConfiguration().Servers)\n\t\t\t_ = res.raft.Shutdown()\n\t\t}\n\t\tcaEmit(t, map[string]interface{}{\n\t\t\t\"event\":                             \"restart_newraft_completed\",\n\t\t\t\"variant\":                           variant,\n\t\t\t\"newraft_returned\":                  true,\n\t\t\t\"elapsed_ms\":                        time.Since(start).Milliseconds(),\n\t\t\t\"error\":                             fmt.Sprint(res.err),\n\t\t\t\"last_applied_after_restart\":        lastApplied,\n\t\t\t\"staged_commit_index_after_restart\": commitIdx,\n\t\t\t\"latest_config_after_restart_len\":   cfgLen,\n\t\t\t\"blocked_frames\":                    []string{},\n\t\t})\n\tcase <-time.After(wait):\n\t\tcaEmit(t, map[string]interface{}{\n\t\t\t\"event\":             \"restart_newraft_completed\",\n\t\t\t\"variant\":           variant,\n\t\t\t\"newraft_returned\":  false,\n\t\t\t\"observed_after_ms\": wait.Milliseconds(),\n\t\t\t\"blocked_frames\":    caBlockedFrames(),\n\t\t})\n\t}\n}\n\n// TestAssurance_RestoreCommittedLogs_LargeCommittedRange probes whether the\n// RestoreCommittedLogs startup path can return at all when the recovered\n// committed range needs more FSM batches than the fsmMutateCh buffer, with a\n// smaller range as a control.\nfunc TestAssurance_RestoreCommittedLogs_LargeCommittedRange(t *testing.T) {\n\tcaLargeRangeCase(t, 6000, 20*time.Second)\n\tcaLargeRangeCase(t, 9000, 20*time.Second)\n}\n\n// TestAssurance_EmptyConfigVoteAdmission drives the restarted node's vote and\n// pre-vote handlers over a real in-memory transport with a candidate that is\n// absent from the configuration entry recorded in the node's own log.\nfunc TestAssurance_EmptyConfigVoteAdmission(t *testing.T) {\n\topts := &MakeClusterOpts{\n\t\tPeers:              1,\n\t\tBootstrap:          true,\n\t\tConf:               caConf(t),\n\t\tCommitTrackingLogs: true,\n\t}\n\tc := MakeClusterCustom(t, opts)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfor i := 0; i < 10; i++ {\n\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"cmd-%d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\n\tvar entry Log\n\tif err := leader.logs.GetLog(1, &entry); err != nil {\n\t\tt.Fatalf(\"GetLog(1): %v\", err)\n\t}\n\tvar logConf Configuration\n\tif entry.Type == LogConfiguration {\n\t\tlogConf = DecodeConfiguration(entry.Data)\n\t}\n\n\tn := caRestart(t, leader)\n\tlive := n.getLatestConfiguration()\n\tvoters := 0\n\tfor _, s := range live.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\n\t// A real transport, wired to the restarted node's transport.\n\tpeerAddr, peerTrans := NewInmemTransport(\"\")\n\tdefer peerTrans.Close()\n\town := n.trans.(*InmemTransport)\n\town.Connect(peerAddr, peerTrans)\n\tpeerTrans.Connect(n.localAddr, own)\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"empty_config_restart_setup\",\n\t\t\"variant\":                  \"no-snapshot-restart\",\n\t\t\"log_recorded_config\":      caServers(logConf),\n\t\t\"log_recorded_config_len\":  len(logConf.Servers),\n\t\t\"live_config_after_restart\": caServers(live),\n\t\t\"live_config_len\":          len(live.Servers),\n\t\t\"live_voters\":              voters,\n\t\t\"derived_quorum_size\":      voters/2 + 1,\n\t})\n\n\tcandidateID := ServerID(\"outsider-not-in-log\")\n\tencoded := peerTrans.EncodePeer(candidateID, peerAddr)\n\tterm := n.getCurrentTerm()\n\n\tvoteResp := &RequestVoteResponse{}\n\tverr := peerTrans.RequestVote(candidateID, n.localAddr, &RequestVoteRequest{\n\t\tRPCHeader:    RPCHeader{ProtocolVersion: n.config().ProtocolVersion, ID: []byte(candidateID), Addr: encoded},\n\t\tTerm:         term + 1,\n\t\tCandidate:    encoded,\n\t\tLastLogIndex: 1 << 40,\n\t\tLastLogTerm:  term + 1,\n\t}, voteResp)\n\n\tpreResp := &RequestPreVoteResponse{}\n\tperr := peerTrans.RequestPreVote(candidateID, n.localAddr, &RequestPreVoteRequest{\n\t\tRPCHeader:    RPCHeader{ProtocolVersion: n.config().ProtocolVersion, ID: []byte(candidateID), Addr: encoded},\n\t\tTerm:         n.getCurrentTerm() + 1,\n\t\tLastLogIndex: 1 << 40,\n\t\tLastLogTerm:  n.getCurrentTerm() + 1,\n\t}, preResp)\n\n\tcaEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"empty_config_vote_admission\",\n\t\t\"variant\":                      \"no-snapshot-restart\",\n\t\t\"log_recorded_config\":          caServers(logConf),\n\t\t\"live_config_after_restart\":    caServers(live),\n\t\t\"live_config_len\":              len(live.Servers),\n\t\t\"live_voters\":                  voters,\n\t\t\"derived_quorum_size\":          voters/2 + 1,\n\t\t\"candidate_in_live_config\":     inConfiguration(live, candidateID),\n\t\t\"request_vote_error\":           fmt.Sprint(verr),\n\t\t\"request_vote_granted\":         voteResp.Granted,\n\t\t\"request_vote_term\":            voteResp.Term,\n\t\t\"request_prevote_error\":        fmt.Sprint(perr),\n\t\t\"request_prevote_granted\":      preResp.Granted,\n\t\t\"request_prevote_term\":         preResp.Term,\n\t\t\"node_term_after_requests\":     n.getCurrentTerm(),\n\t})\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "empty-config-setup",
+                "event": "empty_config_restart_setup",
+                "conditions": [
+                  {
+                    "field": "live_config_len",
+                    "op": "eq",
+                    "value": 0,
+                    "reference": null
+                  },
+                  {
+                    "field": "log_recorded_config_len",
+                    "op": "eq",
+                    "value": 1,
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "s-runfollower-gate",
+            "s-commit-tracking-contract"
+          ],
+          "anchors": [
+            {
+              "material_id": "s-commit-tracking-contract",
+              "symbol": "CommitTrackingLogStore",
+              "start_line": 194,
+              "end_line": 194,
+              "anchor": {
+                "source_ids": [
+                  "s-commit-tracking-contract"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s-commit-tracking-contract",
+                "start_line": 194,
+                "end_line": 194,
+                "symbol": "CommitTrackingLogStore"
+              }
+            }
+          ],
+          "scope": {
+            "description": "One single-node in-memory cluster (repository MakeClusterCustom, CommitTrackingLogStore, RestoreCommittedLogs=true, snapshotting disabled) commits ten commands, restarts via NewRaft so its configuration is empty, and then receives a RequestVote and a RequestPreVote over a real in-memory transport from a candidate whose ID appears in no configuration. The harness emits one setup event with the log-recorded and live configuration sizes and one result event with the two responses, the derived quorum size and the candidate's membership.",
+            "assumptions": [
+              "The log store is the repository's InmemCommitTrackingStore; the candidate transport is the repository's InmemTransport wired to the restarted node's transport.",
+              "The candidate's log is up to date and its term is higher than the restarted node's term, so no log-recency or term rule rejects it by itself.",
+              "The node's log-recorded configuration (the bootstrapped LogConfiguration at index 1) is the cluster membership in force; the empty live configuration comes from the node's own recovery path."
+            ],
+            "excluded": [],
+            "parameters": {}
+          },
+          "prefix": "Bootstrap a one-node cluster with CommitTrackingLogs and RestoreCommittedLogs, apply ten commands, record the log-recorded configuration, Shutdown, restart with NewRaft from the same stores, emit the setup event (log_recorded_config_len, live_config_len, live_voters, derived_quorum_size), then send RequestVote and RequestPreVote through the transport path with candidate ID 'outsider-not-in-log' and emit the responses.",
+          "requirement": "A node whose configuration is in force (recorded in its own log) must treat vote and pre-vote requests from servers outside that configuration as non-members, and its quorum accounting must follow that configuration.",
+          "responsibility": "Raft itself: the node's configuration state is produced by its own restart recovery, and the admission rules in requestVote/requestPreVote rely on it being populated.",
+          "comparisons": [
+            {
+              "event": "empty_config_vote_admission",
+              "identity_fields": [
+                "variant"
+              ],
+              "admission_alias": "empty-config-setup",
+              "assertion": {
+                "field": "request_vote_granted",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "A candidate that is not in the configuration recorded in the node's log is not granted a vote."
+            },
+            {
+              "event": "empty_config_vote_admission",
+              "identity_fields": [
+                "variant"
+              ],
+              "admission_alias": "empty-config-setup",
+              "assertion": {
+                "field": "request_prevote_granted",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "The same candidate is not granted a pre-vote."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "73c89897147e4f31b4f841da8b88836a",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "03d8630fd2a64384a825524b28696d36",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "680bc27c9c50448a8b63097d98091061-interpretation-0",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "s-scan",
+          "s-restore-committed",
+          "s-dispatch-stage",
+          "s-appendentries-stage",
+          "s-runfollower-gate",
+          "s-config-doc",
+          "s-commit-tracking-contract"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Current account: with RestoreCommittedLogs enabled, NewRaft's configuration scan excludes committed configuration entries. restoreFromCommittedLogs clamps the store's commit index and calls processLogs, which ends with setLastApplied(index); the following scan loop iterates from max(snapshotIndex, lastApplied)+1 up to the last log index, so any configuration entry with index at or below the recovered commit index is never passed to processConfigurationLogEntry. Both staging producers cap the staged value at entries already stored (raft.go:1266 for the leader, raft.go:1558 for followers), so the recovered commit index reaches a configuration entry whenever later entries were stored after it was committed. Consequence: the restarted node's r.configurations is the snapshot's configuration or, with no snapshot, empty, while its log reports that configuration entry as committed; an empty configuration makes runFollower abort elections (raft.go:232) and leaves the node's participant eligibility wrong until a later configuration entry or installed snapshot repairs it. Construction feedback: local, non-retained runs of these harness bytes reported variant A with last_applied_after_restart=11, config_scan_start_index=12, the bootstrap LogConfiguration at index 1 not covered and latest_config_after_restart_len=0; variant B reported the committed LogConfiguration at index 23 (adding nonvoter-B) not covered with the post-restart configuration reduced to the snapshot's single voter. Those local numbers are construction feedback only, so the conclusion stays conditional until the retained receipt of the queued experiment is read.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The recovered committed entries are still applied to the FSM (processLogs), and a node can still learn the current configuration from any later configuration entry or installed snapshot, so the omission can be repaired and does not by itself corrupt the FSM.",
+          "Snapshot-level configuration is loaded correctly by restoreSnapshot, so the omission only appears for configuration entries that sit between the last snapshot (or index 0) and the recovered commit index.",
+          "No captured test asserts configuration state after a RestoreCommittedLogs restart, so the captured suite neither confirms nor contradicts the omission."
+        ],
+        "limitations": [
+          "The account applies only to nodes configured with RestoreCommittedLogs=true and a log store implementing CommitTrackingLogStore; with the flag off, lastApplied equals the snapshot index and the scan range is unchanged.",
+          "The consequences on elections, quorum and participant eligibility are currently source-derived (hasVote and the runFollower election gate), not measured.",
+          "The exact reported field values and the runtime confirmation depend on the queued experiment's retained receipt."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "680bc27c9c50448a8b63097d98091061"
+      },
+      {
+        "id": "7e10640e7212486b94a80f04b69febc2-interpretation-0",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-0",
+        "experiment_id": "680bc27c9c50448a8b63097d98091061-experiment",
+        "source_ids": [
+          "s-scan",
+          "s-restore-committed",
+          "s-dispatch-stage",
+          "s-appendentries-stage",
+          "s-runfollower-gate",
+          "s-config-doc",
+          "s-commit-tracking-contract"
+        ],
+        "executions": {
+          "5e1ce9aa430842d5a9325cfecbc885f6": [
+            0,
+            1
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Current account: with RestoreCommittedLogs enabled, NewRaft's configuration scan excludes committed configuration entries, and the retained execution shows it. restoreFromCommittedLogs clamps the store's commit index, applies the recovered range through processLogs (which ends with setLastApplied(index)), and the following scan loop starts at max(lastSnapshotIndex, lastApplied)+1, so a configuration entry at or below the recovered commit index is never passed to processConfigurationLogEntry. Staging producers cap the staged value at entries already stored, so the recovered commit index reaches a configuration entry whenever later entries were written after it committed. Parsed event 0 (event restore_committed_logs_no_snapshot, receipt 5e1ce9aa430842d5a9325cfecbc885f6): staged commit index 11 equals lastApplied 11, scan start 12, the committed LogConfiguration at index 1 is outside the scan, and the node's latest configuration after restart is empty (length 0) although before restart it held one voter and the FSM had been fed up to index 11. Parsed event 1 (restore_committed_logs_snapshot_and_config_change, same receipt): snapshot index 22 with configuration index 1, committed LogConfiguration at index 23 adding nonvoter-B, staged commit index 32 equals lastApplied 32, scan start 33, the entry is outside the scan, and the post-restart configuration is again only the snapshot's single voter, so the committed nonvoter is absent. Requirement contradicted by both witnesses: the restarted node's configuration state does not include every committed configuration entry. Source-derived consequences, not measured here: runFollower aborts elections when the configuration is empty (raft.go:232), quorumSize() returns 1 for an empty voter list, and requestVote/requestPreVote skip the membership rejection when the candidate configuration has no servers.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The recovered committed entries are still applied to the FSM, and any later configuration entry or an installed snapshot restores the node's configuration, so the omission is repaired by normal traffic in a healthy cluster.",
+          "Snapshot configuration is loaded correctly by restoreSnapshot, so the defect needs a committed configuration entry between the last snapshot (or index 0) and the recovered commit index.",
+          "No captured test asserts configuration state after a RestoreCommittedLogs restart, so the captured suite neither contradicts nor covers this path."
+        ],
+        "limitations": [
+          "The account applies to nodes configured with RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; with the flag off lastApplied equals the snapshot index and the scan range is unchanged.",
+          "The executed cases used a single-node in-memory cluster with authored commands and the repository's InmemCommitTrackingStore; behaviour for multi-node clusters, monotonic stores and production stores is not measured.",
+          "Which requests the empty/stale configuration actually admits, and whether the cluster loses progress before a later entry repairs it, remain unmeasured (registered as a child question)."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "7e10640e7212486b94a80f04b69febc2"
+      },
+      {
+        "id": "03d8630fd2a64384a825524b28696d36-interpretation-0",
+        "investigation_id": "680bc27c9c50448a8b63097d98091061-question-1",
+        "experiment_id": "7e10640e7212486b94a80f04b69febc2-experiment",
+        "source_ids": [
+          "s-restore-committed",
+          "s-fsm-ch",
+          "s-goroutines"
+        ],
+        "executions": {
+          "8e041cda11284c539f23fc87e776a4d2": [
+            3,
+            5
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Current account: a RestoreCommittedLogs restart cannot complete startup recovery once the recovered committed range needs more FSM batches than the 128-slot fsmMutateCh, because runFSM is only started after the recovery work that feeds it. The receipt shows both the boundary and the mechanism. Parsed event 3 (variant committed-range-entries-6001, 94 batches): NewRaft returned in 6 ms with lastApplied 6001, i.e. the same code path completes when the range fits the buffer, and that node's configuration after restart was empty (length 0), matching the separate configuration-scan account. Parsed event 5 (variant committed-range-entries-9001, 141 batches): no return within the 20000 ms bound, and the frames captured at that moment are goroutine 10 [select] github.com/hashicorp/raft.(*Raft).processLogs.func1 -> (*Raft).processLogs(index 0x2329 = 9001) -> (*Raft).restoreFromCommittedLogs -> NewRaft, created by the harness restart goroutine. No runFSM goroutine exists for that instance, so no consumer can drain the buffer and no repair is enabled by time alone; the only escape in that select is the instance's own shutdown channel, which nothing closes during construction. Conditions: RestoreCommittedLogs enabled with a commit-tracking store, and a recovered commit index whose distance from the last applied/snapshot index exceeds 8192 authored entries (128 batches of 64) - for example a snapshot gap larger than 8192 entries on a node that crashed before the next snapshot, or a node with snapshotting disabled. Fault assumptions: none injected; the block follows from the retained history produced by the node's own commit path.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The observation is a 20000 ms bounded wait, so the account claims a blocked startup under the stated conditions, not an infinite block proven for all time; a caller that closes the instance's shutdown channel could release the select.",
+          "The two cases differ only in the amount of authored history (6000 versus 9000 commands) and used a single-node in-memory cluster with an InmemCommitTrackingStore and snapshotting disabled, so the boundary is a batch-capacity property of NewRaft rather than a measured property of production stores.",
+          "The blocked range here was recovered from the same node's own log without any snapshot; whether a production restart reaches a range above 8192 entries depends on snapshot cadence and crash timing, which were not measured."
+        ],
+        "limitations": [
+          "Applies only when Config.RestoreCommittedLogs=true with a LogStore implementing CommitTrackingLogStore; with the flag off, NewRaft never calls processLogs before starting runFSM.",
+          "The threshold is expressed in MaxAppendEntries-sized batches against the 128-slot buffer, so a configuration with a different MaxAppendEntries moves the boundary proportionally.",
+          "Interaction with the configuration-scan gap (both appear in the same recovery sequence) is not separated by this experiment; each is independently witnessed."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "03d8630fd2a64384a825524b28696d36"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "03d8630fd2a64384a825524b28696d36",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "effects": [
+        {
+          "object": "knowledge",
+          "action": "update",
+          "target": "7e10640e7212486b94a80f04b69febc2-knowledge-1",
+          "changed_fields": [
+            "statement",
+            "conditions",
+            "executions"
+          ]
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "680bc27c9c50448a8b63097d98091061-question-1"
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "03d8630fd2a64384a825524b28696d36-experiment"
+    },
+    "applied_operations": {
+      "submission-680bc27c9c50448a8b63097d98091061": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_18-00-28-hashicorp_raft-real-run/semantic-commits/submission-680bc27c9c50448a8b63097d98091061.json"
+      },
+      "submission-7e10640e7212486b94a80f04b69febc2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_18-00-28-hashicorp_raft-real-run/semantic-commits/submission-7e10640e7212486b94a80f04b69febc2.json"
+      },
+      "submission-03d8630fd2a64384a825524b28696d36": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_18-00-28-hashicorp_raft-real-run/semantic-commits/submission-03d8630fd2a64384a825524b28696d36.json"
+      }
+    }
+  }
+}

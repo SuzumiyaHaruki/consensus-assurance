@@ -1,0 +1,63 @@
+{
+  "rationale": "Read the retained receipt of experiment 790eb5d64ed94ef5aea4736e6f66381d-experiment (CheckRun 5e092a2b160b4a2f955d48ee6fa06ad9, exit 0, 24 events). The setup event 22 records three voters (quorum two), a voter that cannot be reached, and a reachable non-voter; the result event 23 records VerifyLeader returning success with no error in under a millisecond while the node still leads. The question is therefore a witnessed violation and a behavior entry records the verification path.",
+  "sources": [
+    {
+      "id": "s-lease",
+      "file": "raft.go",
+      "start_line": 1037,
+      "end_line": 1082,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k-verify-nonvoter-ack",
+      "kind": "behavior",
+      "statement": "Leader verification counts acknowledgements from non-voters: with the voter quorum unreachable and one non-voter reachable, VerifyLeader returned success with no error while the node remained leader, because verifyLeader registers its future with every entry of the replication map and that map is built for every server in the configuration, including non-voters.",
+      "conditions": "A configuration with more voters than the reachable set and at least one reachable non-voter; the leader can reach the non-voter but not a quorum of voters; the verification is issued before the leader lease steps the leader down.",
+      "source_ids": [
+        "s-verifyleader",
+        "s-replstate",
+        "s-heartbeat"
+      ],
+      "executions": {
+        "5e092a2b160b4a2f955d48ee6fa06ad9": [
+          23
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "790eb5d64ed94ef5aea4736e6f66381d-question-0",
+      "experiment_id": "790eb5d64ed94ef5aea4736e6f66381d-experiment",
+      "source_ids": [
+        "s-verifyleader",
+        "s-replstate",
+        "s-heartbeat",
+        "s-lease",
+        "s-quorum"
+      ],
+      "executions": {
+        "5e092a2b160b4a2f955d48ee6fa06ad9": [
+          22,
+          23
+        ]
+      },
+      "rationale": "Current account: the leader-verification quorum can be satisfied without a voter quorum, so a client that uses VerifyLeader as its staleness guard can be told a leader is still verified while every voter is unreachable. Parsed event 22 records the premise: the configuration in force has three voters, so the voter quorum is two, a direct AppendEntries from the leader to one voter fails with a connection error, and a direct AppendEntries to the non-voter succeeds. Parsed event 23 records the outcome: VerifyLeader returned with no error in under a millisecond, the declared assertion that verification must fail is violated, and the node still reported itself as Leader. Mechanism from source: verifyLeader starts the vote count at one for itself and registers its future in every entry of the leader's replication map, which startStopReplication builds for every server of the configuration except the leader, without filtering by suffrage; each peer's heartbeat goroutine acknowledges the pending verification when its AppendEntries succeeds, and the non-voter's acknowledgement advances the count to the voter quorum that quorumSize computes from voters alone. Bounds from source: the leader lease counts only voters, so a leader that cannot contact a voter quorum steps down within LeaderLeaseTimeout; the exposure is therefore the interval between losing the voter quorum and the lease check, which the probe widened by slowing the timers so the verification completed first. Consequence: the documented purpose of VerifyLeader is to prevent a node from serving reads on stale assumptions about its leadership, and this path can return success during exactly the window that the lease has not yet closed.",
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "counterevidence": [
+        "The leader lease still counts voters only, so the same node steps down shortly after; the incorrect verification result is bounded by that interval rather than persisting.",
+        "The defect requires a configuration that has non-voters at all; a cluster of voters only cannot exhibit it, since every replication peer is then a voter and the acknowledgement set equals the voter set.",
+        "The probe slowed the heartbeat, election and lease timers and isolated the leader by transport disconnection, so the observed interval is longer than a default-timer deployment would allow; with the default in-memory timers the verification and the lease check compete.",
+        "No write path is affected: entry commitment uses the commitment map, which contains voters only, so this is a read-verification path rather than a commit-rule path."
+      ],
+      "limitations": [
+        "Measured on one four-peer in-memory cluster with the repository's own facilities and slowed timers; production timings and transports are not covered.",
+        "The probe issued the verification directly rather than through an application that then serves a read, so the stale-read consequence is inferred from the documented purpose of the API rather than measured end to end.",
+        "A single run; the isolation is transport-level and confirmed by direct AppendEntries attempts recorded in the same event."
+      ]
+    }
+  ]
+}

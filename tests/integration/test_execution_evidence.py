@@ -9,6 +9,51 @@ from consensus_assurance.workflow.experiments import assessment, observed, valid
 from consensus_assurance.workflow.knowledge import target_receipts
 
 
+@pytest.mark.parametrize('collection',['knowledge','interpretations'])
+def test_event_reference_diagnostic_locates_array_and_reuses_receipt(tmp_path,collection):
+    from consensus_assurance.workflow.audit import validate_submission
+    retained={}
+    def submission(state,indices):
+        check=next(c for c in state['checks'] if c.get('experiment_id'))
+        if collection=='interpretations':
+            return opinion(state,executions={check['id']:indices})
+        return {'rationale':'Retain the observed local return', 'knowledge':[dict(kind='fact',
+            statement='The selected call returned zero.', conditions='One call at the capacity boundary',
+            source_ids=['code'],executions={check['id']:indices})]},{}
+    def invalid(state):
+        check=next(c for c in state['checks'] if c.get('experiment_id'))
+        retained['receipt']=check['id']
+        paths=[*list((engine.root/'fixed-experiments').rglob('*')),
+               *list((engine.root/'logs'/check['id']).rglob('*'))]
+        retained['files']={p:p.read_bytes() for p in paths if p.is_file()}
+        sub,files=submission(state,[-1,1,1,2])
+        (engine.root/'draft'/'invalid.json').write_text(json.dumps(sub))
+        before=engine.state.model_dump(mode='json')
+        result=validate_submission(engine.state,engine.root,'invalid.json',engine.implementation)
+        assert not result['valid'] and engine.state.model_dump(mode='json')==before
+        diagnostic,=result['diagnostics']
+        assert diagnostic['code']=='event_indices' and diagnostic['category']=='association'
+        assert diagnostic['paths']==[f"/{collection}/0/executions/{check['id']}"]
+        assert diagnostic['object_ids']==[check['id']]
+        assert diagnostic['details']==dict(invalid_indices=[-1,2],duplicate_indices=[1],event_count=2,
+            valid_range=[0,1],observations=f"logs/{check['id']}/observations.json",
+            stdout=check['stdout'])
+        assert 'Fix the citation array' in diagnostic['message'] and '0 through 1' in diagnostic['message']
+        retained['diagnostic']=diagnostic
+        return sub,files
+    def repair(state):
+        assert state['current_submission']['rejected']['diagnostics']==[retained['diagnostic']]
+        assert not state['knowledge'] and not state['interpretations']
+        return submission(state,[1])
+    def finish(state):
+        assert state[collection][0]['executions']=={retained['receipt']:[1]}
+        assert state['usage']['experiments']==1
+        assert all(p.read_bytes()==data for p,data in retained['files'].items())
+        return stop(state)
+    engine,repo=engine_for(tmp_path,[combined,invalid,repair,finish])
+    engine.start(repo)
+
+
 def executed_case(tmp_path, tail='', review=None, *, second_operation=False):
     if not shutil.which('bwrap'):
         pytest.skip('bubblewrap is required for original isolated execution')

@@ -1,0 +1,470 @@
+{
+  "input": {
+    "rationale": "Fifth turn: the fixed experiment ran as CheckRun 18e0d44919ed4eb786f1231efbab552c (status completed, tests_passed, exit_code 0, changed_target_files empty) and its parsed result comparison 0 is violated by witness event index 4, so the earlier conditional/unresolved account is replaced by a violated conclusion and an asserted defect claim scoped to the captured snapshot's log-update construction. The prerequisites correlated (admission alias takeover_ready matched at event index 3), so the witness event is emitted from the state the question is about: the responder holds compacted_idx 6 while the preparing node reports decided_idx 3 / accepted_idx 6, and the responder's handling aborts with 'attempt to subtract with overflow' instead of completing.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [],
+    "gaps": [
+      {
+        "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "question": "Does the same below-compaction log-update request (and an aborting endpoint) also arise for a snapshot-capable Entry type and for the captured persistent storage backend, or is the asserted defect confined to entries without snapshots plus the in-memory backend?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [
+      {
+        "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "experiment_id": "8cb68564d0514352a61204d7c6be6f3c-experiment",
+        "source_ids": [
+          "follower_prepare",
+          "logsync",
+          "memstorage_suffix",
+          "storage_get_suffix_contract",
+          "sync_log"
+        ],
+        "executions": {
+          "18e0d44919ed4eb786f1231efbab552c": [
+            4
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Current account: in the captured snapshot, a follower handling a Prepare builds its log update from the preparing leader's decided index whenever that leader's accepted round is older, and for a non-snapshot Entry type it does so through get_suffix(common_prefix_idx) without comparing that index to its own compacted index. The retained run reaches exactly that state and shows the failure: three nodes decide three entries, all three accept three more while one node is kept below decided 3 (accepted_idx 6, decided_idx 3), the leader trims to 6 (legal: every node accepted 6) so the healthy follower's compacted_idx becomes 6 while the stale node misses the forwarded Compaction::Trim, the leader is then removed and the healthy follower becomes the accepted leader under ballot n=2, and the stale node's try_become_leader makes it prepare with decided_idx 3 / accepted_idx 6. CheckRun 18e0d44919ed4eb786f1231efbab552c parses six events; the admission alias takeover_ready matches event 3 (healthy_follower_is_leader true, healthy_follower_compacted_idx 6, stale_node_decided_idx 3, stale_node_accepted_idx 6), and the result event 4 records outcome 'aborted_panic' with panic_message 'attempt to subtract with overflow' at omnipaxos_storage/src/memory_storage.rs:103 while healthy_follower_compacted_idx is still 6. The declared predicate 'outcome == completed' is therefore contradicted by a complete witness with correlated prerequisites. Responsibility in this snapshot is shared and both parts are captured code: the core chooses the below-compaction prefix (legal under the Storage trait, which specifies returning an empty vector when entries do not exist for the interval, so the request itself is permitted) and MemoryStorage::get_suffix violates that contract by computing from - trimmed_idx unchecked, aborting the node. The observable consequence for the cluster is availability loss on a legal recovery/compaction/election sequence: the surviving healthy follower dies while handling an ordinary Prepare, and the takeover cannot be evaluated.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b2606c6f3c1148c5af396ef701166e6f-knowledge-0",
+            "revision": 1,
+            "assertion": "with snapshots disabled the log update is built as get_suffix(common_prefix_idx) with no comparison against the responder's own compacted index"
+          },
+          {
+            "entry_id": "b2606c6f3c1148c5af396ef701166e6f-knowledge-1",
+            "revision": 1,
+            "assertion": "MemoryStorage::get_suffix(from) subtracts trimmed_idx unchecked and panics with overflow checks enabled for from < trimmed_idx"
+          }
+        ],
+        "counterevidence": [
+          "The aborting arithmetic is in the captured MemoryStorage implementation, not in the core crate: the core's call is legal per the Storage::get_suffix contract, so this witness proves the captured snapshot fails this path, not that the core's prefix choice is itself a contract violation.",
+          "Scoping: for a snapshot-capable Entry type the same Prepare takes the snapshot branch (decided_idx 6 > common_prefix_idx 3) and the suffix is then read at the responder's own decided index, so the failure observed here is specific to entries without snapshots (or to decided_idx <= common_prefix_idx); the run does not show a snapshot-capable variant failing.",
+          "The stale state is produced by dropping whole messages of one kind addressed to one node (decisions while it must stay at decided 3, then AcceptSync after it must promise without accepting); that is ordinary message loss under the target's fault model, and the state it produces (accepted 6 / decided 3 / older accepted round with the durable log intact) is what a crash-recovered node legitimately holds, but the drops are part of the harness's construction rather than of a natural crash alone."
+        ],
+        "limitations": [
+          "Only the dev profile was measured (overflow checks enabled, as in the controller's cargo test invocation); the consequence when overflow checks are off is not observed, so no claim is made here about a silently wrong log update in that configuration.",
+          "The captured memory storage backend was used; whether the persistent storage backend also reaches a failing endpoint for the same request, and which endpoint, was not measured.",
+          "The witness is a single deterministic schedule of one cluster size (three nodes, majority quorum, batch_size 3, NoSnapshot entries, trim index 6); the account is scoped to that exercised configuration.",
+          "The panic aborts handling before any reply is produced, so the run witnesses the abort itself; the further cluster-level consequences (a stalled or inconsistent log) are not measured by this execution."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "5d087c25407e4157b6b06176a649ef5c-question-0",
+        "version": 1,
+        "question": "On a follower that receives a batched AcceptDecide, does the accepted index the follower reports back to the leader correspond to the entries it actually holds whenever the leader's decided_idx exceeds the follower's accepted_idx, so that the leader's decision index and the follower's log stay consistent?",
+        "source_ids": [
+          "follower",
+          "batching"
+        ],
+        "hypothesis": "handle_acceptdecide appends entries into the shared batch, then update_decided_idx_and_get_accepted_idx may flush the whole batch and cap decided_idx at the flushed accepted index; the index returned to the leader (reply_accepted) is the flushed length, not necessarily the length the leader assumed.",
+        "discriminator": "Run a 3-node in-process cluster with batch_size > 1 and a flush_batch_tick_timeout large enough that deciding from an AcceptDecide forces the flush, then compare each node's get_decided_idx/get_accepted_idx with the content read back at those indices and with the values the leader decided on.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d087c25407e4157b6b06176a649ef5c"
+      },
+      {
+        "id": "5d087c25407e4157b6b06176a649ef5c-question-1",
+        "version": 1,
+        "question": "When a promise reports n_accepted greater than the leader's, or an accepted_idx beyond the leader's, does the leader adopt exactly the entries that a write quorum may have accepted, and does LogSync/AcceptSync ever truncate or reorder a decided prefix on the follower that receives it?",
+        "source_ids": [
+          "follower_prepare",
+          "leader_accsync",
+          "logsync",
+          "batching"
+        ],
+        "hypothesis": "The follow-up sync index for a more up-to-date follower is derived from the follower's accepted index and the leader's decided index; an off-by-one or a snapshot boundary there would let AcceptSync overwrite entries the follower had accepted or already decided.",
+        "discriminator": "Construct an up-to-date follower (accepted but not decided entries from an earlier ballot) and a leader with a shorter log, force the Prepare/AcceptSync exchange, and compare the follower's decided prefix and entry content at the reported indices before and after the exchange.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d087c25407e4157b6b06176a649ef5c"
+      },
+      {
+        "id": "5d087c25407e4157b6b06176a649ef5c-question-2",
+        "version": 1,
+        "question": "Are the accept-phase support counts in the captured code computed over per-node accepted log lengths, and is that the same quantity the decide step and trim step assume?",
+        "source_ids": [
+          "quorum",
+          "leader_accepted",
+          "batching"
+        ],
+        "hypothesis": "is_chosen counts nodes with accepted_indexes >= idx where accepted_indexes holds log lengths (accepted_idx), and the leader passes a length to it; a consumer that treated the value as a 0-based entry index would be off by one.",
+        "discriminator": "Read the leader's decide step and trim step together with the definition of accepted_idx in state_cache/internal_storage, and confirm whether every producer and consumer of that number uses length semantics.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d087c25407e4157b6b06176a649ef5c"
+      },
+      {
+        "id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "version": 1,
+        "question": "When a node whose decided index lags its accepted index (crash-recovered before the latest decisions reached it, while its accepted index let every peer pass the trim bound) becomes leader, does the healthy follower's construction of the log update stay inside the follower's own compacted prefix, or can it ask for entries that no longer exist and fail?",
+        "source_ids": [
+          "follower_prepare",
+          "logsync",
+          "memstorage_suffix",
+          "storage_get_suffix_contract",
+          "sync_log"
+        ],
+        "hypothesis": "With snapshots disabled, `create_log_sync` takes its non-snapshot branch and reads `get_suffix(common_prefix_idx)`; in the follower's Prepare handling the common prefix is the *preparing leader's decided index* whenever the follower's accepted round is newer than the preparing leader's accepted round. That index can be below the follower's own compacted index, which the trim bound does not prevent (the trim bound constrains accepted indexes, not decided indexes).",
+        "discriminator": "Repeat the exact prefix in a fixed harness: 3 nodes, NoSnapshot entries, batch_size 3, six entries accepted by all, one node held below decided 3 while the others decide 6, leader trims to 6 and the node misses the forwarded compaction, leader crashes, the healthy follower becomes the accepted leader while the stale node promises without accepting, then the stale node calls try_become_leader. Observe whether the healthy follower's Prepare handling completes or aborts.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "b2606c6f3c1148c5af396ef701166e6f"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "22e941df157b4eb3a16f68e31632c475-interpretation-0",
+        "investigation_id": "5d087c25407e4157b6b06176a649ef5c-question-2",
+        "experiment_id": null,
+        "source_ids": [
+          "quorum",
+          "leader_accepted",
+          "batching"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Source-only reading settles the premise the question asked about: `InternalStorage` maintains `accepted_idx` as a log LENGTH (`AppendEntries`/`AppendSync` semantics: `state_cache.accepted_idx = sync.sync_idx + sync.suffix.len()`, increment by one per appended entry and by one for a StopSign), `LeaderState.accepted_indexes` is seeded with 0 for every pid and written with that same length (`set_accepted_idx`) or with a follower-reported length (`handle_accepted` -> `set_accepted_idx(from, accepted.accepted_idx)`), `is_chosen(idx)` counts entries with `accepted_indexes[k] >= idx`, and the leader passes the reported length (`accepted.accepted_idx`) as well as its own length. `get_min_all_accepted_idx` (used by `trim(None)`) takes the minimum of the same lengths. So the decide step, the trim step and the reported values agree on length semantics; no off-by-one between them is visible in the captured code.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The name `accepted_idx` reads like an entry index, and `read_decided_suffix`/`read` use indices; any future consumer that mixes the two conventions would be off by one, but no such consumer is present in the captured code paths I read."
+        ],
+        "limitations": [
+          "This is a source-only account; it establishes the units used by the captured code, not that every message producer/consumer pair is consistent at runtime, which the experiment in this update does not yet cover."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "22e941df157b4eb3a16f68e31632c475"
+      },
+      {
+        "id": "b2606c6f3c1148c5af396ef701166e6f-interpretation-0",
+        "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "follower_prepare",
+          "logsync",
+          "memstorage_suffix",
+          "storage_get_suffix_contract",
+          "sync_log"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "unresolved",
+        "rationale": "Source reading identifies a concrete gap: the follower-side log-update construction can request a suffix at an index below the requestor's own compacted index, and the in-memory storage implementation turns that request into an arithmetic panic (dev profile) rather than the empty suffix its trait requires. A non-retained local run (draft/tmp/ws/omnipaxos/tests/probe4.rs) reproduces exactly that: with v_stale = (accepted 6, decided 3, round r1), f_healthy = (accepted 6, decided 6, compacted 6) and the old leader crashed, f becomes the accepted leader; when v calls try_become_leader, f's Prepare handling panics with 'attempt to subtract with overflow' at omnipaxos_storage/src/memory_storage.rs:103 while computing its log update, and v's preconditions (decided 3 < f's compacted 6, accepted 6 at the trim bound) are unchanged by that panic. Because that execution is local construction feedback and not a retained receipt, this account claims only a conditional expectation, not an asserted defect.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The panic is raised by `MemoryStorage` (a dependency crate in the same captured snapshot) while the core's call is legal per the `Storage::get_suffix` contract, so responsibility is split between the core's choice of prefix and the storage implementation's unchecked subtraction; a fix in either location would remove the observed failure.",
+          "Upstream's trim bound (`get_min_all_accepted_idx`) is what keeps other sync paths away from the compaction boundary, so this path needs the phase where the follower's accepted round is newer than the preparing leader's while the preparing leader's decided index is older than the trim point; a scenario without a crash-recovered node holding a stale decided index does not reach it."
+        ],
+        "limitations": [
+          "The local reproduction is not a retained receipt; the next action repeats the same prefix as a fixed-input experiment in the omnipaxos package and cites its CheckRun.",
+          "The release-profile consequence (empty suffix instead of a panic, leaving `sync_log` to set accepted_idx 3 with decided_idx 6) is a source-level inference in this update and was not measured."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "b2606c6f3c1148c5af396ef701166e6f"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "a6e1fe52471c4864a0b3042da04de8e0",
+      "result": {
+        "submission": "update.json",
+        "summary": "The fixed experiment ran as CheckRun 18e0d44919ed4eb786f1231efbab552c (completed, tests_passed, changed_target_files empty). Parsed comparison 0 ('outcome == completed') is violated by complete witness event index 4, with the takeover_ready prerequisites correlated at event index 3: the healthy follower holds compacted_idx 6, the preparing node reports decided_idx 3 / accepted_idx 6, and the follower's log-update construction aborts with 'attempt to subtract with overflow'. Recorded the current account as violated with an asserted, explicitly scoped defect claim (shared responsibility: below-compaction common prefix chosen by the core, unchecked subtraction in the captured MemoryStorage versus its Storage contract), its counterevidence and limits (dev profile only, memory backend only, non-snapshot entries, single deterministic schedule), and one necessary gap on whether snapshot-capable entries or the persistent backend reach the same endpoint."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-5d087c25407e4157b6b06176a649ef5c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-5d087c25407e4157b6b06176a649ef5c.json"
+      },
+      "submission-22e941df157b4eb3a16f68e31632c475": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-22e941df157b4eb3a16f68e31632c475.json"
+      },
+      "submission-b2606c6f3c1148c5af396ef701166e6f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-b2606c6f3c1148c5af396ef701166e6f.json"
+      },
+      "submission-8cb68564d0514352a61204d7c6be6f3c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-8cb68564d0514352a61204d7c6be6f3c.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "5d087c25407e4157b6b06176a649ef5c-question-0",
+        "version": 1,
+        "question": "On a follower that receives a batched AcceptDecide, does the accepted index the follower reports back to the leader correspond to the entries it actually holds whenever the leader's decided_idx exceeds the follower's accepted_idx, so that the leader's decision index and the follower's log stay consistent?",
+        "source_ids": [
+          "follower",
+          "batching"
+        ],
+        "hypothesis": "handle_acceptdecide appends entries into the shared batch, then update_decided_idx_and_get_accepted_idx may flush the whole batch and cap decided_idx at the flushed accepted index; the index returned to the leader (reply_accepted) is the flushed length, not necessarily the length the leader assumed.",
+        "discriminator": "Run a 3-node in-process cluster with batch_size > 1 and a flush_batch_tick_timeout large enough that deciding from an AcceptDecide forces the flush, then compare each node's get_decided_idx/get_accepted_idx with the content read back at those indices and with the values the leader decided on.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d087c25407e4157b6b06176a649ef5c"
+      },
+      {
+        "id": "5d087c25407e4157b6b06176a649ef5c-question-1",
+        "version": 1,
+        "question": "When a promise reports n_accepted greater than the leader's, or an accepted_idx beyond the leader's, does the leader adopt exactly the entries that a write quorum may have accepted, and does LogSync/AcceptSync ever truncate or reorder a decided prefix on the follower that receives it?",
+        "source_ids": [
+          "follower_prepare",
+          "leader_accsync",
+          "logsync",
+          "batching"
+        ],
+        "hypothesis": "The follow-up sync index for a more up-to-date follower is derived from the follower's accepted index and the leader's decided index; an off-by-one or a snapshot boundary there would let AcceptSync overwrite entries the follower had accepted or already decided.",
+        "discriminator": "Construct an up-to-date follower (accepted but not decided entries from an earlier ballot) and a leader with a shorter log, force the Prepare/AcceptSync exchange, and compare the follower's decided prefix and entry content at the reported indices before and after the exchange.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d087c25407e4157b6b06176a649ef5c"
+      },
+      {
+        "id": "5d087c25407e4157b6b06176a649ef5c-question-2",
+        "version": 1,
+        "question": "Are the accept-phase support counts in the captured code computed over per-node accepted log lengths, and is that the same quantity the decide step and trim step assume?",
+        "source_ids": [
+          "quorum",
+          "leader_accepted",
+          "batching"
+        ],
+        "hypothesis": "is_chosen counts nodes with accepted_indexes >= idx where accepted_indexes holds log lengths (accepted_idx), and the leader passes a length to it; a consumer that treated the value as a 0-based entry index would be off by one.",
+        "discriminator": "Read the leader's decide step and trim step together with the definition of accepted_idx in state_cache/internal_storage, and confirm whether every producer and consumer of that number uses length semantics.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d087c25407e4157b6b06176a649ef5c"
+      },
+      {
+        "id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "version": 1,
+        "question": "When a node whose decided index lags its accepted index (crash-recovered before the latest decisions reached it, while its accepted index let every peer pass the trim bound) becomes leader, does the healthy follower's construction of the log update stay inside the follower's own compacted prefix, or can it ask for entries that no longer exist and fail?",
+        "source_ids": [
+          "follower_prepare",
+          "logsync",
+          "memstorage_suffix",
+          "storage_get_suffix_contract",
+          "sync_log"
+        ],
+        "hypothesis": "With snapshots disabled, `create_log_sync` takes its non-snapshot branch and reads `get_suffix(common_prefix_idx)`; in the follower's Prepare handling the common prefix is the *preparing leader's decided index* whenever the follower's accepted round is newer than the preparing leader's accepted round. That index can be below the follower's own compacted index, which the trim bound does not prevent (the trim bound constrains accepted indexes, not decided indexes).",
+        "discriminator": "Repeat the exact prefix in a fixed harness: 3 nodes, NoSnapshot entries, batch_size 3, six entries accepted by all, one node held below decided 3 while the others decide 6, leader trims to 6 and the node misses the forwarded compaction, leader crashes, the healthy follower becomes the accepted leader while the stale node promises without accepting, then the stale node calls try_become_leader. Observe whether the healthy follower's Prepare handling completes or aborts.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "a6e1fe52471c4864a0b3042da04de8e0-gap-0",
+            "question": "Does the same below-compaction log-update request (and an aborting endpoint) also arise for a snapshot-capable Entry type and for the captured persistent storage backend, or is the asserted defect confined to entries without snapshots plus the in-memory backend?",
+            "experiment_id": null,
+            "operation_id": "a6e1fe52471c4864a0b3042da04de8e0"
+          }
+        ],
+        "history": [],
+        "operation_id": "b2606c6f3c1148c5af396ef701166e6f"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "22e941df157b4eb3a16f68e31632c475-interpretation-0",
+        "investigation_id": "5d087c25407e4157b6b06176a649ef5c-question-2",
+        "experiment_id": null,
+        "source_ids": [
+          "quorum",
+          "leader_accepted",
+          "batching"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Source-only reading settles the premise the question asked about: `InternalStorage` maintains `accepted_idx` as a log LENGTH (`AppendEntries`/`AppendSync` semantics: `state_cache.accepted_idx = sync.sync_idx + sync.suffix.len()`, increment by one per appended entry and by one for a StopSign), `LeaderState.accepted_indexes` is seeded with 0 for every pid and written with that same length (`set_accepted_idx`) or with a follower-reported length (`handle_accepted` -> `set_accepted_idx(from, accepted.accepted_idx)`), `is_chosen(idx)` counts entries with `accepted_indexes[k] >= idx`, and the leader passes the reported length (`accepted.accepted_idx`) as well as its own length. `get_min_all_accepted_idx` (used by `trim(None)`) takes the minimum of the same lengths. So the decide step, the trim step and the reported values agree on length semantics; no off-by-one between them is visible in the captured code.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The name `accepted_idx` reads like an entry index, and `read_decided_suffix`/`read` use indices; any future consumer that mixes the two conventions would be off by one, but no such consumer is present in the captured code paths I read."
+        ],
+        "limitations": [
+          "This is a source-only account; it establishes the units used by the captured code, not that every message producer/consumer pair is consistent at runtime, which the experiment in this update does not yet cover."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "22e941df157b4eb3a16f68e31632c475"
+      },
+      {
+        "id": "b2606c6f3c1148c5af396ef701166e6f-interpretation-0",
+        "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "follower_prepare",
+          "logsync",
+          "memstorage_suffix",
+          "storage_get_suffix_contract",
+          "sync_log"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "unresolved",
+        "rationale": "Source reading identifies a concrete gap: the follower-side log-update construction can request a suffix at an index below the requestor's own compacted index, and the in-memory storage implementation turns that request into an arithmetic panic (dev profile) rather than the empty suffix its trait requires. A non-retained local run (draft/tmp/ws/omnipaxos/tests/probe4.rs) reproduces exactly that: with v_stale = (accepted 6, decided 3, round r1), f_healthy = (accepted 6, decided 6, compacted 6) and the old leader crashed, f becomes the accepted leader; when v calls try_become_leader, f's Prepare handling panics with 'attempt to subtract with overflow' at omnipaxos_storage/src/memory_storage.rs:103 while computing its log update, and v's preconditions (decided 3 < f's compacted 6, accepted 6 at the trim bound) are unchanged by that panic. Because that execution is local construction feedback and not a retained receipt, this account claims only a conditional expectation, not an asserted defect.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The panic is raised by `MemoryStorage` (a dependency crate in the same captured snapshot) while the core's call is legal per the `Storage::get_suffix` contract, so responsibility is split between the core's choice of prefix and the storage implementation's unchecked subtraction; a fix in either location would remove the observed failure.",
+          "Upstream's trim bound (`get_min_all_accepted_idx`) is what keeps other sync paths away from the compaction boundary, so this path needs the phase where the follower's accepted round is newer than the preparing leader's while the preparing leader's decided index is older than the trim point; a scenario without a crash-recovered node holding a stale decided index does not reach it."
+        ],
+        "limitations": [
+          "The local reproduction is not a retained receipt; the next action repeats the same prefix as a fixed-input experiment in the omnipaxos package and cites its CheckRun.",
+          "The release-profile consequence (empty suffix instead of a panic, leaving `sync_log` to set accepted_idx 3 with decided_idx 6) is a source-level inference in this update and was not measured."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "b2606c6f3c1148c5af396ef701166e6f"
+      },
+      {
+        "id": "a6e1fe52471c4864a0b3042da04de8e0-interpretation-0",
+        "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+        "experiment_id": "8cb68564d0514352a61204d7c6be6f3c-experiment",
+        "source_ids": [
+          "follower_prepare",
+          "logsync",
+          "memstorage_suffix",
+          "storage_get_suffix_contract",
+          "sync_log"
+        ],
+        "executions": {
+          "18e0d44919ed4eb786f1231efbab552c": [
+            4
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Current account: in the captured snapshot, a follower handling a Prepare builds its log update from the preparing leader's decided index whenever that leader's accepted round is older, and for a non-snapshot Entry type it does so through get_suffix(common_prefix_idx) without comparing that index to its own compacted index. The retained run reaches exactly that state and shows the failure: three nodes decide three entries, all three accept three more while one node is kept below decided 3 (accepted_idx 6, decided_idx 3), the leader trims to 6 (legal: every node accepted 6) so the healthy follower's compacted_idx becomes 6 while the stale node misses the forwarded Compaction::Trim, the leader is then removed and the healthy follower becomes the accepted leader under ballot n=2, and the stale node's try_become_leader makes it prepare with decided_idx 3 / accepted_idx 6. CheckRun 18e0d44919ed4eb786f1231efbab552c parses six events; the admission alias takeover_ready matches event 3 (healthy_follower_is_leader true, healthy_follower_compacted_idx 6, stale_node_decided_idx 3, stale_node_accepted_idx 6), and the result event 4 records outcome 'aborted_panic' with panic_message 'attempt to subtract with overflow' at omnipaxos_storage/src/memory_storage.rs:103 while healthy_follower_compacted_idx is still 6. The declared predicate 'outcome == completed' is therefore contradicted by a complete witness with correlated prerequisites. Responsibility in this snapshot is shared and both parts are captured code: the core chooses the below-compaction prefix (legal under the Storage trait, which specifies returning an empty vector when entries do not exist for the interval, so the request itself is permitted) and MemoryStorage::get_suffix violates that contract by computing from - trimmed_idx unchecked, aborting the node. The observable consequence for the cluster is availability loss on a legal recovery/compaction/election sequence: the surviving healthy follower dies while handling an ordinary Prepare, and the takeover cannot be evaluated.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b2606c6f3c1148c5af396ef701166e6f-knowledge-0",
+            "revision": 1,
+            "assertion": "with snapshots disabled the log update is built as get_suffix(common_prefix_idx) with no comparison against the responder's own compacted index"
+          },
+          {
+            "entry_id": "b2606c6f3c1148c5af396ef701166e6f-knowledge-1",
+            "revision": 1,
+            "assertion": "MemoryStorage::get_suffix(from) subtracts trimmed_idx unchecked and panics with overflow checks enabled for from < trimmed_idx"
+          }
+        ],
+        "counterevidence": [
+          "The aborting arithmetic is in the captured MemoryStorage implementation, not in the core crate: the core's call is legal per the Storage::get_suffix contract, so this witness proves the captured snapshot fails this path, not that the core's prefix choice is itself a contract violation.",
+          "Scoping: for a snapshot-capable Entry type the same Prepare takes the snapshot branch (decided_idx 6 > common_prefix_idx 3) and the suffix is then read at the responder's own decided index, so the failure observed here is specific to entries without snapshots (or to decided_idx <= common_prefix_idx); the run does not show a snapshot-capable variant failing.",
+          "The stale state is produced by dropping whole messages of one kind addressed to one node (decisions while it must stay at decided 3, then AcceptSync after it must promise without accepting); that is ordinary message loss under the target's fault model, and the state it produces (accepted 6 / decided 3 / older accepted round with the durable log intact) is what a crash-recovered node legitimately holds, but the drops are part of the harness's construction rather than of a natural crash alone."
+        ],
+        "limitations": [
+          "Only the dev profile was measured (overflow checks enabled, as in the controller's cargo test invocation); the consequence when overflow checks are off is not observed, so no claim is made here about a silently wrong log update in that configuration.",
+          "The captured memory storage backend was used; whether the persistent storage backend also reaches a failing endpoint for the same request, and which endpoint, was not measured.",
+          "The witness is a single deterministic schedule of one cluster size (three nodes, majority quorum, batch_size 3, NoSnapshot entries, trim index 6); the account is scoped to that exercised configuration.",
+          "The panic aborts handling before any reply is produced, so the run witnesses the abort itself; the further cluster-level consequences (a stalled or inconsistent log) are not measured by this execution."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "a6e1fe52471c4864a0b3042da04de8e0"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "a6e1fe52471c4864a0b3042da04de8e0",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "effects": [
+        {
+          "object": "investigations",
+          "action": "update",
+          "target": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+          "changed_fields": [
+            "gaps"
+          ]
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "b2606c6f3c1148c5af396ef701166e6f-question-0",
+          "changed_fields": [
+            "experiment_id",
+            "executions",
+            "conclusion",
+            "defect_claim",
+            "rationale",
+            "knowledge",
+            "counterevidence",
+            "limitations"
+          ]
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-5d087c25407e4157b6b06176a649ef5c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-5d087c25407e4157b6b06176a649ef5c.json"
+      },
+      "submission-22e941df157b4eb3a16f68e31632c475": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-22e941df157b4eb3a16f68e31632c475.json"
+      },
+      "submission-b2606c6f3c1148c5af396ef701166e6f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-b2606c6f3c1148c5af396ef701166e6f.json"
+      },
+      "submission-8cb68564d0514352a61204d7c6be6f3c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-8cb68564d0514352a61204d7c6be6f3c.json"
+      },
+      "submission-a6e1fe52471c4864a0b3042da04de8e0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_19-20-29-omnipaxos-real-run/semantic-commits/submission-a6e1fe52471c4864a0b3042da04de8e0.json"
+      }
+    }
+  }
+}

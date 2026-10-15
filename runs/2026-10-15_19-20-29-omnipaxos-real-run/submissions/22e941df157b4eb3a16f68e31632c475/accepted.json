@@ -1,0 +1,94 @@
+{
+  "rationale": "Second turn: ran selected, named tests from the fork's own actor test file plus a new in-process 3-node core battery (draft/tmp/ws/omnipaxos/tests/probe1.rs, probe2.rs, probe3.rs) as construction feedback. Basic agreement, batching content correctness, StopSign reconfiguration, follower crash/recover catch-up, leader-change agreement, sequence-gap resync after a dropped AcceptDecide, and duplicate delivery all hold locally. Two probes initially failed on my own expectations rather than on the target (18 forwarded entries vs 9 unique values; and reading a decided suffix whose prefix is compacted yields a leading compaction marker, so a per-index equality check is invalid). That second observation is source-settled into a knowledge fact, because it contradicts the actor layer's per-index cursor assumption. Question @quorum_lengths is answered from source: the accept-phase support count is over log lengths. Next action is a retained multi-case experiment in the omnipaxos package covering the recovery/compaction interactions that my local driver cannot settle.",
+  "sources": [
+    {
+      "id": "read_path",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 76,
+      "end_line": 157,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_subscribers",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 279,
+      "end_line": 333,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_handle_read",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 242,
+      "end_line": 254,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@decided_suffix_compaction_marker",
+      "kind": "behavior",
+      "statement": "`InternalStorage::read_decided_suffix(from_idx)` delegates to `read(from_idx..decided_idx)`, and `read` returns a single leading compaction marker (`LogEntry::Trimmed(compacted_idx)` or `LogEntry::Snapshotted(..)`) whenever the upper end of the requested range lies inside the compacted prefix. Consequently, when `from_idx < compacted_idx`, the returned vector's element at position k is NOT the log entry at index from_idx + k: position 0 is the marker for the whole compacted prefix and the following elements correspond to indices compacted_idx, compacted_idx+1, ....",
+      "conditions": "Captured snapshot; holds for any range whose exclusive end `to_idx` satisfies `to_idx - 1 < compacted_idx` (the `get_entry_type(to_idx - 1, ...) == Compacted` early return), i.e. whenever the requested decided suffix starts inside or entirely below the compacted prefix; the public wrappers (`OmniPaxos::read_decided_suffix`, `OmniPaxosHandle::read_decided_suffix`) do not re-align or clamp `from_idx`.",
+      "source_ids": [
+        "read_path"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@actor_subscriber_cursor",
+      "kind": "behavior",
+      "statement": "Both decided-log fan-out paths in the actor advance the per-subscriber cursor by exactly one per element returned by `read_decided_suffix` (`push_to_sub`: `sub.next_idx += 1` per successful `try_send`; `push_to_all_subs`: `start = sub.next_idx.saturating_sub(min_next)` then one increment per element sent). They therefore treat a returned element as being at index `next_idx + i`, which is only true while the subscriber's start index is at or above the node's compacted index.",
+      "conditions": "Captured snapshot; `Command::SubscribeDecided { from }` with `from < get_compacted_idx()` on that node, i.e. subscribing (or re-subscribing) to a decided log whose prefix has already been trimmed or snapshotted.",
+      "source_ids": [
+        "actor_subscribers",
+        "read_path",
+        "actor_handle_read"
+      ],
+      "executions": {},
+      "knowledge": [
+        {
+          "entry_id": "@decided_suffix_compaction_marker",
+          "revision": 1,
+          "assertion": "read_decided_suffix(from_idx < compacted_idx) returns a leading compaction marker instead of an entry at from_idx"
+        }
+      ],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "5d087c25407e4157b6b06176a649ef5c-question-2",
+      "experiment_id": null,
+      "source_ids": [
+        "quorum",
+        "leader_accepted",
+        "batching"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": null,
+      "rationale": "Source-only reading settles the premise the question asked about: `InternalStorage` maintains `accepted_idx` as a log LENGTH (`AppendEntries`/`AppendSync` semantics: `state_cache.accepted_idx = sync.sync_idx + sync.suffix.len()`, increment by one per appended entry and by one for a StopSign), `LeaderState.accepted_indexes` is seeded with 0 for every pid and written with that same length (`set_accepted_idx`) or with a follower-reported length (`handle_accepted` -> `set_accepted_idx(from, accepted.accepted_idx)`), `is_chosen(idx)` counts entries with `accepted_indexes[k] >= idx`, and the leader passes the reported length (`accepted.accepted_idx`) as well as its own length. `get_min_all_accepted_idx` (used by `trim(None)`) takes the minimum of the same lengths. So the decide step, the trim step and the reported values agree on length semantics; no off-by-one between them is visible in the captured code.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The name `accepted_idx` reads like an entry index, and `read_decided_suffix`/`read` use indices; any future consumer that mixes the two conventions would be off by one, but no such consumer is present in the captured code paths I read."
+      ],
+      "limitations": [
+        "This is a source-only account; it establishes the units used by the captured code, not that every message producer/consumer pair is consistent at runtime, which the experiment in this update does not yet cover."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}
