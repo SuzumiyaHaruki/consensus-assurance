@@ -18,6 +18,22 @@ def require_uses(state, uses):
             raise ValueError('Knowledge use must name an existing entry and exact revision')
 
 
+def receipt_references(state, receipt_id):
+    """Exact saved citations, not inferred dependence or a review obligation."""
+    latest = {i.investigation_id:i.id for i in state.interpretations}
+    citations = [i for i in state.interpretations if receipt_id in i.executions]
+    historical = [i.id for i in citations if latest[i.investigation_id] != i.id]
+    return {'current':[{'id':i.id, 'investigation_id':i.investigation_id,
+                'experiment_id':i.experiment_id, 'event_indices':list(i.executions[receipt_id])}
+            for i in citations if latest[i.investigation_id] == i.id],
+        'knowledge':[{'id':e.id, 'revision':e.revision, 'event_indices':list(e.executions[receipt_id])}
+            for e in state.knowledge if receipt_id in e.executions],
+        'historical_ids':historical, 'historical_count':len(historical), 'path':'state.json',
+        'historical_knowledge':[{'id':e.id, 'revision':r['revision'],
+                'event_indices':list(r['executions'][receipt_id])}
+            for e in state.knowledge for r in e.history if receipt_id in r.get('executions',{})]}
+
+
 def use_paths(state, entry_id, revision=None):
     """One recorded path per user, across root revisions unless specified; not semantic impact."""
     dependents = {}
@@ -250,7 +266,8 @@ def interpret(state, root, changes, operation, aliases):
             if artifact(state, change.experiment_id).investigation_id != owner.id:
                 raise ValueError('Interpretation must identify its investigation and fixed experiment')
             if not any(c.experiment_id == change.experiment_id and c.id in change.executions for c in state.checks):
-                raise ValueError('An experiment interpretation needs its own actual execution')
+                raise ValueError('When experiment_id is set, cite an actual execution of that fixed experiment; '
+                    'omit it for a question-level explained/conditional/unresolved account reusing applicable receipts')
         target_receipts(state, root, change.executions, owner_id=owner.id, experiment_id=change.experiment_id,
                         joint_history=change.joint_history, failure=change.failure_attribution,
                         support=change.conclusion in {'violated', 'holds'})

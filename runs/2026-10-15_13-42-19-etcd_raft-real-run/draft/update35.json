@@ -1,0 +1,171 @@
+{
+  "rationale": "Request an execution for the gap the current account still lists and for the second half of the question. The three receipts so far cover the single-voter remainder on both routes and the unanswered request in the multi-voter remainder with the quorum options off; this harness measures the same removal when the remainder has two voters and only PreVote is enabled, where the singleton shortcut cannot apply, and records what the caller ends up with. The harness was built against the captured source and its intended sequence appears in a scratch copy of the module: the removed leader takes the request into readOnly.unconfirmedReads and broadcasts two heartbeats instead of taking the shortcut, steps down after one tick when it learns of the new term, and the accepted request then disappears with no answer and no refusal (read_states 0, unconfirmed_reads 0, refused_to_caller false).",
+  "experiment": {
+    "investigation_id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+    "harness_path": "assurance_two_voter_prevote_test.go",
+    "source_ids": [
+      "tracker-singleton",
+      "readindex-singleton-branch",
+      "readonlysafe-doc",
+      "heartbeatresp-readonly",
+      "readonly-maybeadvance",
+      "prop-removed-leader",
+      "switchtoconfig-removal",
+      "config-stepdown-doc",
+      "node-readindex-contract",
+      "readme-linearizable"
+    ],
+    "anchors": [
+      {
+        "material_id": "tracker-singleton",
+        "symbol": "IsSingleton",
+        "start_line": 160,
+        "end_line": 160
+      },
+      {
+        "material_id": "stepleader-decl",
+        "symbol": "stepLeader",
+        "start_line": 1275,
+        "end_line": 1275
+      }
+    ],
+    "scope": {
+      "description": "Observe a ReadIndex request delivered to a leader whose removal the application applied and whose reduced configuration still has two voters, with PreVote enabled and CheckQuorum disabled: node 1 is elected in {1,2,3}, the application proposes and applies the committed removal of node 1 on all three nodes, the two remaining voters elect node 2 and it commits an entry the removed leader never sees, the read is delivered to node 1, one heartbeat tick of node 1 is delivered and its messages pumped, and the state of the request is then recorded.",
+      "assumptions": [
+        "Three voters {1,2,3} with PreVote enabled on every node and CheckQuorum disabled; the election tick is 10 and the heartbeat tick is 1; node 1 is elected with a real MsgHup/MsgPreVote/MsgVote round.",
+        "The application applies the committed removal of node 1 on all three nodes, so node 1 keeps leading a configuration of voters (2 3) under the default StepDownOnRemoval=false while node 2 becomes leader of the same configuration at the next term.",
+        "The read is delivered to node 1 after node 2 has committed, then one heartbeat tick of node 1 is delivered and its messages are pumped through the network."
+      ],
+      "excluded": [
+        "CheckQuorum and lease-based reads.",
+        "Snapshots, asynchronous storage writes, and any state machine behind the read index."
+      ]
+    },
+    "prefix": "Elect node 1 in {1,2,3} with PreVote enabled, apply the committed removal of node 1 on all three nodes, elect node 2 in {2,3} and commit one proposal, deliver MsgReadIndex to node 1 and read its emitted messages, deliver one heartbeat tick of node 1 and pump its messages, then record the request's fate and node 1's state.",
+    "requirement": "A ReadIndex answer must let the application serve a linearizable read (raft.go:233-244 and README.md:27-32 state that ReadOnlySafe achieves linearizability by communicating with the quorum, and node.go:218-224 states that once the application advances past the returned read index, linearizable reads issued before the request can be processed safely) and requests that cannot be answered are the caller's to retry. A leader that is not in its own configuration can neither count its own vote for a quorum it is not part of nor answer safely, so the receipt records whether such a request is answered, refused, or accepted and then dropped.",
+    "responsibility": "raft (target): the MsgReadIndex path decides whether a leader that its own tracker shows is not in the configuration takes the request into a read-only round, and the path that ends its leadership decides what happens to a request it already accepted.",
+    "prerequisites": [
+      {
+        "alias": "esetup",
+        "event": "c_setup"
+      },
+      {
+        "alias": "eremoved",
+        "event": "e_leader_removed",
+        "conditions": [
+          {
+            "field": "scenario",
+            "reference": "esetup.scenario"
+          }
+        ]
+      },
+      {
+        "alias": "enewlead",
+        "event": "e_new_leader_committed",
+        "conditions": [
+          {
+            "field": "scenario",
+            "reference": "eremoved.scenario"
+          }
+        ]
+      },
+      {
+        "alias": "eread",
+        "event": "e_read_taken",
+        "conditions": [
+          {
+            "field": "scenario",
+            "reference": "enewlead.scenario"
+          }
+        ]
+      },
+      {
+        "alias": "estep",
+        "event": "e_stepdown",
+        "conditions": [
+          {
+            "field": "scenario",
+            "reference": "eread.scenario"
+          }
+        ]
+      },
+      {
+        "alias": "eafter",
+        "event": "e_after_stepdown_state",
+        "conditions": [
+          {
+            "field": "scenario",
+            "reference": "estep.scenario"
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "e_leader_removed",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "esetup",
+        "assertion": {
+          "field": "singleton",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Premise: after the removal node 1 still leads, but its configuration has two voters, so the singleton shortcut cannot decide this request."
+      },
+      {
+        "event": "e_new_leader_committed",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "eremoved",
+        "assertion": {
+          "field": "actual_leader_ahead",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Premise: the new leader of {2,3} has committed an entry the removed leader's commit index does not cover."
+      },
+      {
+        "event": "e_read_taken",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "enewlead",
+        "assertion": {
+          "field": "read_pending_confirmation",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Premise: the removed leader accepts the request into readOnly.unconfirmedReads, broadcasts its heartbeats and answers nothing."
+      },
+      {
+        "event": "e_stepdown",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "eread",
+        "assertion": {
+          "field": "ticks_until_stepdown",
+          "op": "eq",
+          "value": 1
+        },
+        "description": "Bound: one heartbeat tick is enough for the removed leader to learn of the new term and leave the leader state."
+      },
+      {
+        "event": "e_after_stepdown_state",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "estep",
+        "assertion": {
+          "field": "read_answered",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Witness: the request the removed leader accepted is never answered - no read state, no unconfirmed or pending request left behind, and no refusal handed to the caller, so its only recourse is its own retry deadline."
+      }
+    ]
+  }
+}

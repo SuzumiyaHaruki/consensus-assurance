@@ -1,0 +1,123 @@
+{
+  "rationale": "Corrected the verify question's timing premise rather than leaving a vague one on record. The account previously attributed the successor-overlap condition to a leader stall or a window of ElectionTimeout - LeaderLeaseTimeout; reading the loops shows ElectionTimeout governs only a candidate's retry, the follower's election trigger is HeartbeatTimeout with randomization to [H, 2H), and the leader's lease check granularity is max(10ms, LeaderLeaseTimeout - maxDiff). Under the documented defaults the leader therefore leaves office about 500ms before the earliest campaign, and the windows can only touch when LeaderLeaseTimeout == HeartbeatTimeout, which validation permits, where the boundary comparison (diff <= leaseTimeout) and the 10ms check floor open an exposure of about 10ms plus the election itself. The question's evidence, executions and defect claim are unchanged; this update corrects the limitation and the gap answer and records the trigger semantics as a reusable Behaviour.",
+  "sources": [
+    {
+      "id": "follower_election_trigger",
+      "file": "config.go",
+      "start_line": 149,
+      "end_line": 155,
+      "kind": "code_observation"
+    },
+    {
+      "id": "follower_campaign_logic",
+      "file": "raft.go",
+      "start_line": 222,
+      "end_line": 252,
+      "kind": "code_observation"
+    },
+    {
+      "id": "lease_check_granularity",
+      "file": "raft.go",
+      "start_line": 933,
+      "end_line": 946,
+      "kind": "code_observation"
+    },
+    {
+      "id": "random_timeout",
+      "file": "util.go",
+      "start_line": 29,
+      "end_line": 35,
+      "kind": "code_observation"
+    },
+    {
+      "id": "candidate_retry",
+      "file": "raft.go",
+      "start_line": 308,
+      "end_line": 318,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@follower_election_trigger_semantics",
+      "kind": "behavior",
+      "statement": "A follower attempts an election after HeartbeatTimeout without contact from a leader, and ElectionTimeout governs only a candidate's retry. runFollower arms heartbeatTimer with randomTimeout(HeartbeatTimeout) and campaigns when the time since last contact is at least HeartbeatTimeout, while runCandidate arms its timer with randomTimeout(ElectionTimeout) and simply restarts the election when it fires. randomTimeout(v) returns v plus a random fraction of v, so a campaign begins in [H, 2H). Correspondingly ValidateConfig requires LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and the leader's own lease check runs every max(minCheckInterval, LeaderLeaseTimeout - maxDiff) with minCheckInterval = 10ms, stepping down at the first check whose voter contact age exceeds LeaderLeaseTimeout; the comparison is diff <= leaseTimeout, so a check at exactly the boundary still counts the voter as contacted.",
+      "conditions": "The default follower and leader loops in this snapshot, with pre-vote enabled or disabled; the numbers quoted are for a configuration accepted by ValidateConfig, and the exposure analysis assumes in-memory or low-latency RPCs.",
+      "source_ids": [
+        "follower_election_trigger",
+        "follower_campaign_logic",
+        "lease_check_granularity",
+        "random_timeout",
+        "config_validation",
+        "lease_check",
+        "candidate_retry"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "start_stop_repl",
+        "notify_all",
+        "verify_vote",
+        "update_last_appended",
+        "heartbeat_ack",
+        "api_verify_leader",
+        "lease_check",
+        "config_validation",
+        "reload_config",
+        "elect_vote_collection",
+        "prevote_vote_collection",
+        "vote_grant_side",
+        "follower_election_trigger",
+        "follower_campaign_logic",
+        "lease_check_granularity",
+        "random_timeout"
+      ],
+      "executions": {
+        "b02d5ff23a504a8ea38116085ba8e23c": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The question was whether its success establishes voter-majority contact; the execution says it does not. In the retained run of the three-partition probe, the leader whose only reachable peer was the non-voter returned success in 0ms while its own latest configuration reported three voters, one non-voter and a quorum size of 2, and the leader was still in Leader state (parsed event index 1); the control partition that kept one voter reachable also returned success, which shows the harness does observe a genuine acknowledgement path (index 3); the control partition with no reachable peer did not return success at all, returning 'leadership lost while committing log' after 202ms with the node in Follower state, so the leader cannot reach the threshold on its own vote and the non-voter acknowledgement is what satisfied it in the first case (index 5). All three declared comparisons hold with the setup event matched as admission (correlations 1->0, 3->2, 5->4). The source explains the mechanism: verifyLeader asks every entry of leaderState.replState to acknowledge, startStopReplication creates such an entry for every configured server except the leader without consulting Suffrage, any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, and the threshold compared against is quorumSize(), counted over voters alone. The same package treats voter eligibility strictly in its other leadership tests: checkLeaderLease does not count a non-voter, requestVote refuses a candidate that holds no vote, and quorumSize itself counts only voters, so the verify path is the outlier rather than a deliberate relaxation. The consequence for reads stays bounded and is not what this receipt measures. The leader's lease is voter-only, and both Config.Validate and ReloadConfig enforce LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so the old leader is normally removed before a voter majority elects a successor; the no-peer control is exactly that lease firing at 202ms with a 200ms lease. What the receipt does establish is the weaker but unconditional part: for an interval in which the leader exchanged nothing with any other voter, VerifyLeader reports success, so a caller relying on that call for read consistency is really relying on the lease timer rather than on the acknowledgements VerifyLeader collected. The same file shows the omission is not a considered relaxation of voter eligibility: electSelf and preElectSelf build the very same voter-sized threshold, and both iterate the leader's latest configuration asking only servers whose Suffrage is Voter, so a candidate neither solicits nor counts a non-voter's grant even though nothing on the granting side stops a non-voter from granting a vote if it were asked. Only the verify path asks every replication peer. That contrast is recorded as its own Behaviour so the finding is not reused without it, and it turns the question's answer from 'the success signal is weaker than its documentation' into 'the success signal contradicts the eligibility rule the same decisions use everywhere else'.",
+      "knowledge": [
+        {
+          "entry_id": "bc29f42a57d34a7bb2748bc0c137b09c-knowledge-0",
+          "revision": 1,
+          "assertion": "Election vote solicitation asks only servers whose Suffrage is Voter, so the verify path's inclusion of non-voters is an omission rather than the intended eligibility rule."
+        },
+        {
+          "entry_id": "@follower_election_trigger_semantics",
+          "revision": 1,
+          "assertion": "A follower campaigns after HeartbeatTimeout without leader contact, not after ElectionTimeout, and the leader's lease check granularity is max(10ms, LeaderLeaseTimeout - maxDiff)."
+        }
+      ],
+      "answers": {
+        "d704b04e706144dc964ff451359eda19-gap-0": {
+          "explanation": "Still unresolved, with a narrower condition set than the earlier answer. Configuration routes are closed by source: checkLeaderLease counts voters only, and both ValidateConfig and ReloadConfig keep LeaderLeaseTimeout <= HeartbeatTimeout. Reading the timings shows why the two windows normally cannot overlap: a follower campaigns after HeartbeatTimeout without contact, with randomTimeout stretching it to [H, 2H), while the leader steps down at the first lease check whose voter contact age exceeds LeaderLeaseTimeout. The exception is LeaderLeaseTimeout == HeartbeatTimeout, which validation permits: the check whose measured age is exactly LeaderLeaseTimeout still counts the voter as contacted, and the step-down then waits for the next check at least minCheckInterval = 10ms later, so a voter may already be campaigning while the old leader still counts a non-voter's acknowledgement; the resulting exposure is about 10ms plus the election itself. No execution has observed that window, so the gap stays open and needs either a probe that hits the boundary or a leader-side stall.",
+          "resolved": false
+        }
+      },
+      "counterevidence": [
+        "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; the no-peer control shows this concretely (leadership lost at 202ms with a 200ms lease), which bounds the stale-read consequence rather than showing the verify decision support to be adequate.",
+        "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so a leader cannot be configured to outlive a follower's election timer through the public reload API.",
+        "In the non-voter partition the other servers stayed in term 2 with no leader change, so the receipt does not witness a successor being elected while the old leader still verified; that half of the consequence remains unobserved."
+      ],
+      "limitations": [
+        "The stale-read consequence needs a successor elected while the old leader reports verify success, and the timing that decides it is now read from source rather than assumed. A follower attempts an election after HeartbeatTimeout without leader contact (config.go: HeartbeatTimeout is 'the time in follower state without contact from a leader before we attempt an election') and randomTimeout adds a random fraction, so it campaigns in [H, 2H); ElectionTimeout only governs a candidate's retry. The leader's lease check runs every max(10ms, LeaderLeaseTimeout - maxDiff) and steps down at the first check whose voter contact age exceeds LeaderLeaseTimeout. ValidateConfig enforces LeaderLeaseTimeout <= HeartbeatTimeout, so with the documented defaults (500ms and 1000ms) the leader leaves the leader state roughly 500ms before the earliest campaign, and the two windows cannot overlap. They can touch when LeaderLeaseTimeout == HeartbeatTimeout, which validation permits: the last check passes while the age is exactly LeaderLeaseTimeout (the comparison is diff <= leaseTimeout), and the step-down then waits for the next check, at least minCheckInterval = 10ms away, while a voter is already allowed to be campaigning. That leaves a source-derived exposure of up to about 10ms plus whatever the election itself takes, and a longer one if the leader's own goroutine is stalled or its clock jumps, which is what the earlier account relied on.",
+        "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks; the partition was made by disconnecting transports in both directions.",
+        "One execution of each case is cited; repeatability of the timing-sensitive control (the 202ms lease step-down) is not established."
+      ]
+    }
+  ]
+}

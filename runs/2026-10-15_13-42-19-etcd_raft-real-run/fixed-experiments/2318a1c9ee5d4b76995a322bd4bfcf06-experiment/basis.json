@@ -1,0 +1,661 @@
+{
+  "id": "2318a1c9ee5d4b76995a322bd4bfcf06-experiment",
+  "investigation_id": "05a1b54cf0ce4ce0bcd9e888623b8fae-question-0",
+  "version": 3,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc assurance3WaitFor(t *testing.T, what string, pred func() bool) bool {\n\tt.Helper()\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif pred() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tt.Logf(\"transition not observed: %s\", what)\n\treturn false\n}\n\nfunc assurance3Emit(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceProposeAfterReAdd observes the Node wrapper's proposal channel\n// for a follower that is removed from the configuration and then added back by\n// the same leader in the same term: the code comments the channel reset as\n// \"not very sound and likely has bugs\" (node.go:409-411) and registers the node\n// as a member again, so the app-side proposal path is compared before the\n// removal, after the re-add, and after a leadership change.\nfunc TestAssuranceProposeAfterReAdd(t *testing.T) {\n\tn2Store := newTestMemoryStorage(withPeers(1, 2))\n\tctx, cancel, h := newNodeTestHarness(context.Background(), t, newTestConfig(2, 10, 1, n2Store))\n\tdefer cancel()\n\tn1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2)))\n\n\t// node 1 leads the group without an election round trip; node 2 learns that\n\t// from the appends it receives below.\n\tn1.becomeCandidate()\n\tn1.becomeLeader()\n\tn1.bcastAppend()\n\n\t// handleReady drains one Ready of the wrapped node, steps the messages it\n\t// carries (and the ones node 1 produces in response) as the application's\n\t// message pump would, and then advances the node.\n\thandleReady := func(timeout time.Duration) bool {\n\t\ttick, tcancel := context.WithTimeout(ctx, timeout)\n\t\tdefer tcancel()\n\t\tselect {\n\t\tcase rd := <-h.Ready():\n\t\t\t// Application duty: HardState, Entries and Snapshot must be on\n\t\t\t// stable storage before this Ready's messages are sent.\n\t\t\tif rd.Snapshot != nil {\n\t\t\t\tif err := n2Store.ApplySnapshot(rd.Snapshot); err != nil && err != ErrSnapOutOfDate {\n\t\t\t\t\tt.Logf(\"node 2 apply snapshot: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tif len(rd.Entries) > 0 {\n\t\t\t\tif err := n2Store.Append(rd.Entries); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 append entries: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tif !IsEmptyHardState(rd.HardState) {\n\t\t\t\tif err := n2Store.SetHardState(rd.HardState); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 hard state: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tvar toNode1 []*pb.Message\n\t\t\tfor _, m := range rd.Messages {\n\t\t\t\tif m.GetTo() == 1 {\n\t\t\t\t\ttoNode1 = append(toNode1, m)\n\t\t\t\t}\n\t\t\t}\n\t\t\th.Advance()\n\t\t\tvar toNode2 []*pb.Message\n\t\t\tfor _, m := range toNode1 {\n\t\t\t\tif err := n1.Step(m); err != nil {\n\t\t\t\t\tt.Logf(\"node 1 step: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\ttoNode2 = append(toNode2, n1.readMessages()...)\n\t\t\tfor _, m := range toNode2 {\n\t\t\t\tif m.GetTo() != 2 {\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t\tif err := h.Step(ctx, m); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 step: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\treturn true\n\t\tcase <-tick.Done():\n\t\t\treturn false\n\t\t}\n\t}\n\t// pump alternates delivering node 1's outgoing messages to node 2 with\n\t// draining one of node 2's Readys until neither side produces anything.\n\tpump := func() {\n\t\tfor i := 0; i < 50; i++ {\n\t\t\tprogressed := false\n\t\t\tfor _, m := range n1.readMessages() {\n\t\t\t\tif m.GetTo() == 2 {\n\t\t\t\t\tif err := h.Step(ctx, m); err != nil {\n\t\t\t\t\t\tt.Logf(\"node 2 step: %v\", err)\n\t\t\t\t\t}\n\t\t\t\t\tprogressed = true\n\t\t\t\t}\n\t\t\t}\n\t\t\tif handleReady(300 * time.Millisecond) {\n\t\t\t\tprogressed = true\n\t\t\t}\n\t\t\tif !progressed {\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n\t// Deliver the new leader's appends, then wait until the wrapped node has\n\t// demonstrably processed them: Node.Step only hands a message to the run\n\t// loop, so an observation taken immediately after Step would read state\n\t// that the node has not updated yet.\n\tfor i := 0; i < 12; i++ {\n\t\tpump()\n\t}\n\tassurance3WaitFor(t, \"node 2 knows leader 1\", func() bool { return h.Status().Lead == 1 })\n\n\tpropose := func(what string) (err error, dur time.Duration) {\n\t\tpctx, pcancel := context.WithTimeout(ctx, 300*time.Millisecond)\n\t\tdefer pcancel()\n\t\tstart := time.Now()\n\t\terr = h.Propose(pctx, []byte(what))\n\t\treturn err, time.Since(start)\n\t}\n\tstate := func() map[string]any {\n\t\tst := h.Status()\n\t\treturn map[string]any{\n\t\t\t\"snapshot_via\":     \"status-channel\",\n\t\t\t\"node\":              st.ID,\n\t\t\t\"state\":             st.RaftState.String(),\n\t\t\t\"known_leader\":      st.Lead,\n\t\t\t\"term\":              st.GetTerm(),\n\t\t\t\"committed_index\":   st.GetCommit(),\n\t\t\t\"applied_index\":     st.Applied,\n\t\t\t\"leader_last_index\": n1.raftLog.lastIndex(),\n\t\t\t\"leader_sees_member\": func() bool { _, ok := n1.trk.Progress[2]; return ok }(),\n\t\t\t\"leader_config\":     n1.trk.Config.String(),\n\t\t}\n\t}\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"setup\", \"step\": \"before-removal\",\n\t\t\"cluster\": \"voters=(1 2)\", \"node2_state\": state()})\n\n\t// Control 1: while node 2 is a plain member it proposes successfully (the\n\t// follower forwards the proposal to leader 1).\n\terr1, dur1 := propose(\"control-before-removal\")\n\tpump()\n\tev := map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"propose_before_removal\", \"step\": \"propose-before-removal\",\n\t\t\"proposal_returned_error\": err1 != nil, \"proposal_duration_ms\": dur1.Milliseconds()}\n\tfor k, v := range state() {\n\t\tev[k] = v\n\t}\n\tif err1 != nil {\n\t\tev[\"proposal_error\"] = err1.Error()\n\t}\n\tassurance3Emit(t, ev)\n\n\t// The leader removes node 2 and both nodes apply the committed change.\n\tremove, err := confChangeToMsg(&pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))})\n\tif err != nil {\n\t\tt.Fatalf(\"remove message: %v\", err)\n\t}\n\tremove.From, remove.To = new(uint64(1)), new(uint64(1))\n\tif err := n1.Step(remove); err != nil {\n\t\tt.Fatalf(\"propose removal: %v\", err)\n\t}\n\tpump()\n\tremoveChange := &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))}\n\tn1.applyConfChange(removeChange.AsV2())\n\th.ApplyConfChange(removeChange.AsV2())\n\tpump()\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"node2_removed\", \"step\": \"after-removal\",\n\t\t\"leader_config\": n1.trk.Config.String(), \"node2_state\": state()})\n\n\t// The same leader adds node 2 back in the same term.\n\tadd, err := confChangeToMsg(&pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))})\n\tif err != nil {\n\t\tt.Fatalf(\"add message: %v\", err)\n\t}\n\tadd.From, add.To = new(uint64(1)), new(uint64(1))\n\tif err := n1.Step(add); err != nil {\n\t\tt.Fatalf(\"propose re-add: %v\", err)\n\t}\n\tpump()\n\taddChange := &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))}\n\tn1.applyConfChange(addChange.AsV2())\n\th.ApplyConfChange(addChange.AsV2())\n\tpump()\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"node2_readded\", \"step\": \"after-re-add\",\n\t\t\"leader_config\": n1.trk.Config.String(), \"node2_state\": state()})\n\n\t// Witness: node 2 is a member again, knows the same leader, and its proposal\n\t// is not delivered to the group.\n\tleaderIndexBefore := n1.raftLog.lastIndex()\n\terr2, dur2 := propose(\"witness-after-re-add\")\n\tpump()\n\tev = map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"propose_after_readd\", \"step\": \"propose-after-re-add\",\n\t\t\"proposal_returned_error\": err2 != nil, \"proposal_duration_ms\": dur2.Milliseconds(),\n\t\t\"leader_index_before\":     leaderIndexBefore,\n\t\t\"leader_last_index\":       n1.raftLog.lastIndex(),\n\t\t\"leader_advanced\":         n1.raftLog.lastIndex() > leaderIndexBefore}\n\tfor k, v := range state() {\n\t\tev[k] = v\n\t}\n\tif err2 != nil {\n\t\tev[\"proposal_error\"] = err2.Error()\n\t}\n\tassurance3Emit(t, ev)\n\n\n\n\t// Restore path: node 2 campaigns on the corrected prefix (its log is\n\t// consistent now) so that the leadership changes, and the same Propose call\n\t// is repeated afterwards.\n\tif err := h.Campaign(ctx); err != nil {\n\t\tt.Logf(\"campaign: %v\", err)\n\t}\n\tfor i := 0; i < 20 && h.Status().RaftState != StateLeader; i++ {\n\t\tpump()\n\t}\n\tcampaignState := h.Status()\n\tassurance3Emit(t, map[string]any{\"event\": \"campaign_attempt\", \"step\": \"after-campaign\",\n\t\t\"scenario\": \"node-propose-after-readd\", \"node\": campaignState.ID,\n\t\t\"state\": campaignState.RaftState.String(), \"term\": campaignState.GetTerm(),\n\t\t\"known_leader\": campaignState.Lead, \"committed_index\": campaignState.GetCommit()})\n\n\tcommitBefore := h.Status().GetCommit()\n\terrRestore, durRestore := propose(\"after-leadership-change\")\n\tpump()\n\trestoreState := h.Status()\n\tassurance3Emit(t, map[string]any{\"event\": \"propose_after_leadership_change\", \"step\": \"propose-after-leadership-change\",\n\t\t\"scenario\": \"node-propose-after-readd\", \"node\": restoreState.ID,\n\t\t\"proposal_returned_error\": errRestore != nil, \"proposal_duration_ms\": durRestore.Milliseconds(),\n\t\t\"commit_before\": commitBefore, \"committed_index\": restoreState.GetCommit(),\n\t\t\"commit_advanced\": restoreState.GetCommit() > commitBefore,\n\t\t\"state\": restoreState.RaftState.String(), \"term\": restoreState.GetTerm(),\n\t\t\"known_leader\": restoreState.Lead})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "s0",
+          "event": "setup",
+          "conditions": []
+        },
+        {
+          "alias": "adv",
+          "event": "propose_before_removal",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "s0.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "wit",
+          "event": "propose_after_readd",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "adv.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "camp",
+          "event": "campaign_attempt",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "wit.scenario"
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "node-propc-guard",
+      "node-propc-restore",
+      "node-propose-block",
+      "node-propose-doc"
+    ],
+    "anchors": [
+      {
+        "material_id": "node-propc-restore",
+        "symbol": "run",
+        "start_line": 343,
+        "end_line": 343,
+        "anchor": {
+          "source_ids": [
+            "node-propc-restore"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "node-propc-restore",
+          "start_line": 343,
+          "end_line": 343,
+          "symbol": "run"
+        }
+      },
+      {
+        "material_id": "node-propose-block",
+        "symbol": "stepWithWaitOption",
+        "start_line": 514,
+        "end_line": 514,
+        "anchor": {
+          "source_ids": [
+            "node-propose-block"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "node-propose-block",
+          "start_line": 514,
+          "end_line": 514,
+          "symbol": "stepWithWaitOption"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Observe the application-facing proposal path of the Node wrapper for one wrapped node 2 that leader 1 removes from the configuration and then adds back in the same term, with the application duties of the Ready/Advance contract honoured: Propose before the removal, after the re-add, and after the wrapped node wins a leadership change.",
+      "assumptions": [
+        "Two voters {1,2} in one process: node 2 is driven through the Node wrapper (newNodeTestHarness, Readys consumed, entries/hard state persisted, Advance called) while node 1 is a bare raft instance driven by the harness's message pump; node 1 is made leader directly and broadcasts its appends.",
+        "Both nodes apply the removal and the re-add through the application path (n1.applyConfChange and the wrapper's ApplyConfChange), and every snapshot of node 2 is taken through its status channel (node.Status), executed inside the run loop.",
+        "Propose is called with a 300ms context deadline.",
+        "After the witness, the wrapped node campaigns; the harness pumps messages until its status reports StateLeader and then repeats the Propose call, recording the node's commit index before and after."
+      ],
+      "excluded": [
+        "StepDownOnRemoval, CheckQuorum and PreVote configurations.",
+        "Snapshots and asynchronous storage writes."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Create the wrapped node 2 over its own storage and a bare node 1 over storages with voters {1,2}; make node 1 leader at term 1 and broadcast its appends; pump messages (persisting whatever node 2's Readys carry) until node 2 knows leader 1 and has applied the bootstrap entry; propose through the wrapper and record the outcome; propose the removal of node 2 on node 1, pump, and apply it on both nodes; propose the re-add of node 2 on node 1, pump, and apply it on both nodes; then propose through the wrapper again and record the outcome and the leader's log index around it. Then the wrapped node campaigns, the harness pumps until it reports StateLeader, and the Propose call is repeated with the node's commit index recorded around it.",
+    "requirement": "Node.Propose is the application-facing proposal path: its documentation states that it proposes data to be appended to the log and warns only that proposals can be lost without notice (node.go:138-140). A node that the application has added back to the configuration, and that knows the leader of that configuration, must therefore be able to hand a proposal to raft - or report why it cannot - rather than block until the caller's context expires while the group never sees the proposal.",
+    "responsibility": "raft (target): the wrapper's own bookkeeping decides whether the application's proposals reach the group, and the target's comment at node.go:409-411 records that this bookkeeping is unsound.",
+    "comparisons": [
+      {
+        "event": "propose_before_removal",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "s0",
+        "assertion": {
+          "field": "proposal_returned_error",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: while node 2 is a plain member of {1,2} and knows leader 1, Propose returns no error."
+      },
+      {
+        "event": "propose_before_removal",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "s0",
+        "assertion": {
+          "field": "leader_last_index",
+          "op": "eq",
+          "value": 2,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: the proposal forwarded by the follower reaches the group - the leader's log index is 2 after the call (the bootstrap entry plus this proposal)."
+      },
+      {
+        "event": "propose_after_readd",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "adv",
+        "assertion": {
+          "field": "leader_sees_member",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise on the witness event: the leader's configuration contains node 2 again after the re-add."
+      },
+      {
+        "event": "propose_after_readd",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "adv",
+        "assertion": {
+          "field": "known_leader",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise on the witness event: the wrapped node still knows leader 1, in the same term, so the leadership is unchanged across the removal and the re-add."
+      },
+      {
+        "event": "propose_after_readd",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "adv",
+        "assertion": {
+          "field": "proposal_returned_error",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "known_leader",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "Witness: with node 2 a member again and still knowing leader 1, Propose returns only when its context deadline fires (context deadline exceeded after about 300ms)."
+      },
+      {
+        "event": "propose_after_readd",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "adv",
+        "assertion": {
+          "field": "leader_advanced",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Witness: the proposal never reached the group - the leader's log index is unchanged at 4 across the call."
+      },
+      {
+        "event": "campaign_attempt",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "wit",
+        "assertion": {
+          "field": "state",
+          "op": "eq",
+          "value": "StateLeader",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Restore premise: after the campaign the wrapped node reports itself as leader, so r.lead changed from 1 to 2 in the same run."
+      },
+      {
+        "event": "propose_after_leadership_change",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "camp",
+        "assertion": {
+          "field": "proposal_returned_error",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Restore path: with the leadership changed, Propose returns no error."
+      },
+      {
+        "event": "propose_after_leadership_change",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "camp",
+        "assertion": {
+          "field": "commit_advanced",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Restore path: the proposal reaches the group - the node's commit index advances from 5 to 6."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "58d590a4e84744e08ee4d0473cd5f863",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "2318a1c9ee5d4b76995a322bd4bfcf06",
+  "previous_id": "c3dd9a52a0c44b21af5b3204cf642efb-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc assurance3WaitFor(t *testing.T, what string, pred func() bool) bool {\n\tt.Helper()\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif pred() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tt.Logf(\"transition not observed: %s\", what)\n\treturn false\n}\n\nfunc assurance3Emit(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceProposeAfterReAdd observes the Node wrapper's proposal channel\n// for a follower that is removed from the configuration and then added back by\n// the same leader in the same term: the code comments the channel reset as\n// \"not very sound and likely has bugs\" (node.go:409-411) and registers the node\n// as a member again, so the app-side proposal path is compared before the\n// removal, after the re-add, and after a leadership change.\nfunc TestAssuranceProposeAfterReAdd(t *testing.T) {\n\tn2Store := newTestMemoryStorage(withPeers(1, 2))\n\tctx, cancel, h := newNodeTestHarness(context.Background(), t, newTestConfig(2, 10, 1, n2Store))\n\tdefer cancel()\n\tn1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2)))\n\n\t// node 1 leads the group without an election round trip; node 2 learns that\n\t// from the appends it receives below.\n\tn1.becomeCandidate()\n\tn1.becomeLeader()\n\tn1.bcastAppend()\n\n\t// handleReady drains one Ready of the wrapped node, steps the messages it\n\t// carries (and the ones node 1 produces in response) as the application's\n\t// message pump would, and then advances the node.\n\thandleReady := func(timeout time.Duration) bool {\n\t\ttick, tcancel := context.WithTimeout(ctx, timeout)\n\t\tdefer tcancel()\n\t\tselect {\n\t\tcase rd := <-h.Ready():\n\t\t\t// Application duty: HardState, Entries and Snapshot must be on\n\t\t\t// stable storage before this Ready's messages are sent.\n\t\t\tif rd.Snapshot != nil {\n\t\t\t\tif err := n2Store.ApplySnapshot(rd.Snapshot); err != nil && err != ErrSnapOutOfDate {\n\t\t\t\t\tt.Logf(\"node 2 apply snapshot: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tif len(rd.Entries) > 0 {\n\t\t\t\tif err := n2Store.Append(rd.Entries); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 append entries: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tif !IsEmptyHardState(rd.HardState) {\n\t\t\t\tif err := n2Store.SetHardState(rd.HardState); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 hard state: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tvar toNode1 []*pb.Message\n\t\t\tfor _, m := range rd.Messages {\n\t\t\t\tif m.GetTo() == 1 {\n\t\t\t\t\ttoNode1 = append(toNode1, m)\n\t\t\t\t}\n\t\t\t}\n\t\t\th.Advance()\n\t\t\tvar toNode2 []*pb.Message\n\t\t\tfor _, m := range toNode1 {\n\t\t\t\tif err := n1.Step(m); err != nil {\n\t\t\t\t\tt.Logf(\"node 1 step: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\ttoNode2 = append(toNode2, n1.readMessages()...)\n\t\t\tfor _, m := range toNode2 {\n\t\t\t\tif m.GetTo() != 2 {\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t\tif err := h.Step(ctx, m); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 step: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\treturn true\n\t\tcase <-tick.Done():\n\t\t\treturn false\n\t\t}\n\t}\n\t// pump alternates delivering node 1's outgoing messages to node 2 with\n\t// draining one of node 2's Readys until neither side produces anything.\n\tpump := func() {\n\t\tfor i := 0; i < 50; i++ {\n\t\t\tprogressed := false\n\t\t\tfor _, m := range n1.readMessages() {\n\t\t\t\tif m.GetTo() == 2 {\n\t\t\t\t\tif err := h.Step(ctx, m); err != nil {\n\t\t\t\t\t\tt.Logf(\"node 2 step: %v\", err)\n\t\t\t\t\t}\n\t\t\t\t\tprogressed = true\n\t\t\t\t}\n\t\t\t}\n\t\t\tif handleReady(300 * time.Millisecond) {\n\t\t\t\tprogressed = true\n\t\t\t}\n\t\t\tif !progressed {\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n\t// Deliver the new leader's appends, then wait until the wrapped node has\n\t// demonstrably processed them: Node.Step only hands a message to the run\n\t// loop, so an observation taken immediately after Step would read state\n\t// that the node has not updated yet.\n\tfor i := 0; i < 12; i++ {\n\t\tpump()\n\t}\n\tassurance3WaitFor(t, \"node 2 knows leader 1\", func() bool { return h.Status().Lead == 1 })\n\n\tpropose := func(what string) (err error, dur time.Duration) {\n\t\tpctx, pcancel := context.WithTimeout(ctx, 300*time.Millisecond)\n\t\tdefer pcancel()\n\t\tstart := time.Now()\n\t\terr = h.Propose(pctx, []byte(what))\n\t\treturn err, time.Since(start)\n\t}\n\tstate := func() map[string]any {\n\t\tst := h.Status()\n\t\treturn map[string]any{\n\t\t\t\"snapshot_via\":     \"status-channel\",\n\t\t\t\"node\":              st.ID,\n\t\t\t\"state\":             st.RaftState.String(),\n\t\t\t\"known_leader\":      st.Lead,\n\t\t\t\"term\":              st.GetTerm(),\n\t\t\t\"committed_index\":   st.GetCommit(),\n\t\t\t\"applied_index\":     st.Applied,\n\t\t\t\"leader_last_index\": n1.raftLog.lastIndex(),\n\t\t\t\"leader_sees_member\": func() bool { _, ok := n1.trk.Progress[2]; return ok }(),\n\t\t\t\"leader_config\":     n1.trk.Config.String(),\n\t\t}\n\t}\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"setup\", \"step\": \"before-removal\",\n\t\t\"cluster\": \"voters=(1 2)\", \"node2_state\": state()})\n\n\t// Control 1: while node 2 is a plain member it proposes successfully (the\n\t// follower forwards the proposal to leader 1).\n\terr1, dur1 := propose(\"control-before-removal\")\n\tpump()\n\tev := map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"propose_before_removal\", \"step\": \"propose-before-removal\",\n\t\t\"proposal_returned_error\": err1 != nil, \"proposal_duration_ms\": dur1.Milliseconds()}\n\tfor k, v := range state() {\n\t\tev[k] = v\n\t}\n\tif err1 != nil {\n\t\tev[\"proposal_error\"] = err1.Error()\n\t}\n\tassurance3Emit(t, ev)\n\n\t// The leader removes node 2 and both nodes apply the committed change.\n\tremove, err := confChangeToMsg(&pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))})\n\tif err != nil {\n\t\tt.Fatalf(\"remove message: %v\", err)\n\t}\n\tremove.From, remove.To = new(uint64(1)), new(uint64(1))\n\tif err := n1.Step(remove); err != nil {\n\t\tt.Fatalf(\"propose removal: %v\", err)\n\t}\n\tpump()\n\tremoveChange := &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))}\n\tn1.applyConfChange(removeChange.AsV2())\n\th.ApplyConfChange(removeChange.AsV2())\n\tpump()\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"node2_removed\", \"step\": \"after-removal\",\n\t\t\"leader_config\": n1.trk.Config.String(), \"node2_state\": state()})\n\n\t// The same leader adds node 2 back in the same term.\n\tadd, err := confChangeToMsg(&pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))})\n\tif err != nil {\n\t\tt.Fatalf(\"add message: %v\", err)\n\t}\n\tadd.From, add.To = new(uint64(1)), new(uint64(1))\n\tif err := n1.Step(add); err != nil {\n\t\tt.Fatalf(\"propose re-add: %v\", err)\n\t}\n\tpump()\n\taddChange := &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))}\n\tn1.applyConfChange(addChange.AsV2())\n\th.ApplyConfChange(addChange.AsV2())\n\tpump()\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"node2_readded\", \"step\": \"after-re-add\",\n\t\t\"leader_config\": n1.trk.Config.String(), \"node2_state\": state()})\n\n\t// Witness: node 2 is a member again, knows the same leader, and its proposal\n\t// is not delivered to the group.\n\tleaderIndexBefore := n1.raftLog.lastIndex()\n\terr2, dur2 := propose(\"witness-after-re-add\")\n\tpump()\n\tev = map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"propose_after_readd\", \"step\": \"propose-after-re-add\",\n\t\t\"proposal_returned_error\": err2 != nil, \"proposal_duration_ms\": dur2.Milliseconds(),\n\t\t\"leader_index_before\":     leaderIndexBefore,\n\t\t\"leader_last_index\":       n1.raftLog.lastIndex(),\n\t\t\"leader_advanced\":         n1.raftLog.lastIndex() > leaderIndexBefore}\n\tfor k, v := range state() {\n\t\tev[k] = v\n\t}\n\tif err2 != nil {\n\t\tev[\"proposal_error\"] = err2.Error()\n\t}\n\tassurance3Emit(t, ev)\n\n\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "s0",
+            "event": "setup",
+            "conditions": []
+          },
+          {
+            "alias": "adv",
+            "event": "propose_before_removal",
+            "conditions": [
+              {
+                "field": "scenario",
+                "op": "eq",
+                "value": null,
+                "reference": "s0.scenario"
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc assurance3WaitFor(t *testing.T, what string, pred func() bool) bool {\n\tt.Helper()\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif pred() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tt.Logf(\"transition not observed: %s\", what)\n\treturn false\n}\n\nfunc assurance3Emit(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceProposeAfterReAdd observes the Node wrapper's proposal channel\n// for a follower that is removed from the configuration and then added back by\n// the same leader in the same term: the code comments the channel reset as\n// \"not very sound and likely has bugs\" (node.go:409-411) and registers the node\n// as a member again, so the app-side proposal path is compared before the\n// removal, after the re-add, and after a leadership change.\nfunc TestAssuranceProposeAfterReAdd(t *testing.T) {\n\tn2Store := newTestMemoryStorage(withPeers(1, 2))\n\tctx, cancel, h := newNodeTestHarness(context.Background(), t, newTestConfig(2, 10, 1, n2Store))\n\tdefer cancel()\n\tn1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2)))\n\n\t// node 1 leads the group without an election round trip; node 2 learns that\n\t// from the appends it receives below.\n\tn1.becomeCandidate()\n\tn1.becomeLeader()\n\tn1.bcastAppend()\n\n\t// handleReady drains one Ready of the wrapped node, steps the messages it\n\t// carries (and the ones node 1 produces in response) as the application's\n\t// message pump would, and then advances the node.\n\thandleReady := func(timeout time.Duration) bool {\n\t\ttick, tcancel := context.WithTimeout(ctx, timeout)\n\t\tdefer tcancel()\n\t\tselect {\n\t\tcase rd := <-h.Ready():\n\t\t\t// Application duty: HardState, Entries and Snapshot must be on\n\t\t\t// stable storage before this Ready's messages are sent.\n\t\t\tif rd.Snapshot != nil {\n\t\t\t\tif err := n2Store.ApplySnapshot(rd.Snapshot); err != nil && err != ErrSnapOutOfDate {\n\t\t\t\t\tt.Logf(\"node 2 apply snapshot: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tif len(rd.Entries) > 0 {\n\t\t\t\tif err := n2Store.Append(rd.Entries); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 append entries: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tif !IsEmptyHardState(rd.HardState) {\n\t\t\t\tif err := n2Store.SetHardState(rd.HardState); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 hard state: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tvar toNode1 []*pb.Message\n\t\t\tfor _, m := range rd.Messages {\n\t\t\t\tif m.GetTo() == 1 {\n\t\t\t\t\ttoNode1 = append(toNode1, m)\n\t\t\t\t}\n\t\t\t}\n\t\t\th.Advance()\n\t\t\tvar toNode2 []*pb.Message\n\t\t\tfor _, m := range toNode1 {\n\t\t\t\tif err := n1.Step(m); err != nil {\n\t\t\t\t\tt.Logf(\"node 1 step: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\ttoNode2 = append(toNode2, n1.readMessages()...)\n\t\t\tfor _, m := range toNode2 {\n\t\t\t\tif m.GetTo() != 2 {\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t\tif err := h.Step(ctx, m); err != nil {\n\t\t\t\t\tt.Logf(\"node 2 step: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\treturn true\n\t\tcase <-tick.Done():\n\t\t\treturn false\n\t\t}\n\t}\n\t// pump alternates delivering node 1's outgoing messages to node 2 with\n\t// draining one of node 2's Readys until neither side produces anything.\n\tpump := func() {\n\t\tfor i := 0; i < 50; i++ {\n\t\t\tprogressed := false\n\t\t\tfor _, m := range n1.readMessages() {\n\t\t\t\tif m.GetTo() == 2 {\n\t\t\t\t\tif err := h.Step(ctx, m); err != nil {\n\t\t\t\t\t\tt.Logf(\"node 2 step: %v\", err)\n\t\t\t\t\t}\n\t\t\t\t\tprogressed = true\n\t\t\t\t}\n\t\t\t}\n\t\t\tif handleReady(300 * time.Millisecond) {\n\t\t\t\tprogressed = true\n\t\t\t}\n\t\t\tif !progressed {\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}\n\t// Deliver the new leader's appends, then wait until the wrapped node has\n\t// demonstrably processed them: Node.Step only hands a message to the run\n\t// loop, so an observation taken immediately after Step would read state\n\t// that the node has not updated yet.\n\tfor i := 0; i < 12; i++ {\n\t\tpump()\n\t}\n\tassurance3WaitFor(t, \"node 2 knows leader 1\", func() bool { return h.Status().Lead == 1 })\n\n\tpropose := func(what string) (err error, dur time.Duration) {\n\t\tpctx, pcancel := context.WithTimeout(ctx, 300*time.Millisecond)\n\t\tdefer pcancel()\n\t\tstart := time.Now()\n\t\terr = h.Propose(pctx, []byte(what))\n\t\treturn err, time.Since(start)\n\t}\n\tstate := func() map[string]any {\n\t\tst := h.Status()\n\t\treturn map[string]any{\n\t\t\t\"snapshot_via\":     \"status-channel\",\n\t\t\t\"node\":              st.ID,\n\t\t\t\"state\":             st.RaftState.String(),\n\t\t\t\"known_leader\":      st.Lead,\n\t\t\t\"term\":              st.GetTerm(),\n\t\t\t\"committed_index\":   st.GetCommit(),\n\t\t\t\"applied_index\":     st.Applied,\n\t\t\t\"leader_last_index\": n1.raftLog.lastIndex(),\n\t\t\t\"leader_sees_member\": func() bool { _, ok := n1.trk.Progress[2]; return ok }(),\n\t\t\t\"leader_config\":     n1.trk.Config.String(),\n\t\t}\n\t}\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"setup\", \"step\": \"before-removal\",\n\t\t\"cluster\": \"voters=(1 2)\", \"node2_state\": state()})\n\n\t// Control 1: while node 2 is a plain member it proposes successfully (the\n\t// follower forwards the proposal to leader 1).\n\terr1, dur1 := propose(\"control-before-removal\")\n\tpump()\n\tev := map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"propose_before_removal\", \"step\": \"propose-before-removal\",\n\t\t\"proposal_returned_error\": err1 != nil, \"proposal_duration_ms\": dur1.Milliseconds()}\n\tfor k, v := range state() {\n\t\tev[k] = v\n\t}\n\tif err1 != nil {\n\t\tev[\"proposal_error\"] = err1.Error()\n\t}\n\tassurance3Emit(t, ev)\n\n\t// The leader removes node 2 and both nodes apply the committed change.\n\tremove, err := confChangeToMsg(&pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))})\n\tif err != nil {\n\t\tt.Fatalf(\"remove message: %v\", err)\n\t}\n\tremove.From, remove.To = new(uint64(1)), new(uint64(1))\n\tif err := n1.Step(remove); err != nil {\n\t\tt.Fatalf(\"propose removal: %v\", err)\n\t}\n\tpump()\n\tremoveChange := &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(2))}\n\tn1.applyConfChange(removeChange.AsV2())\n\th.ApplyConfChange(removeChange.AsV2())\n\tpump()\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"node2_removed\", \"step\": \"after-removal\",\n\t\t\"leader_config\": n1.trk.Config.String(), \"node2_state\": state()})\n\n\t// The same leader adds node 2 back in the same term.\n\tadd, err := confChangeToMsg(&pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))})\n\tif err != nil {\n\t\tt.Fatalf(\"add message: %v\", err)\n\t}\n\tadd.From, add.To = new(uint64(1)), new(uint64(1))\n\tif err := n1.Step(add); err != nil {\n\t\tt.Fatalf(\"propose re-add: %v\", err)\n\t}\n\tpump()\n\taddChange := &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))}\n\tn1.applyConfChange(addChange.AsV2())\n\th.ApplyConfChange(addChange.AsV2())\n\tpump()\n\n\tassurance3Emit(t, map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"node2_readded\", \"step\": \"after-re-add\",\n\t\t\"leader_config\": n1.trk.Config.String(), \"node2_state\": state()})\n\n\t// Witness: node 2 is a member again, knows the same leader, and its proposal\n\t// is not delivered to the group.\n\tleaderIndexBefore := n1.raftLog.lastIndex()\n\terr2, dur2 := propose(\"witness-after-re-add\")\n\tpump()\n\tev = map[string]any{\n\t\t\"scenario\": \"node-propose-after-readd\",\"event\": \"propose_after_readd\", \"step\": \"propose-after-re-add\",\n\t\t\"proposal_returned_error\": err2 != nil, \"proposal_duration_ms\": dur2.Milliseconds(),\n\t\t\"leader_index_before\":     leaderIndexBefore,\n\t\t\"leader_last_index\":       n1.raftLog.lastIndex(),\n\t\t\"leader_advanced\":         n1.raftLog.lastIndex() > leaderIndexBefore}\n\tfor k, v := range state() {\n\t\tev[k] = v\n\t}\n\tif err2 != nil {\n\t\tev[\"proposal_error\"] = err2.Error()\n\t}\n\tassurance3Emit(t, ev)\n\n\n\n\t// Restore path: node 2 campaigns on the corrected prefix (its log is\n\t// consistent now) so that the leadership changes, and the same Propose call\n\t// is repeated afterwards.\n\tif err := h.Campaign(ctx); err != nil {\n\t\tt.Logf(\"campaign: %v\", err)\n\t}\n\tfor i := 0; i < 20 && h.Status().RaftState != StateLeader; i++ {\n\t\tpump()\n\t}\n\tcampaignState := h.Status()\n\tassurance3Emit(t, map[string]any{\"event\": \"campaign_attempt\", \"step\": \"after-campaign\",\n\t\t\"scenario\": \"node-propose-after-readd\", \"node\": campaignState.ID,\n\t\t\"state\": campaignState.RaftState.String(), \"term\": campaignState.GetTerm(),\n\t\t\"known_leader\": campaignState.Lead, \"committed_index\": campaignState.GetCommit()})\n\n\tcommitBefore := h.Status().GetCommit()\n\terrRestore, durRestore := propose(\"after-leadership-change\")\n\tpump()\n\trestoreState := h.Status()\n\tassurance3Emit(t, map[string]any{\"event\": \"propose_after_leadership_change\", \"step\": \"propose-after-leadership-change\",\n\t\t\"scenario\": \"node-propose-after-readd\", \"node\": restoreState.ID,\n\t\t\"proposal_returned_error\": errRestore != nil, \"proposal_duration_ms\": durRestore.Milliseconds(),\n\t\t\"commit_before\": commitBefore, \"committed_index\": restoreState.GetCommit(),\n\t\t\"commit_advanced\": restoreState.GetCommit() > commitBefore,\n\t\t\"state\": restoreState.RaftState.String(), \"term\": restoreState.GetTerm(),\n\t\t\"known_leader\": restoreState.Lead})\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "s0",
+            "event": "setup",
+            "conditions": []
+          },
+          {
+            "alias": "adv",
+            "event": "propose_before_removal",
+            "conditions": [
+              {
+                "field": "scenario",
+                "op": "eq",
+                "value": null,
+                "reference": "s0.scenario"
+              }
+            ]
+          },
+          {
+            "alias": "wit",
+            "event": "propose_after_readd",
+            "conditions": [
+              {
+                "field": "scenario",
+                "op": "eq",
+                "value": null,
+                "reference": "adv.scenario"
+              }
+            ]
+          },
+          {
+            "alias": "camp",
+            "event": "campaign_attempt",
+            "conditions": [
+              {
+                "field": "scenario",
+                "op": "eq",
+                "value": null,
+                "reference": "wit.scenario"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Observe the application-facing proposal path of the Node wrapper for one wrapped node 2 that leader 1 removes from the configuration and then adds back in the same term, with the application duties of the Ready/Advance contract honoured (entries, hard state and snapshots persisted before messages are sent), comparing Propose before the removal and after the re-add together with the leader's log index around each call.",
+        "assumptions": [
+          "Two voters {1,2} in one process: node 2 is driven through the Node wrapper (newNodeTestHarness, Readys consumed, entries/hard state persisted, Advance called) while node 1 is a bare raft instance driven by the harness's message pump; node 1 is made leader directly and broadcasts its appends.",
+          "Both nodes apply the removal and the re-add through the application path (n1.applyConfChange and the wrapper's ApplyConfChange), and every snapshot of node 2 is taken through its status channel (node.Status), executed inside the run loop.",
+          "Propose is called with a 300ms context deadline."
+        ],
+        "excluded": [
+          "StepDownOnRemoval, CheckQuorum and PreVote configurations.",
+          "The leadership-change restore path: the diagnostic attempt was removed from the harness because it hung after the witness, so it is not part of this basis.",
+          "Snapshots and asynchronous storage writes."
+        ],
+        "parameters": {}
+      },
+      "after": {
+        "description": "Observe the application-facing proposal path of the Node wrapper for one wrapped node 2 that leader 1 removes from the configuration and then adds back in the same term, with the application duties of the Ready/Advance contract honoured: Propose before the removal, after the re-add, and after the wrapped node wins a leadership change.",
+        "assumptions": [
+          "Two voters {1,2} in one process: node 2 is driven through the Node wrapper (newNodeTestHarness, Readys consumed, entries/hard state persisted, Advance called) while node 1 is a bare raft instance driven by the harness's message pump; node 1 is made leader directly and broadcasts its appends.",
+          "Both nodes apply the removal and the re-add through the application path (n1.applyConfChange and the wrapper's ApplyConfChange), and every snapshot of node 2 is taken through its status channel (node.Status), executed inside the run loop.",
+          "Propose is called with a 300ms context deadline.",
+          "After the witness, the wrapped node campaigns; the harness pumps messages until its status reports StateLeader and then repeats the Propose call, recording the node's commit index before and after."
+        ],
+        "excluded": [
+          "StepDownOnRemoval, CheckQuorum and PreVote configurations.",
+          "Snapshots and asynchronous storage writes."
+        ],
+        "parameters": {}
+      }
+    },
+    "prefix": {
+      "before": "Create the wrapped node 2 over its own storage and a bare node 1 over storages with voters {1,2}; make node 1 leader at term 1 and broadcast its appends; pump messages (persisting whatever node 2's Readys carry) until node 2 knows leader 1 and has applied the bootstrap entry; propose through the wrapper and record the outcome; propose the removal of node 2 on node 1, pump, and apply it on both nodes; propose the re-add of node 2 on node 1, pump, and apply it on both nodes; then propose through the wrapper again and record the outcome and the leader's log index around it.",
+      "after": "Create the wrapped node 2 over its own storage and a bare node 1 over storages with voters {1,2}; make node 1 leader at term 1 and broadcast its appends; pump messages (persisting whatever node 2's Readys carry) until node 2 knows leader 1 and has applied the bootstrap entry; propose through the wrapper and record the outcome; propose the removal of node 2 on node 1, pump, and apply it on both nodes; propose the re-add of node 2 on node 1, pump, and apply it on both nodes; then propose through the wrapper again and record the outcome and the leader's log index around it. Then the wrapped node campaigns, the harness pumps until it reports StateLeader, and the Propose call is repeated with the node's commit index recorded around it."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "propose_before_removal",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "s0",
+          "assertion": {
+            "field": "proposal_returned_error",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: while node 2 is a plain member of {1,2} and knows leader 1, Propose returns no error."
+        },
+        {
+          "event": "propose_before_removal",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "s0",
+          "assertion": {
+            "field": "leader_last_index",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: the proposal forwarded by the follower reaches the group - the leader's log index is 2 after the call (the bootstrap entry plus this proposal)."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "leader_sees_member",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Premise on the witness event: the leader's configuration contains node 2 again after the re-add."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "known_leader",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Premise on the witness event: the wrapped node still knows leader 1, in the same term, so the leadership is unchanged across the removal and the re-add."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "proposal_returned_error",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "known_leader",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "applicability_conditions": [],
+          "description": "Witness: with node 2 a member again and still knowing leader 1, Propose returns only when its context deadline fires (context deadline exceeded after about 300ms)."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "leader_advanced",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Witness: the proposal never reached the group - the leader's log index is unchanged at 4 across the call."
+        }
+      ],
+      "after": [
+        {
+          "event": "propose_before_removal",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "s0",
+          "assertion": {
+            "field": "proposal_returned_error",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: while node 2 is a plain member of {1,2} and knows leader 1, Propose returns no error."
+        },
+        {
+          "event": "propose_before_removal",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "s0",
+          "assertion": {
+            "field": "leader_last_index",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: the proposal forwarded by the follower reaches the group - the leader's log index is 2 after the call (the bootstrap entry plus this proposal)."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "leader_sees_member",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Premise on the witness event: the leader's configuration contains node 2 again after the re-add."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "known_leader",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Premise on the witness event: the wrapped node still knows leader 1, in the same term, so the leadership is unchanged across the removal and the re-add."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "proposal_returned_error",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "known_leader",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "applicability_conditions": [],
+          "description": "Witness: with node 2 a member again and still knowing leader 1, Propose returns only when its context deadline fires (context deadline exceeded after about 300ms)."
+        },
+        {
+          "event": "propose_after_readd",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "adv",
+          "assertion": {
+            "field": "leader_advanced",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Witness: the proposal never reached the group - the leader's log index is unchanged at 4 across the call."
+        },
+        {
+          "event": "campaign_attempt",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "wit",
+          "assertion": {
+            "field": "state",
+            "op": "eq",
+            "value": "StateLeader",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Restore premise: after the campaign the wrapped node reports itself as leader, so r.lead changed from 1 to 2 in the same run."
+        },
+        {
+          "event": "propose_after_leadership_change",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "camp",
+          "assertion": {
+            "field": "proposal_returned_error",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Restore path: with the leadership changed, Propose returns no error."
+        },
+        {
+          "event": "propose_after_leadership_change",
+          "identity_fields": [
+            "scenario"
+          ],
+          "admission_alias": "camp",
+          "assertion": {
+            "field": "commit_advanced",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Restore path: the proposal reaches the group - the node's commit index advances from 5 to 6."
+        }
+      ]
+    }
+  },
+  "revision_reason": "The harness now also runs the leadership-change restore path after the witness: the wrapped node campaigns on the corrected prefix (its log is consistent, so the election is winnable) and the same Propose call is repeated; the campaign and the repeated call are observed through the node's status channel. The earlier observations are kept."
+}

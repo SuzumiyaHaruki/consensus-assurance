@@ -1,8 +1,8 @@
 """Read-only current-work projections over semantic owners and immutable receipts."""
 import json
 from consensus_assurance.core.types import FixedExperiment
-from .knowledge import gap_answers, open_gaps, use_paths
-from .experiments import assessment
+from .knowledge import gap_answers, open_gaps, use_paths, receipt_references
+from .experiments import assessment, fixed_experiment_locator
 
 
 def execution_cost(check):
@@ -91,10 +91,14 @@ def reselection_view(state):
     questions = []
     for q in state.investigations:
         opinion = latest.get(q.id)
+        account = record_preview({**opinion.model_dump(include={'id','conclusion','defect_claim','rationale'}),
+            'counterevidence_count':len(opinion.counterevidence), 'limitation_count':len(opinion.limitations)},
+            'interpretations') if opinion else None
         questions.append(record_preview({'id':q.id, 'question':q.question, 'disposition':q.disposition,
+            'parent_id':q.parent_id,
             'discriminator':q.discriminator, 'resume_conditions':q.resume_conditions,
             'open_gap_count':len(open_gaps(state,q.id)),
-            'latest_interpretation':interpretation_view(opinion, compact=True)}, 'investigations'))
+            'latest_interpretation':account}, 'investigations'))
     return {'investigation_axes':['Decision formation and progress',
                                 'Context validity and authority transitions'],
         'target':{'repo':state.snapshot.repo, 'snapshot_id':state.snapshot.id},
@@ -104,7 +108,9 @@ def reselection_view(state):
             'statement':e.statement}, 'knowledge') for e in state.knowledge],
         'index':'research.json contains current previews; full records and history: state.json; captured tree: agent-source/',
         'scope':'All registered questions and knowledge, not an exhaustive source frontier or a priority order. '
-            'Choose from overall source understanding as well as these records; the last execution is not the default next task.',
+            'Parent links are recorded relationships, not root-cause groups. Accounts are navigation previews; '
+            'read their counterevidence and limits before reusing a conclusion. Choose from overall source understanding '
+            'as well as these records; the last execution is not the default next task.',
         'execution_capacity':{'available':state.config['allow_experiments'] and state.config['execution_backend']!='none'
             and all(allocation[k]>0 for k in ('seconds','agent_calls','experiments')),
             'timeout_ceiling_seconds':min(allocation['seconds'],state.config['budget']['action_timeout']),
@@ -138,14 +144,15 @@ def current_view(state, root, implementation=None):
     for raw in state.experiments:
         a = FixedExperiment.model_validate(raw)
         checks = [c for c in state.checks if c.experiment_id == a.id]
-        results.append({'id':a.id, 'investigation_id':a.investigation_id, 'previous_id':a.previous_id,
-            'basis':f'fixed-experiments/{a.id}/basis.json',
+        results.append({'id':a.id, **fixed_experiment_locator(a),
             'results':[{k:v for k,v in assessment(state,root,a,c).items() if k not in {'events','comparisons'}} for c in checks]})
     return {'run_id':state.id, 'method':state.framework_revision, 'allocation':available(state),
         'source_path':str(root/'agent-source'), 'draft_path':str(root/'draft'), 'state_path':str(root/'state.json'),
         'submission_schema':str(root/'submission.schema.json'), 'method_path':str(root/'audit-method.md'),
         'directed_question':state.config.get('directed_question'), 'investigation_focus':state.config.get('investigation_focus',[]),
         'investigations':questions, 'knowledge':knowledge, 'experiments':results, 'reselection':reselection_view(state),
+        'citation_scope':'Result citations locate current and historical uses; an absent citation is not a task to clear. '
+            'One applicable receipt can support multiple questions without a dedicated execution for each.',
         'current':state.current_submission, 'validation':validation_tool(root), 'tools':state.tools,
         'build_inputs':implementation.build_inputs(root,state,read) if hasattr(implementation,'build_inputs') else [],
         'implementation':{'name':implementation.name, 'harness_kind':implementation.harness_kind,
@@ -170,10 +177,15 @@ def execution_locator(check, fixed=None):
         'record':f'logs/{check.id}/check.json', 'observations':f'logs/{check.id}/observations.json',
         'stdout':check.stdout, 'stderr':check.stderr}
     if fixed:
-        value.update(experiment_id=fixed.id, investigation_id=fixed.investigation_id,
-            basis=f'fixed-experiments/{fixed.id}/basis.json',
-            harness=f'fixed-experiments/{fixed.id}/{fixed.harness_filename}')
+        value.update(fixed_experiment_locator(fixed))
     return value
+
+
+def source_locations(state, ids):
+    return [{'id':m.id, 'record':{'path':'state.json', 'collection':'materials', 'id':m.id},
+             **({'path':'agent-source/'+m.file, 'start_line':m.start_line, 'end_line':m.end_line}
+                if m.file in state.snapshot.files else {})}
+            for m in state.materials if m.id in ids]
 
 
 def execution_feedback(state, root, fixed, check):
@@ -183,10 +195,7 @@ def execution_feedback(state, root, fixed, check):
     value.update(requirement=fixed.basis.requirement,
         comparisons=[{'comparison_index':i, 'definition':c.model_dump(mode='json')}
                      for i,c in enumerate(fixed.basis.comparisons)],
-        sources=[{'id':m.id, 'record':{'path':'state.json', 'collection':'materials', 'id':m.id},
-                  **({'path':'agent-source/'+m.file, 'start_line':m.start_line, 'end_line':m.end_line}
-                     if m.file in state.snapshot.files else {})}
-                 for m in state.materials if m.id in fixed.basis.source_ids],
+        sources=source_locations(state, fixed.basis.source_ids),
         anchors=[a.model_dump(mode='json') for a in fixed.basis.anchors])
     try:
         observed = json.loads(draft_bytes(root, value['observations']))
@@ -207,14 +216,19 @@ def execution_feedback(state, root, fixed, check):
     return value
 
 
-def cited_execution_feedback(root, check, fixed, prior, opinion, remaining):
+def cited_execution_feedback(state, root, check, fixed, prior, opinion, remaining):
     """Show explicit citations, never select observations by their apparent outcome."""
     from .audit import draft_bytes
     previous = prior.executions.get(check.id, []) if prior else []
     current = opinion.executions.get(check.id, [])
     indices = sorted(set(previous + current))
+    references = receipt_references(state, check.id)
+    references['current'] = [r for r in references['current'] if r['id'] != opinion.id]
+    for r in [*references['current'], *references['knowledge']]:
+        r['overlapping_event_indices'] = sorted(set(indices) & set(r['event_indices']))
     value = {**execution_locator(check, fixed), 'event_indices':indices,
         'previous_event_indices':previous, 'current_event_indices':current,
+        'references':references,
         'selection':'Explicitly cited subset, not the complete receipt or an applicability judgment. '
             'Inline limits are shared across the update. Changed receipts are listed first within each interpretation; '
             'added or removed event indices are shown first within each receipt.'}
@@ -276,8 +290,6 @@ def operation_summary(state, root):
     summary['allocation'] = available(state)
     summary['open_work_index'] = 'research.json'
     summary['diagnostics'] = current.get('rejected',{})
-    if not executed:
-        summary['reselection'] = reselection_view(state)
     turn = next((c for c in reversed(state.checks) if c.action == 'agent_turn'), None)
     if not current and turn and turn.status.value == 'timeout':
         summary['interrupted_turn'] = {'id':turn.id, 'reason':turn.reason,
@@ -289,7 +301,7 @@ def operation_summary(state, root):
                 'otherwise continue the unfinished work. Do not reconstruct work merely because delivery was interrupted.'}
     check = next((c for c in reversed(state.checks) if c.action == 'experiment'),None)
     fixed = next((a for a in state.experiments if a.id == check.experiment_id), None) if check else None
-    summary['necessary_gaps'] = [{**preview({'investigation_id':q.id, 'id':g['id'],
+    necessary_gaps = [{**preview({'investigation_id':q.id, 'id':g['id'],
         'question':g['question'], 'response':g['response'], 'response_record':g['response_record']}), 'view':'preview',
         'record':{'path':'state.json','collection':'investigations','id':q.id}}
         for q in state.investigations for g in open_gap_view(state,q.id)]
@@ -354,38 +366,40 @@ def operation_summary(state, root):
             receipts = sorted((c for c in state.checks if c.id in opinion.executions or (prior and c.id in prior.executions)),
                 key=lambda c: opinion.executions.get(c.id) == (prior.executions.get(c.id) if prior else None))
             changes.append({'investigation_id':opinion.investigation_id,
-                'previous':{'id':prior.id, 'conclusion':prior.conclusion, 'defect_claim':prior.defect_claim} if prior else None,
+                'previous':interpretation_view(prior, compact=True),
                 'current':{'id':opinion.id, 'conclusion':opinion.conclusion, 'defect_claim':opinion.defect_claim},
                 'record':{'path':'state.json', 'collection':'interpretations'},
+                'previous_source_ids':prior.source_ids if prior else [], 'current_source_ids':opinion.source_ids,
+                'sources':source_locations(state, set(opinion.source_ids) | (set(prior.source_ids) if prior else set())),
                 'intermediate_interpretation_ids':batch[:-1],
                 'knowledge_references':interpretation_knowledge(state, prior, opinion),
-                'executions':[cited_execution_feedback(root,c,fixed_by_id.get(c.experiment_id),prior,opinion,remaining)
+                'executions':[cited_execution_feedback(state,root,c,fixed_by_id.get(c.experiment_id),prior,opinion,remaining)
                               for c in receipts]})
         else:
             previous[opinion.investigation_id] = opinion
     if changes:
         summary['interpretation_changes'] = changes
         summary['interpretation_guidance'] = (
-            'Old and new explicit reasons are shown, including removed citations. Recorded uses are review candidates, '
-            'not automatically affected conclusions. Correct identified premises and their uses through existing updates; '
-            'withdrawing a witness does not by itself refute the question. Unrecorded semantic dependencies remain for investigation.')
-    cited = {id for i in state.interpretations for id in i.executions}
-    summary['uncited_executions'] = [{'id':c.id, 'experiment_id':c.experiment_id, 'status':c.status.value,
-        'record':f'logs/{c.id}/check.json', 'observations':f'logs/{c.id}/observations.json'}
-        for c in state.checks if c.action == 'experiment' and c.id not in cited]
-    if 'reselection' not in summary:
-        summary['reselection'] = reselection_view(state)
+            'Relate the changed account to its original question: what did the cited observations establish, '
+            'which consequential conditions were supplied, and what could still change the judgment? '
+            'Old and new reasons include removed citations. Other current citations and historical locators are '
+            'review candidates, not automatically affected conclusions; event overlap alone does not establish impact. '
+            'Correct identified premises and uses, preserving independent support. Withdrawing a witness does not '
+            'refute the question. Unrecorded code reuse remains for investigation. No separate confirmation is required.')
+    summary['necessary_gaps'] = necessary_gaps
+    summary['reselection'] = reselection_view(state)
+    action = ('Interpret the new execution against the question and its necessary conditions, including any changed premises. '
+        if executed else 'Use the changed accounts and their cited basis to decide what still needs investigation. '
+        if changes or corrections else '')
     summary['next'] = (
         'The unchanged submission is already retained; this call still consumed time and a model turn. '
-        if current.get('no_change') else '') + (
+        if current.get('no_change') else '') + action + (
         'Choose and undertake the next action that can change a judgment, using overall source understanding '
-        'and the allocation: inspect an uncited result, resolve a relevant premise or measurement, continue '
-        'valuable construction, or pursue an independent sourced lead. A previous answer does not interpret a new receipt; '
-        'an explicit citation alone does not resolve its applicability or gaps. After a local answer, reconsider '
-        'the available directions rather than inherit the last experiment. No separate selection submission is needed; '
-        'do not repeat closing submissions.')
-    if check and (check.id not in cited or current.get('experiment_id') == check.experiment_id):
-        summary['latest_actual_execution'] = execution_locator(check, fixed)
+        'and the allocation: resolve a consequential premise or measurement, continue valuable construction, '
+        'or pursue an independent sourced lead. Saved receipts can answer multiple applicable questions; '
+        'missing citations are not a queue to clear. Research.json retains every execution and its citation index. '
+        'After a local answer, reconsider the available directions rather than inherit the last experiment; '
+        'a question may remain unresolved while attention moves elsewhere. No separate selection submission is needed.')
     return summary
 
 

@@ -1,0 +1,289 @@
+{
+  "input": {
+    "rationale": "Replace the source-and-native-run account of this question with the retained execution: CheckRun 5d77b839c94544d1bf81b71c506a5b90 (fixed experiment 8769550822c045a18219e24795b9bdc0-experiment) executed the harness retained in fixed-experiments and parsed 16 events with no parse loss. The decisive comparisons are violated in both configuration-change variants and the control comparisons hold, so the question's account becomes evidence-backed: the postponed request is not released when the term's first commit is performed inside switchToConfig. The registered necessary gap is answered from the same receipt.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "experiment_id": "8769550822c045a18219e24795b9bdc0-experiment",
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "executions": {
+          "5d77b839c94544d1bf81b71c506a5b90": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            11,
+            12,
+            14
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "The current account: a leader that receives MsgReadIndex before any entry of its term is committed postpones the request (raft.go:1354-1372), and the implementation discharges that duty through releasePendingReadIndexMessages, which is called only from the MsgAppResp commit path (raft.go:1550-1554) immediately after r.maybeCommit() reports that the committed index advanced to an entry of the leader's term. switchToConfig is a second path that can perform that same first commit of the term: it calls r.maybeCommit() after installing the configuration returned by the changer and, on success, only calls bcastAppend (raft.go:2013-2028); it never releases postponed requests. The executed interval shows the consequence with retained evidence for both ways in which the applied change can make the leader's term entry committable. Case apply-removal-of-unreachable-voter-4: the leader postponed the client's request while committed_index was 10 with committed_entry_term 1 and leader_term 2 (parsed index 2, stashed true, pending_reads 1, unconfirmed_reads 0); applying the committed removal of voter 4 advanced committed_index 10 -> 11 with committed_entry_term 2 equal to leader_term, i.e. the release condition the helper is guarded by became true, yet pending_reads stayed 1, read_states stayed 0 and readindex_responses_emitted was 0 (parsed index 3). Case apply-leave-joint-config, where the applied zero change leaves the joint configuration and the incoming half {1,2,3} alone can commit the term entry, shows exactly the same event shape (parsed index 11). The duty is not discharged by anything else in the interval: the delayed acknowledgement of the no-longer-active configuration arrives (parsed index 4, match_3 11) and a periodic heartbeat round runs (parsed index 5, heartbeats_sent 2, heartbeat_ctx_len 0) with pending_reads still 1 and read_states still 0, because a postponed request is not part of readOnly.unconfirmedReads and therefore never appears in a heartbeat context. The request is answered only when an unrelated entry is committed through the MsgAppResp path: parsed index 6 (and index 14 for the joint variant) shows committed_index 12, pending_reads 0, read_states 1, released_request_ctx A and released_read_index 12, so the eventual answer is safe (the index is taken from raftLog.committed at release time and raftLog.committed never decreases) but late, and on an idle group it does not arrive at all until the client retries. The defect is therefore a lost duty on one of the two paths that can advance the commit index to an entry of the leader's term, scoped to the interval from the postponed request to the next commit outside switchToConfig; the request is not answered, not answered wrongly.",
+        "answers": {
+          "8769550822c045a18219e24795b9bdc0-gap-0": {
+            "explanation": "The retained harness builds the prefix for both variants: four voters are bootstrapped from a ConfState-only snapshot (voters {1,2,3,4}, or the joint voters {1,2,3} with voters_outgoing {1,2,3,4}), ten term-1 entries are appended with entry 10 the configuration change (removal of voter 4, or a zero change that leaves the joint configuration), HardState{Term:1,Commit:10} is persisted, applied is 10 because the application reported applied progress but has not yet called ApplyConfChange for entry 10, node 1 is then elected at term 2 through real MsgHup/MsgVote/MsgVoteResp traffic with voter 4 unreachable and voter 3's append acknowledgements delayed, the client's MsgReadIndex arrives before any term-2 commit, and the application finally applies the change at index 10 taken from the log entry. In that interval the applied change is exactly the configuration that commits the leader's first term-2 entry: committed_index moves 10 -> 11 with committed_entry_term 2 (parsed indices 3 and 11).",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-0",
+            "revision": 1,
+            "assertion": "A leader postpones MsgReadIndex exactly when the configuration is not a singleton and committedEntryInCurrentTerm() is false."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-1",
+            "revision": 1,
+            "assertion": "Postponed requests are released only from the MsgAppResp commit path when maybeCommit reports a commit of an entry of the leader's term."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-2",
+            "revision": 1,
+            "assertion": "switchToConfig can perform the term's first commit and does not release pendingReadIndexMessages."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-3",
+            "revision": 1,
+            "assertion": "A postponed request is not in readOnly.unconfirmedReads, so heartbeats carry no read context and cannot release it."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-4",
+            "revision": 1,
+            "assertion": "The applied progress report and the ApplyConfChange call for a committed change are not ordered by the library's contract."
+          }
+        ],
+        "counterevidence": [
+          "Both control comparisons hold in the retained receipt (parsed indices 6 and 14: the unrelated proposal releases the request with ctx A), so the release mechanism itself is intact for the MsgAppResp commit path; the defect is specific to the switchToConfig path and not to the helper.",
+          "The Node.ReadIndex contract states that read index requests can be lost without notice and that ensuring retries is the caller's job (node.go:218-224), so a retrying client is not blocked; the observation is an unanswered admissible request, not a permanent client-visible outage.",
+          "The reachable prefix relies on documented application latitude: an application may report applied progress before it finishes applying the entries of the previous Ready (node.go:166-178), and the library fixes no ordering between that report and the required ApplyConfChange call for a change it has observed (node.go:179-187). An application that calls ApplyConfChange before reporting progress past the change does not reach this path, because the applied change is then already part of the tracker configuration."
+        ],
+        "limitations": [
+          "The comparison holds the applied configuration change to be the one that first makes a current-term entry committable; a leader that had already committed any entry of its term answers later reads normally (committedEntryInCurrentTerm() is true, so no request is postponed) and this path is not taken.",
+          "The retained harness supplies the starting log, HardState and applied index as an application state fixture (ten term-1 entries with entry 10 the configuration change, persisted commit 10, applied 10) while the election, the append acknowledgements, the read request, the applied change and the proposal are driven through real raft messages; voter 4 is unreachable and voter 3's append acknowledgements are delayed, which is the message-loss part of the fault model, and a client that reads from a follower (forwarded MsgReadIndex expecting MsgReadIndexResp) was not exercised.",
+          "The account covers a leader whose tracker configuration lags a configuration change already present in its log because the application's ApplyConfChange for it is still pending; it makes no claim about a leader that has been removed by a change the application has already applied, and no claim that the library can detect such removal.",
+          "The eventual answer is safe but delayed (released index 12 in the exercised interval); no bound on the delay is claimed other than 'the next commit performed through the MsgAppResp path, or a client retry'."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "interpretations": [
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-interpretation-0",
+        "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The source account is that a leader takes on a duty when it postpones a received ReadIndex request: pendingReadIndexMessages holds requests that cannot yet be answered because no entry of the leader's term is committed, and they are released when the term's first commit is observed (raft.go:1550-1554 calls releasePendingReadIndexMessages immediately before bcastAppend under the comment 'committed index has progressed for the term, so it is safe to respond to pending read index requests'). The same enabling change of state - raftLog.committed advancing to an entry of the leader's term - is also produced inside switchToConfig, which calls r.maybeCommit() and, on success, only calls bcastAppend (raft.go:2013-2028). Applying a committed configuration change is a legal producer of that path: applyConfChange -> switchToConfig is invoked by the application whenever a configuration change is observed in Ready.CommittedEntries. When the applied change makes ProgressTracker.Committed() exceed raftLog.committed (removing a voter that is unreachable, or leaving a joint configuration whose outgoing half contains such a voter) and the entry at the resulting index carries the leader's term, the commit is performed with the postponed request still unreleased. Because the request was stored in pendingReadIndexMessages and not in readOnly.unconfirmedReads, no later heartbeat can carry its context, so the duty is not discharged by the periodic heartbeat round: the received request yields no ReadState for a local read and no MsgReadIndexResp for a forwarded one until an unrelated entry is committed (which again goes through the MsgAppResp path) or the client retries. The defect is therefore a lost duty on one of two enabling paths, scoped to a bounded interval: from the postponed request until the next commit outside switchToConfig. The returned index remains safe whenever the request is eventually released, because the recorded index is taken from raftLog.committed at release time and raftLog.committed never decreases; the defect is a bounded-liveness (unanswered request) issue, not a stale-read safety violation. A native draft probe of both variants (removing an unreachable voter, and leaving a joint configuration) reproduced the observable sequence: the leader postponed the request (pending_reads=1, committed_entry_term 1, leader term 2), then applying the committed change advanced committed 10 -> 11 with committed_entry_term 2 == leader term while pending_reads stayed 1, no ReadState was produced, the delayed acknowledgement of the previous configuration (match_3=11) did not release it, a heartbeat round carried no read context (heartbeat_ctx_len 0) and did not release it, and only an unrelated proposal committed by the new configuration released the request (read_states 1, request ctx A, index 12 - the later commit index, i.e. answered late rather than answered wrong). The formal execution of this harness is requested with this update; the retained receipt is needed before this account can be treated as an executed comparison.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The Node.ReadIndex contract states that read index requests can be lost without notice and that ensuring retries is the caller's job (node.go:218-224), so a client that retries is not permanently blocked; the observation is a delayed or lost answer of an otherwise admissible request, not a permanent outage.",
+          "The library documents that an application may report applied progress before it has finished applying the entries of the previous Ready (node.go:166-178) and fixes no ordering between that evidence and the ApplyConfChange call for a change it has observed (node.go:179-187); the reachable prefix therefore relies on that documented latitude, and an application that calls ApplyConfChange before reporting progress past the change does not hit this path."
+        ],
+        "limitations": [
+          "The scenario requires the applied configuration change to be the one that first makes a current-term entry committable; if the leader had already committed any entry of its term, later reads are not postponed (committedEntryInCurrentTerm() is true) and this path is not taken.",
+          "Only a local source reading and a native draft run of the probe have been done so far; the retained receipt for the harness in this update is still outstanding.",
+          "The account covers a leader whose tracker configuration lags the configuration change already present in its log because the application's ApplyConfChange for it is still pending; it does not claim that the library can detect a leader that has been removed by a change the application already applied."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "95b5c02c9cf545e0bd46770a16fe6d29",
+      "result": {
+        "submission": "update2.json",
+        "summary": "Delivered the same update again, this time as a bare JSON final response (the previous attempt was rejected for surrounding prose): it appends an execution-backed interpretation for 8769550822c045a18219e24795b9bdc0-question-0 citing CheckRun 5d77b839c94544d1bf81b71c506a5b90 (fixed experiment 8769550822c045a18219e24795b9bdc0-experiment; 16 parsed events, no parse loss) at parsed indices 2,3,4,5,6,11,12,14. The account now rests on the retained comparison results instead of the earlier source-and-native-run estimate: violation in both configuration-change variants (index 3 removal of unreachable voter 4, index 11 leave-joint configuration - committed_index 10->11 with committed_entry_term 2 equal to leader_term while pending_reads stayed 1, read_states 0, no ReadIndex response), no repair from the delayed acknowledgement (index 4, match_3 11) or the heartbeat round (index 5, heartbeats_sent 2, heartbeat_ctx_len 0), and control holds (indices 6 and 14: the unrelated proposal releases the request, ctx A, read index 12, safe but late). Conclusion violated, defect_claim asserted; the registered necessary gap is answered as resolved with its producer prefix; knowledge revisions 1 are cited explicitly; counterevidence (working control, documented client retry, documented applied/ApplyConfChange latitude) and limits (narrow trigger, supplied fixture and fault model, eventual safe-but-late answer, no claim for a change the application already applied, forwarded MsgReadIndexResp path unexercised) are recorded. No new experiment was requested this turn."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-8769550822c045a18219e24795b9bdc0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_13-42-19-etcd_raft-real-run/semantic-commits/submission-8769550822c045a18219e24795b9bdc0.json"
+      }
+    }
+  },
+  "after": {
+    "interpretations": [
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-interpretation-0",
+        "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The source account is that a leader takes on a duty when it postpones a received ReadIndex request: pendingReadIndexMessages holds requests that cannot yet be answered because no entry of the leader's term is committed, and they are released when the term's first commit is observed (raft.go:1550-1554 calls releasePendingReadIndexMessages immediately before bcastAppend under the comment 'committed index has progressed for the term, so it is safe to respond to pending read index requests'). The same enabling change of state - raftLog.committed advancing to an entry of the leader's term - is also produced inside switchToConfig, which calls r.maybeCommit() and, on success, only calls bcastAppend (raft.go:2013-2028). Applying a committed configuration change is a legal producer of that path: applyConfChange -> switchToConfig is invoked by the application whenever a configuration change is observed in Ready.CommittedEntries. When the applied change makes ProgressTracker.Committed() exceed raftLog.committed (removing a voter that is unreachable, or leaving a joint configuration whose outgoing half contains such a voter) and the entry at the resulting index carries the leader's term, the commit is performed with the postponed request still unreleased. Because the request was stored in pendingReadIndexMessages and not in readOnly.unconfirmedReads, no later heartbeat can carry its context, so the duty is not discharged by the periodic heartbeat round: the received request yields no ReadState for a local read and no MsgReadIndexResp for a forwarded one until an unrelated entry is committed (which again goes through the MsgAppResp path) or the client retries. The defect is therefore a lost duty on one of two enabling paths, scoped to a bounded interval: from the postponed request until the next commit outside switchToConfig. The returned index remains safe whenever the request is eventually released, because the recorded index is taken from raftLog.committed at release time and raftLog.committed never decreases; the defect is a bounded-liveness (unanswered request) issue, not a stale-read safety violation. A native draft probe of both variants (removing an unreachable voter, and leaving a joint configuration) reproduced the observable sequence: the leader postponed the request (pending_reads=1, committed_entry_term 1, leader term 2), then applying the committed change advanced committed 10 -> 11 with committed_entry_term 2 == leader term while pending_reads stayed 1, no ReadState was produced, the delayed acknowledgement of the previous configuration (match_3=11) did not release it, a heartbeat round carried no read context (heartbeat_ctx_len 0) and did not release it, and only an unrelated proposal committed by the new configuration released the request (read_states 1, request ctx A, index 12 - the later commit index, i.e. answered late rather than answered wrong). The formal execution of this harness is requested with this update; the retained receipt is needed before this account can be treated as an executed comparison.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The Node.ReadIndex contract states that read index requests can be lost without notice and that ensuring retries is the caller's job (node.go:218-224), so a client that retries is not permanently blocked; the observation is a delayed or lost answer of an otherwise admissible request, not a permanent outage.",
+          "The library documents that an application may report applied progress before it has finished applying the entries of the previous Ready (node.go:166-178) and fixes no ordering between that evidence and the ApplyConfChange call for a change it has observed (node.go:179-187); the reachable prefix therefore relies on that documented latitude, and an application that calls ApplyConfChange before reporting progress past the change does not hit this path."
+        ],
+        "limitations": [
+          "The scenario requires the applied configuration change to be the one that first makes a current-term entry committable; if the leader had already committed any entry of its term, later reads are not postponed (committedEntryInCurrentTerm() is true) and this path is not taken.",
+          "Only a local source reading and a native draft run of the probe have been done so far; the retained receipt for the harness in this update is still outstanding.",
+          "The account covers a leader whose tracker configuration lags the configuration change already present in its log because the application's ApplyConfChange for it is still pending; it does not claim that the library can detect a leader that has been removed by a change the application already applied."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      },
+      {
+        "id": "95b5c02c9cf545e0bd46770a16fe6d29-interpretation-0",
+        "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "experiment_id": "8769550822c045a18219e24795b9bdc0-experiment",
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "executions": {
+          "5d77b839c94544d1bf81b71c506a5b90": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            11,
+            12,
+            14
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "The current account: a leader that receives MsgReadIndex before any entry of its term is committed postpones the request (raft.go:1354-1372), and the implementation discharges that duty through releasePendingReadIndexMessages, which is called only from the MsgAppResp commit path (raft.go:1550-1554) immediately after r.maybeCommit() reports that the committed index advanced to an entry of the leader's term. switchToConfig is a second path that can perform that same first commit of the term: it calls r.maybeCommit() after installing the configuration returned by the changer and, on success, only calls bcastAppend (raft.go:2013-2028); it never releases postponed requests. The executed interval shows the consequence with retained evidence for both ways in which the applied change can make the leader's term entry committable. Case apply-removal-of-unreachable-voter-4: the leader postponed the client's request while committed_index was 10 with committed_entry_term 1 and leader_term 2 (parsed index 2, stashed true, pending_reads 1, unconfirmed_reads 0); applying the committed removal of voter 4 advanced committed_index 10 -> 11 with committed_entry_term 2 equal to leader_term, i.e. the release condition the helper is guarded by became true, yet pending_reads stayed 1, read_states stayed 0 and readindex_responses_emitted was 0 (parsed index 3). Case apply-leave-joint-config, where the applied zero change leaves the joint configuration and the incoming half {1,2,3} alone can commit the term entry, shows exactly the same event shape (parsed index 11). The duty is not discharged by anything else in the interval: the delayed acknowledgement of the no-longer-active configuration arrives (parsed index 4, match_3 11) and a periodic heartbeat round runs (parsed index 5, heartbeats_sent 2, heartbeat_ctx_len 0) with pending_reads still 1 and read_states still 0, because a postponed request is not part of readOnly.unconfirmedReads and therefore never appears in a heartbeat context. The request is answered only when an unrelated entry is committed through the MsgAppResp path: parsed index 6 (and index 14 for the joint variant) shows committed_index 12, pending_reads 0, read_states 1, released_request_ctx A and released_read_index 12, so the eventual answer is safe (the index is taken from raftLog.committed at release time and raftLog.committed never decreases) but late, and on an idle group it does not arrive at all until the client retries. The defect is therefore a lost duty on one of the two paths that can advance the commit index to an entry of the leader's term, scoped to the interval from the postponed request to the next commit outside switchToConfig; the request is not answered, not answered wrongly.",
+        "answers": {
+          "8769550822c045a18219e24795b9bdc0-gap-0": {
+            "explanation": "The retained harness builds the prefix for both variants: four voters are bootstrapped from a ConfState-only snapshot (voters {1,2,3,4}, or the joint voters {1,2,3} with voters_outgoing {1,2,3,4}), ten term-1 entries are appended with entry 10 the configuration change (removal of voter 4, or a zero change that leaves the joint configuration), HardState{Term:1,Commit:10} is persisted, applied is 10 because the application reported applied progress but has not yet called ApplyConfChange for entry 10, node 1 is then elected at term 2 through real MsgHup/MsgVote/MsgVoteResp traffic with voter 4 unreachable and voter 3's append acknowledgements delayed, the client's MsgReadIndex arrives before any term-2 commit, and the application finally applies the change at index 10 taken from the log entry. In that interval the applied change is exactly the configuration that commits the leader's first term-2 entry: committed_index moves 10 -> 11 with committed_entry_term 2 (parsed indices 3 and 11).",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-0",
+            "revision": 1,
+            "assertion": "A leader postpones MsgReadIndex exactly when the configuration is not a singleton and committedEntryInCurrentTerm() is false."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-1",
+            "revision": 1,
+            "assertion": "Postponed requests are released only from the MsgAppResp commit path when maybeCommit reports a commit of an entry of the leader's term."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-2",
+            "revision": 1,
+            "assertion": "switchToConfig can perform the term's first commit and does not release pendingReadIndexMessages."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-3",
+            "revision": 1,
+            "assertion": "A postponed request is not in readOnly.unconfirmedReads, so heartbeats carry no read context and cannot release it."
+          },
+          {
+            "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-4",
+            "revision": 1,
+            "assertion": "The applied progress report and the ApplyConfChange call for a committed change are not ordered by the library's contract."
+          }
+        ],
+        "counterevidence": [
+          "Both control comparisons hold in the retained receipt (parsed indices 6 and 14: the unrelated proposal releases the request with ctx A), so the release mechanism itself is intact for the MsgAppResp commit path; the defect is specific to the switchToConfig path and not to the helper.",
+          "The Node.ReadIndex contract states that read index requests can be lost without notice and that ensuring retries is the caller's job (node.go:218-224), so a retrying client is not blocked; the observation is an unanswered admissible request, not a permanent client-visible outage.",
+          "The reachable prefix relies on documented application latitude: an application may report applied progress before it finishes applying the entries of the previous Ready (node.go:166-178), and the library fixes no ordering between that report and the required ApplyConfChange call for a change it has observed (node.go:179-187). An application that calls ApplyConfChange before reporting progress past the change does not reach this path, because the applied change is then already part of the tracker configuration."
+        ],
+        "limitations": [
+          "The comparison holds the applied configuration change to be the one that first makes a current-term entry committable; a leader that had already committed any entry of its term answers later reads normally (committedEntryInCurrentTerm() is true, so no request is postponed) and this path is not taken.",
+          "The retained harness supplies the starting log, HardState and applied index as an application state fixture (ten term-1 entries with entry 10 the configuration change, persisted commit 10, applied 10) while the election, the append acknowledgements, the read request, the applied change and the proposal are driven through real raft messages; voter 4 is unreachable and voter 3's append acknowledgements are delayed, which is the message-loss part of the fault model, and a client that reads from a follower (forwarded MsgReadIndex expecting MsgReadIndexResp) was not exercised.",
+          "The account covers a leader whose tracker configuration lags a configuration change already present in its log because the application's ApplyConfChange for it is still pending; it makes no claim about a leader that has been removed by a change the application has already applied, and no claim that the library can detect such removal.",
+          "The eventual answer is safe but delayed (released index 12 in the exercised interval); no bound on the delay is claimed other than 'the next commit performed through the MsgAppResp path, or a client retry'."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "95b5c02c9cf545e0bd46770a16fe6d29"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "95b5c02c9cf545e0bd46770a16fe6d29",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "effects": [
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+          "changed_fields": [
+            "experiment_id",
+            "executions",
+            "conclusion",
+            "rationale",
+            "answers",
+            "knowledge",
+            "counterevidence",
+            "limitations"
+          ]
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-8769550822c045a18219e24795b9bdc0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_13-42-19-etcd_raft-real-run/semantic-commits/submission-8769550822c045a18219e24795b9bdc0.json"
+      },
+      "submission-95b5c02c9cf545e0bd46770a16fe6d29": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_13-42-19-etcd_raft-real-run/semantic-commits/submission-95b5c02c9cf545e0bd46770a16fe6d29.json"
+      }
+    }
+  }
+}

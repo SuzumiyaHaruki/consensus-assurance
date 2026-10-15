@@ -1,0 +1,412 @@
+{
+  "rationale": "Record the forwarded-completion result and repair the comparison wiring of the forwarded case. CheckRun f6f942daf8df40abb36626675d6923fb resolved the forwarded witness as violated (parsed index 20) and its release control as holds (index 23), confirming that the postponed-request omission also affects the forwarded completion path; four comparisons of that run came back unknown because the forwarded case reused the shared event names, so the existing aliases admitted operations without a result observation of their own. The harness now emits only fwd_-prefixed events for that case and the corrected basis is submitted, while the equivalent local-path comparisons remain resolved by the earlier receipt 5d77b839c94544d1bf81b71c506a5b90.",
+  "experiment": {
+    "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": [
+      "readindex-stash",
+      "msgappresp-release",
+      "switchtoconfig-commit",
+      "release-helper",
+      "heartbeatresp-readonly",
+      "readonly-maybeadvance",
+      "node-advance-contract"
+    ],
+    "scope": {
+      "description": "Observe the whole interval of one postponed ReadIndex request for two completion paths on the same 4-node group: a local request answered into leader 1's readStates, and a forwarded request (client to follower 2, follower forwards to leader 1) whose answer must be a MsgReadIndexResp delivered back to node 2. In both paths the application then applies an already-committed configuration change whose resulting configuration performs the leader's first commit of the term.",
+      "assumptions": [
+        "Four voters {1,2,3,4} bootstrapped from a ConfState-only snapshot, log entries 1..9 ordinary and entry 10 the configuration change, HardState{Term:1, Commit:10}, applied index 10 (the application reported applied progress but has not yet called ApplyConfChange for entry 10, which node.go:166-187 permits).",
+        "Transport preserves raft's per-message semantics; voter 4 is unreachable and voter 3's append acknowledgements are delayed (message loss/delay).",
+        "The forwarded request is produced by delivering MsgReadIndex without a From to follower 2, so follower 2 forwards it to the leader it knows; the forwarded case emits only fwd_-prefixed events so that each prerequisite alias is matched by exactly one case."
+      ],
+      "excluded": [
+        "Pre-vote, check-quorum and lease-based reads.",
+        "Snapshot-based recovery and asynchronous storage writes."
+      ]
+    },
+    "prefix": "For each case: build four nodes whose storage is bootstrapped with the case ConfState (voters {1,2,3,4}, or the joint configuration voters {1,2,3} + voters_outgoing {1,2,3,4}), append ten term-1 entries with entry 10 the case configuration change, persist HardState{Term:1,Commit:10} and set Applied=10; elect node 1 with a real MsgHup/MsgVote/MsgVoteResp round (voter 4 unreachable, voter 3's MsgAppResp delayed); deliver the read request (locally to node 1, or to follower 2 which forwards it); apply the committed change at index 10 via applyConfChange; deliver the delayed acknowledgement; run one heartbeat round (tick); finally propose one unrelated entry.",
+    "requirement": "A ReadIndex request that a leader accepts by postponing (raft.go:1363-1368) must be answered once the leader has committed an entry of its term, whichever path performs that commit (raft.go:1550-1554 for the MsgAppResp path, raft.go:2013-2028 for the switchToConfig path), because the helper that discharges the duty is guarded only by committedEntryInCurrentTerm() (raft.go:2127-2145) and the caller's comment states the release is due once the committed index has progressed for the term.",
+    "responsibility": "raft (target): the leader is the producer of the answer for a request it accepted, and switchToConfig is part of raft, not of the application.",
+    "prerequisites": [
+      {
+        "alias": "elect",
+        "event": "election"
+      },
+      {
+        "alias": "stash",
+        "event": "readindex_received",
+        "conditions": [
+          {
+            "field": "stashed",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "alias": "cc",
+        "event": "confchange_applied",
+        "conditions": [
+          {
+            "reference": "stash.case",
+            "field": "case"
+          }
+        ]
+      },
+      {
+        "alias": "hb",
+        "event": "heartbeat_round",
+        "conditions": [
+          {
+            "reference": "cc.case",
+            "field": "case"
+          }
+        ]
+      },
+      {
+        "alias": "repair",
+        "event": "unrelated_commit",
+        "conditions": [
+          {
+            "reference": "hb.case",
+            "field": "case"
+          }
+        ]
+      },
+      {
+        "alias": "felect",
+        "event": "fwd_election"
+      },
+      {
+        "alias": "ffwd",
+        "event": "fwd_readindex_forwarded",
+        "conditions": [
+          {
+            "field": "case",
+            "reference": "felect.case"
+          }
+        ]
+      },
+      {
+        "alias": "fstash",
+        "event": "fwd_readindex_stashed",
+        "conditions": [
+          {
+            "field": "case",
+            "reference": "ffwd.case"
+          }
+        ]
+      },
+      {
+        "alias": "fcc",
+        "event": "fwd_confchange_applied",
+        "conditions": [
+          {
+            "field": "case",
+            "reference": "fstash.case"
+          }
+        ]
+      },
+      {
+        "alias": "frepair",
+        "event": "fwd_unrelated_commit",
+        "conditions": [
+          {
+            "field": "case",
+            "reference": "fcc.case"
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "readindex_received",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "elect",
+        "assertion": {
+          "field": "stashed",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Precondition observation: the leader postponed the received request because no entry of its term was committed (committed_entry_term 1, leader_term 2).",
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "apply-removal-of-unreachable-voter-4"
+          }
+        ]
+      },
+      {
+        "event": "confchange_applied",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "stash",
+        "assertion": {
+          "field": "pending_reads",
+          "op": "eq",
+          "value": 0
+        },
+        "description": "Witness: applying the committed removal of voter 4 performed the leader's first commit of term 2 (committed 10 -> 11, committed_entry_term 2 == leader_term), so the postponed request is due to be answered, but it is still pending and no ReadState was produced.",
+        "antecedent": {
+          "field": "term_has_commit",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "apply-removal-of-unreachable-voter-4"
+          }
+        ]
+      },
+      {
+        "event": "confchange_applied",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "stash",
+        "assertion": {
+          "field": "pending_reads",
+          "op": "eq",
+          "value": 0
+        },
+        "description": "Variant of the same cause: applying the committed zero change left the joint configuration, so the incoming half committed the leader's first term-2 entry, yet the postponed request is still pending.",
+        "antecedent": {
+          "field": "term_has_commit",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "apply-leave-joint-config"
+          }
+        ]
+      },
+      {
+        "event": "heartbeat_round",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "cc",
+        "assertion": {
+          "field": "read_states",
+          "op": "eq",
+          "value": 1
+        },
+        "description": "No repair from the periodic round: two heartbeats are sent with an empty read context (heartbeat_ctx_len 0), the delayed acknowledgement of the previous configuration is already in place (match_3 11), and no ReadState is produced.",
+        "antecedent": {
+          "field": "term_has_commit",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "apply-removal-of-unreachable-voter-4"
+          }
+        ]
+      },
+      {
+        "event": "unrelated_commit",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "hb",
+        "assertion": {
+          "field": "read_states",
+          "op": "eq",
+          "value": 1
+        },
+        "description": "Control: an unrelated proposal committed by the new configuration releases the postponed request (released_request_ctx A), so the release mechanism works and is reached only through the MsgAppResp commit path.",
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "apply-removal-of-unreachable-voter-4"
+          }
+        ]
+      },
+      {
+        "event": "unrelated_commit",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "hb",
+        "assertion": {
+          "field": "pending_reads",
+          "op": "eq",
+          "value": 0
+        },
+        "description": "Control for the joint variant: the postponed request is only released once the unrelated proposal is committed.",
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "apply-leave-joint-config"
+          }
+        ]
+      },
+      {
+        "event": "fwd_readindex_forwarded",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "felect",
+        "assertion": {
+          "field": "forwarded_to_leader",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Forwarded-path premise: follower 2 (StateFollower, known leader 1) emits MsgReadIndex addressed to leader 1, so the answer owed is a MsgReadIndexResp to node 2."
+      },
+      {
+        "event": "fwd_readindex_stashed",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "ffwd",
+        "assertion": {
+          "field": "pending_reads",
+          "op": "eq",
+          "value": 1
+        },
+        "description": "Forwarded-path premise: the leader postponed the forwarded request because no entry of its term was committed."
+      },
+      {
+        "event": "fwd_confchange_applied",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "fstash",
+        "assertion": {
+          "field": "node2_read_states",
+          "op": "eq",
+          "value": 1
+        },
+        "antecedent": {
+          "field": "term_has_commit",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Forwarded-path witness: applying the committed change performed the leader's first commit of term 2 (committed 10 -> 11, committed_entry_term 2 == leader_term) yet no MsgReadIndexResp was emitted and follower 2 received no ReadState, so the client's forwarded read stays unanswered."
+      },
+      {
+        "event": "fwd_unrelated_commit",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "fcc",
+        "assertion": {
+          "field": "readindex_responses_emitted",
+          "op": "eq",
+          "value": 1
+        },
+        "description": "Forwarded-path control: the unrelated proposal committed by the new configuration releases the postponed request, and only then does follower 2 receive the MsgReadIndexResp (ctx A, index 12)."
+      }
+    ],
+    "anchors": [
+      {
+        "material_id": "switchtoconfig-commit",
+        "symbol": "switchToConfig",
+        "start_line": 1979,
+        "end_line": 1979
+      },
+      {
+        "material_id": "release-helper",
+        "symbol": "releasePendingReadIndexMessages",
+        "start_line": 2127,
+        "end_line": 2127
+      }
+    ],
+    "previous_id": "cb953bd819f247b8b30ac4d1e47e6c4c-experiment",
+    "revision_reason": "The forwarded variant previously reused the shared event names (setup, election, delayed_ack_delivered, heartbeat_round), so the aliases of the existing comparisons admitted operations whose result observation does not exist for that case and four comparisons came back unknown in CheckRun f6f942daf8df40abb36626675d6923fb. The forwarded case now emits only fwd_-prefixed events, so every admitted operation has its own result observation while the earlier cases and comparisons stay unchanged."
+  },
+  "investigations": [
+    {
+      "id": "8769550822c045a18219e24795b9bdc0-question-0",
+      "discriminator": "Whether the state in which switchToConfig performs the term's first commit can be reached without the application reporting applied progress ahead of its ApplyConfChange call, and whether the unreleased request has any consequence beyond the unanswered caller (a lease-based read configuration was not exercised)."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+      "experiment_id": "cb953bd819f247b8b30ac4d1e47e6c4c-experiment",
+      "source_ids": [
+        "readindex-stash",
+        "msgappresp-release",
+        "switchtoconfig-commit",
+        "release-helper",
+        "heartbeatresp-readonly",
+        "readonly-maybeadvance",
+        "node-advance-contract",
+        "test-release-after-term-commit"
+      ],
+      "executions": {
+        "f6f942daf8df40abb36626675d6923fb": [
+          18,
+          19,
+          20,
+          23
+        ],
+        "5d77b839c94544d1bf81b71c506a5b90": [
+          3,
+          5,
+          6,
+          11,
+          12,
+          14
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The account of this question now covers both completion paths of one accepted request, on retained receipts. Source side: a leader postpones MsgReadIndex exactly when its configuration is not a singleton and no entry of its term is committed (raft.go:1354-1372), and the only code that discharges the duty is releasePendingReadIndexMessages, called from the MsgAppResp commit path alone (raft.go:1550-1554) although switchToConfig also performs commits (raft.go:2013-2028) and the helper is guarded only by committedEntryInCurrentTerm() (raft.go:2127-2145); a postponed request is absent from readOnly.unconfirmedReads, so no heartbeat carries its context (read_only.go:93-101, raft.go:1600-1602). Local path, receipt 5d77b839c94544d1bf81b71c506a5b90 with the 10 -> 11 commit: the postponement (parsed index 3 in the pre-revision numbering of that basis is the confchange_applied witness; the same run's indices 3, 5, 6, 11, 12, 14 show the witness, the absent reply to the heartbeat round, and the release only after the unrelated commit). Forwarded path, receipt f6f942daf8df40abb36626675d6923fb: follower 2 forwards the client's request (parsed index 18: StateFollower with known leader 1 emitting MsgReadIndex), leader 1 postpones it (index 19: pending_reads 1, node2_read_states 0), applying the committed removal of voter 4 performs the leader's first commit of term 2 (index 20: committed 10 -> 11 with committed_entry_term 2 equal to leader_term) yet emits no MsgReadIndexResp (readindex_responses_emitted 0) and leaves follower 2 without a ReadState, and only the unrelated proposal releases the request and then produces the response (index 23: readindex_responses_emitted 1, node2_read_states 1, ctx A, index 12). Four comparisons of that receipt (the stashed precondition, the two local release controls and the forwarded premise) came back unknown because the forwarded case reused the shared event names, so the aliases of the earlier comparisons admitted operations whose result observation does not exist for that case; those comparisons are resolved for the equivalent two-case basis by receipt 5d77b839c94544d1bf81b71c506a5b90, and the corrected basis (fwd_-prefixed events only) is submitted with this update so that one receipt resolves all of them. The account therefore stands: a request the leader accepted can stay unanswered across a commit of an entry of its term when that commit is performed inside switchToConfig, for both consumers of the answer, while the returned index is safe whenever the request is eventually released (the index is taken from raftLog.committed at release time and the commit index never decreases) - the defect is an unfulfilled duty, not a wrong index.",
+      "counterevidence": [
+        "The controls hold in both receipts (parsed indices 6 and 14 of receipt 5d77b839c94544d1bf81b71c506a5b90; index 23 of receipt f6f942daf8df40abb36626675d6923fb): an unrelated proposal committed through the MsgAppResp path releases the request and the answer is delivered, so the release mechanism is intact and the omission is specific to the switchToConfig commit path.",
+        "The Node.ReadIndex contract tells callers that read index requests can be lost without notice and that retries are their duty (node.go:218-224), so a retrying client is not blocked; the observation is an unanswered admissible request rather than a permanent client-visible outage.",
+        "The reachable prefix relies on documented application latitude: an application may report applied progress before it finishes applying the entries of a previous Ready (node.go:166-178) and the library fixes no ordering between that report and the required ApplyConfChange call for a change it has observed (node.go:179-187); the unanswered request itself is not caused by that latitude, only the reachability of the state is."
+      ],
+      "limitations": [
+        "The comparison holds the applied configuration change to be the one that first makes a current-term entry committable; a leader that had already committed any entry of its term answers later requests normally (committedEntryInCurrentTerm() is true, so nothing is postponed).",
+        "The retained harnesses supply the starting log, HardState and applied index as an application state fixture (ten term-1 entries with entry 10 the configuration change, persisted commit 10, applied 10) while the election, the acknowledgements, the read requests, the applied change and the proposal are driven through real raft messages; voter 4 is unreachable and voter 3's append acknowledgements are delayed.",
+        "No state machine was run, so the consequence measured is the unanswered request itself (no ReadState, no MsgReadIndexResp). The safe-but-late index of the eventual answer follows from the contract, not from a served value in the receipt.",
+        "Which of the four unknown comparisons of the forwarded receipt would have resolved on that exact basis is not re-measured: the corrected basis is submitted instead, and the equivalent local comparisons remain established by the earlier receipt."
+      ],
+      "knowledge": [
+        {
+          "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-0",
+          "revision": 1,
+          "assertion": "A leader postpones MsgReadIndex exactly when the configuration is not a singleton and committedEntryInCurrentTerm() is false."
+        },
+        {
+          "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-1",
+          "revision": 1,
+          "assertion": "Postponed requests are released only from the MsgAppResp commit path."
+        },
+        {
+          "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-2",
+          "revision": 1,
+          "assertion": "switchToConfig can perform the term's first commit and does not release pendingReadIndexMessages."
+        },
+        {
+          "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-3",
+          "revision": 1,
+          "assertion": "A postponed request is not in readOnly.unconfirmedReads, so heartbeats cannot release it."
+        },
+        {
+          "entry_id": "8769550822c045a18219e24795b9bdc0-knowledge-4",
+          "revision": 1,
+          "assertion": "The applied progress report and the ApplyConfChange call are not ordered by the library's contract."
+        }
+      ],
+      "joint_history": "Both receipts belong to the same harness family and the same scenario: the same four-voter group, the same bootstrap fixture (ten term-1 entries with entry 10 the removal of voter 4, persisted commit 10, applied 10), the same transport fault model (voter 4 unreachable, voter 3's append acknowledgements delayed), the same requirement and the same decisive interval (elect node 1, deliver the read, apply the committed change, observe the release, then observe the unrelated commit). Receipt 5d77b839c94544d1bf81b71c506a5b90 is the two-case basis (local read in the removal case and in the leave-joint case, plus the release controls); receipt f6f942daf8df40abb36626675d6923fb is the successor basis that keeps those cases and adds the forwarded case, whose events are emitted with distinct fwd_-prefixed names. The forwarded witness (index 20) and its release control (index 23) are therefore comparable with the local witnesses of the earlier basis, and the unknown comparisons of the later receipt are the ones the earlier receipt resolves for the equivalent cases."
+    }
+  ]
+}

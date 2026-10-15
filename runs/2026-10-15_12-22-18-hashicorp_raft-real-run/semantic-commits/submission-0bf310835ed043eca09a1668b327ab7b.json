@@ -1,0 +1,1300 @@
+{
+  "input": {
+    "rationale": "Registered a new sourced lead on the configuration-history mechanism, and recorded a negative result about the documentation. docs/membership.md describes AddVoter as making a server staging and Staging as a promotion path, neither of which matches the current API, so it is a design proposal rather than a contract and cannot supply normative support for a defect claim; I did not build on it. The lead comes from the code instead: processConfigurationLogEntry sets the committed configuration to the previous latest configuration before installing the new latest one, so a follower can hold a committed configuration whose entry the leader has not committed, and the log-truncation path resets latest to that committed value. The registered question asks whether those two can combine so that a follower's latest configuration names a server whose configuration entry is no longer in its log, and what that would let it do; no defect is asserted until the trace or a probe settles it.",
+    "sources": [
+      {
+        "id": "process_config_committed",
+        "file": "raft.go",
+        "start_line": 1605,
+        "end_line": 1625,
+        "kind": "code_observation"
+      },
+      {
+        "id": "truncation_reset_latest",
+        "file": "raft.go",
+        "start_line": 1543,
+        "end_line": 1552,
+        "kind": "code_observation"
+      },
+      {
+        "id": "append_commit_update",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation"
+      },
+      {
+        "id": "membership_doc_proposal",
+        "file": "membership.md",
+        "start_line": 12,
+        "end_line": 32,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@follower_committed_heuristic",
+        "question": "Can a follower hold a committed configuration that was never committed and then truncate its log so that its latest configuration names a server with no configuration entry behind it, and what does it do with that configuration?",
+        "source_ids": [
+          "process_config_committed",
+          "truncation_reset_latest",
+          "append_commit_update",
+          "membership_doc_proposal"
+        ],
+        "hypothesis": "processConfigurationLogEntry advances the committed configuration to the previous latest configuration whenever it installs a new one, without checking that the previous one was actually committed, and the appendEntries truncation path resets the latest configuration to the committed one when the conflicting suffix reaches past latestIndex. If a follower appends a configuration entry the leader never commits and later truncates that entry away, its latest configuration can still name the servers from that entry.",
+        "discriminator": "A trace or probe that appends a configuration entry at a follower, leaves the leader's commit index below it, then forces the follower to truncate that index and compares the follower's latest configuration with the entries actually present in its log, together with what the follower then uses that configuration for (vote granting, election participation, lease counting).",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "version": 1,
+        "question": "When the leader of a cluster that includes a non-voter can reach only that non-voter, does VerifyLeader's success still establish the voter-majority contact its stale-read protection is meant to provide?",
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "update_last_appended",
+          "heartbeat_ack",
+          "verify_vote",
+          "api_verify_leader"
+        ],
+        "hypothesis": "VerifyLeader returns nil in that partition because the non-voter's AppendEntries acknowledgement is counted as a vote toward a quorum sized only over voters: quorumSize() counts voters in the latest configuration, while verifyFuture.vote increments on any notifyAll(true) arriving from any replication peer. Without any reachable peer the same call does not succeed, so the acknowledging non-voter is what satisfies the quorum.",
+        "discriminator": "The returned endpoint of VerifyLeader at a leader partitioned so that (a) only the non-voter is reachable, (b) one voter is reachable, and (c) no peer is reachable, together with the quorum size and the suffrage of each server in the leader's latest configuration.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "d704b04e706144dc964ff451359eda19-gap-0",
+            "question": "Which legal condition, if any, lets a successor be elected while the old leader still reports VerifyLeader success, given that the leader lease counts voters only and ReloadConfig cannot raise LeaderLeaseTimeout above HeartbeatTimeout?",
+            "experiment_id": null,
+            "operation_id": "d704b04e706144dc964ff451359eda19"
+          }
+        ],
+        "history": [],
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "version": 1,
+        "question": "When LeadershipTransferToServer names a non-voter, does the call report a transfer that the named server can actually complete, and what happens to the cluster's leadership while it cannot?",
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "docs_transfer"
+        ],
+        "hypothesis": "The leader does not check that the requested target holds a vote. It resolves the target through leaderState.replState, which holds an entry for every configured server except the leader itself, so a non-voter passes that check and receives TimeoutNow; timeoutNow makes it a candidate with candidateFromLeadershipTransfer set, which skips pre-vote by design, so it sends a real RequestVote with a higher term. Each voter adopts that higher term and steps down before reaching the hasVote rejection, then refuses the vote because the candidate has no vote, so no server grants the transfer, yet the leader's transfer goroutine reports success when it observes its own leadership loss. The prediction is that the call returns nil while the requested target never becomes leader, whereas the same call naming a voter does transfer leadership.",
+        "discriminator": "The transfer future's reported result compared with the state of the requested target and of the cluster's leadership, in two cases that differ only in the target's suffrage in the leader's latest configuration.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "627b3ef0c6e049bfb836e40ffbdce875-gap-1",
+            "question": "After a transfer request naming a non-voter, how long is the cluster without a leader, and does the previous leader lose leadership and the higher term before a new election completes?",
+            "experiment_id": null,
+            "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+          }
+        ],
+        "history": [],
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "1f661a68c21d426189d35f4a76d491f4-question-0",
+        "version": 1,
+        "question": "When a leader's main loop is stalled past its lease while a voter majority elects a successor, can a VerifyLeader request queued during the stall still report success by counting the reachable non-voter's acknowledgement?",
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "lease_check",
+          "lease_check_granularity",
+          "start_stop_repl",
+          "notify_all",
+          "update_last_appended",
+          "verify_vote"
+        ],
+        "hypothesis": "During the stall the leader keeps Leader state and its replication goroutines keep running, so a successor can be elected while the old leader still believes itself leader. The queued VerifyLeader cannot be served while the main loop is blocked; once the stall ends both the lease case and the verify case are ready, so the verify either registers and is answered nil after the non-voter's acknowledgement arrives, or the lease case is served first and the request is answered with leadership loss.",
+        "discriminator": "The VerifyLeader endpoint of each trial alongside whether a different server was observed in Leader state while the stalled leader was still Leader, and the terms those servers held.",
+        "disposition": "active",
+        "parent_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1f661a68c21d426189d35f4a76d491f4"
+      },
+      {
+        "id": "b2ccc787c9384b008b5f9c668746f760-question-0",
+        "version": 1,
+        "question": "Can a future returned by VerifyLeader, Barrier or Apply while Shutdown is in progress be left permanently uncompleted, so that the caller's Error() never returns?",
+        "source_ids": [
+          "api_verify_future",
+          "api_barrier_future",
+          "api_apply_future",
+          "defer_error_block",
+          "verify_channel_buffer",
+          "shutdown_close",
+          "test_todo_stuck"
+        ],
+        "hypothesis": "Each call creates a future whose send races the shutdown channel in one select. The channels are buffered (64 for verifyCh), so the send is ready immediately; when Shutdown closes shutdownCh the run loop may take the shutdown case with futures still queued, and because none of these futures sets ShutdownCh, deferError.Error() has nothing to unblock on. VerifyLeader should be the most exposed because the leader loop drains verifyCh one case per iteration, while applyCh is drained in batches up to MaxAppendEntries per iteration and Barrier shares that path.",
+        "discriminator": "The number of futures per API call kind that have not completed 400ms after Shutdown() has returned, compared with the same call kinds on a node that is not shut down.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "b2ccc787c9384b008b5f9c668746f760"
+      }
+    ],
+    "materials": [
+      {
+        "id": "verify_leader",
+        "file": "raft.go",
+        "start_line": 966,
+        "end_line": 988,
+        "kind": "code_observation",
+        "text": "func (r *Raft) verifyLeader(v *verifyFuture) {\n\t// Current leader always votes for self\n\tv.votes = 1\n\n\t// Set the quorum size, hot-path for single node\n\tv.quorumSize = r.quorumSize()\n\tif v.quorumSize == 1 {\n\t\tv.respond(nil)\n\t\treturn\n\t}\n\n\t// Track this request\n\tv.notifyCh = r.verifyCh\n\tr.leaderState.notify[v] = struct{}{}\n\n\t// Trigger immediate heartbeats\n\tfor _, repl := range r.leaderState.replState {\n\t\trepl.notifyLock.Lock()\n\t\trepl.notify[v] = struct{}{}\n\t\trepl.notifyLock.Unlock()\n\t\tasyncNotifyCh(repl.notifyCh)\n\t}\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "quorum_size",
+        "file": "raft.go",
+        "start_line": 1087,
+        "end_line": 1095,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "lease_check",
+        "file": "raft.go",
+        "start_line": 1037,
+        "end_line": 1090,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "start_stop_repl",
+        "file": "raft.go",
+        "start_line": 579,
+        "end_line": 651,
+        "kind": "code_observation",
+        "text": "// startStopReplication will set up state and start asynchronous replication to\n// new peers, and stop replication to removed peers. Before removing a peer,\n// it'll instruct the replication routines to try to replicate to the current\n// index. This must only be called from the main thread.\nfunc (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})\n\t\t} else if ok {\n\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\tif peer.Address != server.Address {\n\t\t\t\tr.logger.Info(\"updating peer\", \"peer\", server.ID)\n\t\t\t\ts.peerLock.Lock()\n\t\t\t\ts.peer = server\n\t\t\t\ts.peerLock.Unlock()\n\t\t\t}\n\t\t}\n\t}\n\n\t// Stop replication goroutines that need stopping\n\tfor serverID, repl := range r.leaderState.replState {\n\t\tif inConfig[serverID] {\n\t\t\tcontinue\n\t\t}\n\t\t// Replicate up to lastIdx and stop\n\t\tr.logger.Info(\"removed peer, stopping replication\", \"peer\", serverID, \"last-index\", lastIdx)\n\t\trepl.stopCh <- lastIdx\n\t\tclose(repl.stopCh)\n\t\tdelete(r.leaderState.replState, serverID)\n\t\tr.observe(PeerObservation{Peer: repl.peer, Removed: true})\n\t}\n\n\t// Update peers metric\n\tmetrics.SetGauge([]string{\"raft\", \"peers\"}, float32(len(r.configurations.latest.Servers)))\n}\n\n// configurationChangeChIfStable returns r.configurationChangeCh if it's safe\n// to process requests from it, or nil otherwise. This must only be called\n// from the main thread.\n//",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "follower_vote_grant",
+        "file": "raft.go",
+        "start_line": 1694,
+        "end_line": 1712,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}\n\t// Check if we have voted yet\n\tlastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)\n\tif err != nil && err.Error() != \"not found\" {\n\t\tr.logger.Error(\"failed to get last vote term\", \"error\", err)\n\t\treturn",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "notify_all",
+        "file": "replication.go",
+        "start_line": 98,
+        "end_line": 117,
+        "kind": "code_observation",
+        "text": "// notifyAll is used to notify all the waiting verify futures\n// if the follower believes we are still the leader.\nfunc (s *followerReplication) notifyAll(leader bool) {\n\t// Clear the waiting notifies minimizing lock time\n\ts.notifyLock.Lock()\n\tn := s.notify\n\ts.notify = make(map[*verifyFuture]struct{})\n\ts.notifyLock.Unlock()\n\n\t// Submit our votes\n\tfor v := range n {\n\t\tv.vote(leader)\n\t}\n}\n\n// cleanNotify is used to delete notify, .\nfunc (s *followerReplication) cleanNotify(v *verifyFuture) {\n\ts.notifyLock.Lock()\n\tdelete(s.notify, v)\n\ts.notifyLock.Unlock()",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "update_last_appended",
+        "file": "replication.go",
+        "start_line": 655,
+        "end_line": 665,
+        "kind": "code_observation",
+        "text": "func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {\n\t// Mark any inflight logs as committed\n\tif logs := req.Entries; len(logs) > 0 {\n\t\tlast := logs[len(logs)-1]\n\t\tatomic.StoreUint64(&s.nextIndex, last.Index+1)\n\t\ts.commitment.match(s.peer.ID, last.Index)\n\t}\n\n\t// Notify still leader\n\ts.notifyAll(true)\n}",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "heartbeat_ack",
+        "file": "replication.go",
+        "start_line": 400,
+        "end_line": 440,
+        "kind": "code_observation",
+        "text": "\t\tselect {\n\t\tcase <-s.notifyCh:\n\t\tcase <-randomTimeout(r.config().HeartbeatTimeout / 10):\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\n\t\ts.peerLock.RLock()\n\t\tpeer := s.peer\n\t\ts.peerLock.RUnlock()\n\n\t\tstart := time.Now()\n\t\tif err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {\n\t\t\tnextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)\n\t\t\tr.logger.Error(\"failed to heartbeat to\", \"peer\", peer.Address, \"backoff time\",\n\t\t\t\tnextBackoffTime, \"error\", err)\n\t\t\tr.observe(FailedHeartbeatObservation{PeerID: peer.ID, LastContact: s.LastContact()})\n\t\t\tfailures++\n\t\t\tselect {\n\t\t\tcase <-time.After(nextBackoffTime):\n\t\t\tcase <-stopCh:\n\t\t\t\treturn\n\t\t\t}\n\t\t} else {\n\t\t\tif failures > 0 {\n\t\t\t\tr.observe(ResumedHeartbeatObservation{PeerID: peer.ID})\n\t\t\t}\n\t\t\ts.setLastContact()\n\t\t\tfailures = 0\n\t\t\tlabels := []metrics.Label{{Name: \"peer_id\", Value: string(peer.ID)}}\n\t\t\tmetrics.MeasureSinceWithLabels([]string{\"raft\", \"replication\", \"heartbeat\"}, start, labels)\n\n\t\t\tif !r.noLegacyTelemetry {\n\t\t\t\t// Duplicated information. Kept for backward compatibility.\n\t\t\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"heartbeat\", string(peer.ID)}, start)\n\t\t\t}\n\n\t\t\ts.notifyAll(resp.Success)\n\t\t}\n\t}\n}",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "install_snapshot_ack",
+        "file": "replication.go",
+        "start_line": 365,
+        "end_line": 378,
+        "kind": "code_observation",
+        "text": "\ts.setLastContact()\n\n\t// Check for success\n\tif resp.Success {\n\t\t// Update the indexes\n\t\tatomic.StoreUint64(&s.nextIndex, meta.Index+1)\n\t\ts.commitment.match(peer.ID, meta.Index)\n\n\t\t// Clear any failures\n\t\ts.failures = 0\n\n\t\t// Notify we are still leader\n\t\ts.notifyAll(true)\n\t} else {",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "verify_vote",
+        "file": "future.go",
+        "start_line": 236,
+        "end_line": 293,
+        "kind": "code_observation",
+        "text": "// verifyFuture is used to verify the current node is still\n// the leader. This is to prevent a stale read.\ntype verifyFuture struct {\n\tdeferError\n\tnotifyCh   chan *verifyFuture\n\tquorumSize int\n\tvotes      int\n\tvoteLock   sync.Mutex\n}\n\n// leadershipTransferFuture is used to track the progress of a leadership\n// transfer internally.\ntype leadershipTransferFuture struct {\n\tdeferError\n\n\tID      *ServerID\n\tAddress *ServerAddress\n}\n\n// configurationsFuture is used to retrieve the current configurations. This is\n// used to allow safe access to this information outside of the main thread.\ntype configurationsFuture struct {\n\tdeferError\n\tconfigurations configurations\n}\n\n// Configuration returns the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Configuration() Configuration {\n\treturn c.configurations.latest\n}\n\n// Index returns the index of the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Index() uint64 {\n\treturn c.configurations.latestIndex\n}\n\n// vote is used to respond to a verifyFuture.\n// This may block when responding on the notifyCh.\nfunc (v *verifyFuture) vote(leader bool) {\n\tv.voteLock.Lock()\n\tdefer v.voteLock.Unlock()\n\n\t// Guard against having notified already\n\tif v.notifyCh == nil {\n\t\treturn\n\t}\n\n\tif leader {\n\t\tv.votes++\n\t\tif v.votes >= v.quorumSize {\n\t\t\tv.notifyCh <- v\n\t\t\tv.notifyCh = nil\n\t\t}\n\t} else {\n\t\tv.notifyCh <- v\n\t\tv.notifyCh = nil\n\t}\n}",
+        "content_digest": "24635504735146af7f77f5b25857ae6e280985916ba3f389cd5a9f49702800c4"
+      },
+      {
+        "id": "api_verify_leader",
+        "file": "api.go",
+        "start_line": 928,
+        "end_line": 941,
+        "kind": "code_observation",
+        "text": "// VerifyLeader is used to ensure this peer is still the leader. It may be used\n// to prevent returning stale data from the FSM after the peer has lost\n// leadership.\nfunc (r *Raft) VerifyLeader() Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"verify_leader\"}, 1)\n\tverifyFuture := &verifyFuture{}\n\tverifyFuture.init()\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.verifyCh <- verifyFuture:\n\t\treturn verifyFuture\n\t}\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "config_validation",
+        "file": "config.go",
+        "start_line": 360,
+        "end_line": 389,
+        "kind": "code_observation",
+        "text": "\t}\n\tif config.HeartbeatTimeout < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"HeartbeatTimeout is too low\")\n\t}\n\tif config.ElectionTimeout < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"ElectionTimeout is too low\")\n\t}\n\tif config.CommitTimeout < time.Millisecond {\n\t\treturn fmt.Errorf(\"CommitTimeout is too low\")\n\t}\n\tif config.MaxAppendEntries <= 0 {\n\t\treturn fmt.Errorf(\"MaxAppendEntries must be positive\")\n\t}\n\tif config.MaxAppendEntries > 1024 {\n\t\treturn fmt.Errorf(\"MaxAppendEntries is too large\")\n\t}\n\tif config.SnapshotInterval < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"SnapshotInterval is too low\")\n\t}\n\tif config.LeaderLeaseTimeout < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"LeaderLeaseTimeout is too low\")\n\t}\n\tif config.LeaderLeaseTimeout > config.HeartbeatTimeout {\n\t\treturn fmt.Errorf(\"LeaderLeaseTimeout (%s) cannot be larger than heartbeat timeout (%s)\", config.LeaderLeaseTimeout, config.HeartbeatTimeout)\n\t}\n\tif config.ElectionTimeout < config.HeartbeatTimeout {\n\t\treturn fmt.Errorf(\"ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)\", config.ElectionTimeout, config.HeartbeatTimeout)\n\t}\n\treturn nil\n}",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "reload_config",
+        "file": "api.go",
+        "start_line": 761,
+        "end_line": 789,
+        "kind": "code_observation",
+        "text": "// ReloadConfig updates the configuration of a running raft node. If the new\n// configuration is invalid an error is returned and no changes made to the\n// instance. All fields will be copied from rc into the new configuration, even\n// if they are zero valued.\nfunc (r *Raft) ReloadConfig(rc ReloadableConfig) error {\n\tr.confReloadMu.Lock()\n\tdefer r.confReloadMu.Unlock()\n\n\t// Load the current config (note we are under a lock so it can't be changed\n\t// between this read and a later Store).\n\toldCfg := r.config()\n\n\t// Set the reloadable fields\n\tnewCfg := rc.apply(oldCfg)\n\n\tif err := ValidateConfig(&newCfg); err != nil {\n\t\treturn err\n\t}\n\tr.conf.Store(newCfg)\n\n\tif rc.HeartbeatTimeout < oldCfg.HeartbeatTimeout {\n\t\t// On leader, ensure replication loops running with a longer\n\t\t// timeout than what we want now discover the change.\n\t\tasyncNotifyCh(r.leaderNotifyCh)\n\t\t// On follower, update current timer to use the shorter new value.\n\t\tasyncNotifyCh(r.followerNotifyCh)\n\t}\n\treturn nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "timeout_now",
+        "file": "raft.go",
+        "start_line": 2232,
+        "end_line": 2237,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "candidate_skips_prevote",
+        "file": "raft.go",
+        "start_line": 296,
+        "end_line": 303,
+        "kind": "code_observation",
+        "text": "\t// Leader transfer do not perform prevote by design\n\tif !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {\n\t\tprevoteCh = r.preElectSelf()\n\t} else {\n\t\tvoteCh = r.electSelf()\n\t}\n\n\t// Make sure the leadership transfer flag is reset after each run. Having this",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "vote_term_bump",
+        "file": "raft.go",
+        "start_line": 1684,
+        "end_line": 1706,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "transfer_target_lookup",
+        "file": "raft.go",
+        "start_line": 760,
+        "end_line": 790,
+        "kind": "code_observation",
+        "text": "\t\t\t}()\n\n\t\t\t// leaderState.replState is accessed here before\n\t\t\t// starting leadership transfer asynchronously because\n\t\t\t// leaderState is only supposed to be accessed in the\n\t\t\t// leaderloop.\n\t\t\tid := future.ID\n\t\t\taddress := future.Address\n\t\t\tif id == nil {\n\t\t\t\ts := r.pickServer()\n\t\t\t\tif s != nil {\n\t\t\t\t\tid = &s.ID\n\t\t\t\t\taddress = &s.Address\n\t\t\t\t} else {\n\t\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find peer\")\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t}\n\t\t\tstate, ok := r.leaderState.replState[*id]\n\t\t\tif !ok {\n\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find replication state for %v\", id)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tr.setLeadershipTransferInProgress(true)\n\t\t\tgo r.leadershipTransfer(*id, *address, state, stopCh, doneCh)\n\n\t\tcase <-r.leaderState.commitCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Process the newly committed entries\n\t\t\toldCommitIndex := r.getCommitIndex()\n\t\t\tcommitIndex := r.leaderState.commitment.getCommitIndex()",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "transfer_lost_leadership",
+        "file": "raft.go",
+        "start_line": 735,
+        "end_line": 758,
+        "kind": "code_observation",
+        "text": "\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"lost leadership during transfer (expected)\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase err := <-doneCh:\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t} else {\n\t\t\t\t\t\t// Wait for up to ElectionTimeout before flagging the\n\t\t\t\t\t\t// leadership transfer as done and unblocking applies in\n\t\t\t\t\t\t// the leaderLoop.\n\t\t\t\t\t\tselect {\n\t\t\t\t\t\tcase <-time.After(r.config().ElectionTimeout):\n\t\t\t\t\t\t\terr := fmt.Errorf(\"leadership transfer timeout\")\n\t\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\t\t\tr.logger.Debug(\"lost leadership during transfer (expected)\")\n\t\t\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t\t}\n\t\t\t\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "pick_server_voters",
+        "file": "raft.go",
+        "start_line": 2186,
+        "end_line": 2208,
+        "kind": "code_observation",
+        "text": "func (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx\n\t\t\ttmp := server\n\t\t\tpick = &tmp\n\t\t}\n\t}\n\treturn pick\n}\n\n// initiateLeadershipTransfer starts the leadership on the leader side, by\n// sending a message to the leadershipTransferCh, to make sure it runs in the",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "api_transfer_to_server",
+        "file": "api.go",
+        "start_line": 1290,
+        "end_line": 1330,
+        "kind": "code_observation",
+        "text": "// but DOES NOT mean that the application's FSM has yet consumed it and applied\n// it to its internal state. Thus, the application's state may lag behind this\n// index.\nfunc (r *Raft) AppliedIndex() uint64 {\n\treturn r.getLastApplied()\n}\n\n// LeadershipTransfer will transfer leadership to a server in the cluster.\n// This can only be called from the leader, or it will fail. The leader will\n// stop accepting client requests, make sure the target server is up to date\n// and starts the transfer with a TimeoutNow message. This message has the same\n// effect as if the election timeout on the target server fires. Since\n// it is unlikely that another server is starting an election, it is very\n// likely that the target server is able to win the election.  Note that raft\n// protocol version 3 is not sufficient to use LeadershipTransfer. A recent\n// version of that library has to be used that includes this feature.  Using\n// transfer leadership is safe however in a cluster where not every node has\n// the latest version. If a follower cannot be promoted, it will fail\n// gracefully.\nfunc (r *Raft) LeadershipTransfer() Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(nil, nil)\n}\n\n// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "docs_transfer",
+        "file": "docs/README.md",
+        "start_line": 48,
+        "end_line": 48,
+        "kind": "code_observation",
+        "text": "* LeadershipTransfer - stop accepting client requests, and tell a different peer to start a leadership election",
+        "content_digest": "ec2ea73a47e87e28aae0a381441a5eba170aff70cf1809b5490731366e4a03ff"
+      },
+      {
+        "id": "elect_vote_collection",
+        "file": "raft.go",
+        "start_line": 1999,
+        "end_line": 2064,
+        "kind": "code_observation",
+        "text": "func (r *Raft) electSelf() <-chan *voteResult {\n\t// Create a response channel\n\trespCh := make(chan *voteResult, len(r.configurations.latest.Servers))\n\n\t// Increment the term\n\tnewTerm := r.getCurrentTerm() + 1\n\n\tr.setCurrentTerm(newTerm)\n\t// Construct the request\n\tlastIdx, lastTerm := r.getLastEntry()\n\treq := &RequestVoteRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      newTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tCandidate:          r.trans.EncodePeer(r.localID, r.localAddr),\n\t\tLastLogIndex:       lastIdx,\n\t\tLastLogTerm:        lastTerm,\n\t\tLeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),\n\t}\n\n\t// Construct a function to ask for a vote\n\taskPeer := func(peer Server) {\n\t\tr.goFunc(func() {\n\t\t\tdefer metrics.MeasureSince([]string{\"raft\", \"candidate\", \"electSelf\"}, time.Now())\n\t\t\tresp := &voteResult{voterID: peer.ID}\n\t\t\terr := r.trans.RequestVote(peer.ID, peer.Address, req, &resp.RequestVoteResponse)\n\t\t\tif err != nil {\n\t\t\t\tr.logger.Error(\"failed to make requestVote RPC\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)\n\t\t\t\tresp.Term = req.Term\n\t\t\t\tresp.Granted = false\n\t\t\t}\n\t\t\trespCh <- resp\n\t\t})\n\t}\n\n\t// For each peer, request a vote\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tr.logger.Debug(\"voting for self\", \"term\", req.Term, \"id\", r.localID)\n\n\t\t\t\t// Persist a vote for ourselves\n\t\t\t\tif err := r.persistVote(req.Term, req.Addr); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to persist vote\", \"error\", err)\n\t\t\t\t\treturn nil\n\n\t\t\t\t}\n\t\t\t\t// Include our own vote\n\t\t\t\trespCh <- &voteResult{\n\t\t\t\t\tRequestVoteResponse: RequestVoteResponse{\n\t\t\t\t\t\tRPCHeader: r.getRPCHeader(),\n\t\t\t\t\t\tTerm:      req.Term,\n\t\t\t\t\t\tGranted:   true,\n\t\t\t\t\t},\n\t\t\t\t\tvoterID: r.localID,\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tr.logger.Debug(\"asking for vote\", \"term\", req.Term, \"from\", server.ID, \"address\", server.Address)\n\t\t\t\taskPeer(server)\n\t\t\t}\n\t\t}\n\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "prevote_vote_collection",
+        "file": "raft.go",
+        "start_line": 2073,
+        "end_line": 2150,
+        "kind": "code_observation",
+        "text": "func (r *Raft) preElectSelf() <-chan *preVoteResult {\n\n\t// At this point transport should support pre-vote\n\t// but check just in case\n\tprevoteTrans, prevoteTransSupported := r.trans.(WithPreVote)\n\tif !prevoteTransSupported {\n\t\tpanic(\"preElection is not possible if the transport don't support pre-vote\")\n\t}\n\n\t// Create a response channel\n\trespCh := make(chan *preVoteResult, len(r.configurations.latest.Servers))\n\n\t// Propose the next term without actually changing our state\n\tnewTerm := r.getCurrentTerm() + 1\n\n\t// Construct the request\n\tlastIdx, lastTerm := r.getLastEntry()\n\treq := &RequestPreVoteRequest{\n\t\tRPCHeader:    r.getRPCHeader(),\n\t\tTerm:         newTerm,\n\t\tLastLogIndex: lastIdx,\n\t\tLastLogTerm:  lastTerm,\n\t}\n\n\t// Construct a function to ask for a vote\n\taskPeer := func(peer Server) {\n\t\tr.goFunc(func() {\n\t\t\tdefer metrics.MeasureSince([]string{\"raft\", \"candidate\", \"preElectSelf\"}, time.Now())\n\t\t\tresp := &preVoteResult{voterID: peer.ID}\n\n\t\t\terr := prevoteTrans.RequestPreVote(peer.ID, peer.Address, req, &resp.RequestPreVoteResponse)\n\n\t\t\t// If the target server do not support Pre-vote RPC we count this as a granted vote to allow\n\t\t\t// the cluster to progress.\n\t\t\tif err != nil && strings.Contains(err.Error(), rpcUnexpectedCommandError) {\n\t\t\t\tr.logger.Error(\"target does not support pre-vote RPC, treating as granted\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)\n\t\t\t\tresp.Term = req.Term\n\t\t\t\tresp.Granted = true\n\t\t\t} else if err != nil {\n\t\t\t\tr.logger.Error(\"failed to make requestVote RPC\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)\n\t\t\t\tresp.Term = req.Term\n\t\t\t\tresp.Granted = false\n\t\t\t}\n\t\t\trespCh <- resp\n\n\t\t})\n\t}\n\n\t// For each peer, request a vote\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tr.logger.Debug(\"pre-voting for self\", \"term\", req.Term, \"id\", r.localID)\n\n\t\t\t\t// cast a pre-vote for our self\n\t\t\t\trespCh <- &preVoteResult{\n\t\t\t\t\tRequestPreVoteResponse: RequestPreVoteResponse{\n\t\t\t\t\t\tRPCHeader: r.getRPCHeader(),\n\t\t\t\t\t\tTerm:      req.Term,\n\t\t\t\t\t\tGranted:   true,\n\t\t\t\t\t},\n\t\t\t\t\tvoterID: r.localID,\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tr.logger.Debug(\"asking for pre-vote\", \"term\", req.Term, \"from\", server.ID, \"address\", server.Address)\n\t\t\t\taskPeer(server)\n\t\t\t}\n\t\t}\n\t}\n\n\treturn respCh\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "vote_grant_side",
+        "file": "raft.go",
+        "start_line": 1660,
+        "end_line": 1700,
+        "kind": "code_observation",
+        "text": "\n\t// For older raft version ID is not part of the packed message\n\t// We assume that the peer is part of the configuration and skip this check\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t\t// Grant the vote\n\t\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not in configuration\",\n\t\t\t\t\"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}\n\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}\n\n\t// Ignore an older term\n\tif req.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "follower_election_trigger",
+        "file": "config.go",
+        "start_line": 149,
+        "end_line": 155,
+        "kind": "code_observation",
+        "text": "\t// HeartbeatTimeout specifies the time in follower state without contact\n\t// from a leader before we attempt an election.\n\tHeartbeatTimeout time.Duration\n\n\t// ElectionTimeout specifies the time in candidate state without contact\n\t// from a leader before we attempt an election.\n\tElectionTimeout time.Duration",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "follower_campaign_logic",
+        "file": "raft.go",
+        "start_line": 222,
+        "end_line": 252,
+        "kind": "code_observation",
+        "text": "\t\t\tif time.Since(lastContact) < hbTimeout {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"heartbeat_timeout\"}, 1)\n\t\t\t\tif hasVote(r.configurations.latest, r.localID) {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, starting election\", \"last-leader-addr\", lastLeaderAddr, \"last-leader-id\", lastLeaderID)\n\t\t\t\t\tr.setState(Candidate)\n\t\t\t\t\treturn\n\t\t\t\t} else if !didWarn {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "lease_check_granularity",
+        "file": "raft.go",
+        "start_line": 933,
+        "end_line": 946,
+        "kind": "code_observation",
+        "text": "\t\t\t}\n\n\t\tcase <-lease:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Check if we've exceeded the lease, potentially stepping down\n\t\t\tmaxDiff := r.checkLeaderLease()\n\n\t\t\t// Next check interval should adjust for the last node we've\n\t\t\t// contacted, without going negative\n\t\t\tcheckInterval := r.config().LeaderLeaseTimeout - maxDiff\n\t\t\tif checkInterval < minCheckInterval {\n\t\t\t\tcheckInterval = minCheckInterval\n\t\t\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "random_timeout",
+        "file": "util.go",
+        "start_line": 29,
+        "end_line": 35,
+        "kind": "code_observation",
+        "text": "func randomTimeout(minVal time.Duration) <-chan time.Time {\n\tif minVal == 0 {\n\t\treturn nil\n\t}\n\textra := time.Duration(rand.Int63()) % minVal\n\treturn time.After(minVal + extra)\n}",
+        "content_digest": "e965e72427730642adc707949ca46e1ca368b3e29e47b4b2e92262db64593443"
+      },
+      {
+        "id": "candidate_retry",
+        "file": "raft.go",
+        "start_line": 308,
+        "end_line": 318,
+        "kind": "code_observation",
+        "text": "\tdefer func() { r.candidateFromLeadershipTransfer.Store(false) }()\n\n\telectionTimeout := r.config().ElectionTimeout\n\telectionTimer := randomTimeout(electionTimeout)\n\n\t// Tally the votes, need a simple majority\n\tpreVoteGrantedVotes := 0\n\tpreVoteRefusedVotes := 0\n\tgrantedVotes := 0\n\tvotesNeeded := r.quorumSize()\n\tr.logger.Debug(\"calculated votes needed\", \"needed\", votesNeeded, \"term\", term)",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "vote_leader_known_check",
+        "file": "raft.go",
+        "start_line": 1673,
+        "end_line": 1679,
+        "kind": "code_observation",
+        "text": "\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "prevote_leader_known_check",
+        "file": "raft.go",
+        "start_line": 1786,
+        "end_line": 1792,
+        "kind": "code_observation",
+        "text": "\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate {\n\t\tr.logger.Warn(\"rejecting pre-vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "follower_clears_leader",
+        "file": "raft.go",
+        "start_line": 225,
+        "end_line": 241,
+        "kind": "code_observation",
+        "text": "\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "api_verify_future",
+        "file": "api.go",
+        "start_line": 928,
+        "end_line": 941,
+        "kind": "code_observation",
+        "text": "// VerifyLeader is used to ensure this peer is still the leader. It may be used\n// to prevent returning stale data from the FSM after the peer has lost\n// leadership.\nfunc (r *Raft) VerifyLeader() Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"verify_leader\"}, 1)\n\tverifyFuture := &verifyFuture{}\n\tverifyFuture.init()\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.verifyCh <- verifyFuture:\n\t\treturn verifyFuture\n\t}\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_barrier_future",
+        "file": "api.go",
+        "start_line": 907,
+        "end_line": 926,
+        "kind": "code_observation",
+        "text": "func (r *Raft) Barrier(timeout time.Duration) Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"barrier\"}, 1)\n\tvar timer <-chan time.Time\n\tif timeout > 0 {\n\t\ttimer = time.After(timeout)\n\t}\n\n\t// Create a log future, no index or term yet\n\tlogFuture := &logFuture{log: Log{Type: LogBarrier}}\n\tlogFuture.init()\n\n\tselect {\n\tcase <-timer:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.applyCh <- logFuture:\n\t\treturn logFuture\n\t}\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_apply_future",
+        "file": "api.go",
+        "start_line": 874,
+        "end_line": 899,
+        "kind": "code_observation",
+        "text": "func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {\n\tmetrics.IncrCounter([]string{\"raft\", \"apply\"}, 1)\n\n\tvar timer <-chan time.Time\n\tif timeout > 0 {\n\t\ttimer = time.After(timeout)\n\t}\n\n\t// Create a log future, no index or term yet\n\tlogFuture := &logFuture{\n\t\tlog: Log{\n\t\t\tType:       LogCommand,\n\t\t\tData:       log.Data,\n\t\t\tExtensions: log.Extensions,\n\t\t},\n\t}\n\tlogFuture.init()\n\n\tselect {\n\tcase <-timer:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.applyCh <- logFuture:\n\t\treturn logFuture\n\t}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "defer_error_block",
+        "file": "future.go",
+        "start_line": 99,
+        "end_line": 117,
+        "kind": "code_observation",
+        "text": "func (d *deferError) init() {\n\td.errCh = make(chan error, 1)\n}\n\nfunc (d *deferError) Error() error {\n\tif d.err != nil {\n\t\t// Note that when we've received a nil error, this\n\t\t// won't trigger, but the channel is closed after\n\t\t// send so we'll still return nil below.\n\t\treturn d.err\n\t}\n\tif d.errCh == nil {\n\t\tpanic(\"waiting for response on nil channel\")\n\t}\n\tselect {\n\tcase d.err = <-d.errCh:\n\tcase <-d.ShutdownCh:\n\t\td.err = ErrRaftShutdown\n\t}",
+        "content_digest": "24635504735146af7f77f5b25857ae6e280985916ba3f389cd5a9f49702800c4"
+      },
+      {
+        "id": "verify_channel_buffer",
+        "file": "api.go",
+        "start_line": 570,
+        "end_line": 578,
+        "kind": "code_observation",
+        "text": "\t\tsnapshots:             snaps,\n\t\tuserSnapshotCh:        make(chan *userSnapshotFuture),\n\t\tuserRestoreCh:         make(chan *userRestoreFuture),\n\t\tshutdownCh:            make(chan struct{}),\n\t\tstable:                stable,\n\t\ttrans:                 trans,\n\t\tverifyCh:              make(chan *verifyFuture, 64),\n\t\tconfigurationsCh:      make(chan *configurationsFuture, 8),\n\t\tbootstrapCh:           make(chan *bootstrapFuture),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "shutdown_close",
+        "file": "api.go",
+        "start_line": 1060,
+        "end_line": 1072,
+        "kind": "code_observation",
+        "text": "func (r *Raft) Shutdown() Future {\n\tr.shutdownLock.Lock()\n\tdefer r.shutdownLock.Unlock()\n\n\tif !r.shutdown {\n\t\tclose(r.shutdownCh)\n\t\tr.shutdown = true\n\t\tr.setState(Shutdown)\n\t\treturn &shutdownFuture{r}\n\t}\n\n\t// avoid closing transport twice\n\treturn &shutdownFuture{nil}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "test_todo_stuck",
+        "file": "raft_test.go",
+        "start_line": 38,
+        "end_line": 42,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// TODO (slackpad) - Barrier, VerifyLeader, and GetConfiguration can get\n\t// stuck if the buffered channel consumes the future but things are shut\n\t// down so they never get processed.",
+        "content_digest": "33d02fbb915164a24d1387e087ffe4d4f5c52d8861e73cbe828152fb3edfdb15"
+      },
+      {
+        "id": "apply_channel_unbuffered",
+        "file": "api.go",
+        "start_line": 545,
+        "end_line": 560,
+        "kind": "code_observation",
+        "text": "\t\treturn nil, fmt.Errorf(\"when running with ProtocolVersion < 3, LocalID must be set to the network address\")\n\t}\n\n\t// Buffer applyCh to MaxAppendEntries if the option is enabled\n\tapplyCh := make(chan *logFuture)\n\tif conf.BatchApplyCh {\n\t\tapplyCh = make(chan *logFuture, conf.MaxAppendEntries)\n\t}\n\n\t_, transportSupportPreVote := trans.(WithPreVote)\n\t// Create Raft struct.\n\tr := &Raft{\n\t\tprotocolVersion:       protocolVersion,\n\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "batch_apply_ch_config",
+        "file": "config.go",
+        "start_line": 163,
+        "end_line": 174,
+        "kind": "code_observation",
+        "text": "\t// MaxAppendEntries controls the maximum number of append entries\n\t// to send at once. We want to strike a balance between efficiency\n\t// and avoiding waste if the follower is going to reject because of\n\t// an inconsistent log.\n\tMaxAppendEntries int\n\n\t// BatchApplyCh indicates whether we should buffer applyCh\n\t// to size MaxAppendEntries. This enables batch log commitment,\n\t// but breaks the timeout guarantee on Apply. Specifically,\n\t// a log can be added to the applyCh buffer but not actually be\n\t// processed until after the specified timeout.\n\tBatchApplyCh bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "0bf310835ed043eca09a1668b327ab7b",
+      "result": {
+        "submission": "update.json",
+        "summary": "Registered a new sourced lead on the configuration-history mechanism, and recorded a negative result about the documentation: docs/membership.md describes AddVoter as making a server staging and Staging as a promotion path, neither of which matches the current API, so it is a design proposal rather than a contract and I did not use it as normative support. The lead comes from the code — processConfigurationLogEntry advances the committed configuration to the previous latest configuration before installing the new one, without checking that the previous one was committed, while the appendEntries truncation path resets the latest configuration to that committed value — so I registered the question whether a follower can hold a latest configuration naming a server whose configuration entry is no longer in its log, and what it would then do with it, with a discriminator that traces or probes the appending, the withheld commit and the forced truncation together. Four source ranges were recorded for that trace, no defect is asserted yet, and no execution was requested; the four existing questions and their accounts are unchanged."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-3b823834c8cb46da98e77d8e988bf5d9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-3b823834c8cb46da98e77d8e988bf5d9.json"
+      },
+      "submission-d704b04e706144dc964ff451359eda19": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d704b04e706144dc964ff451359eda19.json"
+      },
+      "submission-627b3ef0c6e049bfb836e40ffbdce875": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-627b3ef0c6e049bfb836e40ffbdce875.json"
+      },
+      "submission-8e037ca743394e1a8a518b9745b8fe53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-8e037ca743394e1a8a518b9745b8fe53.json"
+      },
+      "submission-ba97eea3cb1c45009b75f70720a38dfd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-ba97eea3cb1c45009b75f70720a38dfd.json"
+      },
+      "submission-bc29f42a57d34a7bb2748bc0c137b09c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-bc29f42a57d34a7bb2748bc0c137b09c.json"
+      },
+      "submission-69ed488d46854e82ac7202fb04ae501e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-69ed488d46854e82ac7202fb04ae501e.json"
+      },
+      "submission-9c35a21ad15841ac80f85fe372647f0f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-9c35a21ad15841ac80f85fe372647f0f.json"
+      },
+      "submission-47ee3da21b494ebba75f696758ad5ec3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-47ee3da21b494ebba75f696758ad5ec3.json"
+      },
+      "submission-d224a7ee6a604e779614bcbd1050240f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d224a7ee6a604e779614bcbd1050240f.json"
+      },
+      "submission-1f661a68c21d426189d35f4a76d491f4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-1f661a68c21d426189d35f4a76d491f4.json"
+      },
+      "submission-983e6d23976b4e4e9eff6a3987874db1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-983e6d23976b4e4e9eff6a3987874db1.json"
+      },
+      "submission-b2ccc787c9384b008b5f9c668746f760": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-b2ccc787c9384b008b5f9c668746f760.json"
+      },
+      "submission-c27ce810268e4535bf01c8870a682db4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-c27ce810268e4535bf01c8870a682db4.json"
+      },
+      "submission-49fa455b2fe94d53ab6fed2fad19ce33": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-49fa455b2fe94d53ab6fed2fad19ce33.json"
+      },
+      "submission-e9fcb98b3a754239a1b61d9547e479fd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-e9fcb98b3a754239a1b61d9547e479fd.json"
+      },
+      "submission-438cbcf830c04b7bb008a707a69bbb32": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-438cbcf830c04b7bb008a707a69bbb32.json"
+      },
+      "submission-3b7823e321e048b88feb0bab3b79b2bd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-3b7823e321e048b88feb0bab3b79b2bd.json"
+      },
+      "submission-9bc3e6d5ea9c4b298e4a229e13b8f86d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-9bc3e6d5ea9c4b298e4a229e13b8f86d.json"
+      },
+      "submission-0c18dc2523f14459925e467d38fe022f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-0c18dc2523f14459925e467d38fe022f.json"
+      },
+      "submission-29a71a7377a44fdbac949d4808f7b847": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-29a71a7377a44fdbac949d4808f7b847.json"
+      },
+      "submission-f02f3b73bd1b44eba8471369b03da52b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-f02f3b73bd1b44eba8471369b03da52b.json"
+      },
+      "submission-e0304928ad0948bba8c4bfd9296712c9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-e0304928ad0948bba8c4bfd9296712c9.json"
+      },
+      "submission-4916079656954a2b81e3a6bfdb12f816": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-4916079656954a2b81e3a6bfdb12f816.json"
+      },
+      "submission-d33dfeeee4124704bae38664b5b63da2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d33dfeeee4124704bae38664b5b63da2.json"
+      },
+      "submission-cb82ce8dacc24e00a509639510e9a722": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-cb82ce8dacc24e00a509639510e9a722.json"
+      },
+      "submission-24f5b25cdc0e4a56a73a459285ab5e35": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-24f5b25cdc0e4a56a73a459285ab5e35.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "version": 1,
+        "question": "When the leader of a cluster that includes a non-voter can reach only that non-voter, does VerifyLeader's success still establish the voter-majority contact its stale-read protection is meant to provide?",
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "update_last_appended",
+          "heartbeat_ack",
+          "verify_vote",
+          "api_verify_leader"
+        ],
+        "hypothesis": "VerifyLeader returns nil in that partition because the non-voter's AppendEntries acknowledgement is counted as a vote toward a quorum sized only over voters: quorumSize() counts voters in the latest configuration, while verifyFuture.vote increments on any notifyAll(true) arriving from any replication peer. Without any reachable peer the same call does not succeed, so the acknowledging non-voter is what satisfies the quorum.",
+        "discriminator": "The returned endpoint of VerifyLeader at a leader partitioned so that (a) only the non-voter is reachable, (b) one voter is reachable, and (c) no peer is reachable, together with the quorum size and the suffrage of each server in the leader's latest configuration.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "d704b04e706144dc964ff451359eda19-gap-0",
+            "question": "Which legal condition, if any, lets a successor be elected while the old leader still reports VerifyLeader success, given that the leader lease counts voters only and ReloadConfig cannot raise LeaderLeaseTimeout above HeartbeatTimeout?",
+            "experiment_id": null,
+            "operation_id": "d704b04e706144dc964ff451359eda19"
+          }
+        ],
+        "history": [],
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "version": 1,
+        "question": "When LeadershipTransferToServer names a non-voter, does the call report a transfer that the named server can actually complete, and what happens to the cluster's leadership while it cannot?",
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "docs_transfer"
+        ],
+        "hypothesis": "The leader does not check that the requested target holds a vote. It resolves the target through leaderState.replState, which holds an entry for every configured server except the leader itself, so a non-voter passes that check and receives TimeoutNow; timeoutNow makes it a candidate with candidateFromLeadershipTransfer set, which skips pre-vote by design, so it sends a real RequestVote with a higher term. Each voter adopts that higher term and steps down before reaching the hasVote rejection, then refuses the vote because the candidate has no vote, so no server grants the transfer, yet the leader's transfer goroutine reports success when it observes its own leadership loss. The prediction is that the call returns nil while the requested target never becomes leader, whereas the same call naming a voter does transfer leadership.",
+        "discriminator": "The transfer future's reported result compared with the state of the requested target and of the cluster's leadership, in two cases that differ only in the target's suffrage in the leader's latest configuration.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "627b3ef0c6e049bfb836e40ffbdce875-gap-1",
+            "question": "After a transfer request naming a non-voter, how long is the cluster without a leader, and does the previous leader lose leadership and the higher term before a new election completes?",
+            "experiment_id": null,
+            "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+          }
+        ],
+        "history": [],
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "1f661a68c21d426189d35f4a76d491f4-question-0",
+        "version": 1,
+        "question": "When a leader's main loop is stalled past its lease while a voter majority elects a successor, can a VerifyLeader request queued during the stall still report success by counting the reachable non-voter's acknowledgement?",
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "lease_check",
+          "lease_check_granularity",
+          "start_stop_repl",
+          "notify_all",
+          "update_last_appended",
+          "verify_vote"
+        ],
+        "hypothesis": "During the stall the leader keeps Leader state and its replication goroutines keep running, so a successor can be elected while the old leader still believes itself leader. The queued VerifyLeader cannot be served while the main loop is blocked; once the stall ends both the lease case and the verify case are ready, so the verify either registers and is answered nil after the non-voter's acknowledgement arrives, or the lease case is served first and the request is answered with leadership loss.",
+        "discriminator": "The VerifyLeader endpoint of each trial alongside whether a different server was observed in Leader state while the stalled leader was still Leader, and the terms those servers held.",
+        "disposition": "active",
+        "parent_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1f661a68c21d426189d35f4a76d491f4"
+      },
+      {
+        "id": "b2ccc787c9384b008b5f9c668746f760-question-0",
+        "version": 1,
+        "question": "Can a future returned by VerifyLeader, Barrier or Apply while Shutdown is in progress be left permanently uncompleted, so that the caller's Error() never returns?",
+        "source_ids": [
+          "api_verify_future",
+          "api_barrier_future",
+          "api_apply_future",
+          "defer_error_block",
+          "verify_channel_buffer",
+          "shutdown_close",
+          "test_todo_stuck"
+        ],
+        "hypothesis": "Each call creates a future whose send races the shutdown channel in one select. The channels are buffered (64 for verifyCh), so the send is ready immediately; when Shutdown closes shutdownCh the run loop may take the shutdown case with futures still queued, and because none of these futures sets ShutdownCh, deferError.Error() has nothing to unblock on. VerifyLeader should be the most exposed because the leader loop drains verifyCh one case per iteration, while applyCh is drained in batches up to MaxAppendEntries per iteration and Barrier shares that path.",
+        "discriminator": "The number of futures per API call kind that have not completed 400ms after Shutdown() has returned, compared with the same call kinds on a node that is not shut down.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "b2ccc787c9384b008b5f9c668746f760"
+      },
+      {
+        "id": "0bf310835ed043eca09a1668b327ab7b-question-0",
+        "version": 1,
+        "question": "Can a follower hold a committed configuration that was never committed and then truncate its log so that its latest configuration names a server with no configuration entry behind it, and what does it do with that configuration?",
+        "source_ids": [
+          "process_config_committed",
+          "truncation_reset_latest",
+          "append_commit_update",
+          "membership_doc_proposal"
+        ],
+        "hypothesis": "processConfigurationLogEntry advances the committed configuration to the previous latest configuration whenever it installs a new one, without checking that the previous one was actually committed, and the appendEntries truncation path resets the latest configuration to the committed one when the conflicting suffix reaches past latestIndex. If a follower appends a configuration entry the leader never commits and later truncates that entry away, its latest configuration can still name the servers from that entry.",
+        "discriminator": "A trace or probe that appends a configuration entry at a follower, leaves the leader's commit index below it, then forces the follower to truncate that index and compares the follower's latest configuration with the entries actually present in its log, together with what the follower then uses that configuration for (vote granting, election participation, lease counting).",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "0bf310835ed043eca09a1668b327ab7b"
+      }
+    ],
+    "materials": [
+      {
+        "id": "verify_leader",
+        "file": "raft.go",
+        "start_line": 966,
+        "end_line": 988,
+        "kind": "code_observation",
+        "text": "func (r *Raft) verifyLeader(v *verifyFuture) {\n\t// Current leader always votes for self\n\tv.votes = 1\n\n\t// Set the quorum size, hot-path for single node\n\tv.quorumSize = r.quorumSize()\n\tif v.quorumSize == 1 {\n\t\tv.respond(nil)\n\t\treturn\n\t}\n\n\t// Track this request\n\tv.notifyCh = r.verifyCh\n\tr.leaderState.notify[v] = struct{}{}\n\n\t// Trigger immediate heartbeats\n\tfor _, repl := range r.leaderState.replState {\n\t\trepl.notifyLock.Lock()\n\t\trepl.notify[v] = struct{}{}\n\t\trepl.notifyLock.Unlock()\n\t\tasyncNotifyCh(repl.notifyCh)\n\t}\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "quorum_size",
+        "file": "raft.go",
+        "start_line": 1087,
+        "end_line": 1095,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "lease_check",
+        "file": "raft.go",
+        "start_line": 1037,
+        "end_line": 1090,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "start_stop_repl",
+        "file": "raft.go",
+        "start_line": 579,
+        "end_line": 651,
+        "kind": "code_observation",
+        "text": "// startStopReplication will set up state and start asynchronous replication to\n// new peers, and stop replication to removed peers. Before removing a peer,\n// it'll instruct the replication routines to try to replicate to the current\n// index. This must only be called from the main thread.\nfunc (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})\n\t\t} else if ok {\n\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\tif peer.Address != server.Address {\n\t\t\t\tr.logger.Info(\"updating peer\", \"peer\", server.ID)\n\t\t\t\ts.peerLock.Lock()\n\t\t\t\ts.peer = server\n\t\t\t\ts.peerLock.Unlock()\n\t\t\t}\n\t\t}\n\t}\n\n\t// Stop replication goroutines that need stopping\n\tfor serverID, repl := range r.leaderState.replState {\n\t\tif inConfig[serverID] {\n\t\t\tcontinue\n\t\t}\n\t\t// Replicate up to lastIdx and stop\n\t\tr.logger.Info(\"removed peer, stopping replication\", \"peer\", serverID, \"last-index\", lastIdx)\n\t\trepl.stopCh <- lastIdx\n\t\tclose(repl.stopCh)\n\t\tdelete(r.leaderState.replState, serverID)\n\t\tr.observe(PeerObservation{Peer: repl.peer, Removed: true})\n\t}\n\n\t// Update peers metric\n\tmetrics.SetGauge([]string{\"raft\", \"peers\"}, float32(len(r.configurations.latest.Servers)))\n}\n\n// configurationChangeChIfStable returns r.configurationChangeCh if it's safe\n// to process requests from it, or nil otherwise. This must only be called\n// from the main thread.\n//",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "follower_vote_grant",
+        "file": "raft.go",
+        "start_line": 1694,
+        "end_line": 1712,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}\n\t// Check if we have voted yet\n\tlastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)\n\tif err != nil && err.Error() != \"not found\" {\n\t\tr.logger.Error(\"failed to get last vote term\", \"error\", err)\n\t\treturn",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "notify_all",
+        "file": "replication.go",
+        "start_line": 98,
+        "end_line": 117,
+        "kind": "code_observation",
+        "text": "// notifyAll is used to notify all the waiting verify futures\n// if the follower believes we are still the leader.\nfunc (s *followerReplication) notifyAll(leader bool) {\n\t// Clear the waiting notifies minimizing lock time\n\ts.notifyLock.Lock()\n\tn := s.notify\n\ts.notify = make(map[*verifyFuture]struct{})\n\ts.notifyLock.Unlock()\n\n\t// Submit our votes\n\tfor v := range n {\n\t\tv.vote(leader)\n\t}\n}\n\n// cleanNotify is used to delete notify, .\nfunc (s *followerReplication) cleanNotify(v *verifyFuture) {\n\ts.notifyLock.Lock()\n\tdelete(s.notify, v)\n\ts.notifyLock.Unlock()",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "update_last_appended",
+        "file": "replication.go",
+        "start_line": 655,
+        "end_line": 665,
+        "kind": "code_observation",
+        "text": "func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {\n\t// Mark any inflight logs as committed\n\tif logs := req.Entries; len(logs) > 0 {\n\t\tlast := logs[len(logs)-1]\n\t\tatomic.StoreUint64(&s.nextIndex, last.Index+1)\n\t\ts.commitment.match(s.peer.ID, last.Index)\n\t}\n\n\t// Notify still leader\n\ts.notifyAll(true)\n}",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "heartbeat_ack",
+        "file": "replication.go",
+        "start_line": 400,
+        "end_line": 440,
+        "kind": "code_observation",
+        "text": "\t\tselect {\n\t\tcase <-s.notifyCh:\n\t\tcase <-randomTimeout(r.config().HeartbeatTimeout / 10):\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\n\t\ts.peerLock.RLock()\n\t\tpeer := s.peer\n\t\ts.peerLock.RUnlock()\n\n\t\tstart := time.Now()\n\t\tif err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {\n\t\t\tnextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)\n\t\t\tr.logger.Error(\"failed to heartbeat to\", \"peer\", peer.Address, \"backoff time\",\n\t\t\t\tnextBackoffTime, \"error\", err)\n\t\t\tr.observe(FailedHeartbeatObservation{PeerID: peer.ID, LastContact: s.LastContact()})\n\t\t\tfailures++\n\t\t\tselect {\n\t\t\tcase <-time.After(nextBackoffTime):\n\t\t\tcase <-stopCh:\n\t\t\t\treturn\n\t\t\t}\n\t\t} else {\n\t\t\tif failures > 0 {\n\t\t\t\tr.observe(ResumedHeartbeatObservation{PeerID: peer.ID})\n\t\t\t}\n\t\t\ts.setLastContact()\n\t\t\tfailures = 0\n\t\t\tlabels := []metrics.Label{{Name: \"peer_id\", Value: string(peer.ID)}}\n\t\t\tmetrics.MeasureSinceWithLabels([]string{\"raft\", \"replication\", \"heartbeat\"}, start, labels)\n\n\t\t\tif !r.noLegacyTelemetry {\n\t\t\t\t// Duplicated information. Kept for backward compatibility.\n\t\t\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"heartbeat\", string(peer.ID)}, start)\n\t\t\t}\n\n\t\t\ts.notifyAll(resp.Success)\n\t\t}\n\t}\n}",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "install_snapshot_ack",
+        "file": "replication.go",
+        "start_line": 365,
+        "end_line": 378,
+        "kind": "code_observation",
+        "text": "\ts.setLastContact()\n\n\t// Check for success\n\tif resp.Success {\n\t\t// Update the indexes\n\t\tatomic.StoreUint64(&s.nextIndex, meta.Index+1)\n\t\ts.commitment.match(peer.ID, meta.Index)\n\n\t\t// Clear any failures\n\t\ts.failures = 0\n\n\t\t// Notify we are still leader\n\t\ts.notifyAll(true)\n\t} else {",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "verify_vote",
+        "file": "future.go",
+        "start_line": 236,
+        "end_line": 293,
+        "kind": "code_observation",
+        "text": "// verifyFuture is used to verify the current node is still\n// the leader. This is to prevent a stale read.\ntype verifyFuture struct {\n\tdeferError\n\tnotifyCh   chan *verifyFuture\n\tquorumSize int\n\tvotes      int\n\tvoteLock   sync.Mutex\n}\n\n// leadershipTransferFuture is used to track the progress of a leadership\n// transfer internally.\ntype leadershipTransferFuture struct {\n\tdeferError\n\n\tID      *ServerID\n\tAddress *ServerAddress\n}\n\n// configurationsFuture is used to retrieve the current configurations. This is\n// used to allow safe access to this information outside of the main thread.\ntype configurationsFuture struct {\n\tdeferError\n\tconfigurations configurations\n}\n\n// Configuration returns the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Configuration() Configuration {\n\treturn c.configurations.latest\n}\n\n// Index returns the index of the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Index() uint64 {\n\treturn c.configurations.latestIndex\n}\n\n// vote is used to respond to a verifyFuture.\n// This may block when responding on the notifyCh.\nfunc (v *verifyFuture) vote(leader bool) {\n\tv.voteLock.Lock()\n\tdefer v.voteLock.Unlock()\n\n\t// Guard against having notified already\n\tif v.notifyCh == nil {\n\t\treturn\n\t}\n\n\tif leader {\n\t\tv.votes++\n\t\tif v.votes >= v.quorumSize {\n\t\t\tv.notifyCh <- v\n\t\t\tv.notifyCh = nil\n\t\t}\n\t} else {\n\t\tv.notifyCh <- v\n\t\tv.notifyCh = nil\n\t}\n}",
+        "content_digest": "24635504735146af7f77f5b25857ae6e280985916ba3f389cd5a9f49702800c4"
+      },
+      {
+        "id": "api_verify_leader",
+        "file": "api.go",
+        "start_line": 928,
+        "end_line": 941,
+        "kind": "code_observation",
+        "text": "// VerifyLeader is used to ensure this peer is still the leader. It may be used\n// to prevent returning stale data from the FSM after the peer has lost\n// leadership.\nfunc (r *Raft) VerifyLeader() Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"verify_leader\"}, 1)\n\tverifyFuture := &verifyFuture{}\n\tverifyFuture.init()\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.verifyCh <- verifyFuture:\n\t\treturn verifyFuture\n\t}\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "config_validation",
+        "file": "config.go",
+        "start_line": 360,
+        "end_line": 389,
+        "kind": "code_observation",
+        "text": "\t}\n\tif config.HeartbeatTimeout < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"HeartbeatTimeout is too low\")\n\t}\n\tif config.ElectionTimeout < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"ElectionTimeout is too low\")\n\t}\n\tif config.CommitTimeout < time.Millisecond {\n\t\treturn fmt.Errorf(\"CommitTimeout is too low\")\n\t}\n\tif config.MaxAppendEntries <= 0 {\n\t\treturn fmt.Errorf(\"MaxAppendEntries must be positive\")\n\t}\n\tif config.MaxAppendEntries > 1024 {\n\t\treturn fmt.Errorf(\"MaxAppendEntries is too large\")\n\t}\n\tif config.SnapshotInterval < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"SnapshotInterval is too low\")\n\t}\n\tif config.LeaderLeaseTimeout < 5*time.Millisecond {\n\t\treturn fmt.Errorf(\"LeaderLeaseTimeout is too low\")\n\t}\n\tif config.LeaderLeaseTimeout > config.HeartbeatTimeout {\n\t\treturn fmt.Errorf(\"LeaderLeaseTimeout (%s) cannot be larger than heartbeat timeout (%s)\", config.LeaderLeaseTimeout, config.HeartbeatTimeout)\n\t}\n\tif config.ElectionTimeout < config.HeartbeatTimeout {\n\t\treturn fmt.Errorf(\"ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)\", config.ElectionTimeout, config.HeartbeatTimeout)\n\t}\n\treturn nil\n}",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "reload_config",
+        "file": "api.go",
+        "start_line": 761,
+        "end_line": 789,
+        "kind": "code_observation",
+        "text": "// ReloadConfig updates the configuration of a running raft node. If the new\n// configuration is invalid an error is returned and no changes made to the\n// instance. All fields will be copied from rc into the new configuration, even\n// if they are zero valued.\nfunc (r *Raft) ReloadConfig(rc ReloadableConfig) error {\n\tr.confReloadMu.Lock()\n\tdefer r.confReloadMu.Unlock()\n\n\t// Load the current config (note we are under a lock so it can't be changed\n\t// between this read and a later Store).\n\toldCfg := r.config()\n\n\t// Set the reloadable fields\n\tnewCfg := rc.apply(oldCfg)\n\n\tif err := ValidateConfig(&newCfg); err != nil {\n\t\treturn err\n\t}\n\tr.conf.Store(newCfg)\n\n\tif rc.HeartbeatTimeout < oldCfg.HeartbeatTimeout {\n\t\t// On leader, ensure replication loops running with a longer\n\t\t// timeout than what we want now discover the change.\n\t\tasyncNotifyCh(r.leaderNotifyCh)\n\t\t// On follower, update current timer to use the shorter new value.\n\t\tasyncNotifyCh(r.followerNotifyCh)\n\t}\n\treturn nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "timeout_now",
+        "file": "raft.go",
+        "start_line": 2232,
+        "end_line": 2237,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "candidate_skips_prevote",
+        "file": "raft.go",
+        "start_line": 296,
+        "end_line": 303,
+        "kind": "code_observation",
+        "text": "\t// Leader transfer do not perform prevote by design\n\tif !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {\n\t\tprevoteCh = r.preElectSelf()\n\t} else {\n\t\tvoteCh = r.electSelf()\n\t}\n\n\t// Make sure the leadership transfer flag is reset after each run. Having this",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "vote_term_bump",
+        "file": "raft.go",
+        "start_line": 1684,
+        "end_line": 1706,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "transfer_target_lookup",
+        "file": "raft.go",
+        "start_line": 760,
+        "end_line": 790,
+        "kind": "code_observation",
+        "text": "\t\t\t}()\n\n\t\t\t// leaderState.replState is accessed here before\n\t\t\t// starting leadership transfer asynchronously because\n\t\t\t// leaderState is only supposed to be accessed in the\n\t\t\t// leaderloop.\n\t\t\tid := future.ID\n\t\t\taddress := future.Address\n\t\t\tif id == nil {\n\t\t\t\ts := r.pickServer()\n\t\t\t\tif s != nil {\n\t\t\t\t\tid = &s.ID\n\t\t\t\t\taddress = &s.Address\n\t\t\t\t} else {\n\t\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find peer\")\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t}\n\t\t\tstate, ok := r.leaderState.replState[*id]\n\t\t\tif !ok {\n\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find replication state for %v\", id)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tr.setLeadershipTransferInProgress(true)\n\t\t\tgo r.leadershipTransfer(*id, *address, state, stopCh, doneCh)\n\n\t\tcase <-r.leaderState.commitCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Process the newly committed entries\n\t\t\toldCommitIndex := r.getCommitIndex()\n\t\t\tcommitIndex := r.leaderState.commitment.getCommitIndex()",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "transfer_lost_leadership",
+        "file": "raft.go",
+        "start_line": 735,
+        "end_line": 758,
+        "kind": "code_observation",
+        "text": "\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"lost leadership during transfer (expected)\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase err := <-doneCh:\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t} else {\n\t\t\t\t\t\t// Wait for up to ElectionTimeout before flagging the\n\t\t\t\t\t\t// leadership transfer as done and unblocking applies in\n\t\t\t\t\t\t// the leaderLoop.\n\t\t\t\t\t\tselect {\n\t\t\t\t\t\tcase <-time.After(r.config().ElectionTimeout):\n\t\t\t\t\t\t\terr := fmt.Errorf(\"leadership transfer timeout\")\n\t\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\t\t\tr.logger.Debug(\"lost leadership during transfer (expected)\")\n\t\t\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t\t}\n\t\t\t\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "pick_server_voters",
+        "file": "raft.go",
+        "start_line": 2186,
+        "end_line": 2208,
+        "kind": "code_observation",
+        "text": "func (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx\n\t\t\ttmp := server\n\t\t\tpick = &tmp\n\t\t}\n\t}\n\treturn pick\n}\n\n// initiateLeadershipTransfer starts the leadership on the leader side, by\n// sending a message to the leadershipTransferCh, to make sure it runs in the",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "api_transfer_to_server",
+        "file": "api.go",
+        "start_line": 1290,
+        "end_line": 1330,
+        "kind": "code_observation",
+        "text": "// but DOES NOT mean that the application's FSM has yet consumed it and applied\n// it to its internal state. Thus, the application's state may lag behind this\n// index.\nfunc (r *Raft) AppliedIndex() uint64 {\n\treturn r.getLastApplied()\n}\n\n// LeadershipTransfer will transfer leadership to a server in the cluster.\n// This can only be called from the leader, or it will fail. The leader will\n// stop accepting client requests, make sure the target server is up to date\n// and starts the transfer with a TimeoutNow message. This message has the same\n// effect as if the election timeout on the target server fires. Since\n// it is unlikely that another server is starting an election, it is very\n// likely that the target server is able to win the election.  Note that raft\n// protocol version 3 is not sufficient to use LeadershipTransfer. A recent\n// version of that library has to be used that includes this feature.  Using\n// transfer leadership is safe however in a cluster where not every node has\n// the latest version. If a follower cannot be promoted, it will fail\n// gracefully.\nfunc (r *Raft) LeadershipTransfer() Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(nil, nil)\n}\n\n// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "docs_transfer",
+        "file": "docs/README.md",
+        "start_line": 48,
+        "end_line": 48,
+        "kind": "code_observation",
+        "text": "* LeadershipTransfer - stop accepting client requests, and tell a different peer to start a leadership election",
+        "content_digest": "ec2ea73a47e87e28aae0a381441a5eba170aff70cf1809b5490731366e4a03ff"
+      },
+      {
+        "id": "elect_vote_collection",
+        "file": "raft.go",
+        "start_line": 1999,
+        "end_line": 2064,
+        "kind": "code_observation",
+        "text": "func (r *Raft) electSelf() <-chan *voteResult {\n\t// Create a response channel\n\trespCh := make(chan *voteResult, len(r.configurations.latest.Servers))\n\n\t// Increment the term\n\tnewTerm := r.getCurrentTerm() + 1\n\n\tr.setCurrentTerm(newTerm)\n\t// Construct the request\n\tlastIdx, lastTerm := r.getLastEntry()\n\treq := &RequestVoteRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      newTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tCandidate:          r.trans.EncodePeer(r.localID, r.localAddr),\n\t\tLastLogIndex:       lastIdx,\n\t\tLastLogTerm:        lastTerm,\n\t\tLeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),\n\t}\n\n\t// Construct a function to ask for a vote\n\taskPeer := func(peer Server) {\n\t\tr.goFunc(func() {\n\t\t\tdefer metrics.MeasureSince([]string{\"raft\", \"candidate\", \"electSelf\"}, time.Now())\n\t\t\tresp := &voteResult{voterID: peer.ID}\n\t\t\terr := r.trans.RequestVote(peer.ID, peer.Address, req, &resp.RequestVoteResponse)\n\t\t\tif err != nil {\n\t\t\t\tr.logger.Error(\"failed to make requestVote RPC\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)\n\t\t\t\tresp.Term = req.Term\n\t\t\t\tresp.Granted = false\n\t\t\t}\n\t\t\trespCh <- resp\n\t\t})\n\t}\n\n\t// For each peer, request a vote\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tr.logger.Debug(\"voting for self\", \"term\", req.Term, \"id\", r.localID)\n\n\t\t\t\t// Persist a vote for ourselves\n\t\t\t\tif err := r.persistVote(req.Term, req.Addr); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to persist vote\", \"error\", err)\n\t\t\t\t\treturn nil\n\n\t\t\t\t}\n\t\t\t\t// Include our own vote\n\t\t\t\trespCh <- &voteResult{\n\t\t\t\t\tRequestVoteResponse: RequestVoteResponse{\n\t\t\t\t\t\tRPCHeader: r.getRPCHeader(),\n\t\t\t\t\t\tTerm:      req.Term,\n\t\t\t\t\t\tGranted:   true,\n\t\t\t\t\t},\n\t\t\t\t\tvoterID: r.localID,\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tr.logger.Debug(\"asking for vote\", \"term\", req.Term, \"from\", server.ID, \"address\", server.Address)\n\t\t\t\taskPeer(server)\n\t\t\t}\n\t\t}\n\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "prevote_vote_collection",
+        "file": "raft.go",
+        "start_line": 2073,
+        "end_line": 2150,
+        "kind": "code_observation",
+        "text": "func (r *Raft) preElectSelf() <-chan *preVoteResult {\n\n\t// At this point transport should support pre-vote\n\t// but check just in case\n\tprevoteTrans, prevoteTransSupported := r.trans.(WithPreVote)\n\tif !prevoteTransSupported {\n\t\tpanic(\"preElection is not possible if the transport don't support pre-vote\")\n\t}\n\n\t// Create a response channel\n\trespCh := make(chan *preVoteResult, len(r.configurations.latest.Servers))\n\n\t// Propose the next term without actually changing our state\n\tnewTerm := r.getCurrentTerm() + 1\n\n\t// Construct the request\n\tlastIdx, lastTerm := r.getLastEntry()\n\treq := &RequestPreVoteRequest{\n\t\tRPCHeader:    r.getRPCHeader(),\n\t\tTerm:         newTerm,\n\t\tLastLogIndex: lastIdx,\n\t\tLastLogTerm:  lastTerm,\n\t}\n\n\t// Construct a function to ask for a vote\n\taskPeer := func(peer Server) {\n\t\tr.goFunc(func() {\n\t\t\tdefer metrics.MeasureSince([]string{\"raft\", \"candidate\", \"preElectSelf\"}, time.Now())\n\t\t\tresp := &preVoteResult{voterID: peer.ID}\n\n\t\t\terr := prevoteTrans.RequestPreVote(peer.ID, peer.Address, req, &resp.RequestPreVoteResponse)\n\n\t\t\t// If the target server do not support Pre-vote RPC we count this as a granted vote to allow\n\t\t\t// the cluster to progress.\n\t\t\tif err != nil && strings.Contains(err.Error(), rpcUnexpectedCommandError) {\n\t\t\t\tr.logger.Error(\"target does not support pre-vote RPC, treating as granted\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)\n\t\t\t\tresp.Term = req.Term\n\t\t\t\tresp.Granted = true\n\t\t\t} else if err != nil {\n\t\t\t\tr.logger.Error(\"failed to make requestVote RPC\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)\n\t\t\t\tresp.Term = req.Term\n\t\t\t\tresp.Granted = false\n\t\t\t}\n\t\t\trespCh <- resp\n\n\t\t})\n\t}\n\n\t// For each peer, request a vote\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tr.logger.Debug(\"pre-voting for self\", \"term\", req.Term, \"id\", r.localID)\n\n\t\t\t\t// cast a pre-vote for our self\n\t\t\t\trespCh <- &preVoteResult{\n\t\t\t\t\tRequestPreVoteResponse: RequestPreVoteResponse{\n\t\t\t\t\t\tRPCHeader: r.getRPCHeader(),\n\t\t\t\t\t\tTerm:      req.Term,\n\t\t\t\t\t\tGranted:   true,\n\t\t\t\t\t},\n\t\t\t\t\tvoterID: r.localID,\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tr.logger.Debug(\"asking for pre-vote\", \"term\", req.Term, \"from\", server.ID, \"address\", server.Address)\n\t\t\t\taskPeer(server)\n\t\t\t}\n\t\t}\n\t}\n\n\treturn respCh\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "vote_grant_side",
+        "file": "raft.go",
+        "start_line": 1660,
+        "end_line": 1700,
+        "kind": "code_observation",
+        "text": "\n\t// For older raft version ID is not part of the packed message\n\t// We assume that the peer is part of the configuration and skip this check\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t\t// Grant the vote\n\t\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not in configuration\",\n\t\t\t\t\"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}\n\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}\n\n\t// Ignore an older term\n\tif req.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "follower_election_trigger",
+        "file": "config.go",
+        "start_line": 149,
+        "end_line": 155,
+        "kind": "code_observation",
+        "text": "\t// HeartbeatTimeout specifies the time in follower state without contact\n\t// from a leader before we attempt an election.\n\tHeartbeatTimeout time.Duration\n\n\t// ElectionTimeout specifies the time in candidate state without contact\n\t// from a leader before we attempt an election.\n\tElectionTimeout time.Duration",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "follower_campaign_logic",
+        "file": "raft.go",
+        "start_line": 222,
+        "end_line": 252,
+        "kind": "code_observation",
+        "text": "\t\t\tif time.Since(lastContact) < hbTimeout {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"heartbeat_timeout\"}, 1)\n\t\t\t\tif hasVote(r.configurations.latest, r.localID) {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, starting election\", \"last-leader-addr\", lastLeaderAddr, \"last-leader-id\", lastLeaderID)\n\t\t\t\t\tr.setState(Candidate)\n\t\t\t\t\treturn\n\t\t\t\t} else if !didWarn {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "lease_check_granularity",
+        "file": "raft.go",
+        "start_line": 933,
+        "end_line": 946,
+        "kind": "code_observation",
+        "text": "\t\t\t}\n\n\t\tcase <-lease:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Check if we've exceeded the lease, potentially stepping down\n\t\t\tmaxDiff := r.checkLeaderLease()\n\n\t\t\t// Next check interval should adjust for the last node we've\n\t\t\t// contacted, without going negative\n\t\t\tcheckInterval := r.config().LeaderLeaseTimeout - maxDiff\n\t\t\tif checkInterval < minCheckInterval {\n\t\t\t\tcheckInterval = minCheckInterval\n\t\t\t}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "random_timeout",
+        "file": "util.go",
+        "start_line": 29,
+        "end_line": 35,
+        "kind": "code_observation",
+        "text": "func randomTimeout(minVal time.Duration) <-chan time.Time {\n\tif minVal == 0 {\n\t\treturn nil\n\t}\n\textra := time.Duration(rand.Int63()) % minVal\n\treturn time.After(minVal + extra)\n}",
+        "content_digest": "e965e72427730642adc707949ca46e1ca368b3e29e47b4b2e92262db64593443"
+      },
+      {
+        "id": "candidate_retry",
+        "file": "raft.go",
+        "start_line": 308,
+        "end_line": 318,
+        "kind": "code_observation",
+        "text": "\tdefer func() { r.candidateFromLeadershipTransfer.Store(false) }()\n\n\telectionTimeout := r.config().ElectionTimeout\n\telectionTimer := randomTimeout(electionTimeout)\n\n\t// Tally the votes, need a simple majority\n\tpreVoteGrantedVotes := 0\n\tpreVoteRefusedVotes := 0\n\tgrantedVotes := 0\n\tvotesNeeded := r.quorumSize()\n\tr.logger.Debug(\"calculated votes needed\", \"needed\", votesNeeded, \"term\", term)",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "vote_leader_known_check",
+        "file": "raft.go",
+        "start_line": 1673,
+        "end_line": 1679,
+        "kind": "code_observation",
+        "text": "\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "prevote_leader_known_check",
+        "file": "raft.go",
+        "start_line": 1786,
+        "end_line": 1792,
+        "kind": "code_observation",
+        "text": "\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate {\n\t\tr.logger.Warn(\"rejecting pre-vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "follower_clears_leader",
+        "file": "raft.go",
+        "start_line": 225,
+        "end_line": 241,
+        "kind": "code_observation",
+        "text": "\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "api_verify_future",
+        "file": "api.go",
+        "start_line": 928,
+        "end_line": 941,
+        "kind": "code_observation",
+        "text": "// VerifyLeader is used to ensure this peer is still the leader. It may be used\n// to prevent returning stale data from the FSM after the peer has lost\n// leadership.\nfunc (r *Raft) VerifyLeader() Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"verify_leader\"}, 1)\n\tverifyFuture := &verifyFuture{}\n\tverifyFuture.init()\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.verifyCh <- verifyFuture:\n\t\treturn verifyFuture\n\t}\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_barrier_future",
+        "file": "api.go",
+        "start_line": 907,
+        "end_line": 926,
+        "kind": "code_observation",
+        "text": "func (r *Raft) Barrier(timeout time.Duration) Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"barrier\"}, 1)\n\tvar timer <-chan time.Time\n\tif timeout > 0 {\n\t\ttimer = time.After(timeout)\n\t}\n\n\t// Create a log future, no index or term yet\n\tlogFuture := &logFuture{log: Log{Type: LogBarrier}}\n\tlogFuture.init()\n\n\tselect {\n\tcase <-timer:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.applyCh <- logFuture:\n\t\treturn logFuture\n\t}\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_apply_future",
+        "file": "api.go",
+        "start_line": 874,
+        "end_line": 899,
+        "kind": "code_observation",
+        "text": "func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {\n\tmetrics.IncrCounter([]string{\"raft\", \"apply\"}, 1)\n\n\tvar timer <-chan time.Time\n\tif timeout > 0 {\n\t\ttimer = time.After(timeout)\n\t}\n\n\t// Create a log future, no index or term yet\n\tlogFuture := &logFuture{\n\t\tlog: Log{\n\t\t\tType:       LogCommand,\n\t\t\tData:       log.Data,\n\t\t\tExtensions: log.Extensions,\n\t\t},\n\t}\n\tlogFuture.init()\n\n\tselect {\n\tcase <-timer:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.applyCh <- logFuture:\n\t\treturn logFuture\n\t}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "defer_error_block",
+        "file": "future.go",
+        "start_line": 99,
+        "end_line": 117,
+        "kind": "code_observation",
+        "text": "func (d *deferError) init() {\n\td.errCh = make(chan error, 1)\n}\n\nfunc (d *deferError) Error() error {\n\tif d.err != nil {\n\t\t// Note that when we've received a nil error, this\n\t\t// won't trigger, but the channel is closed after\n\t\t// send so we'll still return nil below.\n\t\treturn d.err\n\t}\n\tif d.errCh == nil {\n\t\tpanic(\"waiting for response on nil channel\")\n\t}\n\tselect {\n\tcase d.err = <-d.errCh:\n\tcase <-d.ShutdownCh:\n\t\td.err = ErrRaftShutdown\n\t}",
+        "content_digest": "24635504735146af7f77f5b25857ae6e280985916ba3f389cd5a9f49702800c4"
+      },
+      {
+        "id": "verify_channel_buffer",
+        "file": "api.go",
+        "start_line": 570,
+        "end_line": 578,
+        "kind": "code_observation",
+        "text": "\t\tsnapshots:             snaps,\n\t\tuserSnapshotCh:        make(chan *userSnapshotFuture),\n\t\tuserRestoreCh:         make(chan *userRestoreFuture),\n\t\tshutdownCh:            make(chan struct{}),\n\t\tstable:                stable,\n\t\ttrans:                 trans,\n\t\tverifyCh:              make(chan *verifyFuture, 64),\n\t\tconfigurationsCh:      make(chan *configurationsFuture, 8),\n\t\tbootstrapCh:           make(chan *bootstrapFuture),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "shutdown_close",
+        "file": "api.go",
+        "start_line": 1060,
+        "end_line": 1072,
+        "kind": "code_observation",
+        "text": "func (r *Raft) Shutdown() Future {\n\tr.shutdownLock.Lock()\n\tdefer r.shutdownLock.Unlock()\n\n\tif !r.shutdown {\n\t\tclose(r.shutdownCh)\n\t\tr.shutdown = true\n\t\tr.setState(Shutdown)\n\t\treturn &shutdownFuture{r}\n\t}\n\n\t// avoid closing transport twice\n\treturn &shutdownFuture{nil}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "test_todo_stuck",
+        "file": "raft_test.go",
+        "start_line": 38,
+        "end_line": 42,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// TODO (slackpad) - Barrier, VerifyLeader, and GetConfiguration can get\n\t// stuck if the buffered channel consumes the future but things are shut\n\t// down so they never get processed.",
+        "content_digest": "33d02fbb915164a24d1387e087ffe4d4f5c52d8861e73cbe828152fb3edfdb15"
+      },
+      {
+        "id": "apply_channel_unbuffered",
+        "file": "api.go",
+        "start_line": 545,
+        "end_line": 560,
+        "kind": "code_observation",
+        "text": "\t\treturn nil, fmt.Errorf(\"when running with ProtocolVersion < 3, LocalID must be set to the network address\")\n\t}\n\n\t// Buffer applyCh to MaxAppendEntries if the option is enabled\n\tapplyCh := make(chan *logFuture)\n\tif conf.BatchApplyCh {\n\t\tapplyCh = make(chan *logFuture, conf.MaxAppendEntries)\n\t}\n\n\t_, transportSupportPreVote := trans.(WithPreVote)\n\t// Create Raft struct.\n\tr := &Raft{\n\t\tprotocolVersion:       protocolVersion,\n\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "batch_apply_ch_config",
+        "file": "config.go",
+        "start_line": 163,
+        "end_line": 174,
+        "kind": "code_observation",
+        "text": "\t// MaxAppendEntries controls the maximum number of append entries\n\t// to send at once. We want to strike a balance between efficiency\n\t// and avoiding waste if the follower is going to reject because of\n\t// an inconsistent log.\n\tMaxAppendEntries int\n\n\t// BatchApplyCh indicates whether we should buffer applyCh\n\t// to size MaxAppendEntries. This enables batch log commitment,\n\t// but breaks the timeout guarantee on Apply. Specifically,\n\t// a log can be added to the applyCh buffer but not actually be\n\t// processed until after the specified timeout.\n\tBatchApplyCh bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "process_config_committed",
+        "file": "raft.go",
+        "start_line": 1605,
+        "end_line": 1625,
+        "kind": "code_observation",
+        "text": "// processConfigurationLogEntry takes a log entry and updates the latest\n// configuration if the entry results in a new configuration. This must only be\n// called from the main thread, or from NewRaft() before any threads have begun.\nfunc (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}\n\n// requestVote is invoked when we get a request vote RPC call.",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "truncation_reset_latest",
+        "file": "raft.go",
+        "start_line": 1543,
+        "end_line": 1552,
+        "kind": "code_observation",
+        "text": "\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "append_commit_update",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"storeLogs\"}, start)\n\t}\n\n\t// Update the commit index\n\tif a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {\n\t\tstart := time.Now()\n\t\tidx := min(a.LeaderCommitIndex, r.getLastIndex())\n\t\tr.setCommitIndex(idx)\n\t\tif r.configurations.latestIndex <= idx {\n\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t}\n\t\tr.processLogs(idx, nil)\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"processLogs\"}, start)\n\t}\n\n\t// Everything went well, set success",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "membership_doc_proposal",
+        "file": "membership.md",
+        "start_line": 12,
+        "end_line": 32,
+        "kind": "code_observation",
+        "text": " - *Nonvoter*: a server that receives log entries but is not considered for elections or commitment purposes.\n - *Staging*: a server that acts like a nonvoter with one exception: once a staging server receives enough log entries to catch up sufficiently to the leader's log, the leader will invoke a  membership change to change the staging server to a voter.\n\nAll changes to the configuration will be done by writing a new configuration to the log. The new configuration will be in affect as soon as it is appended to the log (not when it is committed like a normal state machine command). Note that, per my dissertation, there can be at most one uncommitted configuration at a time (the next configuration may not be created until the prior one has been committed). It's not strictly necessary to follow these same rules for the nonvoter/staging servers, but we think its best to treat all changes uniformly.\n\nEach server will track two configurations:\n 1. its *committed configuration*: the latest configuration in the log/snapshot that has been committed, along with its index.\n 2. its *latest configuration*: the latest configuration in the log/snapshot (may be committed or uncommitted), along with its index.\n\nWhen there's no membership change happening, these two will be the same. The latest configuration is almost always the one used, except:\n - When followers truncate the suffix of their logs, they may need to fall back to the committed configuration.\n - When snapshotting, the committed configuration is written, to correspond with the committed log prefix that is being snapshotted.\n\n\n## Application API\n\nWe propose the following operations for clients to manipulate the cluster configuration:\n - AddVoter: server becomes staging unless voter,\n - AddNonvoter: server becomes nonvoter unless staging or voter,\n - DemoteVoter: server becomes nonvoter unless absent,\n - RemovePeer: server removed from configuration,",
+        "content_digest": "c50deb5e57d6b2a0cde8a8740b7a796af2c94edfe2c87c7e060e4d1044d9cc44"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "0bf310835ed043eca09a1668b327ab7b",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@follower_committed_heuristic": "0bf310835ed043eca09a1668b327ab7b-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "process_config_committed"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "truncation_reset_latest"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "append_commit_update"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "membership_doc_proposal"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@follower_committed_heuristic"
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-3b823834c8cb46da98e77d8e988bf5d9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-3b823834c8cb46da98e77d8e988bf5d9.json"
+      },
+      "submission-d704b04e706144dc964ff451359eda19": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d704b04e706144dc964ff451359eda19.json"
+      },
+      "submission-627b3ef0c6e049bfb836e40ffbdce875": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-627b3ef0c6e049bfb836e40ffbdce875.json"
+      },
+      "submission-8e037ca743394e1a8a518b9745b8fe53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-8e037ca743394e1a8a518b9745b8fe53.json"
+      },
+      "submission-ba97eea3cb1c45009b75f70720a38dfd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-ba97eea3cb1c45009b75f70720a38dfd.json"
+      },
+      "submission-bc29f42a57d34a7bb2748bc0c137b09c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-bc29f42a57d34a7bb2748bc0c137b09c.json"
+      },
+      "submission-69ed488d46854e82ac7202fb04ae501e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-69ed488d46854e82ac7202fb04ae501e.json"
+      },
+      "submission-9c35a21ad15841ac80f85fe372647f0f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-9c35a21ad15841ac80f85fe372647f0f.json"
+      },
+      "submission-47ee3da21b494ebba75f696758ad5ec3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-47ee3da21b494ebba75f696758ad5ec3.json"
+      },
+      "submission-d224a7ee6a604e779614bcbd1050240f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d224a7ee6a604e779614bcbd1050240f.json"
+      },
+      "submission-1f661a68c21d426189d35f4a76d491f4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-1f661a68c21d426189d35f4a76d491f4.json"
+      },
+      "submission-983e6d23976b4e4e9eff6a3987874db1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-983e6d23976b4e4e9eff6a3987874db1.json"
+      },
+      "submission-b2ccc787c9384b008b5f9c668746f760": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-b2ccc787c9384b008b5f9c668746f760.json"
+      },
+      "submission-c27ce810268e4535bf01c8870a682db4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-c27ce810268e4535bf01c8870a682db4.json"
+      },
+      "submission-49fa455b2fe94d53ab6fed2fad19ce33": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-49fa455b2fe94d53ab6fed2fad19ce33.json"
+      },
+      "submission-e9fcb98b3a754239a1b61d9547e479fd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-e9fcb98b3a754239a1b61d9547e479fd.json"
+      },
+      "submission-438cbcf830c04b7bb008a707a69bbb32": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-438cbcf830c04b7bb008a707a69bbb32.json"
+      },
+      "submission-3b7823e321e048b88feb0bab3b79b2bd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-3b7823e321e048b88feb0bab3b79b2bd.json"
+      },
+      "submission-9bc3e6d5ea9c4b298e4a229e13b8f86d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-9bc3e6d5ea9c4b298e4a229e13b8f86d.json"
+      },
+      "submission-0c18dc2523f14459925e467d38fe022f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-0c18dc2523f14459925e467d38fe022f.json"
+      },
+      "submission-29a71a7377a44fdbac949d4808f7b847": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-29a71a7377a44fdbac949d4808f7b847.json"
+      },
+      "submission-f02f3b73bd1b44eba8471369b03da52b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-f02f3b73bd1b44eba8471369b03da52b.json"
+      },
+      "submission-e0304928ad0948bba8c4bfd9296712c9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-e0304928ad0948bba8c4bfd9296712c9.json"
+      },
+      "submission-4916079656954a2b81e3a6bfdb12f816": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-4916079656954a2b81e3a6bfdb12f816.json"
+      },
+      "submission-d33dfeeee4124704bae38664b5b63da2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d33dfeeee4124704bae38664b5b63da2.json"
+      },
+      "submission-cb82ce8dacc24e00a509639510e9a722": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-cb82ce8dacc24e00a509639510e9a722.json"
+      },
+      "submission-24f5b25cdc0e4a56a73a459285ab5e35": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-24f5b25cdc0e4a56a73a459285ab5e35.json"
+      },
+      "submission-0bf310835ed043eca09a1668b327ab7b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-0bf310835ed043eca09a1668b327ab7b.json"
+      }
+    }
+  }
+}

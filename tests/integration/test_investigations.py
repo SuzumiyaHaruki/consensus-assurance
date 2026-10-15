@@ -20,6 +20,8 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
         seen.append(json.loads((e.root/'research.json').read_text()))
         before=e.state.model_dump(mode='json')
         summary=operation_summary(e.state,e.root)
+        assert 'uncited_executions' not in summary
+        assert list(summary).index('questions') < list(summary).index('reselection')
         question=summary['questions'][0]
         assert (question['question_state'],question['version'],question['hypothesis'])==('current',1,'The boundary may wrap')
         execution=question['execution']
@@ -45,11 +47,13 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
         assert summary['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
         assert 'execution' not in summary['questions'][0]
         change=summary['interpretation_changes'][0]
+        assert list(summary).index('interpretation_changes') < list(summary).index('reselection')
         assert change['previous'] is None and change['current']['id']==state['interpretations'][0]['id']
         citation=change['executions'][0]
         assert citation['event_indices']==citation['current_event_indices']==[1]
         assert citation['previous_event_indices']==[]
         assert citation['cited_events'][0]['event_index']==1 and citation['cited_events'][0]['observation']['value']==0
+        assert citation['references']['current']==[]
         return opinion(state)
     def finish(state):
         index = json.loads((e.root/'research.json').read_text())
@@ -62,7 +66,7 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
         if gap:assert summary['necessary_gaps'][0]['investigation_id']==state['investigations'][0]['id']
         assert summary['reselection']['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
         assert 'latest_actual_execution' not in summary
-        assert list(summary).index('reselection') < list(summary).index('questions')
+        assert list(summary).index('questions') < list(summary).index('reselection')
         account=summary['reselection']['questions'][0]['latest_interpretation']
         assert account['rationale']==state['interpretations'][0]['rationale'] and account['record']['id']==account['id']
         assert summary['reselection']['questions'][0]['discriminator']=='Observe the return'
@@ -151,35 +155,63 @@ def test_interpretation_feedback_uses_its_own_receipts_after_another_question_ex
             for statement in ('The return preserves its input','The return stays bounded','An unrelated source fact')]
         return sub,files
     def initial(state):
-        return opinion(state,defect_claim='asserted',knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=1)])
+        sub,files=opinion(state,defect_claim='asserted',knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=1)])
+        entry=state['knowledge'][2]
+        sub['knowledge']=[dict(id=entry['id'],kind=entry['kind'],statement=entry['statement'],
+            conditions=entry['conditions'],source_ids=entry['source_ids'],executions=sub['interpretations'][0]['executions'])]
+        return sub,files
     def another(state):
         request,files=experiment('@other')
+        receipt=state['interpretations'][0]['executions']
+        entry=state['knowledge'][2]
         return {'rationale':'Investigate another sourced question',
             'knowledge':[dict(id=state['knowledge'][0]['id'],kind='fact',statement='The return can differ from its input',
-                conditions='Capacity input',source_ids=['code','doc'],changed_premise='The exact source permits a different value')],
+                conditions='Capacity input',source_ids=['code','doc'],changed_premise='The exact source permits a different value'),
+                dict(id=entry['id'],kind=entry['kind'],statement=entry['statement'],conditions=entry['conditions'],
+                    source_ids=entry['source_ids'],executions={id:[0] for id in receipt})],
             'investigations':[dict(ref='@other',question='What does another caller observe?',source_ids=['code'],
                 knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=2)])],
+            'interpretations':[dict(investigation_id='@other',source_ids=['code'],conclusion='explained',defect_claim=None,
+                executions={id:[0] for id in receipt},joint_history='The shared admission records the same local invocation',
+                rationale='The admitted input is independently recorded before the local return')],
             'experiment':request},files
     def correct(state):
         original=state['experiments'][0]
         sub,files=opinion(state,investigation_id=original['investigation_id'],experiment_id=None,
-            executions={},conclusion='explained',defect_claim='refuted',
+            executions={},source_ids=['doc'],conclusion='explained',defect_claim='refuted',
             knowledge=[dict(entry_id=state['knowledge'][1]['id'],revision=1)],
             rationale='The receipt is unchanged; the current source interpretation narrows the responsibility')
         sub['investigations']=[dict(id=original['investigation_id'],hypothesis='The local contract permits the sampled return')]
+        other_receipt=next(c['id'] for c in reversed(state['checks']) if c.get('experiment_id')==state['experiments'][1]['id'])
+        sub['knowledge']=[dict(kind='behavior',statement='The independent invocation also returns zero',
+            conditions='A separate local invocation',source_ids=['code'],executions={other_receipt:[1]})]
         sub['interpretations'].insert(0,{**sub['interpretations'][0], 'defect_claim':'unresolved',
             'rationale':'An intermediate account awaiting the final contract explanation',
             'knowledge':[dict(entry_id=state['knowledge'][0]['id'],revision=1)]})
         return sub,files
     def finish(state):
+        before=e.state.model_dump(mode='json')
         summary=operation_summary(e.state,e.root)
         change,=summary['interpretation_changes']
-        old,middle,new=state['interpretations']
-        assert change['previous']==dict(id=old['id'],conclusion='violated',defect_claim='asserted')
+        old,other,middle,new=state['interpretations']
+        assert {k:change['previous'][k] for k in ('id','conclusion','defect_claim')}==dict(
+            id=old['id'],conclusion='violated',defect_claim='asserted')
+        assert change['previous']['rationale']==old['rationale'] and change['previous']['record']['id']==old['id']
         assert change['current']==dict(id=new['id'],conclusion='explained',defect_claim='refuted')
         assert change['intermediate_interpretation_ids']==[middle['id']]
-        assert change['executions'][0]['experiment_id']==state['experiments'][0]['id']
-        assert change['executions'][0]['previous_event_indices']==[1] and change['executions'][0]['current_event_indices']==[]
+        assert change['previous_source_ids']==['code','doc'] and change['current_source_ids']==['doc']
+        assert {s['id'] for s in change['sources']}=={'code','doc'}
+        receipt,=change['executions']
+        assert receipt['experiment_id']==state['experiments'][0]['id']
+        assert receipt['previous_event_indices']==[1] and receipt['current_event_indices']==[]
+        citations=receipt['references']
+        assert citations['current']==[dict(id=other['id'],investigation_id=other['investigation_id'],
+            experiment_id=None,event_indices=[0],overlapping_event_indices=[])]
+        assert citations['knowledge']==[dict(id=state['knowledge'][2]['id'],revision=3,
+            event_indices=[0],overlapping_event_indices=[])]
+        assert citations['historical_ids']==[old['id']] and citations['historical_count']==1
+        assert citations['historical_knowledge']==[dict(id=state['knowledge'][2]['id'],revision=2,event_indices=[1])]
+        assert citations['path']=='state.json'
         refs=change['knowledge_references']
         assert [(r['entry_id'],r['revision']) for r in refs]==[(k['id'],1) for k in state['knowledge'][:2]]
         assert refs[0]['statement']=='The return preserves its input' and refs[0]['current_assertions']==[]
@@ -189,15 +221,16 @@ def test_interpretation_feedback_uses_its_own_receipts_after_another_question_ex
         new_use,=refs[1]['recorded_uses']
         assert new_use['record']==dict(path='state.json',collection='interpretations',id=new['id'],current=True)
         assert not any(q['gaps'] for q in state['investigations']) and state['knowledge'][0]['revision']==2
-        assert summary['latest_actual_execution']['experiment_id']==state['experiments'][1]['id']
+        assert 'latest_actual_execution' not in summary and 'uncited_executions' not in summary
         assert summary['questions'][0]['question_state']=='current' and summary['questions'][0]['version']==2
         assert 'execution' not in summary['questions'][0]
         effect=next(v for v in summary['effects'] if v['object']=='interpretations')
         assert {'conclusion','defect_claim','rationale'} <= set(effect['changed_fields'])
+        assert e.state.model_dump(mode='json')==before
         return stop(state)
     e,repo=engine_for(tmp_path,[start,initial,another,correct,finish])
     state=e.start(repo)
-    assert state.usage['experiments']==2 and len(state.interpretations)==3
+    assert state.usage['experiments']==2 and len(state.interpretations)==4
 
 
 def test_preflight_reports_effect_without_acceptance_or_execution(tmp_path,monkeypatch):
@@ -251,8 +284,13 @@ def test_preflight_reports_effect_without_acceptance_or_execution(tmp_path,monke
         change['statement']='The boundary path returns zero.'
         assert validate({'rationale':'Correct the source explanation','knowledge':[change]},{},(False,False))==[
             {'object':'knowledge','action':'update','target':entry['id'],'changed_fields':['statement']}]
-        assert validate({'rationale':'Reproduce the fixed input','repeat_experiment_id':state['experiments'][0]['id']},{},(False,True))==[
-            {'object':'experiments','action':'repeat_execution','target':state['experiments'][0]['id']}]
+        fixed=state['experiments'][0]
+        repeat,=validate({'rationale':'Reproduce the fixed input','repeat_experiment_id':fixed['id']},{},(False,True))
+        assert repeat['action']=='repeat_execution' and repeat['target']==fixed['id']
+        assert repeat['input_source']=='Retained fixed inputs; the current draft is not read.'
+        assert repeat['fixed_experiment']==dict(experiment_id=fixed['id'],investigation_id=q,version=1,
+            previous_id=None,revision_reason='',difference_fields=[],basis=f"fixed-experiments/{fixed['id']}/basis.json",
+            harness=f"fixed-experiments/{fixed['id']}/{fixed['harness_filename']}")
         validate({'rationale':'Unknown retained input','repeat_experiment_id':'absent'},{},None)
         sub,files=opinion(state)
         sub['investigations']=[dict(id=q,disposition='explained')]
@@ -284,8 +322,17 @@ def test_source_only_answer_and_exact_noop_keep_cost_without_revisions(tmp_path)
             'interpretations':[dict(investigation_id=q,source_ids=['code','doc'],conclusion='explained',
                                     defect_claim=None,counterevidence=['Capacity branch handles the stated case'],rationale='The boundary branch is directly visible in the cited source')]},{}
     seen=[]
+    def source(state):
+        summary=operation_summary(e.state,e.root)
+        assert not summary.get('no_change') and summary['interpretation_changes']
+        return {'rationale':'Retain another declaration locator for later source work',
+            'sources':[dict(id='source-alias',file='target.py',start_line=1,end_line=2,kind='code_observation')]},{}
     def duplicate(state):
-        assert 'reselection' in operation_summary(e.state,e.root)
+        summary=operation_summary(e.state,e.root)
+        assert 'reselection' in summary and not summary.get('no_change')
+        assert not summary['questions'] and 'interpretation_changes' not in summary
+        assert summary['effects']==[dict(object='sources',action='create',target='source-alias')]
+        assert not {'progress','no_progress','uncited_executions','latest_actual_execution'} & summary.keys()
         seen.append(state)
         return answer(state)
     def finish(state):
@@ -298,12 +345,12 @@ def test_source_only_answer_and_exact_noop_keep_cost_without_revisions(tmp_path)
         assert not feedback['questions']
         assert feedback['allocation']['agent_calls']==e.config.budget.agent_calls-state['usage']['agent_calls']
         assert 'already retained' in feedback['next'] and 'still consumed' in feedback['next']
-        assert 'do not repeat closing submissions' in feedback['next'] and 'reselection' in feedback
+        assert 'missing citations are not a queue to clear' in feedback['next'] and 'reselection' in feedback
         return stop(state)
-    e,repo=engine_for(tmp_path,[first,answer,duplicate,finish])
+    e,repo=engine_for(tmp_path,[first,answer,source,duplicate,finish])
     state=e.start(repo)
-    assert state.usage['agent_calls']==4 and state.usage.get('experiments',0)==0
-    assert len(list((e.root/'submissions').glob('*/raw.json')))==3
+    assert state.usage['agent_calls']==5 and state.usage.get('experiments',0)==0
+    assert len(list((e.root/'submissions').glob('*/raw.json')))==4
 
 
 @pytest.mark.parametrize('claim,disposition,gap', [
@@ -343,11 +390,18 @@ def test_necessary_gap_preserves_partial_answers_resolution_and_reopening(tmp_pa
         return sub,files
     def child(state):
         q=state['investigations'][0]['id']
+        receipt=next(c['id'] for c in state['checks'] if c.get('experiment_id'))
         return {'rationale':'Independent local child', 'investigations':[dict(ref='@child',parent_id=q,
             question='What does the return expression compute?',source_ids=['code'],disposition='explained')],
             'interpretations':[dict(investigation_id='@child',source_ids=['code'],conclusion='explained',defect_claim=None,
+                executions={receipt:[1]},joint_history='The child addresses the same observed call as its parent',
                 rationale='The actual expression returns zero at capacity')]},{}
     def answer(state):
+        questions=operation_summary(e.state,e.root)['reselection']['questions']
+        assert {q['id'] for q in questions}=={q['id'] for q in state['investigations']}
+        parent,child=questions
+        assert parent['parent_id'] is None and parent['disposition']=='active'
+        assert child['parent_id']==parent['id'] and child['disposition']=='explained'
         gap=state['investigations'][0]['gaps'][0]['id']
         return opinion(state,answers={gap:dict(resolved=True,
             explanation='The cited local contract allows precisely this input; no distributed prefix is claimed')})
@@ -871,8 +925,9 @@ def test_knowledge_correction_traces_old_root_and_derived_revisions_and_accepts_
     def finish(state):
         summary=operation_summary(e.state,e.root)
         old,current=state['investigations']
-        actual=summary['latest_actual_execution']
-        assert actual['investigation_id']==current['id']
+        assert 'latest_actual_execution' not in summary
+        index=json.loads((e.root/'research.json').read_text())
+        assert index['investigations'][1]['latest_execution']['experiment_id']==state['experiments'][1]['id']
         assert [q['id'] for q in summary['questions']]==[old['id']]
         correction=summary['knowledge_corrections'][0]
         expected=[old['id'],state['experiments'][0]['id'],state['interpretations'][0]['id']]

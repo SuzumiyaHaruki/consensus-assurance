@@ -1,0 +1,118 @@
+{
+  "rationale": "Open a third investigation in a different mechanism (client contracts and authority transitions): the Node wrapper's proposal channel. The target's own comment at node.go:409-411 calls the channel reset 'not very sound and likely has bugs', and applying a configuration change that adds the node back does not appear to restore it, so a draft probe was written and run natively. The native run blocked the proposal after the re-add, but it also showed that the probe's readings are taken before the node's run loop has processed a Step, so the observation cannot yet separate the two competing causes; this update records the lead, the sources, the behaviour, the inconclusive native run and the discriminator instead of claiming a defect.",
+  "sources": [
+    {
+      "id": "node-propc-guard",
+      "file": "node.go",
+      "start_line": 400,
+      "end_line": 432,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node-propc-restore",
+      "file": "node.go",
+      "start_line": 343,
+      "end_line": 380,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node-propose-block",
+      "file": "node.go",
+      "start_line": 514,
+      "end_line": 551,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node-propose-doc",
+      "file": "node.go",
+      "start_line": 138,
+      "end_line": 140,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@node-propose-after-readd",
+      "question": "Does the Node wrapper let an application propose again through a node that was removed from the configuration and then added back while the leadership and term are unchanged?",
+      "source_ids": [
+        "node-propc-guard",
+        "node-propc-restore",
+        "node-propose-block",
+        "node-propose-doc"
+      ],
+      "hypothesis": "node.run sets propc to nil when an applied configuration change removes the local node (okBefore && !okAfter and the node is in neither Voters nor VotersOutgoing) and restores it only in the leadership-change branch when a leader is known; applying the change that adds the node back takes the okBefore=false path, so nothing restores the channel. Node.Propose then selects on the nil channel and returns only through the caller's context or the node's done channel, so the re-added member cannot propose until a leadership change occurs.",
+      "discriminator": "Whether Propose returns nil for the same application sequence when the node's run loop has demonstrably processed the removal and the re-add (member true, known leader unchanged), and whether a deliberate leadership change makes it return nil again in the same run.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@k-propc-removal",
+      "kind": "behavior",
+      "statement": "node.run sets its proposal channel to nil when an applied configuration change removes the local node from Progress and that node appears in neither cs.Voters nor cs.VotersOutgoing, and restores the channel from n.propc only in the branch that reacts to a change of r.lead with a leader known; applying a change that adds the node back does not restore the channel.",
+      "conditions": "Node wrapper (node.run) driven through ApplyConfChange; the removal is applied while the node is in Progress and the addition is applied while it is not.",
+      "source_ids": [
+        "node-propc-guard",
+        "node-propc-restore"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@k-propose-nil-channel",
+      "kind": "behavior",
+      "statement": "With the proposal channel nil - either because the node was removed or because no leader is known - Node.Propose sends into a nil channel inside a select that also watches the caller's context and the node's done channel, so the call blocks until one of those fires and then returns ctx.Err() or ErrStopped.",
+      "conditions": "Node.Propose/stepWait with the run loop's propc variable nil.",
+      "source_ids": [
+        "node-propose-block",
+        "node-propc-restore",
+        "node-propose-doc"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@node-propose-after-readd",
+      "experiment_id": null,
+      "source_ids": [
+        "node-propc-guard",
+        "node-propc-restore",
+        "node-propose-block",
+        "node-propose-doc"
+      ],
+      "executions": {},
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Source account: node.run closes the proposal channel when an applied configuration change removes the local node from the configuration (the guard requires that the node was in Progress before, that it is not in Progress afterwards, and that it appears in neither the incoming nor the outgoing voter list), and the only place that re-opens it is the branch that reacts to a leadership change with a leader known. A node added back by a later change takes the okBefore=false path in that same case, so the channel is left closed while the leader and term stay the same; Node.Propose then selects on a nil channel and can only return through the caller's context or the node's done channel. The draft probe assurance_node_proposal_test.go drives a wrapped node 2 against a bare leader 1, removes and re-adds node 2 through the real propose/apply path, and compares Propose before the removal, after the re-add, and after a leadership change. The native run already shows the blocked proposal (Propose returned context deadline exceeded after the re-add, with the node registered again as a member and still knowing leader 1, and the leader's last index did not advance), but it is not yet admissible evidence: the probe read node 2's status immediately after delivering a message to it, and Node.Step only hands the message to the run loop, so the same run's control observation saw no leader yet and the witness cannot be separated from the competing explanation that the channel was closed because no leader was known at that moment. The next action is to make the probe wait for the observable transition (member and known leader as seen by the reader) before each observation and to keep the leadership-change control, which would let the two explanations be distinguished; no defect is claimed until then.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The Node.Propose documentation states that proposals can be lost without notice and that ensuring retries is the caller's job (node.go:138-140), so a blocked or failed proposal on a re-added node overlaps with behaviour callers are warned about; the specific claim to test is the permanent unavailability of the channel while the node is a member and a leader is known.",
+        "The native run's control was taken before node 2 had observed any leader, and with no leader known the channel is nil by the same design (the run loop closes it in the lead-change branch), so the observed block in that run does not by itself identify the removal as the cause."
+      ],
+      "limitations": [
+        "Only a native draft run exists so far; there is no retained receipt for this probe, and the probe's own sampling must be corrected before an execution would be meaningful.",
+        "The harness drives a wrapped node against a bare raft rather than two application-driven nodes, so the wrapper's asynchronous ready/advance contract is exercised on one side only.",
+        "Whether an application is expected to keep proposing through a node that has been removed and re-added is itself part of the question; the library's own comment calls the current mechanism unsound rather than documenting an intended semantics."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

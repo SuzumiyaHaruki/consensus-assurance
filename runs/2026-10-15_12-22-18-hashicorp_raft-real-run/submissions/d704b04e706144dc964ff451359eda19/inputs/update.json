@@ -1,0 +1,306 @@
+{
+  "rationale": "Repaired the probe harness after the first execution returned no parsed observations: the three emitted CA_EVENT objects had no event name, so the controller rejected each as invalid_observation (receipt c0da4c5aa60d4db2bfe60f897e36bc32, exit 0, tests_passed, 3 parsing errors, 0 events). The harness now emits a named assurance_partition_setup event before the partition and a named assurance_verify_leader_result event after it, and the revised experiment declares the setup event as a prerequisite/admission with three comparisons, one per partition case. This update also adds a source Behaviour closing a rival explanation for the consequence: runtime configuration reloads run the same ValidateConfig, so LeaderLeaseTimeout cannot be raised above HeartbeatTimeout at runtime, and it registers the resulting necessary gap about what legal condition could still overlap a successor election with an old leader that reports verify success.",
+  "sources": [
+    {
+      "id": "verify_leader",
+      "file": "raft.go",
+      "start_line": 966,
+      "end_line": 988,
+      "kind": "code_observation"
+    },
+    {
+      "id": "quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1095,
+      "kind": "code_observation"
+    },
+    {
+      "id": "lease_check",
+      "file": "raft.go",
+      "start_line": 1037,
+      "end_line": 1090,
+      "kind": "code_observation"
+    },
+    {
+      "id": "start_stop_repl",
+      "file": "raft.go",
+      "start_line": 579,
+      "end_line": 651,
+      "kind": "code_observation"
+    },
+    {
+      "id": "follower_vote_grant",
+      "file": "raft.go",
+      "start_line": 1694,
+      "end_line": 1712,
+      "kind": "code_observation"
+    },
+    {
+      "id": "notify_all",
+      "file": "replication.go",
+      "start_line": 98,
+      "end_line": 117,
+      "kind": "code_observation"
+    },
+    {
+      "id": "update_last_appended",
+      "file": "replication.go",
+      "start_line": 655,
+      "end_line": 665,
+      "kind": "code_observation"
+    },
+    {
+      "id": "heartbeat_ack",
+      "file": "replication.go",
+      "start_line": 400,
+      "end_line": 440,
+      "kind": "code_observation"
+    },
+    {
+      "id": "install_snapshot_ack",
+      "file": "replication.go",
+      "start_line": 365,
+      "end_line": 378,
+      "kind": "code_observation"
+    },
+    {
+      "id": "verify_vote",
+      "file": "future.go",
+      "start_line": 236,
+      "end_line": 293,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_verify_leader",
+      "file": "api.go",
+      "start_line": 928,
+      "end_line": 941,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_validation",
+      "file": "config.go",
+      "start_line": 360,
+      "end_line": 389,
+      "kind": "code_observation"
+    },
+    {
+      "id": "reload_config",
+      "file": "api.go",
+      "start_line": 761,
+      "end_line": 789,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@verify_quorum",
+      "question": "When the leader of a cluster that includes a non-voter can reach only that non-voter, does VerifyLeader's success still establish the voter-majority contact its stale-read protection is meant to provide?",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "start_stop_repl",
+        "notify_all",
+        "update_last_appended",
+        "heartbeat_ack",
+        "verify_vote",
+        "api_verify_leader"
+      ],
+      "hypothesis": "VerifyLeader returns nil in that partition because the non-voter's AppendEntries acknowledgement is counted as a vote toward a quorum sized only over voters: quorumSize() counts voters in the latest configuration, while verifyFuture.vote increments on any notifyAll(true) arriving from any replication peer. Without any reachable peer the same call does not succeed, so the acknowledging non-voter is what satisfies the quorum.",
+      "discriminator": "The returned endpoint of VerifyLeader at a leader partitioned so that (a) only the non-voter is reachable, (b) one voter is reachable, and (c) no peer is reachable, together with the quorum size and the suffrage of each server in the leader's latest configuration."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@verify_counts_nonvoter",
+      "kind": "behavior",
+      "statement": "VerifyLeader counts acknowledgements from non-voters toward a voter-sized quorum, so it can report success for an interval in which the leader has had no successful interaction with any other voter. verifyLeader registers every entry of leaderState.replState (which startStopReplication creates for every configured server except the leader itself, without consulting Suffrage) on repl.notify, so each of those peers is asked to acknowledge; a successful AppendEntries reply (updateLastAppended and the heartbeat path) or a successful InstallSnapshot replies with notifyAll(true), which calls verifyFuture.vote(true) and increments votes; the threshold compared against is quorumSize(), computed as (voters in configurations.latest)/2+1. Every other leadership-quorum test in the same package restricts eligibility to voters: checkLeaderLease skips non-voter servers in its contacted count and requestVote rejects a candidate without a vote, so the two leadership tests disagree about whose support counts.",
+      "conditions": "A leader whose latest configuration (configurations.latest) contains a server with Suffrage other than Voter, and which can still exchange AppendEntries or InstallSnapshot RPCs with that server. With three voters and one non-voter, quorumSize() is 2, so the leader's own vote plus one non-voter acknowledgement reaches the threshold.",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "start_stop_repl",
+        "notify_all",
+        "update_last_appended",
+        "heartbeat_ack",
+        "install_snapshot_ack",
+        "verify_vote",
+        "lease_check",
+        "follower_vote_grant"
+      ]
+    },
+    {
+      "ref": "@lease_voter_only",
+      "kind": "behavior",
+      "statement": "The leader's own leadership lease is computed over voters only: checkLeaderLease counts itself plus those servers in configurations.latest whose Suffrage is Voter and whose followerReplication last contact is within LeaderLeaseTimeout, and steps down when that count is below quorumSize(). A leader therefore stops counting an unreachable voter as contacted and steps down within roughly LeaderLeaseTimeout of the last successful interaction, while a follower cannot campaign before ElectionTimeout has elapsed since it last heard from a leader.",
+      "conditions": "A configuration accepted by Config.Validate, which requires 5ms <= LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout; the lease check is driven by the leader's own timer and by the last-contact times its replication goroutines record.",
+      "source_ids": [
+        "lease_check",
+        "quorum_size",
+        "config_validation"
+      ]
+    },
+    {
+      "ref": "@reload_keeps_lease_bounds",
+      "kind": "behavior",
+      "statement": "Runtime configuration reload enforces the same timeout bounds as initial construction: ReloadConfig applies the reloadable fields onto the current configuration and returns the error from ValidateConfig before storing it, so LeaderLeaseTimeout can never exceed HeartbeatTimeout, nor HeartbeatTimeout exceed ElectionTimeout, on a running node. A leader cannot therefore be given a longer lease than a follower's election timeout through the public reload API.",
+      "conditions": "A call to Raft.ReloadConfig on a running node with a protocol-supported configuration; the check is performed under r.confReloadMu before the new configuration is stored, and on failure the previous configuration remains in force.",
+      "source_ids": [
+        "reload_config",
+        "config_validation",
+        "lease_check"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@verify_quorum",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "start_stop_repl",
+        "notify_all",
+        "verify_vote",
+        "api_verify_leader",
+        "lease_check",
+        "config_validation",
+        "reload_config"
+      ],
+      "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM, and the question asks whether its success establishes the voter-majority contact that role implies. The source trace says no: verifyLeader registers every entry of leaderState.replState, which startStopReplication creates for every configured server except the leader without consulting Suffrage, so non-voters are asked to acknowledge; any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, while the threshold compared against is quorumSize(), counted over voters alone. With three voters and one non-voter the threshold is 2, so the leader's own vote plus the non-voter's acknowledgement is a success. The same package treats voter eligibility strictly everywhere else: checkLeaderLease does not count a non-voter in its contacted tally, requestVote refuses a candidate that has no vote, and quorumSize itself counts voters only, so the verify path is the odd one out rather than a deliberate relaxation. The consequence for reads is bounded, not unconditional. Under a validated configuration the leader's lease is also voter-only and normally removes the old leader before a voter majority can elect a successor, and ReloadConfig re-validates the bounds at runtime, so a leader cannot be given a lease longer than a follower's election timeout. What remains unconditionally wrong is narrower and still real for a caller: VerifyLeader returns success for an interval in which the leader has exchanged nothing with any other voter, and the guarantee a client actually relies on is then being carried by the lease timer instead of by the acknowledgements VerifyLeader collected. The requested probe fixes the acknowledging peer's identity independently of the outcome: the partition selects which peer stays reachable, case identity is the case name and leader ID, and the non-voter is joined through the leader's own AddNonvoter path. Each case now emits a placement event before the partition and a result event after it, so the result comparison's admission cannot be the result event itself.",
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "counterevidence": [
+        "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; this bounds the stale-read consequence rather than showing VerifyLeader's decision support to be adequate.",
+        "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so the old leader cannot be configured to outlive a follower's election timer; the new-leader half of a stale read is normally prevented by the lease rather than by the verify quorum."
+      ],
+      "limitations": [
+        "No parsed observation exists yet for this question. The first execution (receipt c0da4c5aa60d4db2bfe60f897e36bc32) completed with exit code 0 and tests_passed but produced 3 invalid_observation events and no parsed events, because the harness emitted CA_EVENT objects without the required event name; that is a harness format fault and cannot be used as evidence either way. The corrected harness is submitted in this update as a revision of the same experiment.",
+        "The account is therefore still source-based; the recorded prediction is that the non-voter-only partition returns verify_error nil while the no-reachable-peer partition does not, with the voter-only partition as the positive control that an acknowledgement from a voter also succeeds.",
+        "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks.",
+        "The stale-read consequence needs a successor elected while the old leader still reports verify success; the registered gap records that no such legal condition has been identified, so the consequence stays conditional while the weaker claim above does not depend on it."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@verify_quorum",
+    "harness_path": "assurance_generated_test.go",
+    "previous_id": "3b823834c8cb46da98e77d8e988bf5d9-experiment",
+    "revision_reason": "The previous harness emitted CA_EVENT objects without an event name, so the controller rejected all three as invalid_observation and no observation could be interpreted. This revision only changes the observation format: each case now emits a named assurance_partition_setup event before the partition and a named assurance_verify_leader_result event afterwards, carrying the same measured fields, and declares the setup event as a prerequisite admission with one comparison per partition case.",
+    "source_ids": [
+      "verify_leader",
+      "quorum_size",
+      "start_stop_repl",
+      "notify_all",
+      "update_last_appended",
+      "heartbeat_ack",
+      "verify_vote",
+      "api_verify_leader"
+    ],
+    "scope": {
+      "description": "Observe VerifyLeader's returned endpoint at the leader of a four-server cluster (three voters plus one non-voter) after partitioning the leader away from the voter majority, comparing a partition that keeps only the non-voter reachable, one that keeps one voter reachable, and one that keeps no peer reachable. Each case emits a setup event with the leader ID and address, the voters and non-voters read from the leader's latest configuration, the voter count, the quorum size and the reachable-peer flags, and a result event with the leader's state, term, the VerifyLeader result and the elapsed time.",
+      "assumptions": [
+        "Three voters plus one non-voter is a supported configuration; the non-voter is added through the leader's AddNonvoter API rather than by constructing configuration state directly.",
+        "HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms and CommitTimeout = 5ms satisfy Config.Validate.",
+        "Disconnecting both directions across the partition boundary models a network split rather than closing a node, so the leader keeps running and its lease timer still fires."
+      ],
+      "excluded": [
+        "The stale-read half of the consequence: no successor election is expected to complete inside the observation window at these timeouts."
+      ]
+    },
+    "prefix": "Each case builds four real Raft instances in one process, each with its own InmemStore, InmemSnapshotStore and InmemTransport; the transports are fully connected before any node is started. The three voters are bootstrapped with BootstrapCluster from a configuration naming all three as Voter; the fourth node is started without a configuration and joined through the elected leader's own AddNonvoter(id, address, 0, 5s) call, and the case waits until the leader's latest configuration reports the non-voter before proceeding. After a 300ms settling period the case emits assurance_partition_setup, then disconnects the transports in both directions across the chosen boundary, so only the listed peers remain reachable from the leader. The observation then calls VerifyLeader() on the leader and reports nil, a concrete error string, or pending after a 900ms wait, followed by assurance_verify_leader_result carrying the same case and leader identity. The peer kept reachable as a voter is chosen by position in the bootstrap configuration and the non-voter by its join identity, never by a measured result. Each case runs in a fresh cluster; the harness is TestAssuranceVerifyLeaderNonvoterQuorum.",
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "assurance_partition_setup"
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "assurance_verify_leader_result",
+        "identity_fields": [
+          "case",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "eq",
+          "value": "nil"
+        },
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "voter_reachable",
+            "op": "eq",
+            "value": false
+          }
+        ],
+        "description": "Non-voter only reachable: the leader succeeds even though no other voter acknowledged. Holds means the predicted success was observed, which supports the defect account rather than contradicting it."
+      },
+      {
+        "event": "assurance_verify_leader_result",
+        "identity_fields": [
+          "case",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "eq",
+          "value": "nil"
+        },
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "voter_reachable",
+            "op": "eq",
+            "value": true
+          }
+        ],
+        "description": "One voter reachable: positive control that a voter acknowledgement also produces success."
+      },
+      {
+        "event": "assurance_verify_leader_result",
+        "identity_fields": [
+          "case",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "ne",
+          "value": "nil"
+        },
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable",
+            "op": "eq",
+            "value": false
+          },
+          {
+            "field": "voter_reachable",
+            "op": "eq",
+            "value": false
+          }
+        ],
+        "description": "No peer reachable: control showing that success requires some acknowledged peer, so the non-voter-only success is not available to the leader on its own vote."
+      }
+    ]
+  },
+  "gaps": [
+    {
+      "investigation_id": "@verify_quorum",
+      "question": "Which legal condition, if any, lets a successor be elected while the old leader still reports VerifyLeader success, given that the leader lease counts voters only and ReloadConfig cannot raise LeaderLeaseTimeout above HeartbeatTimeout?",
+      "experiment_id": null
+    }
+  ]
+}

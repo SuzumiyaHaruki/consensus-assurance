@@ -1,0 +1,108 @@
+{
+  "rationale": "Interpret the CheckQuorum multi-voter execution (CheckRun 11c411f5e9734ad6bb95fffd61f1b7c8, fixed experiment f87487ff302344ad90063b266f2302f5-experiment): all five comparisons resolved and the witness is violated, so the account gains a fifth configuration and has to correct one of its own bounds - the one-tick end of the exposure does not hold where no replacement leader can be elected.",
+  "investigations": [
+    {
+      "id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+      "discriminator": "Whether an application using the Node wrapper is handed the same stale index, or the same unanswered request, as the raft-level witnesses; and whether the voters of a multi-voter remainder eventually elect a replacement once their own election timers run, or stay in the removed leader's lease indefinitely."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+      "experiment_id": "f87487ff302344ad90063b266f2302f5-experiment",
+      "source_ids": [
+        "tracker-singleton",
+        "readindex-singleton-branch",
+        "readindex-follower-forward",
+        "readindex-forwarded-response",
+        "readonlysafe-doc",
+        "heartbeatresp-readonly",
+        "readonly-maybeadvance",
+        "prop-removed-leader",
+        "switchtoconfig-removal",
+        "config-stepdown-doc",
+        "inlease-vote-guard",
+        "node-readindex-contract",
+        "readme-linearizable"
+      ],
+      "executions": {
+        "11c411f5e9734ad6bb95fffd61f1b7c8": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "79d6bcb6f89a41dbbd391a742cdf9916": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "815614d02b874bc8b0661039ae0552da": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "c72c66880fd9498ca1efb95774b0b06e": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "8090da09e0d44e13af56696a62f13d45": [
+          12,
+          13,
+          14,
+          15,
+          16
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Five receipts now cover the same removal in five configurations, and none of them produces the safe outcome the question allows. Source side: tracker.IsSingleton is a size test whose comment asserts that the single voting member is the leader (tracker/tracker.go:158-162); stepLeader's MsgReadIndex case answers from that test without a round (raft.go:1354-1361) and otherwise takes the read-only path, in which it adds the request and counts its own acknowledgement before broadcasting heartbeats; the answer leaves as a MsgReadIndexResp whenever the requester is another node (raft.go:2072-2087) and a follower forwards its read to the leader it knows (raft.go:1764-1770); the write path refuses proposals from a leader that is not in the configuration (raft.go:1294-1303) while the read path has no such guard, and applying a committed removal of the leading node leaves it leading under the default StepDownOnRemoval=false (raft.go:1985-2012, 282-287); a voter inside its election-timeout lease ignores a vote request from a higher term (in-lease guard), which is why a remainder that keeps hearing the removed leader elects nobody. Measured: (1) singleton remainder, CheckQuorum - the stale answer at parsed index 14 of the first receipt against the actual leader's committed index, that leader's control answer at parsed index 4, the one-tick step-down at parsed index 15 and the unanswered read afterwards at parsed index 16; (2) singleton remainder, PreVote - same shape, every comparison resolved; (3) forwarded route, PreVote singleton - the learner consumes the answer as its own read state with index 4 violated against the actual leader's committed 4 (receipt 815614d0 indices 3-4), control at 5, one-tick step-down (6), retry unanswered (7); (4) two-voter remainder, PreVote - the shortcut cannot apply at its parsed index 1, the removed leader takes the request into readOnly at its parsed index 3, steps down after one tick at its parsed index 4 and the accepted request is gone with no answer and no refusal at its violated parsed index 5; (5) two-voter remainder, CheckQuorum - the removal leaves node 1 leading voters (2 3) at its parsed index 1, three heartbeat rounds pass with node 2 and node 3 still followers at term 1 and no replacement elected at its holding parsed index 2, the read is taken into readOnly with two heartbeats broadcast at its holding parsed index 3, and after three further rounds node 1 is still the leader and the request is answered at its violated parsed index 4 (state_is_leader true, read_answered true, unconfirmed_reads back to 0, read_states 1). The last receipt therefore corrects the account's earlier bound: the one-tick end of the exposure is not a property of the quorum option alone but of a replacement leader existing - in the singleton remainder the remaining voter elects itself, and under PreVote the voters grant a new election, while with CheckQuorum and a multi-voter remainder the voters keep answering the removed leader, refuse each other's votes inside their leases, and elect nobody, so the removed leader keeps leading and answers the read from a round whose quorum it counted itself into although it is not one of the configuration's voters. The outcome is safe in none of the five configurations: a frozen index is handed out where the shortcut applies, an accepted request is lost without answer or refusal where the remainder is larger and the leader's term turns, and where CheckQuorum holds the voters in lease the removed leader keeps serving from a round the current configuration did not confirm.",
+      "counterevidence": [
+        "The controls hold in the singleton receipts (parsed index 4 of 8090da09e0d44e13af56696a62f13d45, parsed index 5 of 815614d02b874bc8b0661039ae0552da): the node that is the configuration's voter answers its own read with an index that covers its commit index, so the defect is the answering node's membership, not the singleton answer itself.",
+        "The CheckQuorum multi-voter receipt hands out no stale index: no new leader exists there and no entry is committed behind the removed leader's back (both committed indices are 2), so what the receipt shows is that the answering round counted the removed leader's own acknowledgement - a confirmation defect, not yet a stale read.",
+        "The same receipt's setup event still carries the field prevote:true, a label copied from the PreVote harness the file was derived from; the executed configuration set Config.CheckQuorum=true and left PreVote false, as the scope of the fixed experiment states.",
+        "The voters in that receipt were never ticked, so their election timers did not expire; the receipt shows that the removed leader keeps its lease over six rounds it initiates, not that a ticked voter could never campaign and win.",
+        "The two-voter PreVote receipt shows the opposite outcome in the same membership shape (the accepted request is lost without an answer), so the multi-voter defect is configuration-dependent: PreVote ends the leadership, CheckQuorum holds it.",
+        "The Node.ReadIndex contract tells callers that requests can be lost without notice and that retries are their duty (node.go:218-224); the receipts add that in this state nothing in the request's path refuses the caller, so only an application that retries unconditionally is safe."
+      ],
+      "limitations": [
+        "Every scenario needs an application that applies the committed change removing the leading node while Config.StepDownOnRemoval is false and keeps that node running; applications that set the option, or that stop the removed node, do not reach the state.",
+        "The witnesses are at the ReadIndex contract level: the receipts show the index handed to the reader (locally or across the wire), or the request disappearing, or a round that counted a non-member - no state machine was run, so a served value that misses an entry is a consequence of the contract rather than a measured value.",
+        "The tick ratio is one heartbeat tick against ten election ticks in all five configurations; the multi-voter CheckQuorum receipt delivers no ticks to the voters, so the length of that exposure is unbounded within the receipt.",
+        "The lease-based configuration is still supported by source reading rather than by a retained receipt, and read-only rounds that fail (a leader that cannot reach a quorum) are not measured."
+      ],
+      "knowledge": [
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-0",
+          "revision": 1,
+          "assertion": "IsSingleton is a size-only test over the configuration and never compares the single voter with the local node."
+        },
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-1",
+          "revision": 1,
+          "assertion": "StepLeader answers MsgReadIndex locally whenever IsSingleton holds, using its own commit index and without a round."
+        },
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-2",
+          "revision": 1,
+          "assertion": "A removed leader keeps leading by default while its proposals are refused and its read answers are not."
+        },
+        {
+          "entry_id": "47945d2fd63048e7b016caa61e6e2d26-knowledge-0",
+          "revision": 1,
+          "assertion": "Lease-based reads force CheckQuorum, and the lease makes voters refuse higher-term vote requests while they still hear the leader."
+        }
+      ],
+      "joint_history": "All five receipts measure the same removal and read on one fixture family - a small group, the application proposing and applying the committed removal of the leading node, the removed leader keeping its leadership under the default StepDownOnRemoval=false, and a ReadIndex request then delivered to it - with the same decisive endpoints: the configuration the removed leader holds, what it does with the request, whether a replacement leader appears, and what the caller ends up with. Receipt 8090da09e0d44e13af56696a62f13d45 covers three scenarios of one harness; c72c66880fd9498ca1efb95774b0b06e repeats its CheckQuorum scenario with PreVote only; 815614d02b874bc8b0661039ae0552da uses the PreVote setting with a learner that forwards and holds its read; 79d6bcb6f89a41dbbd391a742cdf9916 keeps PreVote but lets the remainder have two voters, where the shortcut cannot apply and the request is lost with the leadership; 11c411f5e9734ad6bb95fffd61f1b7c8 uses the same two-voter membership with CheckQuorum, where no replacement is elected and the request is answered instead. The five receipts agree on every shared endpoint and differ exactly along the two axes they were built to separate: the size of the remainder and which quorum option is enabled."
+    }
+  ]
+}

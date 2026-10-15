@@ -1,0 +1,49 @@
+{
+  "rationale": "Interpret the retained execution of the Node-wrapper proposal probe (CheckRun 8b3e88d4b4a641fa8ddc723ecc0ba56d, fixed experiment 7f6aa45d046c4714992282dd5e6d8389-experiment): the control comparison holds, both witness comparisons are violated with a complete valid witness, and four comparisons came back unknown because the compared fields are nested under node2_state in the events rather than at the event top level - a field-shape artifact of my specification, whose values are visible in the same receipt's events. The account therefore becomes execution-backed for the witness and its control, and the question's second discriminator item (the leadership-change restore path) stays unmeasured.",
+  "interpretations": [
+    {
+      "investigation_id": "05a1b54cf0ce4ce0bcd9e888623b8fae-question-0",
+      "experiment_id": "7f6aa45d046c4714992282dd5e6d8389-experiment",
+      "source_ids": [
+        "node-propc-guard",
+        "node-propc-restore",
+        "node-propose-block",
+        "node-propose-doc"
+      ],
+      "executions": {
+        "8b3e88d4b4a641fa8ddc723ecc0ba56d": [
+          1,
+          2,
+          3,
+          4
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The account rests on this receipt. Source side: node.run sets its proposal channel to nil when an applied configuration change removes the local node from Progress and the node appears in neither cs.Voters nor cs.VotersOutgoing (node.go:400-432), it restores the channel from n.propc only in the branch that reacts to a change of r.lead with a leader known (node.go:343-380), and Node.Propose sends into that channel inside a select that also watches the caller's context and the node's done channel (node.go:514-551), so a nil channel turns the call into a wait for the caller's deadline; the target's own comment calls this reset 'not very sound and likely has bugs' (node.go:409-411) and the only documented caveat is that proposals can be lost without notice (node.go:138-140). Executed interval on a two-voter group {1,2} with node 2 driven through the Node wrapper: parsed index 1, while node 2 is a plain member that knows leader 1 it proposes successfully - Propose returns no error in 0ms and the leader's log index advances to 2, so the wrapper's proposal path works and the follower does forward to its leader; parsed index 2, after the application applied the removal on both nodes the leader's configuration is voters=(1) and no longer contains node 2, while node 2 remains a follower that still knows leader 1 at term 1; parsed index 3, after the application applied the re-add on both nodes the leader's configuration is voters=(1 2) again and node 2 has caught up to the leader's log (committed and applied 4, leader last index 4), still in the same term with the same known leader; parsed index 4, Propose through that node now returns only when its 300ms context deadline fires ('context deadline exceeded', measured 300ms) and the leader's log index is unchanged (4 before and after), so the proposal never reaches the group. Both witness comparisons are violated with a complete witness (proposal_returned_error expected false; leader_advanced expected true) and the control holds, while the four comparisons that read leader_sees_member, known_leader, leader_advanced and the state fields of the removal and re-add events came back unknown because those fields are nested under the events' node2_state object - their values are present in the same receipt (events 2 and 3) but the comparisons could not read them at the top level; that is a specification artifact, not a missing observation, and it is not repaired by rerunning for labels. The claim is therefore scoped: a node that the application has added back to the configuration, and that knows the leader of that configuration in the same term, cannot hand a proposal to raft through the Node interface - the wrapper holds it until the caller's context expires - while the same node's proposal succeeded before it was removed; the mechanism the source identifies for restoring the channel is a leadership change, which no longer happens in this state.",
+      "counterevidence": [
+        "The control comparison holds (parsed index 1): the same call on the same node before the removal returns no error and the leader's log index advances, so the Node wrapper's proposal path and its forwarding to the leader are intact in that state.",
+        "The Node.Propose documentation warns that proposals can be lost without notice and that retries are the caller's job (node.go:138-140), so a caller that uses a deadline and retries elsewhere is not blocked; the specific defect is that the channel stays closed while the node is a member again and a leader is known, i.e. the document's warning does not describe this cause.",
+        "Four comparisons of this receipt are unknown because of the field nesting described above, so the removal and re-add premises are read from the receipt's raw events rather than from completed comparisons; the witness comparisons themselves completed with their prerequisite chain matched (correlations show indices 0-3)."
+      ],
+      "limitations": [
+        "The harness drives a wrapped node against a bare raft instance, so the wrapper's asynchronous ready/advance contract is exercised on one side only, and both nodes run in one process.",
+        "The proposed call uses a 300ms deadline; the receipt measures that the call did not complete within it and that the group's log did not change, not how long the channel would stay closed in absolute terms (the source supports that it stays closed until the leadership changes).",
+        "The leadership-change restore path named in the question's discriminator was not exercised: the draft's campaign attempt did not win, and no basis has measured that a leadership change re-opens the channel.",
+        "Whether an application is expected to keep proposing through a node that has been removed and re-added is itself part of the question; the library's own comment calls the current mechanism unsound rather than documenting an intended semantics."
+      ],
+      "knowledge": [
+        {
+          "entry_id": "05a1b54cf0ce4ce0bcd9e888623b8fae-knowledge-0",
+          "revision": 1,
+          "assertion": "The proposal channel is closed by the removal guard and restored only by a leadership change with a leader known."
+        },
+        {
+          "entry_id": "05a1b54cf0ce4ce0bcd9e888623b8fae-knowledge-1",
+          "revision": 1,
+          "assertion": "With a nil proposal channel Propose blocks until the caller's context or the node's done channel fires."
+        }
+      ]
+    }
+  ]
+}

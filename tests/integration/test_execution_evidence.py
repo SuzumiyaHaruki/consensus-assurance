@@ -392,6 +392,14 @@ def test_separate_receipt_requires_association_and_successor_cannot_borrow_it(tm
         target_receipts(state, engine.root, {old_check.id: [1]}, experiment_id=state.experiments[1].id)
     assert len(state.interpretations[0].executions) == 2
     assert state.experiments[0].id != state.experiments[1].id
+    from consensus_assurance.workflow.research import current_view
+    old, revised = current_view(state, engine.root)['experiments']
+    assert old['version'] == 1 and old['previous_id'] is None
+    assert revised['version'] == 2 and revised['previous_id'] == old['experiment_id']
+    assert revised['revision_reason'] == 'Change the stated responsibility and execute it'
+    saved = json.loads((engine.root / revised['basis']).read_text())
+    assert revised['difference_fields'] == list(saved['difference']) == ['requirement']
+    assert (engine.root / revised['harness']).read_text() == saved['basis']['harness']['source']
 
 
 def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(tmp_path):
@@ -401,11 +409,13 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
 
     def changed(state):
         assert state['current_submission']['no_change']
-        from consensus_assurance.workflow.research import operation_summary
+        from consensus_assurance.workflow.research import operation_summary, current_view
         summary=operation_summary(engine.state,engine.root)
         assert not summary['questions']
-        assert summary['uncited_executions'][0]['experiment_id']==state['experiments'][0]['id']
-        assert summary['latest_actual_execution']['id'] not in {id for i in state['interpretations'] for id in i['executions']}
+        assert 'uncited_executions' not in summary
+        result=current_view(engine.state,engine.root)['experiments'][0]['results'][0]
+        assert result['experiment_id']==state['experiments'][0]['id']
+        assert not result['interpretation_citations']['current']
         sub, files = duplicate(state)
         sub['experiment']['prefix'] += ' A changed assumption.'
         return sub, files
@@ -522,14 +532,23 @@ marker.write_text('observed one invocation')
     repeated=[]
     def repeat(state):
         repeated.append(state['current_submission']['no_change'])
-        return repeat_existing(state)
+        sub,_=repeat_existing(state)
+        return sub,{'check.py':"raise AssertionError('The current draft must not be executed by a repeat')\n"}
     def explain(state):
-        from consensus_assurance.workflow.research import operation_summary
+        from consensus_assurance.workflow.research import operation_summary, current_view
         checks=[c for c in state['checks'] if c.get('experiment_id')]
         summary=operation_summary(engine.state,engine.root)
         assert summary['questions'][0]['latest_interpretation']['executions']=={checks[0]['id']:[1]}
-        assert {c['id'] for c in summary['uncited_executions']}=={c['id'] for c in checks[1:]}
+        assert 'uncited_executions' not in summary
+        assert summary['questions'][0]['execution']['id']==checks[-1]['id']
+        results=current_view(engine.state,engine.root)['experiments'][0]['results']
+        assert {r['check_id'] for r in results if not r['interpretation_citations']['current']}=={c['id'] for c in checks[1:]}
         assert summary['effects']==state['current_submission']['effects']
+        effect=next(e for e in summary['effects'] if e['action']=='repeat_execution')
+        locator=effect['fixed_experiment']
+        assert locator['experiment_id']==state['experiments'][0]['id'] and locator['version']==1
+        assert (engine.root/locator['harness']).read_text()==source
+        assert 'current draft is not read' in effect['input_source']
         sub,_=opinion(state)
         value=sub['interpretations'][0]
         sub['interpretations']=[{**value,'executions':{c['id']:[1]},

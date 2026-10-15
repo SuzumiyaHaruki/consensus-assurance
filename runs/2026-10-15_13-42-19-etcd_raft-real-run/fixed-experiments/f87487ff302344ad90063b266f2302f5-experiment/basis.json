@@ -1,0 +1,238 @@
+{
+  "id": "f87487ff302344ad90063b266f2302f5-experiment",
+  "investigation_id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc assurance8Emit(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc assurance8IsVoter(r *raft) bool {\n\t_, ok := r.trk.Voters.IDs()[r.id]\n\treturn ok\n}\n\n// TestAssuranceReadIndexFromRemovedLeaderTwoVoterRemainderWithCheckQuorum observes\n// what happens to a ReadIndex request that reaches a leader whose removal left\n// a configuration with more than one voter, in the configuration in which only\n// PreVote is enabled: the request cannot use the singleton shortcut, so the\n// leader takes it into readOnly.unconfirmedReads and broadcasts heartbeats, and\n// the receipt records whether the caller is ever answered or refused.\nfunc TestAssuranceReadIndexFromRemovedLeaderTwoVoterRemainderWithCheckQuorum(t *testing.T) {\n\tconst scenario = \"removed-two-voter-remainder-read-checkquorum\"\n\n\tmk := func(id uint64) *raft {\n\t\tcfg := newTestConfig(id, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\t\tcfg.CheckQuorum = true\n\t\treturn newRaft(cfg)\n\t}\n\tn1, n2, n3 := mk(1), mk(2), mk(3)\n\tnt := newNetwork(n1, n2, n3)\n\tsetRandomizedElectionTimeout(n2, n2.electionTimeout*10)\n\tsetRandomizedElectionTimeout(n3, n3.electionTimeout*10)\n\n\tassurance8Emit(t, map[string]any{\n\t\t\"scenario\":       scenario,\n\t\t\"event\":          \"c_setup\",\n\t\t\"step\":           \"setup\",\n\t\t\"cluster\":        \"voters=(1 2 3)\",\n\t\t\"prevote\":        true,\n\t\t\"heartbeat_tick\": n1.heartbeatTimeout,\n\t\t\"election_tick\":  n1.electionTimeout,\n\t})\n\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\tfor _, n := range []*raft{n1, n2, n3} {\n\t\tnextEnts(n, n.raftLog.storage.(*MemoryStorage))\n\t}\n\n\tcc := &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(1))}\n\tm, err := confChangeToMsg(cc)\n\tif err != nil {\n\t\tt.Fatalf(\"conf change message: %v\", err)\n\t}\n\tm.From, m.To = new(uint64(1)), new(uint64(1))\n\tnt.send(m)\n\tccv2 := cc.AsV2()\n\tn1.applyConfChange(ccv2)\n\tn2.applyConfChange(ccv2)\n\tn3.applyConfChange(ccv2)\n\tfor _, n := range []*raft{n1, n2, n3} {\n\t\tnextEnts(n, n.raftLog.storage.(*MemoryStorage))\n\t}\n\n\tassurance8Emit(t, map[string]any{\n\t\t\"scenario\":        scenario,\n\t\t\"event\":           \"e_leader_removed\",\n\t\t\"step\":            \"leader-1-removed\",\n\t\t\"node\":            1,\n\t\t\"state\":           n1.state.String(),\n\t\t\"term\":            n1.Term,\n\t\t\"config\":          n1.trk.Config.String(),\n\t\t\"singleton\":       n1.trk.IsSingleton(),\n\t\t\"is_voter\":        assurance8IsVoter(n1),\n\t\t\"voter_count\":     len(n1.trk.Voters.IDs()),\n\t\t\"committed_index\": n1.raftLog.committed,\n\t})\n\n\t// The removed leader keeps hearing from the voters it still counts, so it\n\t// keeps its lease: three heartbeat rounds pass without a new leader.\n\trounds := 0\n\tfor rounds < 3 {\n\t\tn1.tick()\n\t\trounds++\n\t\tnt.send(n1.readMessages()...)\n\t}\n\totherCommitted := n2.raftLog.committed\n\n\tassurance8Emit(t, map[string]any{\n\t\t\"scenario\":                       scenario,\n\t\t\"event\":                          \"e_no_new_leader\",\n\t\t\"step\":                           \"no-replacement-after-heartbeat-rounds\",\n\t\t\"node\":                           2,\n\t\t\"state\":                          n2.state.String(),\n\t\t\"term\":                           n2.Term,\n\t\t\"config\":                         n2.trk.Config.String(),\n\t\t\"committed_index\":                otherCommitted,\n\t\t\"removed_leader_committed_index\": n1.raftLog.committed,\n\t\t\"removed_leader_state\":           n1.state.String(),\n\t\t\"removed_leader_term\":            n1.Term,\n\t\t\"node2_state\":                    n2.state.String(),\n\t\t\"node2_term\":                     n2.Term,\n\t\t\"node3_state\":                    n3.state.String(),\n\t\t\"node3_term\":                     n3.Term,\n\t\t\"heartbeat_rounds\":               rounds,\n\t\t\"new_leader_elected\":             n2.state == StateLeader || n3.state == StateLeader,\n\t})\n\n\t// The application issues the read through the removed leader.\n\tif err := n1.Step(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgReadIndex.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"R\")}}}); err != nil {\n\t\tt.Fatalf(\"read index: %v\", err)\n\t}\n\temitted := n1.readMessages()\n\theartbeats := 0\n\tfor _, msg := range emitted {\n\t\tif msg.GetType() == pb.MsgHeartbeat {\n\t\t\theartbeats++\n\t\t}\n\t}\n\tassurance8Emit(t, map[string]any{\n\t\t\"scenario\":                        scenario,\n\t\t\"event\":                           \"e_read_taken\",\n\t\t\"step\":                            \"read-via-removed-leader\",\n\t\t\"node\":                            1,\n\t\t\"state\":                           n1.state.String(),\n\t\t\"term\":                            n1.Term,\n\t\t\"singleton\":                       n1.trk.IsSingleton(),\n\t\t\"is_voter\":                        assurance8IsVoter(n1),\n\t\t\"state_is_leader\":                 n1.state == StateLeader,\n\t\t\"committed_entry_in_current_term\": n1.committedEntryInCurrentTerm(),\n\t\t\"read_states\":                     len(n1.readStates),\n\t\t\"pending_reads\":                   len(n1.pendingReadIndexMessages),\n\t\t\"unconfirmed_reads\":               len(n1.readOnly.unconfirmedReads),\n\t\t\"heartbeats_emitted\":              heartbeats,\n\t\t\"committed_index\":                 n1.raftLog.committed,\n\t\t\"other_committed_index\":           otherCommitted,\n\t\t\"read_pending_confirmation\":       len(n1.readStates) == 0 && len(n1.readOnly.unconfirmedReads) == 1,\n\t})\n\n\t// More rounds of the same heartbeats: the request is still unanswered.\n\tfor i := 0; i < 3; i++ {\n\t\tn1.tick()\n\t\tnt.send(n1.readMessages()...)\n\t}\n\tassurance8Emit(t, map[string]any{\n\t\t\"scenario\":                       scenario,\n\t\t\"event\":                          \"e_lease_after_rounds\",\n\t\t\"step\":                           \"state-after-further-heartbeat-rounds\",\n\t\t\"node\":                           1,\n\t\t\"state\":                          n1.state.String(),\n\t\t\"state_is_leader\":                n1.state == StateLeader,\n\t\t\"term\":                           n1.Term,\n\t\t\"lead\":                           n1.lead,\n\t\t\"read_states\":                    len(n1.readStates),\n\t\t\"read_answered\":                  len(n1.readStates) > 0,\n\t\t\"unconfirmed_reads\":              len(n1.readOnly.unconfirmedReads),\n\t\t\"pending_reads\":                  len(n1.pendingReadIndexMessages),\n\t\t\"removed_leader_committed_index\": n1.raftLog.committed,\n\t\t\"other_committed_index\":          otherCommitted,\n\t\t\"node2_state\":                    n2.state.String(),\n\t\t\"node2_term\":                     n2.Term,\n\t\t\"node3_state\":                    n3.state.String(),\n\t\t\"node3_term\":                     n3.Term,\n\t\t\"new_leader_elected\":             n2.state == StateLeader || n3.state == StateLeader,\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "esetup",
+          "event": "c_setup",
+          "conditions": []
+        },
+        {
+          "alias": "eremoved",
+          "event": "e_leader_removed",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "esetup.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "enolead",
+          "event": "e_no_new_leader",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "eremoved.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "eread",
+          "event": "e_read_taken",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "enolead.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "elease",
+          "event": "e_lease_after_rounds",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "eread.scenario"
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "tracker-singleton",
+      "readindex-singleton-branch",
+      "readonlysafe-doc",
+      "heartbeatresp-readonly",
+      "readonly-maybeadvance",
+      "prop-removed-leader",
+      "switchtoconfig-removal",
+      "config-stepdown-doc",
+      "node-readindex-contract",
+      "readme-linearizable"
+    ],
+    "anchors": [
+      {
+        "material_id": "tracker-singleton",
+        "symbol": "IsSingleton",
+        "start_line": 160,
+        "end_line": 160,
+        "anchor": {
+          "source_ids": [
+            "tracker-singleton"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "tracker-singleton",
+          "start_line": 160,
+          "end_line": 160,
+          "symbol": "IsSingleton"
+        }
+      },
+      {
+        "material_id": "stepleader-decl",
+        "symbol": "stepLeader",
+        "start_line": 1275,
+        "end_line": 1275,
+        "anchor": {
+          "source_ids": [
+            "stepleader-decl"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "stepleader-decl",
+          "start_line": 1275,
+          "end_line": 1275,
+          "symbol": "stepLeader"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Observe a ReadIndex request delivered to a leader whose removal the application applied and whose reduced configuration has two voters, with CheckQuorum enabled: node 1 is elected in {1,2,3}, the application proposes and applies the committed removal of node 1 on all three nodes, six heartbeat rounds of node 1 are delivered and pumped, a read is delivered to node 1, and three further heartbeat rounds are delivered and pumped before the request's state is recorded.",
+      "assumptions": [
+        "Three voters {1,2,3} with CheckQuorum enabled on every node and PreVote disabled; the election tick is 10 and the heartbeat tick is 1; node 1 is elected with a real MsgHup/MsgVote round.",
+        "The application applies the committed removal of node 1 on all three nodes, so node 1 keeps leading voters (2 3) under the default StepDownOnRemoval=false while the two remaining voters keep it as their leader.",
+        "No ticks are delivered to nodes 2 and 3, so their election timers do not expire and their leases stay in force; the receipt therefore measures the leaders' own rounds only."
+      ],
+      "excluded": [
+        "PreVote, and lease-based reads (which force CheckQuorum but bypass the round).",
+        "Snapshots, asynchronous storage writes, and any state machine behind the read index."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Elect node 1 in {1,2,3} with CheckQuorum enabled, apply the committed removal of node 1 on all three nodes, deliver three heartbeat rounds of node 1 and pump its messages, deliver MsgReadIndex to node 1 and read its emitted messages, deliver three more heartbeat rounds of node 1 and pump its messages, then record the request's fate and the state of all three nodes.",
+    "requirement": "A ReadIndex answer must let the application serve a linearizable read (raft.go:233-244 and README.md:27-32 state that ReadOnlySafe achieves linearizability by communicating with the quorum, and node.go:218-224 states that once the application advances past the returned read index, linearizable reads issued before the request can be processed safely). A leader that its own tracker shows is not in the configuration counts its own acknowledgement toward a round (raft.go:1600) whose quorum belongs to voters it is not one of, so the receipt records whether such a request is answered and whether the configuration replaces the leader at all.",
+    "responsibility": "raft (target): the MsgReadIndex path decides whether a leader that is not in its own configuration takes the request into a read-only round and which acknowledgements that round counts, and the lease path decides whether the remaining voters ever elect a replacement.",
+    "comparisons": [
+      {
+        "event": "e_leader_removed",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "esetup",
+        "assertion": {
+          "field": "singleton",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: after the removal node 1 still leads a configuration of two voters, so the singleton shortcut cannot decide this request."
+      },
+      {
+        "event": "e_no_new_leader",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "eremoved",
+        "assertion": {
+          "field": "new_leader_elected",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: three heartbeat rounds pass and the two remaining voters elect no replacement - they still answer the removed leader and their leases keep them from voting."
+      },
+      {
+        "event": "e_read_taken",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "enolead",
+        "assertion": {
+          "field": "read_pending_confirmation",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: the removed leader takes the request into readOnly.unconfirmedReads and broadcasts its heartbeats."
+      },
+      {
+        "event": "e_lease_after_rounds",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "eread",
+        "assertion": {
+          "field": "state_is_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: after three further rounds the removed leader is still the leader at its own term, so nothing in this configuration ends its lease."
+      },
+      {
+        "event": "e_lease_after_rounds",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "eread",
+        "assertion": {
+          "field": "read_answered",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Witness: the request is answered even though the answering node is not a voter of the configuration whose quorum the round needed - the round counted the removed leader's own acknowledgement, and no replacement leader exists to end the state."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "58d590a4e84744e08ee4d0473cd5f863",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "f87487ff302344ad90063b266f2302f5",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

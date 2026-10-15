@@ -18,6 +18,14 @@ def artifact(state, id):
     return FixedExperiment.model_validate(raw)
 
 
+def fixed_experiment_locator(fixed):
+    folder = f'fixed-experiments/{fixed.id}'
+    return {'experiment_id': fixed.id, 'investigation_id': fixed.investigation_id,
+            'version': fixed.version, 'previous_id': fixed.previous_id,
+            'revision_reason': fixed.revision_reason, 'difference_fields': list(fixed.difference),
+            'basis': folder + '/basis.json', 'harness': folder + '/' + fixed.harness_filename}
+
+
 def validate_basis(state, basis, implementation):
     from .knowledge import require_sources, require_uses
     from .locations import locate
@@ -183,13 +191,10 @@ def validate_failure(state, root, fixed, check, measurement, value):
 
 
 def assessment(state, root, fixed, check):
-    from .knowledge import open_gaps
+    from .knowledge import open_gaps, receipt_references
     value = observed(fixed, check, root)
     interpretations = [i for i in state.interpretations if i.experiment_id == fixed.id and check.id in i.executions]
     opinion = interpretations[-1] if interpretations else None
-    latest = {i.investigation_id: i.id for i in state.interpretations}
-    citations = [i for i in state.interpretations if check.id in i.executions]
-    current_citations = [i for i in citations if latest[i.investigation_id] == i.id]
     blockers = []
     if not fixed.basis.requirement:
         blockers.append('Exploratory basis has no fixed requirement. Retained observations still support '
@@ -244,8 +249,4 @@ def assessment(state, root, fixed, check):
                        'holds' if complete else 'unknown',
             'blockers': list(dict.fromkeys(blockers)), 'gap_ids': [g.id for g in gaps],
             'interpretation_id': opinion.id if opinion else None,
-            'interpretation_citations': {
-                'current': [{'id': i.id, 'investigation_id': i.investigation_id,
-                             'experiment_id': i.experiment_id, 'event_indices': i.executions[check.id]}
-                            for i in current_citations],
-                'historical_count': len(citations) - len(current_citations), 'path': 'state.json'}}
+            'interpretation_citations': receipt_references(state, check.id)}

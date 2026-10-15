@@ -1,0 +1,1157 @@
+{
+  "input": {
+    "rationale": "Open the run's first investigation into the postponed ReadIndex duty, sourced from the leader's ReadIndex path (raft.go:1354-1372), the postponed-request release helper (raft.go:2127-2145) and the two code paths that can perform a leader's first commit of its term (raft.go:1550-1554 via MsgAppResp, raft.go:2013-2028 via switchToConfig). A probe was drafted and run natively to see whether a received ReadIndex request survives a commit that happens inside switchToConfig while the application applies a committed configuration change.",
+    "sources": [
+      {
+        "id": "readindex-stash",
+        "file": "raft.go",
+        "start_line": 1354,
+        "end_line": 1372,
+        "kind": "code_observation"
+      },
+      {
+        "id": "msgappresp-release",
+        "file": "raft.go",
+        "start_line": 1546,
+        "end_line": 1561,
+        "kind": "code_observation"
+      },
+      {
+        "id": "switchtoconfig-commit",
+        "file": "raft.go",
+        "start_line": 1979,
+        "end_line": 2035,
+        "kind": "code_observation"
+      },
+      {
+        "id": "release-helper",
+        "file": "raft.go",
+        "start_line": 2127,
+        "end_line": 2145,
+        "kind": "code_observation"
+      },
+      {
+        "id": "heartbeatresp-readonly",
+        "file": "raft.go",
+        "start_line": 1579,
+        "end_line": 1610,
+        "kind": "code_observation"
+      },
+      {
+        "id": "readonly-maybeadvance",
+        "file": "read_only.go",
+        "start_line": 77,
+        "end_line": 101,
+        "kind": "code_observation"
+      },
+      {
+        "id": "node-advance-contract",
+        "file": "node.go",
+        "start_line": 166,
+        "end_line": 187,
+        "kind": "document_statement"
+      },
+      {
+        "id": "node-readindex-contract",
+        "file": "node.go",
+        "start_line": 218,
+        "end_line": 224,
+        "kind": "document_statement"
+      },
+      {
+        "id": "test-release-after-term-commit",
+        "file": "raft_test.go",
+        "start_line": 2087,
+        "end_line": 2144,
+        "kind": "test_expectation"
+      },
+      {
+        "id": "test-frees-readonly-mem",
+        "file": "raft_test.go",
+        "start_line": 1240,
+        "end_line": 1263,
+        "kind": "test_expectation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@readindex-postponed-release",
+        "question": "Does a ReadIndex request that the leader postponed (because it had not committed an entry in its term) get answered when the leader's first commit of the term is performed inside switchToConfig while the application applies an already-committed configuration change?",
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "hypothesis": "The postponed request is released only on the MsgAppResp commit path (raft.go:1550-1554), so a commit performed inside switchToConfig (raft.go:2013-2028) satisfies the release condition (newApplied >= pendingConfIndex is not involved; committedEntryInCurrentTerm() becomes true) without releasing it, leaving the received request unanswered until an unrelated commit or a client retry.",
+        "discriminator": "Whether r.raftLog.committed advances to an entry of the leader's term inside switchToConfig while len(r.pendingReadIndexMessages) is still 1 and no ReadState/response is produced, and whether a later periodic heartbeat round changes that.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k-when-postponed",
+        "kind": "behavior",
+        "statement": "A leader that receives MsgReadIndex postpones the request (appends it to r.pendingReadIndexMessages and returns without answering) exactly when its current configuration is not a singleton and r.committedEntryInCurrentTerm() is false, i.e. when the entry at its committed index was issued by an earlier term.",
+        "conditions": "Local raft instance in StateLeader; message type MsgReadIndex; configuration not a singleton (tracker.IsSingleton() false).",
+        "source_ids": [
+          "readindex-stash"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k-release-sites",
+        "kind": "behavior",
+        "statement": "Postponed ReadIndex requests are released only from the MsgAppResp success path when r.maybeCommit() reports that the commit index advanced to an entry of the leader's term; the helper refuses to release them when committedEntryInCurrentTerm() is false.",
+        "conditions": "StateLeader; MsgAppResp handling for which pr.MaybeUpdate or the probe-recovery condition is true; releasePendingReadIndexMessages is the only consumer of pendingReadIndexMessages.",
+        "source_ids": [
+          "msgappresp-release",
+          "release-helper"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k-switchtoconfig-commit",
+        "kind": "fact",
+        "statement": "switchToConfig is a second code path on which a leader can perform the term's first commit: when the configuration returned by the conforming changer raises ProgressTracker.Committed() above raftLog.committed and the entry at that index carries the leader's current term, it calls r.maybeCommit() and, on success, only broadcasts appends; it does not release pendingReadIndexMessages.",
+        "conditions": "StateLeader with a non-empty voter set; called from applyConfChange (application applies a committed configuration change) with the leader's Progress values already reflecting quorum-level acknowledgement of a current-term entry.",
+        "source_ids": [
+          "switchtoconfig-commit",
+          "release-helper"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k-heartbeat-cannot-release",
+        "kind": "behavior",
+        "statement": "A postponed request is not part of readOnly.unconfirmedReads, so readOnly.heartbeatCtx() returns nil, outgoing heartbeats carry no read context, and the MsgHeartbeatResp handler returns early on an empty context: a periodic heartbeat round cannot release a postponed request.",
+        "conditions": "ReadOnlySafe; pendingReadIndexMessages non-empty while readOnly.unconfirmedReads is empty.",
+        "source_ids": [
+          "readonly-maybeadvance",
+          "heartbeatresp-readonly"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k-app-applied-vs-applyconfchange",
+        "kind": "behavior",
+        "statement": "The library permits an application to report applied progress (Advance / MsgStorageApplyResp) while it is still applying the entries of a previous Ready, and it fixes no ordering between that progress report and the required ApplyConfChange call for a committed configuration change; the campaign gate hasUnappliedConfChanges() reads raftLog.applied only.",
+        "conditions": "Node/RawNode consumer following the documented Ready/Advance contract.",
+        "source_ids": [
+          "node-advance-contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [
+      {
+        "investigation_id": "@readindex-postponed-release",
+        "question": "Which producer prefix establishes a postponed ReadIndex request together with an applied configuration change whose resulting configuration is the one that commits the leader's first entry of the term?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [
+      {
+        "investigation_id": "@readindex-postponed-release",
+        "experiment_id": null,
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The source account is that a leader takes on a duty when it postpones a received ReadIndex request: pendingReadIndexMessages holds requests that cannot yet be answered because no entry of the leader's term is committed, and they are released when the term's first commit is observed (raft.go:1550-1554 calls releasePendingReadIndexMessages immediately before bcastAppend under the comment 'committed index has progressed for the term, so it is safe to respond to pending read index requests'). The same enabling change of state - raftLog.committed advancing to an entry of the leader's term - is also produced inside switchToConfig, which calls r.maybeCommit() and, on success, only calls bcastAppend (raft.go:2013-2028). Applying a committed configuration change is a legal producer of that path: applyConfChange -> switchToConfig is invoked by the application whenever a configuration change is observed in Ready.CommittedEntries. When the applied change makes ProgressTracker.Committed() exceed raftLog.committed (removing a voter that is unreachable, or leaving a joint configuration whose outgoing half contains such a voter) and the entry at the resulting index carries the leader's term, the commit is performed with the postponed request still unreleased. Because the request was stored in pendingReadIndexMessages and not in readOnly.unconfirmedReads, no later heartbeat can carry its context, so the duty is not discharged by the periodic heartbeat round: the received request yields no ReadState for a local read and no MsgReadIndexResp for a forwarded one until an unrelated entry is committed (which again goes through the MsgAppResp path) or the client retries. The defect is therefore a lost duty on one of two enabling paths, scoped to a bounded interval: from the postponed request until the next commit outside switchToConfig. The returned index remains safe whenever the request is eventually released, because the recorded index is taken from raftLog.committed at release time and raftLog.committed never decreases; the defect is a bounded-liveness (unanswered request) issue, not a stale-read safety violation. A native draft probe of both variants (removing an unreachable voter, and leaving a joint configuration) reproduced the observable sequence: the leader postponed the request (pending_reads=1, committed_entry_term 1, leader term 2), then applying the committed change advanced committed 10 -> 11 with committed_entry_term 2 == leader term while pending_reads stayed 1, no ReadState was produced, the delayed acknowledgement of the previous configuration (match_3=11) did not release it, a heartbeat round carried no read context (heartbeat_ctx_len 0) and did not release it, and only an unrelated proposal committed by the new configuration released the request (read_states 1, request ctx A, index 12 - the later commit index, i.e. answered late rather than answered wrong). The formal execution of this harness is requested with this update; the retained receipt is needed before this account can be treated as an executed comparison.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The Node.ReadIndex contract states that read index requests can be lost without notice and that ensuring retries is the caller's job (node.go:218-224), so a client that retries is not permanently blocked; the observation is a delayed or lost answer of an otherwise admissible request, not a permanent outage.",
+          "The library documents that an application may report applied progress before it has finished applying the entries of the previous Ready (node.go:166-178) and fixes no ordering between that evidence and the ApplyConfChange call for a change it has observed (node.go:179-187); the reachable prefix therefore relies on that documented latitude, and an application that calls ApplyConfChange before reporting progress past the change does not hit this path."
+        ],
+        "limitations": [
+          "The scenario requires the applied configuration change to be the one that first makes a current-term entry committable; if the leader had already committed any entry of its term, later reads are not postponed (committedEntryInCurrentTerm() is true) and this path is not taken.",
+          "Only a local source reading and a native draft run of the probe have been done so far; the retained receipt for the harness in this update is still outstanding.",
+          "The account covers a leader whose tracker configuration lags the configuration change already present in its log because the application's ApplyConfChange for it is still pending; it does not claim that the library can detect a leader that has been removed by a change the application already applied."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "@readindex-postponed-release",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "source_ids": [
+        "readindex-stash",
+        "msgappresp-release",
+        "switchtoconfig-commit",
+        "release-helper",
+        "heartbeatresp-readonly",
+        "readonly-maybeadvance",
+        "node-advance-contract"
+      ],
+      "anchors": [
+        {
+          "material_id": "switchtoconfig-commit",
+          "symbol": "switchToConfig",
+          "start_line": 1979,
+          "end_line": 1979,
+          "anchor": null
+        },
+        {
+          "material_id": "release-helper",
+          "symbol": "releasePendingReadIndexMessages",
+          "start_line": 2127,
+          "end_line": 2127,
+          "anchor": null
+        }
+      ],
+      "scope": {
+        "description": "Observe the whole interval of one postponed ReadIndex request on a real 4-node group: the leader postpones it, the application then applies an already-committed configuration change whose resulting configuration commits the leader's first entry of the term, the acknowledgement of the previous configuration arrives late, a heartbeat round runs, and finally an unrelated proposal is committed.",
+        "assumptions": [
+          "Four voters {1,2,3,4} bootstrapped from a ConfState-only snapshot, with log entries 1..9 ordinary and entry 10 the configuration change, HardState{Term:1, Commit:10}, applied index 10 (the application has reported applied progress but has not yet called ApplyConfChange for entry 10, which node.go:166-187 permits).",
+          "Transport preserves raft's per-message semantics (each message is Stepped by its target and resulting messages are delivered in order); voters are reachable for votes; voter 4 is unreachable and voter 3's append acknowledgements are delayed, which is the message-loss/delay part of the fault model.",
+          "The applied change is taken from the log entry at index 10 exactly as an application does when it applies CommittedEntries."
+        ],
+        "excluded": [
+          "Pre-vote, check-quorum and lease-based reads (all disabled by the test configuration stub).",
+          "Snapshot-based recovery and asynchronous storage writes."
+        ],
+        "parameters": {}
+      },
+      "prefix": "For each case: build four nodes whose storage is bootstrapped with the case ConfState (voters {1,2,3,4}, or the joint configuration voters {1,2,3} + voters_outgoing {1,2,3,4}), append ten term-1 entries with entry 10 the case configuration change, persist HardState{Term:1,Commit:10} and set Applied=10; then elect node 1 with a real MsgHup/MsgVote/MsgVoteResp round (voter 4 unreachable, voter 3's MsgAppResp delayed), deliver the client's MsgReadIndex, apply the committed change at index 10 via applyConfChange, deliver the delayed acknowledgement, run one heartbeat round (tick), and finally propose one unrelated entry.",
+      "semantic_changes": [],
+      "requirement": "A ReadIndex request that a leader accepts by postponing (raft.go:1363-1368) must be answered once the leader has committed an entry of its term, whichever path performs that commit (raft.go:1550-1554 for the MsgAppResp path, raft.go:2013-2028 for the switchToConfig path), because the helper that discharges the duty is guarded only by committedEntryInCurrentTerm() (raft.go:2127-2145) and the caller's comment states the release is due once the committed index has progressed for the term.",
+      "responsibility": "raft (target): the leader is the producer of the answer for a request it accepted, and switchToConfig is part of raft, not of the application.",
+      "prerequisites": [
+        {
+          "alias": "elect",
+          "event": "election",
+          "conditions": []
+        },
+        {
+          "alias": "stash",
+          "event": "readindex_received",
+          "conditions": [
+            {
+              "field": "stashed",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "cc",
+          "event": "confchange_applied",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": null,
+              "reference": "stash.case"
+            }
+          ]
+        },
+        {
+          "alias": "hb",
+          "event": "heartbeat_round",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": null,
+              "reference": "cc.case"
+            }
+          ]
+        },
+        {
+          "alias": "repair",
+          "event": "unrelated_commit",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": null,
+              "reference": "hb.case"
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "readindex_received",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "elect",
+          "assertion": {
+            "field": "stashed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "apply-removal-of-unreachable-voter-4",
+              "reference": null
+            }
+          ],
+          "description": "Precondition observation: the leader postponed the received request because no entry of its term was committed (committed_entry_term 1, leader_term 2)."
+        },
+        {
+          "event": "confchange_applied",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "stash",
+          "assertion": {
+            "field": "pending_reads",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "term_has_commit",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "apply-removal-of-unreachable-voter-4",
+              "reference": null
+            }
+          ],
+          "description": "Witness: applying the committed removal of voter 4 performed the leader's first commit of term 2 (committed 10 -> 11, committed_entry_term 2 == leader_term), so the postponed request is due to be answered, but it is still pending and no ReadState was produced."
+        },
+        {
+          "event": "confchange_applied",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "stash",
+          "assertion": {
+            "field": "pending_reads",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "term_has_commit",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "apply-leave-joint-config",
+              "reference": null
+            }
+          ],
+          "description": "Variant of the same cause: applying the committed zero change left the joint configuration, so the incoming half committed the leader's first term-2 entry, yet the postponed request is still pending."
+        },
+        {
+          "event": "heartbeat_round",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "cc",
+          "assertion": {
+            "field": "read_states",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "term_has_commit",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "apply-removal-of-unreachable-voter-4",
+              "reference": null
+            }
+          ],
+          "description": "No repair from the periodic round: two heartbeats are sent with an empty read context (heartbeat_ctx_len 0), the delayed acknowledgement of the previous configuration is already in place (match_3 11), and no ReadState is produced."
+        },
+        {
+          "event": "unrelated_commit",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "hb",
+          "assertion": {
+            "field": "read_states",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "apply-removal-of-unreachable-voter-4",
+              "reference": null
+            }
+          ],
+          "description": "Control: an unrelated proposal committed by the new configuration releases the postponed request (released_request_ctx A), so the release mechanism works and is reached only through the MsgAppResp commit path."
+        },
+        {
+          "event": "unrelated_commit",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "hb",
+          "assertion": {
+            "field": "pending_reads",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "apply-leave-joint-config",
+              "reference": null
+            }
+          ],
+          "description": "Control for the joint variant: the postponed request is only released once the unrelated proposal is committed."
+        }
+      ],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "interpretations": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "8769550822c045a18219e24795b9bdc0",
+      "result": {
+        "submission": "update.json",
+        "summary": "Repaired and delivered the run's first update (the previous turn timed out before delivery): one investigation into whether a leader answers a ReadIndex request it postponed when the term's first commit happens inside switchToConfig while the application applies an already-committed configuration change. Recorded 10 sources (ReadIndex stash path raft.go:1354-1372, release helper 2127-2145, MsgAppResp commit path 1546-1561, switchToConfig 1979-2035, heartbeat path, and the Node Advance/ApplyConfChange contracts), 5 behaviors/facts, and a question-level interpretation (conditional, defect_claim asserted) whose account is a lost duty on one of two enabling commit paths and a bounded (not stale-read) liveness consequence. Requested one formal execution of the focused 4-node probe assurance_generated_test.go, which natively reproduced both variants: after the postponed request (pending_reads=1, committed term 1, leader term 2) applying the committed change advanced committed 10->11 with a current-term entry while pending_reads stayed 1 with no ReadState; the delayed acknowledgement and a heartbeat round released nothing, and only an unrelated commit released it (ctx A, index 12). Incomplete: the retained receipt is outstanding, so the comparison results and a receipt-cited account still need to be added; no second lead was started this turn."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "version": 1,
+        "question": "Does a ReadIndex request that the leader postponed (because it had not committed an entry in its term) get answered when the leader's first commit of the term is performed inside switchToConfig while the application applies an already-committed configuration change?",
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "hypothesis": "The postponed request is released only on the MsgAppResp commit path (raft.go:1550-1554), so a commit performed inside switchToConfig (raft.go:2013-2028) satisfies the release condition (newApplied >= pendingConfIndex is not involved; committedEntryInCurrentTerm() becomes true) without releasing it, leaving the received request unanswered until an unrelated commit or a client retry.",
+        "discriminator": "Whether r.raftLog.committed advances to an entry of the leader's term inside switchToConfig while len(r.pendingReadIndexMessages) is still 1 and no ReadState/response is produced, and whether a later periodic heartbeat round changes that.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "8769550822c045a18219e24795b9bdc0-gap-0",
+            "question": "Which producer prefix establishes a postponed ReadIndex request together with an applied configuration change whose resulting configuration is the one that commits the leader's first entry of the term?",
+            "experiment_id": null,
+            "operation_id": "8769550822c045a18219e24795b9bdc0"
+          }
+        ],
+        "history": [],
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "A leader that receives MsgReadIndex postpones the request (appends it to r.pendingReadIndexMessages and returns without answering) exactly when its current configuration is not a singleton and r.committedEntryInCurrentTerm() is false, i.e. when the entry at its committed index was issued by an earlier term.",
+        "conditions": "Local raft instance in StateLeader; message type MsgReadIndex; configuration not a singleton (tracker.IsSingleton() false).",
+        "source_ids": [
+          "readindex-stash"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      },
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Postponed ReadIndex requests are released only from the MsgAppResp success path when r.maybeCommit() reports that the commit index advanced to an entry of the leader's term; the helper refuses to release them when committedEntryInCurrentTerm() is false.",
+        "conditions": "StateLeader; MsgAppResp handling for which pr.MaybeUpdate or the probe-recovery condition is true; releasePendingReadIndexMessages is the only consumer of pendingReadIndexMessages.",
+        "source_ids": [
+          "msgappresp-release",
+          "release-helper"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      },
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "switchToConfig is a second code path on which a leader can perform the term's first commit: when the configuration returned by the conforming changer raises ProgressTracker.Committed() above raftLog.committed and the entry at that index carries the leader's current term, it calls r.maybeCommit() and, on success, only broadcasts appends; it does not release pendingReadIndexMessages.",
+        "conditions": "StateLeader with a non-empty voter set; called from applyConfChange (application applies a committed configuration change) with the leader's Progress values already reflecting quorum-level acknowledgement of a current-term entry.",
+        "source_ids": [
+          "switchtoconfig-commit",
+          "release-helper"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      },
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "A postponed request is not part of readOnly.unconfirmedReads, so readOnly.heartbeatCtx() returns nil, outgoing heartbeats carry no read context, and the MsgHeartbeatResp handler returns early on an empty context: a periodic heartbeat round cannot release a postponed request.",
+        "conditions": "ReadOnlySafe; pendingReadIndexMessages non-empty while readOnly.unconfirmedReads is empty.",
+        "source_ids": [
+          "readonly-maybeadvance",
+          "heartbeatresp-readonly"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      },
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-knowledge-4",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The library permits an application to report applied progress (Advance / MsgStorageApplyResp) while it is still applying the entries of a previous Ready, and it fixes no ordering between that progress report and the required ApplyConfChange call for a committed configuration change; the campaign gate hasUnappliedConfChanges() reads raftLog.applied only.",
+        "conditions": "Node/RawNode consumer following the documented Ready/Advance contract.",
+        "source_ids": [
+          "node-advance-contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-experiment",
+        "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"google.golang.org/protobuf/proto\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// assuranceEmit prints one machine-readable observation. Every event carries the\n// scenario name so that observations of the two configuration-change variants\n// stay distinguishable.\nfunc assuranceEmit(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// assuranceNet is a transport that preserves raft's message semantics (each\n// message is Stepped by its target and the resulting messages are delivered in\n// order) and adds the fault model this scenario needs: a node can be\n// unreachable, and individual messages can be delayed in the network.\ntype assuranceNet struct {\n\tpeers    map[uint64]*raft\n\tisolated map[uint64]bool\n\thold     func(m *pb.Message) bool\n\theld     []*pb.Message\n}\n\nfunc (nt *assuranceNet) deliver(msgs ...*pb.Message) []*pb.Message {\n\tvar delivered []*pb.Message\n\tfor len(msgs) > 0 {\n\t\tm := msgs[0]\n\t\tmsgs = msgs[1:]\n\t\tif nt.isolated[m.GetTo()] || nt.isolated[m.GetFrom()] {\n\t\t\tcontinue\n\t\t}\n\t\tif nt.hold != nil && nt.hold(m) {\n\t\t\tnt.held = append(nt.held, m)\n\t\t\tcontinue\n\t\t}\n\t\tp := nt.peers[m.GetTo()]\n\t\tif p == nil {\n\t\t\tcontinue\n\t\t}\n\t\tdelivered = append(delivered, m)\n\t\t_ = p.Step(m)\n\t\tmsgs = append(msgs, p.readMessages()...)\n\t}\n\treturn delivered\n}\n\nfunc assuranceTypes(msgs []*pb.Message) []string {\n\tout := make([]string, 0, len(msgs))\n\tfor _, m := range msgs {\n\t\tout = append(out, m.GetType().String())\n\t}\n\treturn out\n}\n\n// assuranceEntries returns ten entries of term 1. Entry 10 is the supplied\n// configuration change; entries 1..9 are ordinary entries.\nfunc assuranceEntries(t *testing.T, cc pb.ConfChangeI) []*pb.Entry {\n\tt.Helper()\n\ttyp, data, err := pb.MarshalConfChange(cc)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal conf change: %v\", err)\n\t}\n\tents := make([]*pb.Entry, 10)\n\tfor i := 0; i < 9; i++ {\n\t\tents[i] = &pb.Entry{Term: new(uint64(1)), Index: new(uint64(i + 1)), Data: []byte(\"payload\")}\n\t}\n\tents[9] = &pb.Entry{Term: new(uint64(1)), Index: new(uint64(10)), Type: typ.Enum(), Data: data}\n\treturn ents\n}\n\n// assuranceNewNode bootstraps one node from a ConfState-only snapshot (the\n// application-level bootstrap path), appends the committed entries up to index\n// 10 and persists a HardState that commits index 10. The applied index is\n// reported as 10 while the application's ApplyConfChange for the committed\n// change at index 10 is still pending, which the Node interface allows: an\n// application may call Advance while it is still applying the entries of a\n// previous Ready.\nfunc assuranceNewNode(t *testing.T, id uint64, cs *pb.ConfState, ents []*pb.Entry) *raft {\n\tt.Helper()\n\ts := newTestMemoryStorage()\n\tif err := s.ApplySnapshot(&pb.Snapshot{\n\t\tMetadata: &pb.SnapshotMetadata{ConfState: proto.Clone(cs).(*pb.ConfState)},\n\t}); err != nil {\n\t\tt.Fatalf(\"bootstrap snapshot: %v\", err)\n\t}\n\tif err := s.Append(ents); err != nil {\n\t\tt.Fatalf(\"append entries: %v\", err)\n\t}\n\tif err := s.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(uint64(10))}); err != nil {\n\t\tt.Fatalf(\"set hard state: %v\", err)\n\t}\n\tcfg := newTestConfig(id, 10, 1, s)\n\tcfg.Applied = 10\n\treturn newRaft(cfg)\n}\n\nfunc assuranceCommittedEntryInCurrentTerm(r *raft) (term uint64, ok bool) {\n\tt, err := r.raftLog.term(r.raftLog.committed)\n\tif err != nil {\n\t\treturn 0, false\n\t}\n\treturn t, t == r.Term\n}\n\nfunc assuranceDutyState(r *raft) map[string]any {\n\tt, inTerm := assuranceCommittedEntryInCurrentTerm(r)\n\tst := map[string]any{\n\t\t\"committed_index\":     r.raftLog.committed,\n\t\t\"committed_entry_term\": t,\n\t\t\"leader_term\":         r.Term,\n\t\t\"last_index\":          r.raftLog.lastIndex(),\n\t\t\"applied_index\":       r.raftLog.applied,\n\t\t\"term_has_commit\":     inTerm,\n\t\t\"pending_reads\":       len(r.pendingReadIndexMessages),\n\t\t\"unconfirmed_reads\":   len(r.readOnly.unconfirmedReads),\n\t\t\"read_states\":         len(r.readStates),\n\t\t\"config\":              r.trk.Config.String(),\n\t}\n\treturn st\n}\n\ntype assuranceCase struct {\n\tname      string\n\tconfState *pb.ConfState\n\tchange    pb.ConfChangeI\n}\n\n// TestAssurancePostponedReadIndexAcrossConfigCommit observes whether a read\n// index request that the leader postponed (because it had not committed an\n// entry in its term yet) is released when the leader's first commit of the term\n// is performed inside switchToConfig while the application applies a committed\n// configuration change. The two cases differ only in how the applied change\n// makes the leader's term entry committable: removing an unreachable voter, and\n// leaving a joint configuration whose outgoing half contains an unreachable\n// voter.\nfunc TestAssurancePostponedReadIndexAcrossConfigCommit(t *testing.T) {\n\tcases := []assuranceCase{\n\t\t{\n\t\t\tname:      \"apply-removal-of-unreachable-voter-4\",\n\t\t\tconfState: &pb.ConfState{Voters: []uint64{1, 2, 3, 4}},\n\t\t\tchange: &pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{\n\t\t\t\t{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(4))},\n\t\t\t}},\n\t\t},\n\t\t{\n\t\t\tname:      \"apply-leave-joint-config\",\n\t\t\tconfState: &pb.ConfState{Voters: []uint64{1, 2, 3}, VotersOutgoing: []uint64{1, 2, 3, 4}},\n\t\t\tchange:    &pb.ConfChangeV2{},\n\t\t},\n\t}\n\tfor _, c := range cases {\n\t\tassuranceRunCase(t, c)\n\t}\n}\n\nfunc assuranceRunCase(t *testing.T, c assuranceCase) {\n\tents := assuranceEntries(t, c.change)\n\tpeers := map[uint64]*raft{}\n\tfor id := uint64(1); id <= 4; id++ {\n\t\tpeers[id] = assuranceNewNode(t, id, c.confState, ents)\n\t}\n\tn1 := peers[1]\n\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":                 \"setup\",\n\t\t\"case\":                  c.name,\n\t\t\"node\":                  1,\n\t\t\"bootstrap_conf_state\":  DescribeConfState(c.confState),\n\t\t\"last_log_entry_type\":   ents[9].GetType().String(),\n\t\t\"last_log_entry_index\":  ents[9].GetIndex(),\n\t\t\"persisted_commit\":      n1.raftLog.committed,\n\t\t\"persisted_commit_term\": 1,\n\t\t\"applied_index\":         n1.raftLog.applied,\n\t\t\"config\":                n1.trk.Config.String(),\n\t})\n\n\tnt := &assuranceNet{peers: peers, isolated: map[uint64]bool{4: true}}\n\t// Voter 3 votes but its append acknowledgements are delayed in the network:\n\t// the leader cannot yet commit anything under the configuration that is\n\t// still active in its tracker.\n\tnt.hold = func(m *pb.Message) bool {\n\t\treturn m.GetType() == pb.MsgAppResp && m.GetFrom() == 3\n\t}\n\n\t// Elect node 1 (term 2). Voters 1, 2 and 3 are reachable, voter 4 is not.\n\tnt.deliver(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\n\tev := map[string]any{\"event\": \"election\", \"case\": c.name, \"node\": 1, \"state\": n1.state.String()}\n\tfor k, v := range assuranceDutyState(n1) {\n\t\tev[k] = v\n\t}\n\tev[\"match\"] = map[uint64]uint64{\n\t\t1: n1.trk.Progress[1].Match,\n\t\t2: n1.trk.Progress[2].Match,\n\t\t3: n1.trk.Progress[3].Match,\n\t\t4: n1.trk.Progress[4].Match,\n\t}\n\tev[\"held_messages\"] = len(nt.held)\n\tassuranceEmit(t, ev)\n\n\t// A linearizable read request reaches the leader before it has committed an\n\t// entry in its term, so the leader postpones it.\n\tnt.deliver(&pb.Message{\n\t\tFrom:    new(uint64(1)),\n\t\tTo:      new(uint64(1)),\n\t\tType:    pb.MsgReadIndex.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"A\")}},\n\t})\n\tev = map[string]any{\n\t\t\"event\":               \"readindex_received\",\n\t\t\"case\":                c.name,\n\t\t\"node\":                1,\n\t\t\"request_ctx\":         \"A\",\n\t\t\"committed_at_receipt\": n1.raftLog.committed,\n\t\t\"stashed\":             len(n1.pendingReadIndexMessages) == 1,\n\t}\n\tfor k, v := range assuranceDutyState(n1) {\n\t\tev[k] = v\n\t}\n\tassuranceEmit(t, ev)\n\n\t// The application applies the committed configuration change at index 10\n\t// (the change is taken from the log entry it applies).\n\tentry, err := n1.raftLog.slice(10, 11, noLimit)\n\tif err != nil || len(entry) != 1 {\n\t\tt.Fatalf(\"cannot read entry 10: %v\", err)\n\t}\n\tchange := &pb.ConfChangeV2{}\n\tif err := proto.Unmarshal(entry[0].GetData(), change); err != nil {\n\t\tt.Fatalf(\"cannot unmarshal applied change: %v\", err)\n\t}\n\tcommittedBefore := n1.raftLog.committed\n\tn1.applyConfChange(change)\n\temitted := nt.deliver(n1.readMessages()...)\n\n\tev = map[string]any{\n\t\t\"event\":             \"confchange_applied\",\n\t\t\"case\":              c.name,\n\t\t\"node\":              1,\n\t\t\"applied_change\":    DescribeConfChange(change),\n\t\t\"committed_before\":  committedBefore,\n\t\t\"messages_emitted\":  assuranceTypes(emitted),\n\t\t\"readindex_responses_emitted\": func() int {\n\t\t\tn := 0\n\t\t\tfor _, m := range emitted {\n\t\t\t\tif m.GetType() == pb.MsgReadIndexResp {\n\t\t\t\t\tn++\n\t\t\t\t}\n\t\t\t}\n\t\t\treturn n\n\t\t}(),\n\t}\n\tfor k, v := range assuranceDutyState(n1) {\n\t\tev[k] = v\n\t}\n\tassuranceEmit(t, ev)\n\n\t// The delayed acknowledgement of the configuration that is no longer active\n\t// reaches the leader now (the delay is removed for this delivery).\n\tnt.hold = nil\n\theld := nt.held\n\tnt.held = nil\n\trt := nt.deliver(held...)\n\tev = map[string]any{\n\t\t\"event\":            \"delayed_ack_delivered\",\n\t\t\"case\":             c.name,\n\t\t\"node\":             1,\n\t\t\"delayed_from\":     3,\n\t\t\"delivered_types\":  assuranceTypes(rt),\n\t\t\"match_3\":          n1.trk.Progress[3].Match,\n\t}\n\tfor k, v := range assuranceDutyState(n1) {\n\t\tev[k] = v\n\t}\n\tassuranceEmit(t, ev)\n\n\t// A periodic heartbeat round: the postponed request is not part of\n\t// readOnly.unconfirmedReads, so the heartbeats carry no read context and the\n\t// returning acknowledgements cannot release it.\n\tn1.tick()\n\temitted = nt.deliver(n1.readMessages()...)\n\theartbeats, ctxLen := 0, -1\n\tfor _, m := range emitted {\n\t\tif m.GetType() == pb.MsgHeartbeat {\n\t\t\theartbeats++\n\t\t\tctxLen = len(m.GetContext())\n\t\t}\n\t}\n\tev = map[string]any{\n\t\t\"event\":               \"heartbeat_round\",\n\t\t\"case\":                c.name,\n\t\t\"node\":                1,\n\t\t\"heartbeats_sent\":     heartbeats,\n\t\t\"heartbeat_ctx_len\":   ctxLen,\n\t\t\"delivered_types\":     assuranceTypes(emitted),\n\t}\n\tfor k, v := range assuranceDutyState(n1) {\n\t\tev[k] = v\n\t}\n\tassuranceEmit(t, ev)\n\n\t// An unrelated proposal is committed by the (now active) configuration. This\n\t// is the only path that releases the postponed request.\n\tcommittedBeforeProposal := n1.raftLog.committed\n\tif err := n1.Step(&pb.Message{\n\t\tFrom:    new(uint64(1)),\n\t\tTo:      new(uint64(1)),\n\t\tType:    pb.MsgProp.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"unrelated\")}},\n\t}); err != nil {\n\t\tt.Fatalf(\"propose: %v\", err)\n\t}\n\temitted = nt.deliver(n1.readMessages()...)\n\tev = map[string]any{\n\t\t\"event\":            \"unrelated_commit\",\n\t\t\"case\":             c.name,\n\t\t\"node\":             1,\n\t\t\"committed_before\": committedBeforeProposal,\n\t\t\"delivered_types\":  assuranceTypes(emitted),\n\t}\n\tfor k, v := range assuranceDutyState(n1) {\n\t\tev[k] = v\n\t}\n\tif len(n1.readStates) > 0 {\n\t\tev[\"released_request_ctx\"] = string(n1.readStates[0].RequestCtx)\n\t\tev[\"released_read_index\"] = n1.readStates[0].Index\n\t}\n\tassuranceEmit(t, ev)\n\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\": \"case_end\",\n\t\t\"case\":  c.name,\n\t\t\"node\":  1,\n\t})\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "elect",
+                "event": "election",
+                "conditions": []
+              },
+              {
+                "alias": "stash",
+                "event": "readindex_received",
+                "conditions": [
+                  {
+                    "field": "stashed",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "cc",
+                "event": "confchange_applied",
+                "conditions": [
+                  {
+                    "field": "case",
+                    "op": "eq",
+                    "value": null,
+                    "reference": "stash.case"
+                  }
+                ]
+              },
+              {
+                "alias": "hb",
+                "event": "heartbeat_round",
+                "conditions": [
+                  {
+                    "field": "case",
+                    "op": "eq",
+                    "value": null,
+                    "reference": "cc.case"
+                  }
+                ]
+              },
+              {
+                "alias": "repair",
+                "event": "unrelated_commit",
+                "conditions": [
+                  {
+                    "field": "case",
+                    "op": "eq",
+                    "value": null,
+                    "reference": "hb.case"
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "readindex-stash",
+            "msgappresp-release",
+            "switchtoconfig-commit",
+            "release-helper",
+            "heartbeatresp-readonly",
+            "readonly-maybeadvance",
+            "node-advance-contract"
+          ],
+          "anchors": [
+            {
+              "material_id": "switchtoconfig-commit",
+              "symbol": "switchToConfig",
+              "start_line": 1979,
+              "end_line": 1979,
+              "anchor": {
+                "source_ids": [
+                  "switchtoconfig-commit"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "switchtoconfig-commit",
+                "start_line": 1979,
+                "end_line": 1979,
+                "symbol": "switchToConfig"
+              }
+            },
+            {
+              "material_id": "release-helper",
+              "symbol": "releasePendingReadIndexMessages",
+              "start_line": 2127,
+              "end_line": 2127,
+              "anchor": {
+                "source_ids": [
+                  "release-helper"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "release-helper",
+                "start_line": 2127,
+                "end_line": 2127,
+                "symbol": "releasePendingReadIndexMessages"
+              }
+            }
+          ],
+          "scope": {
+            "description": "Observe the whole interval of one postponed ReadIndex request on a real 4-node group: the leader postpones it, the application then applies an already-committed configuration change whose resulting configuration commits the leader's first entry of the term, the acknowledgement of the previous configuration arrives late, a heartbeat round runs, and finally an unrelated proposal is committed.",
+            "assumptions": [
+              "Four voters {1,2,3,4} bootstrapped from a ConfState-only snapshot, with log entries 1..9 ordinary and entry 10 the configuration change, HardState{Term:1, Commit:10}, applied index 10 (the application has reported applied progress but has not yet called ApplyConfChange for entry 10, which node.go:166-187 permits).",
+              "Transport preserves raft's per-message semantics (each message is Stepped by its target and resulting messages are delivered in order); voters are reachable for votes; voter 4 is unreachable and voter 3's append acknowledgements are delayed, which is the message-loss/delay part of the fault model.",
+              "The applied change is taken from the log entry at index 10 exactly as an application does when it applies CommittedEntries."
+            ],
+            "excluded": [
+              "Pre-vote, check-quorum and lease-based reads (all disabled by the test configuration stub).",
+              "Snapshot-based recovery and asynchronous storage writes."
+            ],
+            "parameters": {}
+          },
+          "prefix": "For each case: build four nodes whose storage is bootstrapped with the case ConfState (voters {1,2,3,4}, or the joint configuration voters {1,2,3} + voters_outgoing {1,2,3,4}), append ten term-1 entries with entry 10 the case configuration change, persist HardState{Term:1,Commit:10} and set Applied=10; then elect node 1 with a real MsgHup/MsgVote/MsgVoteResp round (voter 4 unreachable, voter 3's MsgAppResp delayed), deliver the client's MsgReadIndex, apply the committed change at index 10 via applyConfChange, deliver the delayed acknowledgement, run one heartbeat round (tick), and finally propose one unrelated entry.",
+          "requirement": "A ReadIndex request that a leader accepts by postponing (raft.go:1363-1368) must be answered once the leader has committed an entry of its term, whichever path performs that commit (raft.go:1550-1554 for the MsgAppResp path, raft.go:2013-2028 for the switchToConfig path), because the helper that discharges the duty is guarded only by committedEntryInCurrentTerm() (raft.go:2127-2145) and the caller's comment states the release is due once the committed index has progressed for the term.",
+          "responsibility": "raft (target): the leader is the producer of the answer for a request it accepted, and switchToConfig is part of raft, not of the application.",
+          "comparisons": [
+            {
+              "event": "readindex_received",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "elect",
+              "assertion": {
+                "field": "stashed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "case",
+                  "op": "eq",
+                  "value": "apply-removal-of-unreachable-voter-4",
+                  "reference": null
+                }
+              ],
+              "description": "Precondition observation: the leader postponed the received request because no entry of its term was committed (committed_entry_term 1, leader_term 2)."
+            },
+            {
+              "event": "confchange_applied",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "stash",
+              "assertion": {
+                "field": "pending_reads",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              },
+              "antecedent": {
+                "field": "term_has_commit",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "applicability_conditions": [
+                {
+                  "field": "case",
+                  "op": "eq",
+                  "value": "apply-removal-of-unreachable-voter-4",
+                  "reference": null
+                }
+              ],
+              "description": "Witness: applying the committed removal of voter 4 performed the leader's first commit of term 2 (committed 10 -> 11, committed_entry_term 2 == leader_term), so the postponed request is due to be answered, but it is still pending and no ReadState was produced."
+            },
+            {
+              "event": "confchange_applied",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "stash",
+              "assertion": {
+                "field": "pending_reads",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              },
+              "antecedent": {
+                "field": "term_has_commit",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "applicability_conditions": [
+                {
+                  "field": "case",
+                  "op": "eq",
+                  "value": "apply-leave-joint-config",
+                  "reference": null
+                }
+              ],
+              "description": "Variant of the same cause: applying the committed zero change left the joint configuration, so the incoming half committed the leader's first term-2 entry, yet the postponed request is still pending."
+            },
+            {
+              "event": "heartbeat_round",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "cc",
+              "assertion": {
+                "field": "read_states",
+                "op": "eq",
+                "value": 1,
+                "reference": null
+              },
+              "antecedent": {
+                "field": "term_has_commit",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "applicability_conditions": [
+                {
+                  "field": "case",
+                  "op": "eq",
+                  "value": "apply-removal-of-unreachable-voter-4",
+                  "reference": null
+                }
+              ],
+              "description": "No repair from the periodic round: two heartbeats are sent with an empty read context (heartbeat_ctx_len 0), the delayed acknowledgement of the previous configuration is already in place (match_3 11), and no ReadState is produced."
+            },
+            {
+              "event": "unrelated_commit",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "hb",
+              "assertion": {
+                "field": "read_states",
+                "op": "eq",
+                "value": 1,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "case",
+                  "op": "eq",
+                  "value": "apply-removal-of-unreachable-voter-4",
+                  "reference": null
+                }
+              ],
+              "description": "Control: an unrelated proposal committed by the new configuration releases the postponed request (released_request_ctx A), so the release mechanism works and is reached only through the MsgAppResp commit path."
+            },
+            {
+              "event": "unrelated_commit",
+              "identity_fields": [
+                "case"
+              ],
+              "admission_alias": "hb",
+              "assertion": {
+                "field": "pending_reads",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "case",
+                  "op": "eq",
+                  "value": "apply-leave-joint-config",
+                  "reference": null
+                }
+              ],
+              "description": "Control for the joint variant: the postponed request is only released once the unrelated proposal is committed."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "58d590a4e84744e08ee4d0473cd5f863",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "go.etcd.io/raft/v3",
+            "variant": "etcd_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "8769550822c045a18219e24795b9bdc0",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "8769550822c045a18219e24795b9bdc0-interpretation-0",
+        "investigation_id": "8769550822c045a18219e24795b9bdc0-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "readindex-stash",
+          "msgappresp-release",
+          "switchtoconfig-commit",
+          "release-helper",
+          "heartbeatresp-readonly",
+          "readonly-maybeadvance",
+          "node-advance-contract",
+          "test-release-after-term-commit"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The source account is that a leader takes on a duty when it postpones a received ReadIndex request: pendingReadIndexMessages holds requests that cannot yet be answered because no entry of the leader's term is committed, and they are released when the term's first commit is observed (raft.go:1550-1554 calls releasePendingReadIndexMessages immediately before bcastAppend under the comment 'committed index has progressed for the term, so it is safe to respond to pending read index requests'). The same enabling change of state - raftLog.committed advancing to an entry of the leader's term - is also produced inside switchToConfig, which calls r.maybeCommit() and, on success, only calls bcastAppend (raft.go:2013-2028). Applying a committed configuration change is a legal producer of that path: applyConfChange -> switchToConfig is invoked by the application whenever a configuration change is observed in Ready.CommittedEntries. When the applied change makes ProgressTracker.Committed() exceed raftLog.committed (removing a voter that is unreachable, or leaving a joint configuration whose outgoing half contains such a voter) and the entry at the resulting index carries the leader's term, the commit is performed with the postponed request still unreleased. Because the request was stored in pendingReadIndexMessages and not in readOnly.unconfirmedReads, no later heartbeat can carry its context, so the duty is not discharged by the periodic heartbeat round: the received request yields no ReadState for a local read and no MsgReadIndexResp for a forwarded one until an unrelated entry is committed (which again goes through the MsgAppResp path) or the client retries. The defect is therefore a lost duty on one of two enabling paths, scoped to a bounded interval: from the postponed request until the next commit outside switchToConfig. The returned index remains safe whenever the request is eventually released, because the recorded index is taken from raftLog.committed at release time and raftLog.committed never decreases; the defect is a bounded-liveness (unanswered request) issue, not a stale-read safety violation. A native draft probe of both variants (removing an unreachable voter, and leaving a joint configuration) reproduced the observable sequence: the leader postponed the request (pending_reads=1, committed_entry_term 1, leader term 2), then applying the committed change advanced committed 10 -> 11 with committed_entry_term 2 == leader term while pending_reads stayed 1, no ReadState was produced, the delayed acknowledgement of the previous configuration (match_3=11) did not release it, a heartbeat round carried no read context (heartbeat_ctx_len 0) and did not release it, and only an unrelated proposal committed by the new configuration released the request (read_states 1, request ctx A, index 12 - the later commit index, i.e. answered late rather than answered wrong). The formal execution of this harness is requested with this update; the retained receipt is needed before this account can be treated as an executed comparison.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The Node.ReadIndex contract states that read index requests can be lost without notice and that ensuring retries is the caller's job (node.go:218-224), so a client that retries is not permanently blocked; the observation is a delayed or lost answer of an otherwise admissible request, not a permanent outage.",
+          "The library documents that an application may report applied progress before it has finished applying the entries of the previous Ready (node.go:166-178) and fixes no ordering between that evidence and the ApplyConfChange call for a change it has observed (node.go:179-187); the reachable prefix therefore relies on that documented latitude, and an application that calls ApplyConfChange before reporting progress past the change does not hit this path."
+        ],
+        "limitations": [
+          "The scenario requires the applied configuration change to be the one that first makes a current-term entry committable; if the leader had already committed any entry of its term, later reads are not postponed (committedEntryInCurrentTerm() is true) and this path is not taken.",
+          "Only a local source reading and a native draft run of the probe have been done so far; the retained receipt for the harness in this update is still outstanding.",
+          "The account covers a leader whose tracker configuration lags the configuration change already present in its log because the application's ApplyConfChange for it is still pending; it does not claim that the library can detect a leader that has been removed by a change the application already applied."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8769550822c045a18219e24795b9bdc0"
+      }
+    ],
+    "materials": [
+      {
+        "id": "readindex-stash",
+        "file": "raft.go",
+        "start_line": 1354,
+        "end_line": 1372,
+        "kind": "code_observation",
+        "text": "\tcase pb.MsgReadIndex:\n\t\t// only one voting member (the leader) in the cluster\n\t\tif r.trk.IsSingleton() {\n\t\t\tif resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.GetTo() != None {\n\t\t\t\tr.send(resp)\n\t\t\t}\n\t\t\treturn nil\n\t\t}\n\n\t\t// Postpone read only request when this leader has not committed\n\t\t// any log entry at its term.\n\t\tif !r.committedEntryInCurrentTerm() {\n\t\t\tr.pendingReadIndexMessages = append(r.pendingReadIndexMessages, m)\n\t\t\treturn nil\n\t\t}\n\n\t\tsendMsgReadIndexResponse(r, m)\n\n\t\treturn nil",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      },
+      {
+        "id": "msgappresp-release",
+        "file": "raft.go",
+        "start_line": 1546,
+        "end_line": 1561,
+        "kind": "code_observation",
+        "text": "\t\t\t\tcase pr.State == tracker.StateReplicate:\n\t\t\t\t\tpr.Inflights.FreeLE(m.GetIndex())\n\t\t\t\t}\n\n\t\t\t\tif r.maybeCommit() {\n\t\t\t\t\t// committed index has progressed for the term, so it is safe\n\t\t\t\t\t// to respond to pending read index requests\n\t\t\t\t\treleasePendingReadIndexMessages(r)\n\t\t\t\t\tr.bcastAppend()\n\t\t\t\t} else if r.id != m.GetFrom() && pr.CanBumpCommit(r.raftLog.committed) {\n\t\t\t\t\t// This node may be missing the latest commit index, so send it.\n\t\t\t\t\t// NB: this is not strictly necessary because the periodic heartbeat\n\t\t\t\t\t// messages deliver commit indices too. However, a message sent now\n\t\t\t\t\t// may arrive earlier than the next heartbeat fires.\n\t\t\t\t\tr.sendAppend(m.GetFrom())\n\t\t\t\t}",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      },
+      {
+        "id": "switchtoconfig-commit",
+        "file": "raft.go",
+        "start_line": 1979,
+        "end_line": 2035,
+        "kind": "code_observation",
+        "text": "func (r *raft) switchToConfig(cfg tracker.Config, trk tracker.ProgressMap) *pb.ConfState {\n\ttraceConfChangeEvent(cfg, r)\n\n\tr.trk.Config = cfg\n\tr.trk.Progress = trk\n\n\tr.logger.Infof(\"%x switched to configuration %s\", r.id, r.trk.Config)\n\tcs := r.trk.ConfState()\n\tpr, ok := r.trk.Progress[r.id]\n\n\t// Update whether the node itself is a learner, resetting to false when the\n\t// node is removed.\n\tr.isLearner = ok && pr.IsLearner\n\n\tif (!ok || r.isLearner) && r.state == StateLeader {\n\t\t// This node is leader and was removed or demoted, step down if requested.\n\t\t//\n\t\t// We prevent demotions at the time writing but hypothetically we handle\n\t\t// them the same way as removing the leader.\n\t\t//\n\t\t// TODO(tbg): ask follower with largest Match to TimeoutNow (to avoid\n\t\t// interruption). This might still drop some proposals but it's better than\n\t\t// nothing.\n\t\tif r.stepDownOnRemoval {\n\t\t\tr.becomeFollower(r.Term, None)\n\t\t}\n\t\treturn cs\n\t}\n\n\t// The remaining steps only make sense if this node is the leader and there\n\t// are other nodes.\n\tif r.state != StateLeader || len(cs.Voters) == 0 {\n\t\treturn cs\n\t}\n\n\tif r.maybeCommit() {\n\t\t// If the configuration change means that more entries are committed now,\n\t\t// broadcast/append to everyone in the updated config.\n\t\tr.bcastAppend()\n\t} else {\n\t\t// Otherwise, still probe the newly added replicas; there's no reason to\n\t\t// let them wait out a heartbeat interval (or the next incoming\n\t\t// proposal).\n\t\tr.trk.Visit(func(id uint64, _ *tracker.Progress) {\n\t\t\tif id == r.id {\n\t\t\t\treturn\n\t\t\t}\n\t\t\tr.maybeSendAppend(id, false /* sendIfEmpty */)\n\t\t})\n\t}\n\t// If the leadTransferee was removed or demoted, abort the leadership transfer.\n\tif _, tOK := r.trk.Config.Voters.IDs()[r.leadTransferee]; !tOK && r.leadTransferee != 0 {\n\t\tr.abortLeaderTransfer()\n\t}\n\n\treturn cs\n}",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      },
+      {
+        "id": "release-helper",
+        "file": "raft.go",
+        "start_line": 2127,
+        "end_line": 2145,
+        "kind": "code_observation",
+        "text": "func releasePendingReadIndexMessages(r *raft) {\n\tif len(r.pendingReadIndexMessages) == 0 {\n\t\t// Fast path for the common case to avoid a call to storage.LastIndex()\n\t\t// via committedEntryInCurrentTerm.\n\t\treturn\n\t}\n\tif !r.committedEntryInCurrentTerm() {\n\t\tr.logger.Error(\"pending MsgReadIndex should be released only after first commit in current term\")\n\t\treturn\n\t}\n\n\tmsgs := r.pendingReadIndexMessages\n\tr.pendingReadIndexMessages = nil\n\n\tfor _, m := range msgs {\n\t\tsendMsgReadIndexResponse(r, m)\n\t}\n}\n",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      },
+      {
+        "id": "heartbeatresp-readonly",
+        "file": "raft.go",
+        "start_line": 1579,
+        "end_line": 1610,
+        "kind": "code_observation",
+        "text": "\tcase pb.MsgHeartbeatResp:\n\t\tpr.RecentActive = true\n\t\tpr.MsgAppFlowPaused = false\n\n\t\t// NB: if the follower is paused (full Inflights), this will still send an\n\t\t// empty append, allowing it to recover from situations in which all the\n\t\t// messages that filled up Inflights in the first place were dropped. Note\n\t\t// also that the outgoing heartbeat already communicated the commit index.\n\t\t//\n\t\t// If the follower is fully caught up but also in StateProbe (as can happen\n\t\t// if ReportUnreachable was called), we also want to send an append (it will\n\t\t// be empty) to allow the follower to transition back to StateReplicate once\n\t\t// it responds.\n\t\t//\n\t\t// Note that StateSnapshot typically satisfies pr.Match < lastIndex, but\n\t\t// `pr.Paused()` is always true for StateSnapshot, so sendAppend is a\n\t\t// no-op.\n\t\tif pr.Match < r.raftLog.lastIndex() || pr.State == tracker.StateProbe {\n\t\t\tr.sendAppend(m.GetFrom())\n\t\t}\n\n\t\tif r.readOnly.option != ReadOnlySafe || len(m.GetContext()) == 0 {\n\t\t\treturn nil\n\t\t}\n\n\t\tr.readOnly.recvAck(m.GetFrom(), m.GetContext())\n\t\trss := r.readOnly.maybeAdvance(r.trk.Voters)\n\t\tfor _, rs := range rss {\n\t\t\tif resp := r.responseToReadIndexReq(rs.req, rs.index); resp.GetTo() != None {\n\t\t\t\tr.send(resp)\n\t\t\t}\n\t\t}",
+        "content_digest": "d3d8fa573e1488e3aa35b9b997ba943454f3f357740a550d4bcc44d81975f07f"
+      },
+      {
+        "id": "readonly-maybeadvance",
+        "file": "read_only.go",
+        "start_line": 77,
+        "end_line": 101,
+        "kind": "code_observation",
+        "text": "// maybeAdvance uses the existing acknowledgements and current raft\n// configuration to confirm and return as many unconfirmed reads as possible.\nfunc (ro *readOnly) maybeAdvance(c quorum.JointConfig) []*readIndexRequest {\n\t// Use `CommittedIndex` to figure out how many reads are now confirmed.\n\tnewConfirmedReads := uint64(c.CommittedIndex(ro))\n\tif newConfirmedReads <= ro.confirmedReads {\n\t\treturn nil\n\t}\n\treadStates := ro.unconfirmedReads[:newConfirmedReads-ro.confirmedReads]\n\tro.unconfirmedReads = ro.unconfirmedReads[newConfirmedReads-ro.confirmedReads:]\n\tro.confirmedReads = newConfirmedReads\n\treturn readStates\n}\n\n// heartbeatCtx returns the `Context` that should be sent in order to confirm\n// all currently unconfirmed reads.\nfunc (ro *readOnly) heartbeatCtx() []byte {\n\tif len(ro.unconfirmedReads) == 0 {\n\t\treturn nil\n\t}\n\tunconfirmedReadPosition := ro.confirmedReads + uint64(len(ro.unconfirmedReads))\n\tencLastIndex := make([]byte, 8)\n\tbinary.LittleEndian.PutUint64(encLastIndex, unconfirmedReadPosition)\n\treturn encLastIndex\n}",
+        "content_digest": "7277fd552348bee2dcc7f9afe8ce24860f35bb9693b64d293b3d343ca38d669a"
+      },
+      {
+        "id": "node-advance-contract",
+        "file": "node.go",
+        "start_line": 166,
+        "end_line": 187,
+        "kind": "document_statement",
+        "text": "\t// Advance notifies the Node that the application has saved progress up to the last Ready.\n\t// It prepares the node to return the next available Ready.\n\t//\n\t// The application should generally call Advance after it applies the entries in last Ready.\n\t//\n\t// However, as an optimization, the application may call Advance while it is applying the\n\t// commands. For example. when the last Ready contains a snapshot, the application might take\n\t// a long time to apply the snapshot data. To continue receiving Ready without blocking raft\n\t// progress, it can call Advance before finishing applying the last ready.\n\t//\n\t// NOTE: Advance must not be called when using AsyncStorageWrites. Response messages from the\n\t// local append and apply threads take its place.\n\tAdvance()\n\t// ApplyConfChange applies a config change (previously passed to\n\t// ProposeConfChange) to the node. This must be called whenever a config\n\t// change is observed in Ready.CommittedEntries, except when the app decides\n\t// to reject the configuration change (i.e. treats it as a noop instead), in\n\t// which case it must not be called.\n\t//\n\t// Returns an opaque non-nil ConfState protobuf which must be recorded in\n\t// snapshots.\n\tApplyConfChange(cc pb.ConfChangeI) *pb.ConfState",
+        "content_digest": "311ece789019299836c97ca24908a52ca0e96ea11d3c81109444b41f625607a9"
+      },
+      {
+        "id": "node-readindex-contract",
+        "file": "node.go",
+        "start_line": 218,
+        "end_line": 224,
+        "kind": "document_statement",
+        "text": "\t// ReadIndex request a read state. The read state will be set in the ready.\n\t// Read state has a read index. Once the application advances further than the read\n\t// index, any linearizable read requests issued before the read request can be\n\t// processed safely. The read state will have the same rctx attached.\n\t// Note that request can be lost without notice, therefore it is user's job\n\t// to ensure read index retries.\n\tReadIndex(ctx context.Context, rctx []byte) error",
+        "content_digest": "311ece789019299836c97ca24908a52ca0e96ea11d3c81109444b41f625607a9"
+      },
+      {
+        "id": "test-release-after-term-commit",
+        "file": "raft_test.go",
+        "start_line": 2087,
+        "end_line": 2144,
+        "kind": "test_expectation",
+        "text": "// TestReadOnlyForNewLeader ensures that a leader only accepts MsgReadIndex message\n// when it commits at least one log entry at it term.\nfunc TestReadOnlyForNewLeader(t *testing.T) {\n\tnodeConfigs := []struct {\n\t\tid           uint64\n\t\tcommitted    uint64\n\t\tapplied      uint64\n\t\tcompactIndex uint64\n\t}{\n\t\t{1, 1, 1, 0},\n\t\t{2, 2, 2, 2},\n\t\t{3, 2, 2, 2},\n\t}\n\tpeers := make([]stateMachine, 0)\n\tfor _, c := range nodeConfigs {\n\t\tstorage := newTestMemoryStorage(withPeers(1, 2, 3))\n\t\trequire.NoError(t, storage.Append(index(1).terms(1, 1)))\n\t\tstorage.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(c.committed)})\n\t\tif c.compactIndex != 0 {\n\t\t\tstorage.Compact(c.compactIndex)\n\t\t}\n\t\tcfg := newTestConfig(c.id, 10, 1, storage)\n\t\tcfg.Applied = c.applied\n\t\traft := newRaft(cfg)\n\t\tpeers = append(peers, raft)\n\t}\n\tnt := newNetwork(peers...)\n\n\t// Drop MsgApp to forbid peer a to commit any log entry at its term after it becomes leader.\n\tnt.ignore(pb.MsgApp)\n\t// Force peer a to become leader.\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\n\tsm := nt.peers[1].(*raft)\n\trequire.Equal(t, StateLeader, sm.state)\n\n\t// Ensure peer a drops read only request.\n\tvar windex uint64 = 4\n\twctx := []byte(\"ctx\")\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: wctx}}})\n\trequire.Empty(t, sm.readStates)\n\n\tnt.recover()\n\n\t// Force peer a to commit a log entry at its term\n\tfor i := 0; i < sm.heartbeatTimeout; i++ {\n\t\tsm.tick()\n\t}\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgProp.Enum(), Entries: []*pb.Entry{{}}})\n\trequire.Equal(t, uint64(4), sm.raftLog.committed)\n\tlastLogTerm := sm.raftLog.zeroTermOnOutOfBounds(sm.raftLog.term(sm.raftLog.committed))\n\trequire.Equal(t, sm.Term, lastLogTerm)\n\n\t// Ensure peer a processed postponed read only request after it committed an entry at its term.\n\trequire.Len(t, sm.readStates, 1)\n\trs := sm.readStates[0]\n\trequire.Equal(t, windex, rs.Index)\n\trequire.Equal(t, wctx, rs.RequestCtx)",
+        "content_digest": "5f48681ef9c4fe99995662ce5e997bee7f52176515024b8fcbd1acd730e26311"
+      },
+      {
+        "id": "test-frees-readonly-mem",
+        "file": "raft_test.go",
+        "start_line": 1240,
+        "end_line": 1263,
+        "kind": "test_expectation",
+        "text": "// TestRaftFreesReadOnlyMem ensures raft will free read requests from\n// readOnly unconfirmedReads once they are confirmed.\n// related issue: https://github.com/etcd-io/etcd/issues/7571\nfunc TestRaftFreesReadOnlyMem(t *testing.T) {\n\tsm := newTestRaft(1, 5, 1, newTestMemoryStorage(withPeers(1, 2)))\n\tsm.becomeCandidate()\n\tsm.becomeLeader()\n\tsm.raftLog.commitTo(sm.raftLog.lastIndex())\n\n\treqCtx := []byte(\"ctx\")\n\n\t// leader starts linearizable read request.\n\t// more info: raft dissertation 6.4, step 2.\n\tsm.Step(&pb.Message{From: new(uint64(2)), Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: reqCtx}}})\n\tmsgs := sm.readMessages()\n\trequire.Len(t, msgs, 1)\n\trequire.Equal(t, pb.MsgHeartbeat, msgs[0].GetType())\n\trequire.Len(t, sm.readOnly.unconfirmedReads, 1)\n\n\t// heartbeat responses from majority of followers (1 in this case)\n\t// acknowledge the authority of the leader.\n\t// more info: raft dissertation 6.4, step 3.\n\tsm.Step(&pb.Message{From: new(uint64(2)), Type: pb.MsgHeartbeatResp.Enum(), Context: msgs[0].GetContext()})\n\trequire.Empty(t, sm.readOnly.unconfirmedReads)",
+        "content_digest": "5f48681ef9c4fe99995662ce5e997bee7f52176515024b8fcbd1acd730e26311"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "8769550822c045a18219e24795b9bdc0",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k-when-postponed": "8769550822c045a18219e24795b9bdc0-knowledge-0",
+        "@k-release-sites": "8769550822c045a18219e24795b9bdc0-knowledge-1",
+        "@k-switchtoconfig-commit": "8769550822c045a18219e24795b9bdc0-knowledge-2",
+        "@k-heartbeat-cannot-release": "8769550822c045a18219e24795b9bdc0-knowledge-3",
+        "@k-app-applied-vs-applyconfchange": "8769550822c045a18219e24795b9bdc0-knowledge-4",
+        "@readindex-postponed-release": "8769550822c045a18219e24795b9bdc0-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "readindex-stash"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "msgappresp-release"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "switchtoconfig-commit"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "release-helper"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "heartbeatresp-readonly"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "readonly-maybeadvance"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "node-advance-contract"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "node-readindex-contract"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "test-release-after-term-commit"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "test-frees-readonly-mem"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k-when-postponed"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k-release-sites"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k-switchtoconfig-commit"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k-heartbeat-cannot-release"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k-app-applied-vs-applyconfchange"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@readindex-postponed-release"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "@readindex-postponed-release"
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "8769550822c045a18219e24795b9bdc0-experiment"
+    },
+    "applied_operations": {
+      "submission-8769550822c045a18219e24795b9bdc0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_13-42-19-etcd_raft-real-run/semantic-commits/submission-8769550822c045a18219e24795b9bdc0.json"
+      }
+    }
+  }
+}

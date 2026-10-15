@@ -1,0 +1,150 @@
+{
+  "rationale": "Interpreted the stall-route probe and folded it into the parent account. The eight-trial receipt confirms the intended condition was reached (a successor at term 3 was observed while the stalled leader kept Leader state, first at 345-464ms) and that the queued VerifyLeader nevertheless never reported success: all endpoints were non-nil, at 600-602ms, with the two error values distinguishing the interleavings in which the verify had been registered and was answered by the leadership-loss cleanup from those in which it never left the channel. The child question is therefore refuted for this model, a Fact records it, and the parent question's gap narrows to the sub-millisecond interleaving rather than closing; the parent's own defect claim is untouched because the non-voter counting behaviour was observed directly in that question's probe. No execution is requested this turn.",
+  "knowledge": [
+    {
+      "ref": "@stalled_leader_verify_not_successful",
+      "kind": "fact",
+      "statement": "A VerifyLeader request queued while a leader's main loop is stalled past its lease is answered without success once the stall ends, even though a successor has been elected in the meantime. Across eight trials the stalled leader held only Leader state for every 1ms sample while another server led at term 3 (first seen at 345-464ms), yet the queued verify returned non-nil in all eight: seven times 'leadership lost while committing log' and twice 'node is not the leader', at 600-602ms, the moment the stall released the main loop; the concurrent Apply failed the same way. The endpoints show the lease case was already ready when the loop resumed, so leadership was given up before the non-voter's acknowledgement could be counted, which is ordering rather than the eligibility rule that the verify quorum itself violates.",
+      "conditions": "Three voters plus one non-voter, the leader partitioned so only the non-voter is reachable, HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms, a 600ms stall that blocks StoreLogs on the leader's main thread while a client Apply is in flight, in-memory transports in one process.",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "lease_check",
+        "lease_check_granularity",
+        "start_stop_repl",
+        "notify_all",
+        "update_last_appended",
+        "verify_vote"
+      ],
+      "executions": {
+        "2e5f37f634834b8197227626ed6d99b7": [
+          1,
+          3,
+          5,
+          7,
+          9,
+          11,
+          13,
+          15
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "1f661a68c21d426189d35f4a76d491f4-question-0",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "lease_check",
+        "lease_check_granularity",
+        "start_stop_repl",
+        "notify_all",
+        "update_last_appended",
+        "verify_vote"
+      ],
+      "executions": {
+        "2e5f37f634834b8197227626ed6d99b7": [
+          1,
+          3,
+          5,
+          7,
+          9,
+          11,
+          13,
+          15
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "refuted",
+      "rationale": "The question asked whether a leader stalled past its lease can still answer a queued VerifyLeader with success by counting the reachable non-voter, and the execution answers no for this model. In all eight trials (parsed result events at indices 1, 3, 5, 7, 9, 11, 13, 15) the intended condition was reached: the stalled leader kept Leader state for every sample (leader_not_leader_samples 0 in seven trials and 1 in one) while a different server was observed in Leader state at term 3 between 345ms and 464ms after the partition, so the cluster really did have two servers believing they led it during the stall. The queued VerifyLeader nevertheless never reported success: every endpoint was non-nil, seven trials answering 'leadership lost while committing log' and two answering 'node is not the leader', all at 600-602ms, which is exactly when the 600ms store stall released the main loop. The same run's Apply in the same window also ended with ErrLeadershipLost. The endpoints distinguish the two interleavings: 'leadership lost while committing log' is the answer the leader loop's cleanup gives to a verify it has already registered, so in those trials the verify case was served and then the runLeader defer answered it when leadership was given up, while 'node is not the leader' is the follower loop's answer to a request still queued in verifyCh, so in those trials the request never even reached verifyLeader. Neither outcome counts the non-voter's acknowledgement. The reason is ordering rather than eligibility: by the time the stall ends, the lease case is already ready, so the main loop gives up leadership in the next iteration, before the heartbeat round trip to the non-voter can return a vote. This refutes the suspicion for this route, not the parent defect: the accounting behaviour that counts a non-voter remains in the source and was observed directly in the parent question's probe. What the trial excludes is the specific consequence I was probing, namely that a stalled leader serving a queued verify hands a client a stale-read verdict. Two limits keep that exclusion narrow: it was measured with in-memory transports, where the acknowledgement round trip is far faster than the loop iteration that gives up leadership, and at eight trials it cannot bound an interleaving whose window is sub-millisecond. The parent question's gap therefore narrows to that scheduling residue rather than closing.",
+      "counterevidence": [
+        "The stall model, not the source, is what the trials refute: a slower or differently placed stall could change which case the main loop serves first, and a networked deployment makes each RPC round trip orders of magnitude slower than the loop iteration, which is the opposite direction from the one that produced these endpoints.",
+        "In two trials the failure was ErrNotLeader rather than ErrLeadershipLost, showing the queued request sometimes never reached verifyLeader at all; those trials measure the queue being drained after leadership loss rather than the race between the acknowledgement and the step-down."
+      ],
+      "limitations": [
+        "One execution of eight trials is cited; the endpoints were uniform (0/8 success) but the reported interleavings are inferred from the two error values, not sampled directly.",
+        "The stall is a wrapper around the log store that blocks the leader's main loop inside StoreLogs; the source comment on dispatchLogs shows the store write happens on the main thread, so the model matches that path, but a stall elsewhere (for example inside the lease check itself or a host suspension) is not covered.",
+        "HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms, stall 600ms, in-process in-memory transports, three voters plus one non-voter with only the non-voter reachable from the stalled leader."
+      ],
+      "experiment_id": "1f661a68c21d426189d35f4a76d491f4-experiment"
+    },
+    {
+      "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "start_stop_repl",
+        "notify_all",
+        "verify_vote",
+        "update_last_appended",
+        "heartbeat_ack",
+        "api_verify_leader",
+        "lease_check",
+        "config_validation",
+        "reload_config",
+        "elect_vote_collection",
+        "prevote_vote_collection",
+        "vote_grant_side",
+        "follower_election_trigger",
+        "follower_campaign_logic",
+        "lease_check_granularity",
+        "random_timeout",
+        "vote_leader_known_check",
+        "prevote_leader_known_check",
+        "follower_clears_leader"
+      ],
+      "executions": {
+        "b02d5ff23a504a8ea38116085ba8e23c": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "107a6d6c816d448da2b7ff6e3145bac1": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The question was whether its success establishes voter-majority contact; the execution says it does not. In the retained run of the three-partition probe, the leader whose only reachable peer was the non-voter returned success in 0ms while its own latest configuration reported three voters, one non-voter and a quorum size of 2, and the leader was still in Leader state (parsed event index 1); the control partition that kept one voter reachable also returned success, which shows the harness does observe a genuine acknowledgement path (index 3); the control partition with no reachable peer did not return success at all, returning 'leadership lost while committing log' after 202ms with the node in Follower state, so the leader cannot reach the threshold on its own vote and the non-voter acknowledgement is what satisfied it in the first case (index 5). All three declared comparisons hold with the setup event matched as admission (correlations 1->0, 3->2, 5->4). The source explains the mechanism: verifyLeader asks every entry of leaderState.replState to acknowledge, startStopReplication creates such an entry for every configured server except the leader without consulting Suffrage, any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, and the threshold compared against is quorumSize(), counted over voters alone. The same package treats voter eligibility strictly in its other leadership tests: checkLeaderLease does not count a non-voter, requestVote refuses a candidate that holds no vote, and quorumSize itself counts only voters, so the verify path is the outlier rather than a deliberate relaxation. The consequence for reads stays bounded and is not what this receipt measures. The leader's lease is voter-only, and both Config.Validate and ReloadConfig enforce LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so the old leader is normally removed before a voter majority elects a successor; the no-peer control is exactly that lease firing at 202ms with a 200ms lease. What the receipt does establish is the weaker but unconditional part: for an interval in which the leader exchanged nothing with any other voter, VerifyLeader reports success, so a caller relying on that call for read consistency is really relying on the lease timer rather than on the acknowledgements VerifyLeader collected. The same file shows the omission is not a considered relaxation of voter eligibility: electSelf and preElectSelf build the very same voter-sized threshold, and both iterate the leader's latest configuration asking only servers whose Suffrage is Voter, so a candidate neither solicits nor counts a non-voter's grant even though nothing on the granting side stops a non-voter from granting a vote if it were asked. Only the verify path asks every replication peer. That contrast is recorded as its own Behaviour so the finding is not reused without it, and it turns the question's answer from 'the success signal is weaker than its documentation' into 'the success signal contradicts the eligibility rule the same decisions use everywhere else'.",
+      "knowledge": [
+        {
+          "entry_id": "bc29f42a57d34a7bb2748bc0c137b09c-knowledge-0",
+          "revision": 1,
+          "assertion": "Election vote solicitation asks only servers whose Suffrage is Voter, so the verify path's inclusion of non-voters is an omission rather than the intended eligibility rule."
+        },
+        {
+          "entry_id": "69ed488d46854e82ac7202fb04ae501e-knowledge-0",
+          "revision": 1,
+          "assertion": "A follower campaigns after HeartbeatTimeout without leader contact, not after ElectionTimeout, and the leader's lease check granularity is max(10ms, LeaderLeaseTimeout - maxDiff)."
+        }
+      ],
+      "answers": {
+        "d704b04e706144dc964ff451359eda19-gap-0": {
+          "explanation": "Still unresolved, with one candidate trigger now excluded by execution. Configuration routes are closed by source (checkLeaderLease counts voters only, and ValidateConfig and ReloadConfig keep LeaderLeaseTimeout <= HeartbeatTimeout), and the timing bound stands: a voter refuses votes while it knows another leader and clears that only in its own campaign path, so the earliest successor is HeartbeatTimeout plus an election round, while the lease removes the leader by LeaderLeaseTimeout + minCheckInterval at the latest. The remaining trigger was a leader whose main loop is stalled past its lease; the child question's probe exercised exactly that in eight trials and reached the condition (a successor at term 3 while the stalled leader stayed Leader, first seen at 345-464ms) without producing a verify success, because the lease case was already ready when the loop resumed and leadership was given up before the non-voter's acknowledgement could be counted. What is left is the sub-millisecond interleaving in which that acknowledgement is counted in the same iteration in which the loop resumes, which these trials neither reached nor bounded.",
+          "resolved": false
+        }
+      },
+      "counterevidence": [
+        "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; the no-peer control shows this concretely (leadership lost at 202ms with a 200ms lease), which bounds the stale-read consequence rather than showing the verify decision support to be adequate.",
+        "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so a leader cannot be configured to outlive a follower's election timer through the public reload API.",
+        "In the non-voter partition the other servers stayed in term 2 with no leader change, so the receipt does not witness a successor being elected while the old leader still verified; that half of the consequence remains unobserved.",
+        "The grant side bounds the consequence more tightly than the verify quorum does: because a voter refuses votes while it knows another leader, no successor can be elected before HeartbeatTimeout plus an election round after the last leader contact, while the lease removes the old leader at LeaderLeaseTimeout + minCheckInterval at the latest; with the documented defaults the two cannot overlap, and even when LeaderLeaseTimeout equals HeartbeatTimeout the residual is a few milliseconds.",
+        "A targeted attempt at the stall trigger failed to produce the consequence: eight trials with a leader blocked in StoreLogs past its lease, a successor elected at term 3, and only a non-voter reachable all answered the queued verify with leadership loss or not-the-leader rather than success (receipt 2e5f37f634834b8197227626ed6d99b7, result indices 1,3,5,7,9,11,13,15)."
+      ],
+      "limitations": [
+        "Repeatability under the same fixed input is now shown for one additional run: receipt 107a6d6c816d448da2b7ff6e3145bac1 reproduces all three outcomes of receipt b02d5ff23a504a8ea38116085ba8e23c, with the non-voter-only partition returning success in 0ms while the leader stayed Leader, the voter-only control also returning success, and the no-peer partition returning 'leadership lost while committing log' at 208ms against 202ms in the first run. The two step-down times are the schedule-dependent quantity in that control; a repeat under the same timeouts and transports shows reproducibility, not schedule independence or independence from the JIT of the harness.",
+        "The stale-read consequence needs a successor elected while the old leader reports verify success, and the two orderings that decide it are both in the source. A voter refuses a vote or a pre-vote while it still knows a leader other than the candidate (raft.go 1673-1679 and 1786-1792), and it clears that knowledge only in its own campaign path, which runs after HeartbeatTimeout without leader contact (raft.go 227-228). A successor therefore needs a quorum of voters that have already reached that trigger, so it cannot exist earlier than HeartbeatTimeout after their last contact with the old leader, plus the election rounds. The leader, meanwhile, steps down at the first lease check whose voter contact age exceeds LeaderLeaseTimeout, and ValidateConfig allows LeaderLeaseTimeout to equal HeartbeatTimeout: in the worst schedule the boundary check still counts the voter (the comparison is diff <= leaseTimeout) and the step-down follows after minCheckInterval = 10ms. So under a validated configuration the leader leaves office in at most LeaderLeaseTimeout + 10ms, which is at most HeartbeatTimeout + 10ms, while no successor can be elected before HeartbeatTimeout plus a round of pre-vote and vote. The residual exposure is therefore confined to configurations with LeaderLeaseTimeout == HeartbeatTimeout and schedules where the granters clear at the earliest instant, and it is a few milliseconds at most; the practical route to a longer exposure is a leader whose own goroutine is stalled or whose clock jumps, which the earlier account relied on.",
+        "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks; the partition was made by disconnecting transports in both directions."
+      ]
+    }
+  ]
+}

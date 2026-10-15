@@ -1,0 +1,244 @@
+{
+  "rationale": "Opened a third question on the client-contract and completion mechanism. VerifyLeader, Barrier and ApplyLog each hand a future to a buffered channel in a select that also races the shutdown channel, and none of them sets the future's ShutdownCh, so a future whose send wins that race while the run loop is exiting is never answered. The stated contract names ErrRaftShutdown as one of the generic errors a client may see, and the repository's own test file already carries a TODO admitting that Barrier, VerifyLeader and GetConfiguration can get stuck this way. The submitted probe hammers each API from 64 goroutines against a concurrently shutting-down single node and counts futures that never complete, with a no-shutdown control for each kind; its execution is requested. No observation is claimed until the receipt exists.",
+  "sources": [
+    {
+      "id": "api_verify_future",
+      "file": "api.go",
+      "start_line": 928,
+      "end_line": 941,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_barrier_future",
+      "file": "api.go",
+      "start_line": 907,
+      "end_line": 926,
+      "kind": "code_observation"
+    },
+    {
+      "id": "api_apply_future",
+      "file": "api.go",
+      "start_line": 874,
+      "end_line": 899,
+      "kind": "code_observation"
+    },
+    {
+      "id": "defer_error_block",
+      "file": "future.go",
+      "start_line": 99,
+      "end_line": 117,
+      "kind": "code_observation"
+    },
+    {
+      "id": "verify_channel_buffer",
+      "file": "api.go",
+      "start_line": 570,
+      "end_line": 578,
+      "kind": "code_observation"
+    },
+    {
+      "id": "shutdown_close",
+      "file": "api.go",
+      "start_line": 1060,
+      "end_line": 1072,
+      "kind": "code_observation"
+    },
+    {
+      "id": "test_todo_stuck",
+      "file": "raft_test.go",
+      "start_line": 38,
+      "end_line": 42,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@shutdown_future_hang",
+      "question": "Can a future returned by VerifyLeader, Barrier or Apply while Shutdown is in progress be left permanently uncompleted, so that the caller's Error() never returns?",
+      "source_ids": [
+        "api_verify_future",
+        "api_barrier_future",
+        "api_apply_future",
+        "defer_error_block",
+        "verify_channel_buffer",
+        "shutdown_close",
+        "test_todo_stuck"
+      ],
+      "hypothesis": "Each call creates a future whose send races the shutdown channel in one select. The channels are buffered (64 for verifyCh), so the send is ready immediately; when Shutdown closes shutdownCh the run loop may take the shutdown case with futures still queued, and because none of these futures sets ShutdownCh, deferError.Error() has nothing to unblock on. VerifyLeader should be the most exposed because the leader loop drains verifyCh one case per iteration, while applyCh is drained in batches up to MaxAppendEntries per iteration and Barrier shares that path.",
+      "discriminator": "The number of futures per API call kind that have not completed 400ms after Shutdown() has returned, compared with the same call kinds on a node that is not shut down.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@shutdown_future_hang",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "api_verify_future",
+      "api_barrier_future",
+      "api_apply_future",
+      "defer_error_block",
+      "verify_channel_buffer",
+      "shutdown_close"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Issue 64 VerifyLeader, Barrier or Apply calls in parallel against a freshly started single-voter node while Shutdown runs concurrently, count how many of those futures have not completed 400ms after Shutdown has returned, and compare with the same call kinds issued on a node that is never shut down. Each case emits an assurance_shutdown_setup event and an assurance_shutdown_result event carrying the counts, the outcome histogram and the shutdown error.",
+      "assumptions": [
+        "A single-voter node is a supported configuration and makes each call complete quickly when the node is running, so any incomplete future is attributable to the shutdown race rather than to slow commit.",
+        "64 concurrent calls per trial is a probe of exposure, not a rate estimate; the concurrency is what makes the race observable.",
+        "Waiting 400ms after Shutdown() has returned is enough for any future that can still be answered, because the run loop has already exited by then."
+      ],
+      "excluded": [
+        "Whether a stuck future can be recovered by any other API, and any multi-node variant where a future could still be answered by another goroutine after shutdown."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Each case starts one real Raft instance in this process with its own InmemStore, InmemSnapshotStore and InmemTransport, bootstrapped as a single Voter with HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 50ms, and waits until it reports Leader. It then emits assurance_shutdown_setup and issues 64 calls of the chosen kind from separate goroutines, each waiting on Error() with a 1500ms local deadline and recording whether it returned and with which error. Concurrently, in the shutdown cases, Shutdown() is called and the case waits for it to return, then sleeps 400ms so that any future which can still be answered has been, and finally waits for all per-call timers before emitting assurance_shutdown_result with the returned and stuck counts, the outcome histogram, the shutdown error and the node state. The no-shutdown control issues the same calls without ever calling Shutdown. The harness is TestAssuranceShutdownFutureCompletion.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "assurance_shutdown_setup",
+        "conditions": []
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "assurance_shutdown_result",
+        "identity_fields": [
+          "trial",
+          "kind"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "any_stuck",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "shutdown",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "kind",
+            "op": "eq",
+            "value": "verify",
+            "reference": null
+          }
+        ],
+        "description": "VerifyLeader against a concurrent shutdown: at least one future never completed. Holds means the predicted hang was observed."
+      },
+      {
+        "event": "assurance_shutdown_result",
+        "identity_fields": [
+          "trial",
+          "kind"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "any_stuck",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "shutdown",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "kind",
+            "op": "eq",
+            "value": "verify",
+            "reference": null
+          }
+        ],
+        "description": "VerifyLeader control without shutdown: no future is left incomplete, so incompleteness is not a property of the probe itself."
+      },
+      {
+        "event": "assurance_shutdown_result",
+        "identity_fields": [
+          "trial",
+          "kind"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "any_stuck",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "shutdown",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "kind",
+            "op": "eq",
+            "value": "barrier",
+            "reference": null
+          }
+        ],
+        "description": "Barrier against a concurrent shutdown: whether the same hang appears on the apply-channel path, which the harness drains in batches."
+      },
+      {
+        "event": "assurance_shutdown_result",
+        "identity_fields": [
+          "trial",
+          "kind"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "any_stuck",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "shutdown",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "kind",
+            "op": "eq",
+            "value": "apply",
+            "reference": null
+          }
+        ],
+        "description": "Apply against a concurrent shutdown: whether the same hang appears for command application."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

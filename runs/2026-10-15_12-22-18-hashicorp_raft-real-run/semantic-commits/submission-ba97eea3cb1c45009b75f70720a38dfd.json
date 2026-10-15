@@ -1,0 +1,921 @@
+{
+  "input": {
+    "rationale": "Interpreted the revised transfer probe: all six comparisons hold, and the liveness half of the question is now measured rather than inferred. In the non-voter case the previous leader was outside Leader state in every one of the 1289 samples taken from the instant of the call, 241 samples found no leader at all (first 1ms, last 278ms after the call, about 1.4 election timeouts against a 200ms election timeout), the maximum term rose from 2 to 4, and leadership ended on a voter other than the requested target, while the call had already returned nil; the voter-target control recorded a completed transfer. The gap about the interruption is therefore resolved, and the measured disruption is promoted as a Fact because it is durable and will be reused. The question account stays scoped: it asserts the wrong success report and the observed interruption, not data loss or failure to recover.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@transfer_nonvoter_disruption",
+        "kind": "fact",
+        "statement": "A leadership transfer requested for a non-voter leaves the cluster without a leader until a voter wins the next election, while the call itself has already reported success. In the observed run with HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms, the call returned nil, the requested non-voter was never Leader, the previous leader was sampled outside Leader state in all 1289 samples from the instant of the call, 241 samples found no leader at all (first 1ms, last 278ms after the call, about 1.4 election timeouts), the maximum term rose from 2 to 4, and a different voter held leadership at the end. The voter-target control with the same call returned nil and did hand leadership to the requested server.",
+        "conditions": "Cluster of three voters plus one non-voter joined through AddNonvoter, protocol version >= 3, all peers reachable, pre-vote left at its default, and a single process with in-memory transports; the target is chosen by its suffrage in the leader's latest configuration, not by any observed result.",
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "start_stop_repl"
+        ],
+        "executions": {
+          "23acf06d8a524b2790ef674d5eb04cb0": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "b2c0026c56d54511999e5c37ef8372cd": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer",
+          "start_stop_repl"
+        ],
+        "executions": {
+          "23acf06d8a524b2790ef674d5eb04cb0": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The question was whether LeadershipTransferToServer reports a transfer that the named server can complete when that server is a non-voter, and what happens to leadership while it cannot; both halves are now execution-backed. Naming a voter (receipt 23acf06d8a524b2790ef674d5eb04cb0, setup index 0 and result index 1, and the earlier receipt b2c0026c56d54511999e5c37ef8372cd) the call returned nil, the requested server was Leader at the endpoint and the previous leader Follower, so the call does perform real transfers. Naming the non-voter (setup index 2, result index 3) the same call returned nil while the requested server was never observed as Leader and finished Follower; the previous leader was outside Leader state in all 1289 samples taken from the instant of the call; 241 samples found no leader in the cluster at all, the first 1ms and the last 278ms after the call, so the cluster was leaderless for about 277ms against a 200ms election timeout; the maximum term rose from 2 to 4; and leadership ended on a voter other than the requested target. The source explains the mechanism as predicted. The leader resolves the requested ID only through leaderState.replState, which startStopReplication populates for every configured server except the leader without consulting Suffrage, so a non-voter passes and receives TimeoutNow; timeoutNow sets it to Candidate and marks candidateFromLeadershipTransfer, a flag that by design suppresses pre-vote, so it sends a real RequestVote carrying the next term. Every voter adopts the higher term and becomes a follower before reaching the hasVote check, which then refuses the vote because the candidate holds no vote, so the requested server can never collect a grant. The old leader learns of the higher term, steps down, and its transfer goroutine reports success from the leftLeaderLoop branch, so the caller is told the handover succeeded while leadership has left it for a server it did not choose. That mismatch is the defect: the documented purpose of the call is to hand leadership to the named server, and a success result that the named server can never satisfy leaves the caller unable to distinguish a completed handover from a self-inflicted interruption that costs the cluster the leaderless interval it takes to elect someone else. The interruption is bounded rather than unbounded, and its length is now measured rather than inferred. No data loss is claimed: committed entries stay committed, and the control case shows the probe does observe a completed transfer.",
+        "answers": {
+          "627b3ef0c6e049bfb836e40ffbdce875-gap-1": {
+            "explanation": "Resolved by the revised probe (receipt 23acf06d8a524b2790ef674d5eb04cb0). In the non-voter case (result event index 3) the previous leader was outside Leader state in every one of the 1289 samples taken from the instant of the call, and at least one sample found no leader in the cluster: 241 of those samples were leaderless, the first at 1ms and the last at 278ms after the call, so with a 200ms election timeout the cluster was observed without a leader for about 277ms, roughly 1.4 election timeouts, while the requested target never held leadership and the maximum term rose from 2 to 4 with a different voter holding leadership at the end. The control case with a voter target (result event index 1) recorded no leaderless sample at all; its sampling window was about one millisecond because the transfer completed immediately, so its zero count is a short window rather than evidence about longer gaps.",
+            "resolved": true
+          }
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "The API comment does not state that the target must be a voter, and a caller who names only voters never reaches this path, so the defect depends on an accepted calling pattern rather than on the library's own choice of target.",
+          "LeadershipTransfer() without an explicit target filters non-voters in pickServer, which shows the intended transfer target set is the voter set and supports reading the targeted call as requiring the same premise.",
+          "A TimeoutNow that cannot be delivered (unreachable target) is reported as an error by the transfer path, so not every unusable target is silently accepted.",
+          "The interruption is bounded: the remaining voters re-elect after their election timers, and the control case shows the probe does observe a completed transfer, so the outcome is a wrong success report and a leadership interruption rather than a cluster that never recovers."
+        ],
+        "limitations": [
+          "The reported-result and interval observations rest on two executions of this probe (receipts b2c0026c56d54511999e5c37ef8372cd and 23acf06d8a524b2790ef674d5eb04cb0); across them the leader holding office at the end differed (in the first, the previous leader was Leader again at term 4; in the second, another voter), so the identity of the successor is timing dependent and is recorded rather than asserted.",
+          "The leaderless interval is an observed span at 1ms sampling resolution between a 200ms election timeout and a single-process in-memory transport; it is not a bound for configurations with different timeouts, and it does not distinguish time spent campaigning from time waiting for election timers.",
+          "The control case with a voter target finished in about one millisecond, so its sampling window is too short for its zero leaderless count to say anything about longer gaps.",
+          "The claim concerns the reported result of the call, the requested target's inability to win and the observed interruption; it does not assert data loss or that the cluster fails to recover, since a voter is elected afterwards.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own transfer, election and vote paths but not process-level partitions or multi-host clocks."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "knowledge": [
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "VerifyLeader counts acknowledgements from non-voters toward a voter-sized quorum, so it can report success for an interval in which the leader has had no successful interaction with any other voter. verifyLeader registers every entry of leaderState.replState (which startStopReplication creates for every configured server except the leader itself, without consulting Suffrage) on repl.notify, so each of those peers is asked to acknowledge; a successful AppendEntries reply (updateLastAppended and the heartbeat path) or a successful InstallSnapshot replies with notifyAll(true), which calls verifyFuture.vote(true) and increments votes; the threshold compared against is quorumSize(), computed as (voters in configurations.latest)/2+1. Every other leadership-quorum test in the same package restricts eligibility to voters: checkLeaderLease skips non-voter servers in its contacted count and requestVote rejects a candidate without a vote, so the two leadership tests disagree about whose support counts.",
+        "conditions": "A leader whose latest configuration (configurations.latest) contains a server with Suffrage other than Voter, and which can still exchange AppendEntries or InstallSnapshot RPCs with that server. With three voters and one non-voter, quorumSize() is 2, so the leader's own vote plus one non-voter acknowledgement reaches the threshold.",
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "update_last_appended",
+          "heartbeat_ack",
+          "install_snapshot_ack",
+          "verify_vote",
+          "lease_check",
+          "follower_vote_grant"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The leader's own leadership lease is computed over voters only: checkLeaderLease counts itself plus those servers in configurations.latest whose Suffrage is Voter and whose followerReplication last contact is within LeaderLeaseTimeout, and steps down when that count is below quorumSize(). A leader therefore stops counting an unreachable voter as contacted and steps down within roughly LeaderLeaseTimeout of the last successful interaction, while a follower cannot campaign before ElectionTimeout has elapsed since it last heard from a leader.",
+        "conditions": "A configuration accepted by Config.Validate, which requires 5ms <= LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout; the lease check is driven by the leader's own timer and by the last-contact times its replication goroutines record.",
+        "source_ids": [
+          "lease_check",
+          "quorum_size",
+          "config_validation"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "d704b04e706144dc964ff451359eda19-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Runtime configuration reload enforces the same timeout bounds as initial construction: ReloadConfig applies the reloadable fields onto the current configuration and returns the error from ValidateConfig before storing it, so LeaderLeaseTimeout can never exceed HeartbeatTimeout, nor HeartbeatTimeout exceed ElectionTimeout, on a running node. A leader cannot therefore be given a longer lease than a follower's election timeout through the public reload API.",
+        "conditions": "A call to Raft.ReloadConfig on a running node with a protocol-supported configuration; the check is performed under r.confReloadMu before the new configuration is stored, and on failure the previous configuration remains in force.",
+        "source_ids": [
+          "reload_config",
+          "config_validation",
+          "lease_check"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "d704b04e706144dc964ff451359eda19"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "LeadershipTransferToServer accepts a non-voter target and reports success without transferring leadership to it. The leader resolves the requested ID in leaderState.replState, which contains an entry for every configured server except the leader (startStopReplication creates one per server without consulting Suffrage) and only errors with 'cannot find replication state' when no entry exists. The selected target is sent TimeoutNow, which sets it to Candidate and marks candidateFromLeadershipTransfer; that flag makes runCandidate skip pre-vote, so the target sends a real RequestVote carrying the next term. A voter handling that request adopts the higher term and becomes a follower before it reaches the hasVote check, which then refuses the vote because the candidate holds no vote; the candidate therefore cannot win. When the old leader observes the higher term it steps down, the transfer goroutine's leftLeaderLoop branch responds nil, and the caller sees success. By contrast LeadershipTransfer with no explicit target picks through pickServer, which skips every server whose Suffrage is not Voter.",
+        "conditions": "Protocol version >= 3 (otherwise LeadershipTransferToServer returns ErrUnsupportedProtocol), a cluster whose latest configuration at the leader contains the named server with Suffrage other than Voter, and pre-vote enabled or disabled (the transfer path skips pre-vote either way). The named server must be reachable from the leader, otherwise the leader reports a TimeoutNow failure instead.",
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "start_stop_repl",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "api_verify_leader",
+          "lease_check"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The source trace shows the guarantee is weaker than that role requires: the confirming votes are gathered from every replication peer, including non-voters, while the threshold is a voter quorum. With three voters and one non-voter, quorumSize() is 2, so the leader's own vote plus a single non-voter acknowledgement reaches the threshold and VerifyLeader returns nil; the same code gives the non-voter no standing in checkLeaderLease's lease count or in a vote request, so the two leadership tests disagree about whose support counts. The consequence for reads is bounded rather than unconditional: checkLeaderLease uses voters only, so under a validated configuration the lease normally removes the old leader before a voter majority can elect a successor, and the acknowledgements counted while the leader is still legitimately leader are not themselves stale. The account therefore asserts a defect in the decision support VerifyLeader provides (success without voter-majority acknowledgement) and treats the stale-read consequence as conditional on the lease's timing assumption (a leader stall, clock jump or lease check interleaving that lets a successor be elected while the old leader still reports success). The requested probe fixes the acknowledging peer's identity independently of the result: the partition, not the outcome, selects the peer, and the non-voter is joined through the leader's own AddNonvoter path.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; this bounds the stale-read consequence rather than showing VerifyLeader's decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so a follower's election timer normally fires no earlier than the lease that causes the old leader to step down; the new-leader half of a stale read is therefore usually prevented by the lease rather than by the verify quorum."
+        ],
+        "limitations": [
+          "The account is currently source-based; the three-case probe is requested with the recorded prediction that the non-voter-only partition returns success while the no-reachable-peer partition does not, and its retained receipt and parsed indices will be cited in a later update.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks.",
+          "The stale-read consequence requires a successor to be elected while the old leader still reports verify success (for example a leader stall or clock jump longer than ElectionTimeout - LeaderLeaseTimeout, or a verify request served before the ready lease case); no such condition has been observed yet."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "d704b04e706144dc964ff451359eda19-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "api_verify_leader",
+          "lease_check",
+          "config_validation",
+          "reload_config"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM, and the question asks whether its success establishes the voter-majority contact that role implies. The source trace says no: verifyLeader registers every entry of leaderState.replState, which startStopReplication creates for every configured server except the leader without consulting Suffrage, so non-voters are asked to acknowledge; any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, while the threshold compared against is quorumSize(), counted over voters alone. With three voters and one non-voter the threshold is 2, so the leader's own vote plus the non-voter's acknowledgement is a success. The same package treats voter eligibility strictly everywhere else: checkLeaderLease does not count a non-voter in its contacted tally, requestVote refuses a candidate that has no vote, and quorumSize itself counts voters only, so the verify path is the odd one out rather than a deliberate relaxation. The consequence for reads is bounded, not unconditional. Under a validated configuration the leader's lease is also voter-only and normally removes the old leader before a voter majority can elect a successor, and ReloadConfig re-validates the bounds at runtime, so a leader cannot be given a lease longer than a follower's election timeout. What remains unconditionally wrong is narrower and still real for a caller: VerifyLeader returns success for an interval in which the leader has exchanged nothing with any other voter, and the guarantee a client actually relies on is then being carried by the lease timer instead of by the acknowledgements VerifyLeader collected. The requested probe fixes the acknowledging peer's identity independently of the outcome: the partition selects which peer stays reachable, case identity is the case name and leader ID, and the non-voter is joined through the leader's own AddNonvoter path. Each case now emits a placement event before the partition and a result event after it, so the result comparison's admission cannot be the result event itself.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; this bounds the stale-read consequence rather than showing VerifyLeader's decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so the old leader cannot be configured to outlive a follower's election timer; the new-leader half of a stale read is normally prevented by the lease rather than by the verify quorum."
+        ],
+        "limitations": [
+          "No parsed observation exists yet for this question. The first execution (receipt c0da4c5aa60d4db2bfe60f897e36bc32) completed with exit code 0 and tests_passed but produced 3 invalid_observation events and no parsed events, because the harness emitted CA_EVENT objects without the required event name; that is a harness format fault and cannot be used as evidence either way. The corrected harness is submitted in this update as a revision of the same experiment.",
+          "The account is therefore still source-based; the recorded prediction is that the non-voter-only partition returns verify_error nil while the no-reachable-peer partition does not, with the voter-only partition as the positive control that an acknowledgement from a voter also succeeds.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks.",
+          "The stale-read consequence needs a successor elected while the old leader still reports verify success; the registered gap records that no such legal condition has been identified, so the consequence stays conditional while the weaker claim above does not depend on it."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "d704b04e706144dc964ff451359eda19"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "update_last_appended",
+          "heartbeat_ack",
+          "api_verify_leader",
+          "lease_check",
+          "config_validation",
+          "reload_config"
+        ],
+        "executions": {
+          "b02d5ff23a504a8ea38116085ba8e23c": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The question was whether its success establishes voter-majority contact; the execution says it does not. In the retained run of the three-partition probe, the leader whose only reachable peer was the non-voter returned success in 0ms while its own latest configuration reported three voters, one non-voter and a quorum size of 2, and the leader was still in Leader state (parsed event index 1); the control partition that kept one voter reachable also returned success, which shows the harness does observe a genuine acknowledgement path (index 3); the control partition with no reachable peer did not return success at all, returning 'leadership lost while committing log' after 202ms with the node in Follower state, so the leader cannot reach the threshold on its own vote and the non-voter acknowledgement is what satisfied it in the first case (index 5). All three declared comparisons hold with the setup event matched as admission (correlations 1->0, 3->2, 5->4). The source explains the mechanism: verifyLeader asks every entry of leaderState.replState to acknowledge, startStopReplication creates such an entry for every configured server except the leader without consulting Suffrage, any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, and the threshold compared against is quorumSize(), counted over voters alone. The same package treats voter eligibility strictly in its other leadership tests: checkLeaderLease does not count a non-voter, requestVote refuses a candidate that holds no vote, and quorumSize itself counts only voters, so the verify path is the outlier rather than a deliberate relaxation. The consequence for reads stays bounded and is not what this receipt measures. The leader's lease is voter-only, and both Config.Validate and ReloadConfig enforce LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so the old leader is normally removed before a voter majority elects a successor; the no-peer control is exactly that lease firing at 202ms with a 200ms lease. What the receipt does establish is the weaker but unconditional part: for an interval in which the leader exchanged nothing with any other voter, VerifyLeader reports success, so a caller relying on that call for read consistency is really relying on the lease timer rather than on the acknowledgements VerifyLeader collected.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; the no-peer control shows this concretely (leadership lost at 202ms with a 200ms lease), which bounds the stale-read consequence rather than showing the verify decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so a leader cannot be configured to outlive a follower's election timer through the public reload API.",
+          "In the non-voter partition the other servers stayed in term 2 with no leader change, so the receipt does not witness a successor being elected while the old leader still verified; that half of the consequence remains unobserved."
+        ],
+        "limitations": [
+          "The stale-read consequence still needs a successor elected while the old leader reports verify success, for example a leader-side stall or clock jump longer than ElectionTimeout - LeaderLeaseTimeout, or a verify request served before a ready lease case; the registered gap tracks that search and is not resolved by this receipt.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks; the partition was made by disconnecting transports in both directions.",
+          "One execution of each case is cited; repeatability of the timing-sensitive control (the 202ms lease step-down) is not established."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-interpretation-1",
+        "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer",
+          "start_stop_repl"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The documented purpose of LeadershipTransferToServer is to transition leadership to a specific server in the cluster, and the only target validation in the leader is a lookup in leaderState.replState, which holds an entry for every configured server except the leader regardless of Suffrage; a missing entry is the sole error. A non-voter therefore passes validation and is sent TimeoutNow, which makes it a Candidate with candidateFromLeadershipTransfer set, a flag that by design suppresses pre-vote so the node sends a real RequestVote with a higher term. Voters processing that request adopt the higher term and set themselves to Follower before the hasVote check rejects the candidate, so the candidate cannot collect a single grant, while the old leader loses leadership because it adopts the higher term too and its transfer goroutine then reports success from the leftLeaderLoop branch. The account is asserted on that source basis and stays conditional until the requested two-case probe reports what the call returns versus which server actually takes leadership; the controlling contrast is the same call naming a voter, and the note that auto-targeted LeadershipTransfer() skips non-voters via pickServer shows the library itself does not consider a non-voter a valid transfer target when it chooses.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The API does not state in its comment that the target must be a voter, and a caller who names only voters never reaches this path, so the defect depends on an accepted calling pattern rather than on the library's own choice of target.",
+          "LeadershipTransfer() without an explicit target filters non-voters in pickServer, which shows the intended transfer target set is the voter set and supports reading the targeted call as requiring the same premise.",
+          "A TimeoutNow that cannot be delivered (unreachable target) is reported as an error by the transfer path, so not every unusable target is silently accepted."
+        ],
+        "limitations": [
+          "No receipt exists yet for this question; the harness for the two-case probe is submitted with this update and its outcome is predicted, not observed.",
+          "Whether the cluster is briefly leaderless after the non-voter's campaign, and for how long, is registered as a gap: the current probe samples leadership state at the end of a 1500ms window, which is too coarse to bound a leaderless interval.",
+          "The claim concerns the reported result of the call and the requested target's inability to win; it does not assert data loss, since committed entries remain committed and a fresh election follows."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "8e037ca743394e1a8a518b9745b8fe53-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "update_last_appended",
+          "heartbeat_ack",
+          "api_verify_leader",
+          "lease_check",
+          "config_validation",
+          "reload_config"
+        ],
+        "executions": {
+          "b02d5ff23a504a8ea38116085ba8e23c": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The question was whether its success establishes voter-majority contact; the execution says it does not. In the retained run of the three-partition probe, the leader whose only reachable peer was the non-voter returned success in 0ms while its own latest configuration reported three voters, one non-voter and a quorum size of 2, and the leader was still in Leader state (parsed event index 1); the control partition that kept one voter reachable also returned success, which shows the harness does observe a genuine acknowledgement path (index 3); the control partition with no reachable peer did not return success at all, returning 'leadership lost while committing log' after 202ms with the node in Follower state, so the leader cannot reach the threshold on its own vote and the non-voter acknowledgement is what satisfied it in the first case (index 5). All three declared comparisons hold with the setup event matched as admission (correlations 1->0, 3->2, 5->4). The source explains the mechanism: verifyLeader asks every entry of leaderState.replState to acknowledge, startStopReplication creates such an entry for every configured server except the leader without consulting Suffrage, any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, and the threshold compared against is quorumSize(), counted over voters alone. The same package treats voter eligibility strictly in its other leadership tests: checkLeaderLease does not count a non-voter, requestVote refuses a candidate that holds no vote, and quorumSize itself counts only voters, so the verify path is the outlier rather than a deliberate relaxation. The consequence for reads stays bounded and is not what this receipt measures. The leader's lease is voter-only, and both Config.Validate and ReloadConfig enforce LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so the old leader is normally removed before a voter majority elects a successor; the no-peer control is exactly that lease firing at 202ms with a 200ms lease. What the receipt does establish is the weaker but unconditional part: for an interval in which the leader exchanged nothing with any other voter, VerifyLeader reports success, so a caller relying on that call for read consistency is really relying on the lease timer rather than on the acknowledgements VerifyLeader collected.",
+        "answers": {
+          "d704b04e706144dc964ff451359eda19-gap-0": {
+            "explanation": "Partial progress only. The receipt for this question did not witness a successor being elected while the old leader verified: in the non-voter partition the other servers stayed in term 2 with no leader change and the leader was still Leader at the endpoint. The two configuration routes that could stretch the old leader's mandate past a follower's election timer are closed by source: checkLeaderLease counts voters only, and ReloadConfig re-runs ValidateConfig so LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout holds on a running node. What remains to be shown is a leader-side timing condition - a stall or clock jump longer than ElectionTimeout minus LeaderLeaseTimeout, or a verify request admitted before the ready lease case - and no legal instance has been identified.",
+            "resolved": false
+          }
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; the no-peer control shows this concretely (leadership lost at 202ms with a 200ms lease), which bounds the stale-read consequence rather than showing the verify decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so a leader cannot be configured to outlive a follower's election timer through the public reload API.",
+          "In the non-voter partition the other servers stayed in term 2 with no leader change, so the receipt does not witness a successor being elected while the old leader still verified; that half of the consequence remains unobserved."
+        ],
+        "limitations": [
+          "The stale-read consequence still needs a successor elected while the old leader reports verify success, for example a leader-side stall or clock jump longer than ElectionTimeout - LeaderLeaseTimeout, or a verify request served before a ready lease case; the registered gap tracks that search and is not resolved by this receipt.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks; the partition was made by disconnecting transports in both directions.",
+          "One execution of each case is cited; repeatability of the timing-sensitive control (the 202ms lease step-down) is not established."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8e037ca743394e1a8a518b9745b8fe53"
+      },
+      {
+        "id": "8e037ca743394e1a8a518b9745b8fe53-interpretation-1",
+        "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer",
+          "start_stop_repl"
+        ],
+        "executions": {
+          "b2c0026c56d54511999e5c37ef8372cd": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The question was whether LeadershipTransferToServer reports a transfer that the named server can complete when that server is a non-voter, and what happens to leadership while it cannot. The execution answers the first half directly. In the control case naming a voter (parsed indices 0 and 1) the call returned nil and the requested server was Leader at the endpoint while the previous leader was Follower, so the call does perform real transfers. In the case naming the non-voter (parsed indices 2 and 3, setup event index 2 matched as admission) the same call returned nil while the requested server was never observed as Leader within 1500ms and finished as Follower; the previous leader was not Leader at the endpoint and the maximum term across the cluster had risen from 2 to 4, with the same server holding leadership at term 4, which a Raft leader cannot do without having stepped down and won a later election. The source explains the mechanism as predicted. The leader resolves the requested ID only through leaderState.replState, which startStopReplication populates for every configured server except the leader without consulting Suffrage, so a non-voter passes and receives TimeoutNow; timeoutNow sets it to Candidate and marks candidateFromLeadershipTransfer, a flag that by design suppresses pre-vote, so it sends a real RequestVote carrying the next term. Each voter adopts the higher term and becomes a follower before reaching the hasVote check, which then refuses the vote because the candidate holds no vote, so the requested server can never collect a grant. The old leader learns of the higher term, steps down, and its transfer goroutine reports success from the leftLeaderLoop branch, so the caller is told the transfer succeeded while leadership has in fact left it for a server it did not choose, or returned to it in a later term. That mismatch is the defect: for the documented purpose of handing leadership over, a success result that the named target can never satisfy leaves the caller unable to distinguish a completed handover from a self-inflicted leadership interruption. The liveness side is bounded rather than unbounded and this receipt does not measure it, since leadership was sampled only at the end of the observation window; the revised probe samples every millisecond and records the leaderless samples. No data loss is claimed: committed entries stay committed and a voter is elected afterwards.",
+        "answers": {
+          "627b3ef0c6e049bfb836e40ffbdce875-gap-1": {
+            "explanation": "Partial progress. The execution shows the previous leader does not keep leadership: in the non-voter case it was not Leader at the endpoint and the cluster's maximum term had risen from 2 to 4 with the same server holding leadership at term 4, which a leader cannot do without having stepped down and won a later election. The leaderless interval itself is not bounded by that receipt, because leadership was only sampled when the returned result and the 1500ms target window ended. The revised probe submitted here samples leadership every millisecond and records leaderless sample counts, the first and last leaderless millisecond, and how often the previous leader was seen outside Leader state.",
+            "resolved": false
+          }
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "The API comment does not state that the target must be a voter, and a caller who names only voters never reaches this path, so the defect depends on an accepted calling pattern rather than on the library's own choice of target.",
+          "LeadershipTransfer() without an explicit target filters non-voters in pickServer, which shows the intended transfer target set is the voter set and supports reading the targeted call as requiring the same premise.",
+          "A TimeoutNow that cannot be delivered (unreachable target) is reported as an error by the transfer path, so not every unusable target is silently accepted.",
+          "The interruption is bounded: the remaining voters re-elect after their election timers, and the control case shows the probe does observe a completed transfer, so the outcome is a wrong success report and a leadership interruption rather than a cluster that never recovers."
+        ],
+        "limitations": [
+          "Whether the call reports success and the requested target cannot win rests on one execution per case (receipt b2c0026c56d54511999e5c37ef8372cd, indices 0-3); the identity of the leader after the interruption is timing dependent and is only recorded, not asserted.",
+          "The leaderless interval is not bounded by this receipt: leadership state was sampled once after the returned result and after a 1500ms wait, so no interval measurement exists yet; the revised probe with 1ms sampling is submitted for that.",
+          "The claim concerns the reported result of the call, the requested target's inability to win and the observed leadership change; it does not assert data loss.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own transfer, election and vote paths but not process-level partitions or multi-host clocks."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8e037ca743394e1a8a518b9745b8fe53"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "ba97eea3cb1c45009b75f70720a38dfd",
+      "result": {
+        "submission": "update.json",
+        "summary": "Interpreted the revised transfer receipt (23acf06d8a524b2790ef674d5eb04cb0): all six comparisons hold, and the liveness half is now measured rather than inferred — in the non-voter case the previous leader was outside Leader state in all 1289 samples from the instant of the call, 241 samples found no leader at all (first 1ms, last 278ms after the call, about 1.4 election timeouts against a 200ms timeout), the maximum term rose 2 to 4, leadership ended on a voter other than the requested target, and the call had already returned nil, while the voter-target control recorded a completed transfer. The account stays scoped to the wrong success report plus the observed bounded interruption, with no data-loss claim. The gap about the interruption is resolved, and the measured disruption is promoted as a new Fact (@transfer_nonvoter_disruption) with both receipts cited. Remaining work: the identity of the successor is timing dependent (the two receipts differed) and is recorded only; and a read of the live-bootstrap path (liveBootstrap, BootstrapCluster, HasExistingState) surfaced no defect — HasExistingState rejects a node with a persisted term — so no new suspicion was registered from it."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-3b823834c8cb46da98e77d8e988bf5d9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-3b823834c8cb46da98e77d8e988bf5d9.json"
+      },
+      "submission-d704b04e706144dc964ff451359eda19": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d704b04e706144dc964ff451359eda19.json"
+      },
+      "submission-627b3ef0c6e049bfb836e40ffbdce875": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-627b3ef0c6e049bfb836e40ffbdce875.json"
+      },
+      "submission-8e037ca743394e1a8a518b9745b8fe53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-8e037ca743394e1a8a518b9745b8fe53.json"
+      }
+    }
+  },
+  "after": {
+    "knowledge": [
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "VerifyLeader counts acknowledgements from non-voters toward a voter-sized quorum, so it can report success for an interval in which the leader has had no successful interaction with any other voter. verifyLeader registers every entry of leaderState.replState (which startStopReplication creates for every configured server except the leader itself, without consulting Suffrage) on repl.notify, so each of those peers is asked to acknowledge; a successful AppendEntries reply (updateLastAppended and the heartbeat path) or a successful InstallSnapshot replies with notifyAll(true), which calls verifyFuture.vote(true) and increments votes; the threshold compared against is quorumSize(), computed as (voters in configurations.latest)/2+1. Every other leadership-quorum test in the same package restricts eligibility to voters: checkLeaderLease skips non-voter servers in its contacted count and requestVote rejects a candidate without a vote, so the two leadership tests disagree about whose support counts.",
+        "conditions": "A leader whose latest configuration (configurations.latest) contains a server with Suffrage other than Voter, and which can still exchange AppendEntries or InstallSnapshot RPCs with that server. With three voters and one non-voter, quorumSize() is 2, so the leader's own vote plus one non-voter acknowledgement reaches the threshold.",
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "update_last_appended",
+          "heartbeat_ack",
+          "install_snapshot_ack",
+          "verify_vote",
+          "lease_check",
+          "follower_vote_grant"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The leader's own leadership lease is computed over voters only: checkLeaderLease counts itself plus those servers in configurations.latest whose Suffrage is Voter and whose followerReplication last contact is within LeaderLeaseTimeout, and steps down when that count is below quorumSize(). A leader therefore stops counting an unreachable voter as contacted and steps down within roughly LeaderLeaseTimeout of the last successful interaction, while a follower cannot campaign before ElectionTimeout has elapsed since it last heard from a leader.",
+        "conditions": "A configuration accepted by Config.Validate, which requires 5ms <= LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout; the lease check is driven by the leader's own timer and by the last-contact times its replication goroutines record.",
+        "source_ids": [
+          "lease_check",
+          "quorum_size",
+          "config_validation"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "d704b04e706144dc964ff451359eda19-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Runtime configuration reload enforces the same timeout bounds as initial construction: ReloadConfig applies the reloadable fields onto the current configuration and returns the error from ValidateConfig before storing it, so LeaderLeaseTimeout can never exceed HeartbeatTimeout, nor HeartbeatTimeout exceed ElectionTimeout, on a running node. A leader cannot therefore be given a longer lease than a follower's election timeout through the public reload API.",
+        "conditions": "A call to Raft.ReloadConfig on a running node with a protocol-supported configuration; the check is performed under r.confReloadMu before the new configuration is stored, and on failure the previous configuration remains in force.",
+        "source_ids": [
+          "reload_config",
+          "config_validation",
+          "lease_check"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "d704b04e706144dc964ff451359eda19"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "LeadershipTransferToServer accepts a non-voter target and reports success without transferring leadership to it. The leader resolves the requested ID in leaderState.replState, which contains an entry for every configured server except the leader (startStopReplication creates one per server without consulting Suffrage) and only errors with 'cannot find replication state' when no entry exists. The selected target is sent TimeoutNow, which sets it to Candidate and marks candidateFromLeadershipTransfer; that flag makes runCandidate skip pre-vote, so the target sends a real RequestVote carrying the next term. A voter handling that request adopts the higher term and becomes a follower before it reaches the hasVote check, which then refuses the vote because the candidate holds no vote; the candidate therefore cannot win. When the old leader observes the higher term it steps down, the transfer goroutine's leftLeaderLoop branch responds nil, and the caller sees success. By contrast LeadershipTransfer with no explicit target picks through pickServer, which skips every server whose Suffrage is not Voter.",
+        "conditions": "Protocol version >= 3 (otherwise LeadershipTransferToServer returns ErrUnsupportedProtocol), a cluster whose latest configuration at the leader contains the named server with Suffrage other than Voter, and pre-vote enabled or disabled (the transfer path skips pre-vote either way). The named server must be reachable from the leader, otherwise the leader reports a TimeoutNow failure instead.",
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "start_stop_repl",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "ba97eea3cb1c45009b75f70720a38dfd-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "A leadership transfer requested for a non-voter leaves the cluster without a leader until a voter wins the next election, while the call itself has already reported success. In the observed run with HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms, the call returned nil, the requested non-voter was never Leader, the previous leader was sampled outside Leader state in all 1289 samples from the instant of the call, 241 samples found no leader at all (first 1ms, last 278ms after the call, about 1.4 election timeouts), the maximum term rose from 2 to 4, and a different voter held leadership at the end. The voter-target control with the same call returned nil and did hand leadership to the requested server.",
+        "conditions": "Cluster of three voters plus one non-voter joined through AddNonvoter, protocol version >= 3, all peers reachable, pre-vote left at its default, and a single process with in-memory transports; the target is chosen by its suffrage in the leader's latest configuration, not by any observed result.",
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "start_stop_repl"
+        ],
+        "executions": {
+          "23acf06d8a524b2790ef674d5eb04cb0": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "b2c0026c56d54511999e5c37ef8372cd": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ba97eea3cb1c45009b75f70720a38dfd"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "3b823834c8cb46da98e77d8e988bf5d9-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "api_verify_leader",
+          "lease_check"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The source trace shows the guarantee is weaker than that role requires: the confirming votes are gathered from every replication peer, including non-voters, while the threshold is a voter quorum. With three voters and one non-voter, quorumSize() is 2, so the leader's own vote plus a single non-voter acknowledgement reaches the threshold and VerifyLeader returns nil; the same code gives the non-voter no standing in checkLeaderLease's lease count or in a vote request, so the two leadership tests disagree about whose support counts. The consequence for reads is bounded rather than unconditional: checkLeaderLease uses voters only, so under a validated configuration the lease normally removes the old leader before a voter majority can elect a successor, and the acknowledgements counted while the leader is still legitimately leader are not themselves stale. The account therefore asserts a defect in the decision support VerifyLeader provides (success without voter-majority acknowledgement) and treats the stale-read consequence as conditional on the lease's timing assumption (a leader stall, clock jump or lease check interleaving that lets a successor be elected while the old leader still reports success). The requested probe fixes the acknowledging peer's identity independently of the result: the partition, not the outcome, selects the peer, and the non-voter is joined through the leader's own AddNonvoter path.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; this bounds the stale-read consequence rather than showing VerifyLeader's decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so a follower's election timer normally fires no earlier than the lease that causes the old leader to step down; the new-leader half of a stale read is therefore usually prevented by the lease rather than by the verify quorum."
+        ],
+        "limitations": [
+          "The account is currently source-based; the three-case probe is requested with the recorded prediction that the non-voter-only partition returns success while the no-reachable-peer partition does not, and its retained receipt and parsed indices will be cited in a later update.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks.",
+          "The stale-read consequence requires a successor to be elected while the old leader still reports verify success (for example a leader stall or clock jump longer than ElectionTimeout - LeaderLeaseTimeout, or a verify request served before the ready lease case); no such condition has been observed yet."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3b823834c8cb46da98e77d8e988bf5d9"
+      },
+      {
+        "id": "d704b04e706144dc964ff451359eda19-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "api_verify_leader",
+          "lease_check",
+          "config_validation",
+          "reload_config"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM, and the question asks whether its success establishes the voter-majority contact that role implies. The source trace says no: verifyLeader registers every entry of leaderState.replState, which startStopReplication creates for every configured server except the leader without consulting Suffrage, so non-voters are asked to acknowledge; any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, while the threshold compared against is quorumSize(), counted over voters alone. With three voters and one non-voter the threshold is 2, so the leader's own vote plus the non-voter's acknowledgement is a success. The same package treats voter eligibility strictly everywhere else: checkLeaderLease does not count a non-voter in its contacted tally, requestVote refuses a candidate that has no vote, and quorumSize itself counts voters only, so the verify path is the odd one out rather than a deliberate relaxation. The consequence for reads is bounded, not unconditional. Under a validated configuration the leader's lease is also voter-only and normally removes the old leader before a voter majority can elect a successor, and ReloadConfig re-validates the bounds at runtime, so a leader cannot be given a lease longer than a follower's election timeout. What remains unconditionally wrong is narrower and still real for a caller: VerifyLeader returns success for an interval in which the leader has exchanged nothing with any other voter, and the guarantee a client actually relies on is then being carried by the lease timer instead of by the acknowledgements VerifyLeader collected. The requested probe fixes the acknowledging peer's identity independently of the outcome: the partition selects which peer stays reachable, case identity is the case name and leader ID, and the non-voter is joined through the leader's own AddNonvoter path. Each case now emits a placement event before the partition and a result event after it, so the result comparison's admission cannot be the result event itself.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; this bounds the stale-read consequence rather than showing VerifyLeader's decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so the old leader cannot be configured to outlive a follower's election timer; the new-leader half of a stale read is normally prevented by the lease rather than by the verify quorum."
+        ],
+        "limitations": [
+          "No parsed observation exists yet for this question. The first execution (receipt c0da4c5aa60d4db2bfe60f897e36bc32) completed with exit code 0 and tests_passed but produced 3 invalid_observation events and no parsed events, because the harness emitted CA_EVENT objects without the required event name; that is a harness format fault and cannot be used as evidence either way. The corrected harness is submitted in this update as a revision of the same experiment.",
+          "The account is therefore still source-based; the recorded prediction is that the non-voter-only partition returns verify_error nil while the no-reachable-peer partition does not, with the voter-only partition as the positive control that an acknowledgement from a voter also succeeds.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks.",
+          "The stale-read consequence needs a successor elected while the old leader still reports verify success; the registered gap records that no such legal condition has been identified, so the consequence stays conditional while the weaker claim above does not depend on it."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "d704b04e706144dc964ff451359eda19"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "update_last_appended",
+          "heartbeat_ack",
+          "api_verify_leader",
+          "lease_check",
+          "config_validation",
+          "reload_config"
+        ],
+        "executions": {
+          "b02d5ff23a504a8ea38116085ba8e23c": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The question was whether its success establishes voter-majority contact; the execution says it does not. In the retained run of the three-partition probe, the leader whose only reachable peer was the non-voter returned success in 0ms while its own latest configuration reported three voters, one non-voter and a quorum size of 2, and the leader was still in Leader state (parsed event index 1); the control partition that kept one voter reachable also returned success, which shows the harness does observe a genuine acknowledgement path (index 3); the control partition with no reachable peer did not return success at all, returning 'leadership lost while committing log' after 202ms with the node in Follower state, so the leader cannot reach the threshold on its own vote and the non-voter acknowledgement is what satisfied it in the first case (index 5). All three declared comparisons hold with the setup event matched as admission (correlations 1->0, 3->2, 5->4). The source explains the mechanism: verifyLeader asks every entry of leaderState.replState to acknowledge, startStopReplication creates such an entry for every configured server except the leader without consulting Suffrage, any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, and the threshold compared against is quorumSize(), counted over voters alone. The same package treats voter eligibility strictly in its other leadership tests: checkLeaderLease does not count a non-voter, requestVote refuses a candidate that holds no vote, and quorumSize itself counts only voters, so the verify path is the outlier rather than a deliberate relaxation. The consequence for reads stays bounded and is not what this receipt measures. The leader's lease is voter-only, and both Config.Validate and ReloadConfig enforce LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so the old leader is normally removed before a voter majority elects a successor; the no-peer control is exactly that lease firing at 202ms with a 200ms lease. What the receipt does establish is the weaker but unconditional part: for an interval in which the leader exchanged nothing with any other voter, VerifyLeader reports success, so a caller relying on that call for read consistency is really relying on the lease timer rather than on the acknowledgements VerifyLeader collected.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; the no-peer control shows this concretely (leadership lost at 202ms with a 200ms lease), which bounds the stale-read consequence rather than showing the verify decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so a leader cannot be configured to outlive a follower's election timer through the public reload API.",
+          "In the non-voter partition the other servers stayed in term 2 with no leader change, so the receipt does not witness a successor being elected while the old leader still verified; that half of the consequence remains unobserved."
+        ],
+        "limitations": [
+          "The stale-read consequence still needs a successor elected while the old leader reports verify success, for example a leader-side stall or clock jump longer than ElectionTimeout - LeaderLeaseTimeout, or a verify request served before a ready lease case; the registered gap tracks that search and is not resolved by this receipt.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks; the partition was made by disconnecting transports in both directions.",
+          "One execution of each case is cited; repeatability of the timing-sensitive control (the 202ms lease step-down) is not established."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "627b3ef0c6e049bfb836e40ffbdce875-interpretation-1",
+        "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer",
+          "start_stop_repl"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "The documented purpose of LeadershipTransferToServer is to transition leadership to a specific server in the cluster, and the only target validation in the leader is a lookup in leaderState.replState, which holds an entry for every configured server except the leader regardless of Suffrage; a missing entry is the sole error. A non-voter therefore passes validation and is sent TimeoutNow, which makes it a Candidate with candidateFromLeadershipTransfer set, a flag that by design suppresses pre-vote so the node sends a real RequestVote with a higher term. Voters processing that request adopt the higher term and set themselves to Follower before the hasVote check rejects the candidate, so the candidate cannot collect a single grant, while the old leader loses leadership because it adopts the higher term too and its transfer goroutine then reports success from the leftLeaderLoop branch. The account is asserted on that source basis and stays conditional until the requested two-case probe reports what the call returns versus which server actually takes leadership; the controlling contrast is the same call naming a voter, and the note that auto-targeted LeadershipTransfer() skips non-voters via pickServer shows the library itself does not consider a non-voter a valid transfer target when it chooses.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The API does not state in its comment that the target must be a voter, and a caller who names only voters never reaches this path, so the defect depends on an accepted calling pattern rather than on the library's own choice of target.",
+          "LeadershipTransfer() without an explicit target filters non-voters in pickServer, which shows the intended transfer target set is the voter set and supports reading the targeted call as requiring the same premise.",
+          "A TimeoutNow that cannot be delivered (unreachable target) is reported as an error by the transfer path, so not every unusable target is silently accepted."
+        ],
+        "limitations": [
+          "No receipt exists yet for this question; the harness for the two-case probe is submitted with this update and its outcome is predicted, not observed.",
+          "Whether the cluster is briefly leaderless after the non-voter's campaign, and for how long, is registered as a gap: the current probe samples leadership state at the end of a 1500ms window, which is too coarse to bound a leaderless interval.",
+          "The claim concerns the reported result of the call and the requested target's inability to win; it does not assert data loss, since committed entries remain committed and a fresh election follows."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "627b3ef0c6e049bfb836e40ffbdce875"
+      },
+      {
+        "id": "8e037ca743394e1a8a518b9745b8fe53-interpretation-0",
+        "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "verify_leader",
+          "quorum_size",
+          "start_stop_repl",
+          "notify_all",
+          "verify_vote",
+          "update_last_appended",
+          "heartbeat_ack",
+          "api_verify_leader",
+          "lease_check",
+          "config_validation",
+          "reload_config"
+        ],
+        "executions": {
+          "b02d5ff23a504a8ea38116085ba8e23c": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "VerifyLeader's documented role is to ensure this peer is still the leader so that stale data is not returned from the FSM. The question was whether its success establishes voter-majority contact; the execution says it does not. In the retained run of the three-partition probe, the leader whose only reachable peer was the non-voter returned success in 0ms while its own latest configuration reported three voters, one non-voter and a quorum size of 2, and the leader was still in Leader state (parsed event index 1); the control partition that kept one voter reachable also returned success, which shows the harness does observe a genuine acknowledgement path (index 3); the control partition with no reachable peer did not return success at all, returning 'leadership lost while committing log' after 202ms with the node in Follower state, so the leader cannot reach the threshold on its own vote and the non-voter acknowledgement is what satisfied it in the first case (index 5). All three declared comparisons hold with the setup event matched as admission (correlations 1->0, 3->2, 5->4). The source explains the mechanism: verifyLeader asks every entry of leaderState.replState to acknowledge, startStopReplication creates such an entry for every configured server except the leader without consulting Suffrage, any successful AppendEntries or InstallSnapshot reply from such a peer calls notifyAll(true) and increments verifyFuture.votes, and the threshold compared against is quorumSize(), counted over voters alone. The same package treats voter eligibility strictly in its other leadership tests: checkLeaderLease does not count a non-voter, requestVote refuses a candidate that holds no vote, and quorumSize itself counts only voters, so the verify path is the outlier rather than a deliberate relaxation. The consequence for reads stays bounded and is not what this receipt measures. The leader's lease is voter-only, and both Config.Validate and ReloadConfig enforce LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so the old leader is normally removed before a voter majority elects a successor; the no-peer control is exactly that lease firing at 202ms with a 200ms lease. What the receipt does establish is the weaker but unconditional part: for an interval in which the leader exchanged nothing with any other voter, VerifyLeader reports success, so a caller relying on that call for read consistency is really relying on the lease timer rather than on the acknowledgements VerifyLeader collected.",
+        "answers": {
+          "d704b04e706144dc964ff451359eda19-gap-0": {
+            "explanation": "Partial progress only. The receipt for this question did not witness a successor being elected while the old leader verified: in the non-voter partition the other servers stayed in term 2 with no leader change and the leader was still Leader at the endpoint. The two configuration routes that could stretch the old leader's mandate past a follower's election timer are closed by source: checkLeaderLease counts voters only, and ReloadConfig re-runs ValidateConfig so LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout holds on a running node. What remains to be shown is a leader-side timing condition - a stall or clock jump longer than ElectionTimeout minus LeaderLeaseTimeout, or a verify request admitted before the ready lease case - and no legal instance has been identified.",
+            "resolved": false
+          }
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "checkLeaderLease counts voters only, so a leader that has lost voter-majority contact steps down within about LeaderLeaseTimeout; the no-peer control shows this concretely (leadership lost at 202ms with a 200ms lease), which bounds the stale-read consequence rather than showing the verify decision support to be adequate.",
+          "Config.Validate keeps LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, and ReloadConfig re-runs ValidateConfig, so a leader cannot be configured to outlive a follower's election timer through the public reload API.",
+          "In the non-voter partition the other servers stayed in term 2 with no leader change, so the receipt does not witness a successor being elected while the old leader still verified; that half of the consequence remains unobserved."
+        ],
+        "limitations": [
+          "The stale-read consequence still needs a successor elected while the old leader reports verify success, for example a leader-side stall or clock jump longer than ElectionTimeout - LeaderLeaseTimeout, or a verify request served before a ready lease case; the registered gap tracks that search and is not resolved by this receipt.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own replication and verify paths but not process-level partitions or multi-host clocks; the partition was made by disconnecting transports in both directions.",
+          "One execution of each case is cited; repeatability of the timing-sensitive control (the 202ms lease step-down) is not established."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8e037ca743394e1a8a518b9745b8fe53"
+      },
+      {
+        "id": "8e037ca743394e1a8a518b9745b8fe53-interpretation-1",
+        "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer",
+          "start_stop_repl"
+        ],
+        "executions": {
+          "b2c0026c56d54511999e5c37ef8372cd": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The question was whether LeadershipTransferToServer reports a transfer that the named server can complete when that server is a non-voter, and what happens to leadership while it cannot. The execution answers the first half directly. In the control case naming a voter (parsed indices 0 and 1) the call returned nil and the requested server was Leader at the endpoint while the previous leader was Follower, so the call does perform real transfers. In the case naming the non-voter (parsed indices 2 and 3, setup event index 2 matched as admission) the same call returned nil while the requested server was never observed as Leader within 1500ms and finished as Follower; the previous leader was not Leader at the endpoint and the maximum term across the cluster had risen from 2 to 4, with the same server holding leadership at term 4, which a Raft leader cannot do without having stepped down and won a later election. The source explains the mechanism as predicted. The leader resolves the requested ID only through leaderState.replState, which startStopReplication populates for every configured server except the leader without consulting Suffrage, so a non-voter passes and receives TimeoutNow; timeoutNow sets it to Candidate and marks candidateFromLeadershipTransfer, a flag that by design suppresses pre-vote, so it sends a real RequestVote carrying the next term. Each voter adopts the higher term and becomes a follower before reaching the hasVote check, which then refuses the vote because the candidate holds no vote, so the requested server can never collect a grant. The old leader learns of the higher term, steps down, and its transfer goroutine reports success from the leftLeaderLoop branch, so the caller is told the transfer succeeded while leadership has in fact left it for a server it did not choose, or returned to it in a later term. That mismatch is the defect: for the documented purpose of handing leadership over, a success result that the named target can never satisfy leaves the caller unable to distinguish a completed handover from a self-inflicted leadership interruption. The liveness side is bounded rather than unbounded and this receipt does not measure it, since leadership was sampled only at the end of the observation window; the revised probe samples every millisecond and records the leaderless samples. No data loss is claimed: committed entries stay committed and a voter is elected afterwards.",
+        "answers": {
+          "627b3ef0c6e049bfb836e40ffbdce875-gap-1": {
+            "explanation": "Partial progress. The execution shows the previous leader does not keep leadership: in the non-voter case it was not Leader at the endpoint and the cluster's maximum term had risen from 2 to 4 with the same server holding leadership at term 4, which a leader cannot do without having stepped down and won a later election. The leaderless interval itself is not bounded by that receipt, because leadership was only sampled when the returned result and the 1500ms target window ended. The revised probe submitted here samples leadership every millisecond and records leaderless sample counts, the first and last leaderless millisecond, and how often the previous leader was seen outside Leader state.",
+            "resolved": false
+          }
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "The API comment does not state that the target must be a voter, and a caller who names only voters never reaches this path, so the defect depends on an accepted calling pattern rather than on the library's own choice of target.",
+          "LeadershipTransfer() without an explicit target filters non-voters in pickServer, which shows the intended transfer target set is the voter set and supports reading the targeted call as requiring the same premise.",
+          "A TimeoutNow that cannot be delivered (unreachable target) is reported as an error by the transfer path, so not every unusable target is silently accepted.",
+          "The interruption is bounded: the remaining voters re-elect after their election timers, and the control case shows the probe does observe a completed transfer, so the outcome is a wrong success report and a leadership interruption rather than a cluster that never recovers."
+        ],
+        "limitations": [
+          "Whether the call reports success and the requested target cannot win rests on one execution per case (receipt b2c0026c56d54511999e5c37ef8372cd, indices 0-3); the identity of the leader after the interruption is timing dependent and is only recorded, not asserted.",
+          "The leaderless interval is not bounded by this receipt: leadership state was sampled once after the returned result and after a 1500ms wait, so no interval measurement exists yet; the revised probe with 1ms sampling is submitted for that.",
+          "The claim concerns the reported result of the call, the requested target's inability to win and the observed leadership change; it does not assert data loss.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own transfer, election and vote paths but not process-level partitions or multi-host clocks."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "8e037ca743394e1a8a518b9745b8fe53"
+      },
+      {
+        "id": "ba97eea3cb1c45009b75f70720a38dfd-interpretation-0",
+        "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+        "experiment_id": null,
+        "source_ids": [
+          "api_transfer_to_server",
+          "transfer_target_lookup",
+          "timeout_now",
+          "candidate_skips_prevote",
+          "vote_term_bump",
+          "transfer_lost_leadership",
+          "pick_server_voters",
+          "follower_vote_grant",
+          "docs_transfer",
+          "start_stop_repl"
+        ],
+        "executions": {
+          "23acf06d8a524b2790ef674d5eb04cb0": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "conclusion": "explained",
+        "defect_claim": "asserted",
+        "rationale": "The question was whether LeadershipTransferToServer reports a transfer that the named server can complete when that server is a non-voter, and what happens to leadership while it cannot; both halves are now execution-backed. Naming a voter (receipt 23acf06d8a524b2790ef674d5eb04cb0, setup index 0 and result index 1, and the earlier receipt b2c0026c56d54511999e5c37ef8372cd) the call returned nil, the requested server was Leader at the endpoint and the previous leader Follower, so the call does perform real transfers. Naming the non-voter (setup index 2, result index 3) the same call returned nil while the requested server was never observed as Leader and finished Follower; the previous leader was outside Leader state in all 1289 samples taken from the instant of the call; 241 samples found no leader in the cluster at all, the first 1ms and the last 278ms after the call, so the cluster was leaderless for about 277ms against a 200ms election timeout; the maximum term rose from 2 to 4; and leadership ended on a voter other than the requested target. The source explains the mechanism as predicted. The leader resolves the requested ID only through leaderState.replState, which startStopReplication populates for every configured server except the leader without consulting Suffrage, so a non-voter passes and receives TimeoutNow; timeoutNow sets it to Candidate and marks candidateFromLeadershipTransfer, a flag that by design suppresses pre-vote, so it sends a real RequestVote carrying the next term. Every voter adopts the higher term and becomes a follower before reaching the hasVote check, which then refuses the vote because the candidate holds no vote, so the requested server can never collect a grant. The old leader learns of the higher term, steps down, and its transfer goroutine reports success from the leftLeaderLoop branch, so the caller is told the handover succeeded while leadership has left it for a server it did not choose. That mismatch is the defect: the documented purpose of the call is to hand leadership to the named server, and a success result that the named server can never satisfy leaves the caller unable to distinguish a completed handover from a self-inflicted interruption that costs the cluster the leaderless interval it takes to elect someone else. The interruption is bounded rather than unbounded, and its length is now measured rather than inferred. No data loss is claimed: committed entries stay committed, and the control case shows the probe does observe a completed transfer.",
+        "answers": {
+          "627b3ef0c6e049bfb836e40ffbdce875-gap-1": {
+            "explanation": "Resolved by the revised probe (receipt 23acf06d8a524b2790ef674d5eb04cb0). In the non-voter case (result event index 3) the previous leader was outside Leader state in every one of the 1289 samples taken from the instant of the call, and at least one sample found no leader in the cluster: 241 of those samples were leaderless, the first at 1ms and the last at 278ms after the call, so with a 200ms election timeout the cluster was observed without a leader for about 277ms, roughly 1.4 election timeouts, while the requested target never held leadership and the maximum term rose from 2 to 4 with a different voter holding leadership at the end. The control case with a voter target (result event index 1) recorded no leaderless sample at all; its sampling window was about one millisecond because the transfer completed immediately, so its zero count is a short window rather than evidence about longer gaps.",
+            "resolved": true
+          }
+        },
+        "knowledge": [],
+        "counterevidence": [
+          "The API comment does not state that the target must be a voter, and a caller who names only voters never reaches this path, so the defect depends on an accepted calling pattern rather than on the library's own choice of target.",
+          "LeadershipTransfer() without an explicit target filters non-voters in pickServer, which shows the intended transfer target set is the voter set and supports reading the targeted call as requiring the same premise.",
+          "A TimeoutNow that cannot be delivered (unreachable target) is reported as an error by the transfer path, so not every unusable target is silently accepted.",
+          "The interruption is bounded: the remaining voters re-elect after their election timers, and the control case shows the probe does observe a completed transfer, so the outcome is a wrong success report and a leadership interruption rather than a cluster that never recovers."
+        ],
+        "limitations": [
+          "The reported-result and interval observations rest on two executions of this probe (receipts b2c0026c56d54511999e5c37ef8372cd and 23acf06d8a524b2790ef674d5eb04cb0); across them the leader holding office at the end differed (in the first, the previous leader was Leader again at term 4; in the second, another voter), so the identity of the successor is timing dependent and is recorded rather than asserted.",
+          "The leaderless interval is an observed span at 1ms sampling resolution between a 200ms election timeout and a single-process in-memory transport; it is not a bound for configurations with different timeouts, and it does not distinguish time spent campaigning from time waiting for election timers.",
+          "The control case with a voter target finished in about one millisecond, so its sampling window is too short for its zero leaderless count to say anything about longer gaps.",
+          "The claim concerns the reported result of the call, the requested target's inability to win and the observed interruption; it does not assert data loss or that the cluster fails to recover, since a voter is elected afterwards.",
+          "The probe uses one process with real Raft instances and in-memory transports, so it exercises the leader's own transfer, election and vote paths but not process-level partitions or multi-host clocks."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "ba97eea3cb1c45009b75f70720a38dfd"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "ba97eea3cb1c45009b75f70720a38dfd",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@transfer_nonvoter_disruption": "ba97eea3cb1c45009b75f70720a38dfd-knowledge-0"
+      },
+      "effects": [
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@transfer_nonvoter_disruption"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "627b3ef0c6e049bfb836e40ffbdce875-question-1",
+          "changed_fields": [
+            "executions",
+            "rationale",
+            "answers",
+            "limitations"
+          ]
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-3b823834c8cb46da98e77d8e988bf5d9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-3b823834c8cb46da98e77d8e988bf5d9.json"
+      },
+      "submission-d704b04e706144dc964ff451359eda19": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-d704b04e706144dc964ff451359eda19.json"
+      },
+      "submission-627b3ef0c6e049bfb836e40ffbdce875": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-627b3ef0c6e049bfb836e40ffbdce875.json"
+      },
+      "submission-8e037ca743394e1a8a518b9745b8fe53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-8e037ca743394e1a8a518b9745b8fe53.json"
+      },
+      "submission-ba97eea3cb1c45009b75f70720a38dfd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_12-22-18-hashicorp_raft-real-run/semantic-commits/submission-ba97eea3cb1c45009b75f70720a38dfd.json"
+      }
+    }
+  }
+}

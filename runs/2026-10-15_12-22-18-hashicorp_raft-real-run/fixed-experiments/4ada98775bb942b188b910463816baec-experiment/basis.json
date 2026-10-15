@@ -1,0 +1,58 @@
+{
+  "id": "4ada98775bb942b188b910463816baec-experiment",
+  "investigation_id": "1b3fce74c01648f7a4d2f39a7e6f9439-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceFailStore wraps a log store and fails one StoreLogs call on demand.\ntype assuranceFailStore struct {\n\tLogStore\n\tfail atomic.Bool\n}\n\nfunc (s *assuranceFailStore) StoreLogs(logs []*Log) error {\n\tif s.fail.CompareAndSwap(true, false) {\n\t\treturn fmt.Errorf(\"assurance injected StoreLogs failure\")\n\t}\n\treturn s.LogStore.StoreLogs(logs)\n}\n\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tt.Log(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceAppendStoreFailure asks what a follower is left with when the\n// AppendEntries conflict path deletes a suffix and the following StoreLogs\n// fails, and whether a later AppendEntries carrying the full log can repair it.\nfunc TestAssuranceAppendStoreFailure(t *testing.T) {\n\tassuranceAppendStoreTrial(t, \"injected-store-failure\", true)\n\tassuranceAppendStoreTrial(t, \"control-no-failure\", false)\n}\n\nfunc assuranceAppendStoreTrial(t *testing.T, name string, inject bool) {\n\tconf := inmemConfig(t)\n\tconf.LocalID = \"assurance-B\"\n\tconf.HeartbeatTimeout = 2 * time.Second\n\tconf.ElectionTimeout = 2 * time.Second\n\tconf.LeaderLeaseTimeout = 2 * time.Second\n\n\tinner := NewInmemStore()\n\tstore := &assuranceFailStore{LogStore: inner}\n\t_, followerTrans := NewInmemTransport(\"assurance-B\")\n\tr, err := NewRaft(conf, &MockFSM{}, store, inner, NewInmemSnapshotStore(), followerTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\tdefer r.Shutdown()\n\n\t_, leaderTrans := NewInmemTransport(\"assurance-A\")\n\tleaderTrans.Connect(\"assurance-B\", followerTrans)\n\n\t// A leader at term 1 fills the follower's log with three entries.\n\tbaseline := []*Log{\n\t\t{Index: 1, Term: 1, Type: LogCommand, Data: []byte(\"a\")},\n\t\t{Index: 2, Term: 1, Type: LogCommand, Data: []byte(\"b\")},\n\t\t{Index: 3, Term: 1, Type: LogCommand, Data: []byte(\"c\")},\n\t}\n\t// A later leader at term 2 replaces both of those entries, which makes the\n\t// follower delete its suffix before storing.\n\tconflict := []*Log{\n\t\t{Index: 2, Term: 2, Type: LogCommand, Data: []byte(\"b2\")},\n\t\t{Index: 3, Term: 2, Type: LogCommand, Data: []byte(\"c2\")},\n\t}\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":            \"assurance_append_store_setup\",\n\t\t\"case\":             name,\n\t\t\"local_id\":         string(r.localID),\n\t\t\"heartbeat_ms\":     conf.HeartbeatTimeout.Milliseconds(),\n\t\t\"election_ms\":      conf.ElectionTimeout.Milliseconds(),\n\t\t\"baseline_entries\": len(baseline),\n\t\t\"conflict_entries\": len(conflict),\n\t})\n\n\tresp := &AppendEntriesResponse{}\n\treq := &AppendEntriesRequest{\n\t\tRPCHeader:    RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte(\"assurance-A\"), Addr: []byte(\"assurance-A\")},\n\t\tTerm:         1,\n\t\tPrevLogEntry: 0,\n\t\tPrevLogTerm:  0,\n\t\tEntries:      baseline,\n\t}\n\tcallErr := leaderTrans.AppendEntries(\"assurance-B\", \"assurance-B\", req, resp)\n\tif callErr != nil {\n\t\tt.Fatalf(\"%s baseline append: %v\", name, callErr)\n\t}\n\n\t// Arm the failure, then send the conflicting suffix.\n\tstore.fail.Store(inject)\n\tresp2 := &AppendEntriesResponse{}\n\treq2 := &AppendEntriesRequest{\n\t\tRPCHeader:    RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte(\"assurance-A\"), Addr: []byte(\"assurance-A\")},\n\t\tTerm:         2,\n\t\tPrevLogEntry: 1,\n\t\tPrevLogTerm:  1,\n\t\tEntries:      conflict,\n\t}\n\terr2 := leaderTrans.AppendEntries(\"assurance-B\", \"assurance-B\", req2, resp2)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                 \"assurance_append_store_conflict\",\n\t\t\"case\":                  name,\n\t\t\"failure_armed\":         inject,\n\t\t\"rpc_error\":             errString(err2),\n\t\t\"resp_success\":          resp2.Success,\n\t\t\"resp_last_log\":         resp2.LastLog,\n\t\t\"in_memory_last_index\":  r.getLastIndex(),\n\t\t\"store_last_index\":      storeLastIndex(inner),\n\t\t\"store_has_index_2\":     storeHasIndex(inner, 2),\n\t})\n\n\ttime.Sleep(50 * time.Millisecond)\n\n\t// A leader whose replication stair has reached the start of its log sends\n\t// the whole log; for a consistent follower this is a plain re-append.\n\tresp3 := &AppendEntriesResponse{}\n\treq3 := &AppendEntriesRequest{\n\t\tRPCHeader:    RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte(\"assurance-A\"), Addr: []byte(\"assurance-A\")},\n\t\tTerm:         2,\n\t\tPrevLogEntry: 0,\n\t\tPrevLogTerm:  0,\n\t\tEntries:      baseline,\n\t}\n\terr3 := leaderTrans.AppendEntries(\"assurance-B\", \"assurance-B\", req3, resp3)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                 \"assurance_append_store_repair\",\n\t\t\"case\":                  name,\n\t\t\"failure_armed\":         false,\n\t\t\"rpc_error\":             errString(err3),\n\t\t\"resp_success\":          resp3.Success,\n\t\t\"resp_last_log\":         resp3.LastLog,\n\t\t\"in_memory_last_index\":  r.getLastIndex(),\n\t\t\"store_last_index\":      storeLastIndex(inner),\n\t\t\"store_has_index_2\":     storeHasIndex(inner, 2),\n\t})\n}\n\nfunc errString(err error) string {\n\tif err == nil {\n\t\treturn \"nil\"\n\t}\n\treturn err.Error()\n}\n\nfunc storeLastIndex(store LogStore) uint64 {\n\tidx, err := store.LastIndex()\n\tif err != nil {\n\t\treturn 0\n\t}\n\treturn idx\n}\n\nfunc storeHasIndex(store LogStore, idx uint64) bool {\n\tvar l Log\n\treturn store.GetLog(idx, &l) == nil\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "append_store_failure_window",
+      "truncation_reset_latest",
+      "append_conflict_loop",
+      "append_failure_response",
+      "append_success_tail",
+      "set_last_log_state",
+      "repl_reject_next_index"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Observe what a follower is left with when its AppendEntries conflict path deletes a suffix and the following store write fails, and whether a later whole-log AppendEntries is accepted, against the same sequence without the injected store failure.",
+      "assumptions": [],
+      "excluded": [],
+      "parameters": {}
+    },
+    "prefix": "Each of the two cases builds one real raft node (local id assurance-B) with an in-memory log store wrapped by a store whose StoreLogs returns an injected error once when armed, an in-memory stable store and snapshot store, a second in-memory transport registered as assurance-A connected to the node's transport, and heartbeat, election and lease timeouts of two seconds so no election interferes. The producer calls are three AppendEntries RPCs sent through the assurance-A transport into the node's own RPC handler: entries 1-3 at term 1 with previous index 0; entries 2-3 at term 2 with previous index 1, which conflicts at index 2 and makes the handler delete its suffix before storing, with the injected failure armed only in the first case; then entries 1-3 again at term 2 with previous index 0. Each case logs the handler's response fields, the node's own last log index, the wrapped store's last index and whether the store still holds index 2, right after the conflicting append and again after the whole-log append. The RPCs are supplied by the test rather than by a live leader, which is the request the follower's handler sees in either case; the supplied premise is that the conflict and the whole-log retry are what a term 2 leader produces once its rejection stair has lowered nextIndex to one.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "b8981977dfd34fbfa3028112c3fae84d",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "4ada98775bb942b188b910463816baec",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

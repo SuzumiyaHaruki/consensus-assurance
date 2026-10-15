@@ -1,0 +1,101 @@
+{
+  "rationale": "Interpret the two-voter-remainder execution (CheckRun 79d6bcb6f89a41dbbd391a742cdf9916, fixed experiment 5657629e62d44fc4a14c63b05fe5a81e-experiment) that the previous update requested: all five comparisons resolved - the three premises and the one-tick bound hold, the witness is violated - so the account now covers the second half of the question as well: where the shortcut cannot apply, the removed leader takes the request into a read-only round and then loses it when its leadership ends, without answering or refusing the caller. The question's remaining discriminator narrows to routes that reach the same state without an application-applied removal and to the public wrapper.",
+  "investigations": [
+    {
+      "id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+      "discriminator": "Whether the same leading-but-not-the-voter state is reached by a route other than an application-applied removal of the leading node - a leader demoted to learner under the same default, or a joint transition that leaves a single voter - and whether an application using the Node wrapper is handed the same stale index, or the same silently lost request, as the raft-level witnesses."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+      "experiment_id": "5657629e62d44fc4a14c63b05fe5a81e-experiment",
+      "source_ids": [
+        "tracker-singleton",
+        "readindex-singleton-branch",
+        "readindex-follower-forward",
+        "readindex-forwarded-response",
+        "readonlysafe-doc",
+        "heartbeatresp-readonly",
+        "readonly-maybeadvance",
+        "prop-removed-leader",
+        "switchtoconfig-removal",
+        "config-stepdown-doc",
+        "node-readindex-contract",
+        "readme-linearizable"
+      ],
+      "executions": {
+        "79d6bcb6f89a41dbbd391a742cdf9916": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "815614d02b874bc8b0661039ae0552da": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "c72c66880fd9498ca1efb95774b0b06e": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "8090da09e0d44e13af56696a62f13d45": [
+          12,
+          13,
+          14,
+          15,
+          16
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Four receipts now measure the same removal under four configurations, and both halves of the question are answered negatively. Source side: tracker.IsSingleton is a size test whose comment asserts that the single voting member is the leader (tracker/tracker.go:158-162), stepLeader's MsgReadIndex case answers from that test without any round (raft.go:1354-1361), the answer leaves as a MsgReadIndexResp whenever the request came from another node (raft.go:2072-2087) and a follower forwards its own read to the leader it knows (raft.go:1764-1770); otherwise the leader needs committedEntryInCurrentTerm() and enters a read-only round whose quorum it cannot reach (raft.go:1362-1370, read_only.go:59-101); the write path refuses proposals from exactly this node (raft.go:1294-1303) while the read path has no equivalent guard, and applying a committed removal of the leading node leaves it leading under the default StepDownOnRemoval=false (raft.go:1985-2012, 282-287). (1) Single-voter remainder with CheckQuorum: receipt 8090da09e0d44e13af56696a62f13d45 - the removed leader answers immediately with an index below what the actual leader had already committed (parsed index 14) while the actual leader's own answer covers its commit index (index 4), and the exposure ends one tick later when it steps down (index 15) and no longer answers (index 16). (2) Single-voter remainder with PreVote only: receipt c72c66880fd9498ca1efb95774b0b06e resolves every comparison and shows either quorum option alone bounds the window to one heartbeat tick. (3) Forwarded route: receipt 815614d02b874bc8b0661039ae0552da - the group's learner, which still knew node 1 as its leader, forwards its read to node 1 (index 3), node 1 answers with MsgReadIndexResp carrying index 2 and the requester consumes it as its own read state against the actual leader's committed 4 (index 4 violated), the actual leader answers its own read correctly (index 5), the removed leader steps down after one tick (index 6) and the retry is not answered (index 7). (4) Two-voter remainder with PreVote only: receipt 79d6bcb6f89a41dbbd391a742cdf9916 - the removal leaves node 1 leading voters (2 3) so the shortcut cannot decide the request (index 1 holds, singleton false, voter_count 2) while node 2 leads the same configuration and commits 4 against node 1's 2 (index 2 holds); the read reaching node 1 is therefore accepted into readOnly.unconfirmedReads with two heartbeats broadcast and no answer, even though node 1 is not a voter of the configuration whose quorum it is counting (index 3 holds, unconfirmed_reads 1, heartbeats_emitted 2, read_states 0); one heartbeat tick ends its leadership (index 4 holds, ticks_until_stepdown 1); and the accepted request is then gone - no read state, nothing pending or unconfirmed, and no refusal handed to the caller (index 5 violated: read_answered false, pending_reads 0, unconfirmed_reads 0, refused_to_caller false), while no stale index was handed out (stale_answer_handed_out false). So the outcome is safe in neither of the two ways the question allows: with a single remaining voter the removed leader hands out a frozen index, immediately and, on the forwarded route, to another node's read state; with more than one remaining voter it accepts the request, cannot reach a quorum it is not part of, and silently losses it when its leadership ends, so the caller is neither answered with a current index nor refused.",
+      "counterevidence": [
+        "The controls hold in both singleton receipts (parsed index 4 of 8090da09e0d44e13af56696a62f13d45 and index 5 of 815614d02b874bc8b0661039ae0552da: the node that is the configuration's voter answers its own read with an index that covers its commit index), so answering from the singleton test is not itself the defect - the violation depends on the answering node not being that voter.",
+        "The multi-voter configuration produces no stale answer at all: the request dies with the removed leader's leadership, so the defect there is that an accepted request is lost without an answer or a refusal, not that a stale index is served.",
+        "The Node.ReadIndex contract tells callers that read index requests can be lost without notice and that retries are their duty (node.go:218-224), and the same paragraph is the documented remedy here; what the receipts add is that the loss is systematic in this state and that nothing in the request's path signals it - an application that follows the contract retries, one that trusts the acceptance does not.",
+        "The measured bounds limit the impact in every configuration tested: with either CheckQuorum or PreVote the removed leader leaves the leader state after one heartbeat tick (indices 15 of the first receipt, 4 of the PreVote receipt, 6 of the forwarded receipt, 4 of this one), and ReadOnlyLeaseBased cannot be combined with CheckQuorum disabled, which is the setting that would extend the window.",
+        "The forwarded witness depends on the delivery order that the scenario supplies: the requester's request was issued while node 1 was still the leader it knew and was delivered after the reconfiguration, so that receipt measures a stalled path rather than a requester that keeps choosing a removed node."
+      ],
+      "limitations": [
+        "Every scenario needs an application that applies the committed change removing the leading node while Config.StepDownOnRemoval is false and keeps that node running; an application that sets the option, or that stops the removed node, does not reach the state.",
+        "All four witnesses are at the ReadIndex contract level: the receipts show the index handed to the reader (locally, or across the wire as a MsgReadIndexResp) below an entry the actual leader had already committed, or the accepted request disappearing, and no state machine was run, so a served value that misses that entry is a consequence of the contract rather than a measured value.",
+        "The bound is one heartbeat interval at the exercised tick ratio (heartbeat tick 1, election tick 10) in all four configurations; other ratios are not measured.",
+        "The multi-voter measurement covers exactly one remainder size (two voters) with PreVote only, and CheckQuorum with a multi-voter remainder is still unmeasured.",
+        "The lease-based negative is supported by source reading plus an incomplete native scenario, not by a retained receipt."
+      ],
+      "knowledge": [
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-0",
+          "revision": 1,
+          "assertion": "IsSingleton is a size-only test over the configuration and never compares the single voter with the local node."
+        },
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-1",
+          "revision": 1,
+          "assertion": "StepLeader answers MsgReadIndex locally whenever IsSingleton holds, using its own commit index and without a round."
+        },
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-2",
+          "revision": 1,
+          "assertion": "A removed leader keeps leading by default while its proposals are refused and its read answers are not."
+        },
+        {
+          "entry_id": "47945d2fd63048e7b016caa61e6e2d26-knowledge-0",
+          "revision": 1,
+          "assertion": "Lease-based reads force CheckQuorum, and the lease makes voters refuse higher-term vote requests while they still hear the leader."
+        }
+      ],
+      "joint_history": "All four receipts measure the same removal and read on one fixture family: a small group in which the application proposes and applies the committed removal of the leading node, the removed leader keeps its leadership under the default StepDownOnRemoval=false, the remaining voters elect a new leader of the reduced configuration that commits an entry the removed leader never sees, and a ReadIndex request is then delivered to the removed leader, with the same decisive endpoints - the configuration the removed leader holds, what it does with the request, the number of ticks needed to leave the leader state, and what the caller ends up with. Receipt 8090da09e0d44e13af56696a62f13d45 covers three scenarios of one harness; receipt c72c66880fd9498ca1efb95774b0b06e repeats the CheckQuorum scenario with PreVote only; receipt 815614d02b874bc8b0661039ae0552da uses that same PreVote setting with a learner that forwards its read and holds it across the reconfiguration; receipt 79d6bcb6f89a41dbbd391a742cdf9916 keeps the PreVote setting and the same kind of removal but lets the reduced configuration keep two voters, so its parsed index 1 is the two-voter counterpart of the singleton premise in the other receipts, index 2 repeats the new-leader premise, index 3 is the readOnly round that the singleton shortcut bypasses, index 4 repeats the one-tick bound, and index 5 records the caller's outcome where the other receipts record a stale index. The four receipts agree on every shared endpoint."
+    }
+  ]
+}

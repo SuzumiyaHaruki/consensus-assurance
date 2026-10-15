@@ -1,0 +1,87 @@
+{
+  "rationale": "Interpret the retained control execution (CheckRun e17ebb2095714b6289c41dc4e029e3d4, fixed experiment 425ee562e1dc40a2928df98330de575c-experiment, version 3): eleven parsed events without loss, the single-voter scenario repeats its violated witness, and the two-voter control holds for 'no answer' while the unconfirmed-read comparisons are violated. The question's account is therefore unified: a removed-but-not-stepped-down leader never checks membership before accepting a read, and the symptom depends on the size of the reduced configuration. The question record is refined to that form and its now-answered discriminator is cleared.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+      "ref": null,
+      "question": "What does raft do with a ReadIndex request that reaches a node which is no longer a voter of its own configuration, and is the outcome safe - either the request is answered with a current index, or it is refused and retried elsewhere?",
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "Whether the same missing membership check produces a stale answer through another route to the removed node (a forwarded MsgReadIndex answered with MsgReadIndexResp, or a lease-based read configuration), and whether enabling CheckQuorum or PreVote bounds the window in which the stale answer is issued.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+      "experiment_id": "425ee562e1dc40a2928df98330de575c-experiment",
+      "source_ids": [
+        "tracker-singleton",
+        "readindex-singleton-branch",
+        "prop-removed-leader",
+        "switchtoconfig-removal",
+        "config-stepdown-doc",
+        "readonlysafe-doc",
+        "node-readindex-contract",
+        "readme-linearizable"
+      ],
+      "executions": {
+        "e17ebb2095714b6289c41dc4e029e3d4": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          7,
+          8,
+          9,
+          10
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The account of this question now covers both shapes of the same removed-leader state, and rests on this receipt together with the earlier one. Root cause (source side): the ReadIndex path never asks whether the local node belongs to its own configuration. tracker.IsSingleton (tracker/tracker.go:158-162) is a size test whose comment asserts that the single voting member is the leader, and stepLeader's MsgReadIndex case (raft.go:1354-1361) treats it as authority to answer locally from r.raftLog.committed as a ReadState (local request) or MsgReadIndexResp (forwarded request) without any round; when the test does not hold, the same case accepts the request into readOnly and waits for quorum acknowledgements (raft.go:2160-2166) that a non-member cannot obtain from a configuration that has moved on. Neither branch consults membership, while the write path refuses proposals from exactly this node (raft.go:1294-1303), and the state itself is produced by permitted use: applying a committed change that removes the leading node leaves it leading under the default Config.StepDownOnRemoval=false (raft.go:1985-2012, raft.go:282-287). Receipt e17ebb2095714b6289c41dc4e029e3d4 (11 events, no parse loss) measures the two shapes side by side. Single-voter remainder {2} (parsed indices 1, 2, 3): the removed leader is StateLeader at term 1 with config voters=(2), singleton true and is_voter false while the actual leader of {2} has committed index 4 against its frozen 2, and the read is answered immediately with read_index 2 - below that committed entry - emitting no message at all (heartbeats_emitted 0, messages_emitted empty, pending_reads 0, unconfirmed_reads 0); the actual leader answers the same request with index 4 (index 4), and after three heartbeat intervals with no replies the removed leader repeats the same stale index (index 5). Two-voter remainder {2,3} (parsed indices 7, 8, 9, 10): the same removal leaves config voters=(2 3) with singleton false while the removed leader still leads, the new leader of {2,3} is again ahead (committed 4 vs 2), and the same read now produces no answer at all - read_states 0 with read_answered false while the hidden readOnly round runs (heartbeats_emitted 2 with a read context, unconfirmed_reads 1) - and three further heartbeat intervals leave it unanswered with unconfirmed_reads still 1 and no reply from the current configuration. The safety claim is therefore scoped and supported: on a node that its own configuration proves is not the voter, a client can be handed an index that misses entries the actual leader has already committed, with no confirmation round and no repair inside raft, and the failure is not an artefact of answering locally - the control comparison at parsed index 4 shows the actual leader answering the same request correctly. The second shape adds that the same missing check leaves a received request permanently unanswerable (accepted into readOnly, never confirmed, no refusal to the caller) instead of producing a wrong answer, which is how the account distinguishes the defect from the general claim that a stale leader cannot detect its staleness: with two voters remaining the node has no bad index to hand out, but it also never tells the caller that it cannot serve the read.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-0",
+          "revision": 1,
+          "assertion": "IsSingleton is a size-only test over the configuration and never compares the single voter with the local node."
+        },
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-1",
+          "revision": 1,
+          "assertion": "StepLeader answers MsgReadIndex locally whenever IsSingleton holds, using its own commit index and without a round."
+        },
+        {
+          "entry_id": "9ad1a10e85bb41578fbb8a42a6890ab3-knowledge-2",
+          "revision": 1,
+          "assertion": "A removed leader keeps leading by default while its proposals are refused and its read answers are not."
+        }
+      ],
+      "counterevidence": [
+        "The control comparison at parsed index 4 holds: the same request answered by the node that is the actual leader returns an index covering its commit index, so answering locally is not itself the defect - the violation depends on the answering node not being the configuration's voter.",
+        "In the two-voter shape no wrong index is produced (parsed index 9: read_answered false), so that shape is a liveness symptom rather than a stale-read symptom, and the Node.ReadIndex contract already tells callers that read index requests can be lost and that retries are their duty (node.go:218-224); it is recorded as part of this defect's mechanism, not as an independent safety claim.",
+        "A client is expected to direct linearizable reads at the current leader, and the library cannot generally detect that a leader is stale; what is specific here is that the local tracker already establishes that the only voter is another node, and that the same library refuses this node's proposals.",
+        "The window depends on the exercised configuration: StepDownOnRemoval false and CheckQuorum/PreVote off, so nothing carries the higher term back to the removed leader (with those options the next heartbeat exchange makes it step down)."
+      ],
+      "limitations": [
+        "The scenario requires the application to apply a committed configuration change that removes the leading node while Config.StepDownOnRemoval is false; applications that set that option, or that stop the removed node, do not reach it.",
+        "The witness is at the ReadIndex contract level: the receipt shows the returned index is below an already-committed entry and that no confirmation message was sent. No state machine was run, so the miss of that write in a served value is a consequence of the contract, not something the receipt measures.",
+        "Only requests addressed to the removed node itself were exercised (local requests, and in the two-voter shape the same). The forwarded form in which a follower's MsgReadIndex is answered with MsgReadIndexResp rests on the same branch, but in the single-voter shape such a follower would be the singleton voter itself and nothing newer would be committed at that moment, so no stale outcome was constructed for it.",
+        "The persistence observations cover the three heartbeat intervals exercised; no rate or duration bound is claimed, and the removed leader stops answering this way as soon as a higher term reaches it."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

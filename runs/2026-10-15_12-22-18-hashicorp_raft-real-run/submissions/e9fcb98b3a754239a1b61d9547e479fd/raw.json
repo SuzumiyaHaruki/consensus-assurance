@@ -1,0 +1,94 @@
+{
+  "rationale": "Interpreted the revised shutdown probe, whose post-shutdown phase isolates the defect from the shutdown race: 14 of 24 VerifyLeader calls made after Shutdown() had returned received futures that were still incomplete 500ms later, while Barrier and Apply answered all 48 of their post-shutdown calls with the documented shutdown error and the no-shutdown controls left nothing incomplete. The source explains the split through channel buffering, so the existing Fact is corrected under its own id: the operative condition is the buffered verifyCh plus a future without ShutdownCh, not the timing of the shutdown, and the affected interpretation is listed. The question account now rests on the post-shutdown form, with the racing form from the first receipt kept as the timing-dependent manifestation that did not reproduce in the revision. No execution is requested this turn.",
+  "knowledge": [
+    {
+      "id": "983e6d23976b4e4e9eff6a3987874db1-knowledge-0",
+      "kind": "fact",
+      "statement": "VerifyLeader can hand back a future that nothing will ever complete, because the request waits in the buffered verifyCh that no reader drains once the run loop has exited and the future itself carries no shutdown channel to unblock on. The trigger does not require racing Shutdown: calls made after Shutdown has already returned strand about half the time, since the closed shutdown channel and a send into the 64-slot verifyCh are both selectable. In the revision, post-shutdown VerifyLeader calls were answered 4, 3 and 3 of 8 times and left unanswered 4, 5 and 5 times (14 of 24 stranded), while Barrier and Apply answered all 48 of their post-shutdown calls with ErrRaftShutdown, which matches verifyCh being buffered and applyCh unbuffered by default. The earlier receipt shows the racing form as well, leaving 9 and 41 of 64 futures incomplete in two of three trials with none in the control.",
+      "conditions": "Single-voter Raft instance, HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 50ms, in-memory transport in one process, BatchApplyCh not set; calls are made from 128 concurrent goroutines during shutdown and from 8 sequential calls after Shutdown has returned.",
+      "source_ids": [
+        "api_verify_future",
+        "defer_error_block",
+        "verify_channel_buffer",
+        "shutdown_close",
+        "api_barrier_future",
+        "api_apply_future",
+        "apply_channel_unbuffered",
+        "test_todo_stuck"
+      ],
+      "executions": {
+        "a1933fdba3e74bd1b98cd6e8dcd138c4": [
+          1,
+          7,
+          13,
+          19
+        ],
+        "b3b821a061f346a1aa27e3fee5e44cb9": [
+          1,
+          7,
+          13,
+          3,
+          9,
+          15
+        ]
+      },
+      "changed_premise": "The trigger is corrected rather than extended: the behaviour was described as a VerifyLeader call handed back while Shutdown is in progress, and the revision shows the same strand for calls issued after Shutdown has already returned, so the operative condition is the buffered verifyCh with no drainer and a future without ShutdownCh, not the timing of the shutdown. The earlier racing evidence is kept and the post-shutdown counts are added.",
+      "affected_uses": []
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "b2ccc787c9384b008b5f9c668746f760-question-0",
+      "experiment_id": "49fa455b2fe94d53ab6fed2fad19ce33-experiment",
+      "source_ids": [
+        "api_verify_future",
+        "api_barrier_future",
+        "api_apply_future",
+        "defer_error_block",
+        "verify_channel_buffer",
+        "shutdown_close",
+        "apply_channel_unbuffered",
+        "test_todo_stuck"
+      ],
+      "executions": {
+        "a1933fdba3e74bd1b98cd6e8dcd138c4": [
+          1,
+          7,
+          13,
+          3,
+          9,
+          15,
+          19
+        ],
+        "b3b821a061f346a1aa27e3fee5e44cb9": [
+          1,
+          3,
+          5,
+          7,
+          9,
+          11,
+          13,
+          15,
+          17,
+          19
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "The question was whether a future handed back by VerifyLeader, Barrier or Apply around Shutdown can be left permanently uncompleted, and both retained runs say yes for VerifyLeader while excluding the other two. The revision isolates the mechanism better than the first run did, because its post-shutdown phase has no race with the shutdown itself: in the three verify cases (parsed result events at indices 1, 7 and 13) only 4, 3 and 3 of the 8 calls made after Shutdown() had returned were answered, all with 'raft is already shutdown', while the other 4, 5 and 5 returned futures that were still incomplete 500ms later and can never be answered because the run loop, the FSM goroutine and every other reader of verifyCh have already exited. That is 14 of 24 post-shutdown VerifyLeader calls stranded, and it is a per-call coin flip rather than a rare race. The same receipt shows the contrast in the two other call kinds: Barrier and Apply answered all 48 of their post-shutdown calls with the shutdown error (indices 3, 9, 15 and 5, 11, 17), and no call in the racing phase of any case was left incomplete (0 stuck out of 128 per case, with 128 answered in the no-shutdown control at index 19). The source explains exactly that split. VerifyLeader builds a verifyFuture whose init() allocates only the error channel (future.go 99-101), so nothing sets ShutdownCh and deferError.Error() waits on errCh or on a channel that is never used (future.go 103-117); the call then selects between the closed shutdown channel and a send into verifyCh, which is buffered with 64 slots (api.go 576), so the send is ready with no receiver and the select returns an unanswerable future whenever it picks that case. Barrier and ApplyLog use the same select shape (api.go 907-926 and 874-899) but send to applyCh, which is unbuffered unless BatchApplyCh is set (api.go 549), so once the loop has exited their send cannot be selected and the shutdown case always wins. The repository's own test file already notes the class as a TODO for Barrier, VerifyLeader and GetConfiguration (raft_test.go 38-42), which is an admission of the gap rather than a contract that permits it. The first receipt adds the racing form of the same defect: with 64 calls issued just before Shutdown and a 1500ms wait, two of its three verify trials left 9 and 41 futures incomplete while the control left none (indices 1, 7, 13 and 19 there). The revision's racing phase left none, so that form is timing dependent; the post-shutdown form is not, and it is the one the account now rests on.",
+      "counterevidence": [
+        "The racing form did not reproduce in the revision: 0 of 128 calls per case were left incomplete, so the earlier 9 and 41 are a timing-dependent manifestation rather than a rate.",
+        "Barrier and Apply never stranded a future in either run (0 of 192 and 0 of 192 in the first receipt; 0 of 384 in the revision), which limits the defect to the VerifyLeader path unless BatchApplyCh is enabled.",
+        "Every call that was answered in these runs returned success or the documented 'raft is already shutdown' error, so the defect is confined to calls whose future is never served.",
+        "The repository's test file records the same class as a known TODO, which is evidence that the gap was noticed; it does not make the documented ErrRaftShutdown behaviour any less expected for a caller."
+      ],
+      "limitations": [
+        "The post-shutdown counts come from 24 VerifyLeader calls in one execution (14 stranded); they bound the mechanism, not a population rate, and the per-call split is consistent with an unbiased select rather than a measured probability.",
+        "The strand is classified by a 500ms window; permanence is inferred from the source (no reader of verifyCh remains and ShutdownCh is nil on these futures) rather than observed indefinitely.",
+        "A single-voter node with in-memory transport and 50ms timeouts is used, so no peer round trip or networked shutdown is involved.",
+        "A BatchApplyCh configuration, where applyCh becomes buffered and the apply path should inherit the same defect, has not been measured."
+      ],
+      "joint_history": "Both receipts come from the same harness lineage: receipt a1933fdba3e74bd1b98cd6e8dcd138c4 is the fixed experiment b2ccc787c9384b008b5f9c668746f760-experiment and receipt b3b821a061f346a1aa27e3fee5e44cb9 is its revision 49fa455b2fe94d53ab6fed2fad19ce33-experiment, which kept the event names, the case kinds and every measured field and changed only the completion window (1500ms to 4000ms), the call count (64 to 128), an interleaved 2ms shutdown and the added post-shutdown phase. The two are compatible because the racing fields mean the same thing in both and the revision is a superset: the earlier receipt supplies the racing form with its 1500ms window and the later one supplies the post-shutdown form and reports its own racing counts as zero."
+    }
+  ]
+}

@@ -1,0 +1,306 @@
+{
+  "id": "6b71731acf2441de9145c5c6f1d03f8b-experiment",
+  "investigation_id": "9ad1a10e85bb41578fbb8a42a6890ab3-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc assurance6Emit(t *testing.T, ev map[string]any) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"cannot marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc assurance6IsVoter(r *raft) bool {\n\t_, ok := r.trk.Voters.IDs()[r.id]\n\treturn ok\n}\n\n// TestAssuranceReadIndexForwardedToRemovedSingletonLeader measures the second\n// route into the same missing membership check: a ReadIndex request that was\n// issued on another node, forwarded by that node to the leader it knows, and\n// delivered to that leader while it is still leading a configuration whose only\n// voter is someone else. The requester is the group's learner, and the\n// forwarded request is delivered only after the application has applied the\n// committed removal of the leader and the remaining voter has become leader of\n// the reduced configuration and committed a further entry.\nfunc TestAssuranceReadIndexForwardedToRemovedSingletonLeader(t *testing.T) {\n\tconst scenario = \"removed-singleton-leader-read-forwarded\"\n\n\tmk := func(id uint64) *raft {\n\t\ts := newTestMemoryStorage(withPeers(1, 2), withLearners(3))\n\t\tcfg := newTestConfig(id, 10, 1, s)\n\t\tcfg.PreVote = true\n\t\treturn newRaft(cfg)\n\t}\n\tn1, n2, n3 := mk(1), mk(2), mk(3)\n\tnt := newNetwork(n1, n2, n3)\n\tsetRandomizedElectionTimeout(n2, n2.electionTimeout*10)\n\tsetRandomizedElectionTimeout(n3, n3.electionTimeout*10)\n\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":       scenario,\n\t\t\"event\":          \"c_setup\",\n\t\t\"step\":           \"setup\",\n\t\t\"cluster\":        \"voters=(1 2), learner=(3)\",\n\t\t\"prevote\":        true,\n\t\t\"heartbeat_tick\": n1.heartbeatTimeout,\n\t\t\"election_tick\":  n1.electionTimeout,\n\t\t\"requester_role\": \"learner\",\n\t\t\"delivery\":       \"the requester's forwarded request and its answer are held until after the removal\",\n\t})\n\n\t// Node 1 is elected leader of {1,2}; every node hears from it, so node 3\n\t// knows node 1 as its leader.\n\tnt.send(&pb.Message{From: new(uint64(1)), To: new(uint64(1)), Type: pb.MsgHup.Enum()})\n\tnextEnts(n1, n1.raftLog.storage.(*MemoryStorage))\n\tnextEnts(n2, n2.raftLog.storage.(*MemoryStorage))\n\n\t// The requester's application issues a read while node 1 is still the leader\n\t// it knows. The forwarded message leaves the requester, but its delivery is\n\t// held back, so it reaches node 1 only after the group has moved on.\n\tif err := n3.Step(&pb.Message{\n\t\tFrom:    new(uint64(3)),\n\t\tTo:      new(uint64(3)),\n\t\tType:    pb.MsgReadIndex.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"R\")}},\n\t}); err != nil {\n\t\tt.Fatalf(\"read index on the requester: %v\", err)\n\t}\n\theld := n3.readMessages()\n\trequesterReadStates := len(n3.readStates)\n\trequesterLead := n3.lead\n\trequesterTerm := n3.Term\n\trequesterConfig := n3.trk.Config.String()\n\tforwardType, forwardTo := \"\", uint64(0)\n\tif len(held) > 0 {\n\t\tforwardType, forwardTo = held[0].GetType().String(), held[0].GetTo()\n\t}\n\n\t// The application proposes removing node 1 - the leader - and applies the\n\t// committed change on the two voters.\n\tcc := &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: new(uint64(1))}\n\tm, err := confChangeToMsg(cc)\n\tif err != nil {\n\t\tt.Fatalf(\"conf change message: %v\", err)\n\t}\n\tm.From, m.To = new(uint64(1)), new(uint64(1))\n\tnt.send(m)\n\tccv2 := cc.AsV2()\n\tn1.applyConfChange(ccv2)\n\tn2.applyConfChange(ccv2)\n\tnextEnts(n1, n1.raftLog.storage.(*MemoryStorage))\n\tnextEnts(n2, n2.raftLog.storage.(*MemoryStorage))\n\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":        scenario,\n\t\t\"event\":           \"e_leader_removed\",\n\t\t\"step\":            \"leader-1-removed\",\n\t\t\"node\":            1,\n\t\t\"state\":           n1.state.String(),\n\t\t\"term\":            n1.Term,\n\t\t\"config\":          n1.trk.Config.String(),\n\t\t\"singleton\":       n1.trk.IsSingleton(),\n\t\t\"is_voter\":        assurance6IsVoter(n1),\n\t\t\"committed_index\": n1.raftLog.committed,\n\t})\n\n\t// The remaining voter becomes leader of {2} and commits a new entry. Its\n\t// messages are drained instead of delivered: the requester has not heard\n\t// from the new leader yet.\n\tif err := n2.Step(&pb.Message{From: new(uint64(2)), To: new(uint64(2)), Type: pb.MsgHup.Enum()}); err != nil {\n\t\tt.Fatalf(\"node 2 campaign: %v\", err)\n\t}\n\tn2.readMessages()\n\tif err := n2.Step(&pb.Message{\n\t\tFrom:    new(uint64(2)),\n\t\tTo:      new(uint64(2)),\n\t\tType:    pb.MsgProp.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"w\")}},\n\t}); err != nil {\n\t\tt.Fatalf(\"node 2 proposal: %v\", err)\n\t}\n\tn2.readMessages()\n\totherCommitted := n2.raftLog.committed\n\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":                       scenario,\n\t\t\"event\":                          \"e_new_leader_committed\",\n\t\t\"step\":                           \"node-2-leads\",\n\t\t\"node\":                           2,\n\t\t\"state\":                          n2.state.String(),\n\t\t\"term\":                           n2.Term,\n\t\t\"config\":                         n2.trk.Config.String(),\n\t\t\"committed_index\":                otherCommitted,\n\t\t\"last_index\":                     n2.raftLog.lastIndex(),\n\t\t\"removed_leader_committed_index\": n1.raftLog.committed,\n\t\t\"removed_leader_term\":            n1.Term,\n\t\t\"removed_leader_state\":           n1.state.String(),\n\t\t\"actual_leader_ahead\":            otherCommitted > n1.raftLog.committed,\n\t})\n\n\t// The held request now reaches the removed leader.\n\tfor _, heldMsg := range held {\n\t\tif err := n1.Step(heldMsg); err != nil {\n\t\t\tt.Fatalf(\"step held request into the removed leader: %v\", err)\n\t\t}\n\t}\n\tanswers := n1.readMessages()\n\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":                       scenario,\n\t\t\"event\":                          \"e_forwarded_request\",\n\t\t\"step\":                           \"held-forward-reaches-removed-leader\",\n\t\t\"node\":                           3,\n\t\t\"requester_lead\":                 requesterLead,\n\t\t\"requester_term\":                 requesterTerm,\n\t\t\"requester_state\":                n3.state.String(),\n\t\t\"requester_config\":               requesterConfig,\n\t\t\"requester_read_states\":          requesterReadStates,\n\t\t\"forward_type\":                   forwardType,\n\t\t\"forward_to\":                     forwardTo,\n\t\t\"forwarded_to_removed_leader\":    forwardTo == 1 && forwardType == pb.MsgReadIndex.String(),\n\t\t\"removed_leader_state\":           n1.state.String(),\n\t\t\"removed_leader_config\":          n1.trk.Config.String(),\n\t\t\"removed_leader_committed_index\": n1.raftLog.committed,\n\t\t\"other_committed_index\":          otherCommitted,\n\t\t\"singleton\":                      n1.trk.IsSingleton(),\n\t\t\"answer_count\":                   len(answers),\n\t})\n\n\t// The answer travels back to the requester, which consumes it.\n\tanswerType, answerTo, answerIndex := \"\", uint64(0), uint64(0)\n\tfor _, answer := range answers {\n\t\tif answer.GetType() == pb.MsgReadIndexResp {\n\t\t\tanswerType, answerTo, answerIndex = answer.GetType().String(), answer.GetTo(), answer.GetIndex()\n\t\t\tbreak\n\t\t}\n\t}\n\tfor _, answer := range answers {\n\t\tif err := n3.Step(answer); err != nil {\n\t\t\tt.Fatalf(\"step answer into the requester: %v\", err)\n\t\t}\n\t}\n\treadIndex := uint64(0)\n\tif len(n3.readStates) > 0 {\n\t\treadIndex = n3.readStates[len(n3.readStates)-1].Index\n\t}\n\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":                            scenario,\n\t\t\"event\":                               \"e_forwarded_read_state\",\n\t\t\"step\":                                \"requester-consumes-the-answer\",\n\t\t\"node\":                                3,\n\t\t\"answer_type\":                         answerType,\n\t\t\"answer_to\":                           answerTo,\n\t\t\"answer_index\":                        answerIndex,\n\t\t\"read_states\":                         len(n3.readStates),\n\t\t\"read_index\":                          readIndex,\n\t\t\"other_committed_index\":               otherCommitted,\n\t\t\"read_index_at_least_other_committed\": readIndex >= otherCommitted,\n\t\t\"removed_leader_state\":                n1.state.String(),\n\t\t\"removed_leader_committed_index\":      n1.raftLog.committed,\n\t})\n\n\t// Control: the node that is the configuration's voter answers its own read\n\t// with an index that covers its commit index.\n\tif err := n2.Step(&pb.Message{\n\t\tFrom:    new(uint64(2)),\n\t\tTo:      new(uint64(2)),\n\t\tType:    pb.MsgReadIndex.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"C\")}},\n\t}); err != nil {\n\t\tt.Fatalf(\"read index on the actual leader: %v\", err)\n\t}\n\tleaderReadIndex := uint64(0)\n\tif len(n2.readStates) > 0 {\n\t\tleaderReadIndex = n2.readStates[len(n2.readStates)-1].Index\n\t}\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":                          scenario,\n\t\t\"event\":                             \"e_leader_control\",\n\t\t\"step\":                              \"actual-leader-answers-its-own-read\",\n\t\t\"node\":                              2,\n\t\t\"state\":                             n2.state.String(),\n\t\t\"term\":                              n2.Term,\n\t\t\"singleton\":                         n2.trk.IsSingleton(),\n\t\t\"is_voter\":                          assurance6IsVoter(n2),\n\t\t\"committed_index\":                   otherCommitted,\n\t\t\"read_states\":                       len(n2.readStates),\n\t\t\"read_index\":                        leaderReadIndex,\n\t\t\"read_index_at_least_own_committed\": leaderReadIndex >= otherCommitted,\n\t})\n\n\t// One heartbeat interval is enough for the removed leader to learn of the\n\t// new term and leave the leader state.\n\tticks := 0\n\tfor n1.state == StateLeader && ticks < 5*n1.heartbeatTimeout {\n\t\tn1.tick()\n\t\tticks++\n\t\tnt.send(n1.readMessages()...)\n\t}\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":                       scenario,\n\t\t\"event\":                          \"e_stepdown\",\n\t\t\"step\":                           \"stepdown-after-heartbeat\",\n\t\t\"node\":                           1,\n\t\t\"state\":                          n1.state.String(),\n\t\t\"term\":                           n1.Term,\n\t\t\"lead\":                           n1.lead,\n\t\t\"ticks_until_stepdown\":           ticks,\n\t\t\"removed_leader_committed_index\": n1.raftLog.committed,\n\t\t\"other_committed_index\":          otherCommitted,\n\t})\n\n\t// After the window closed the requester issues the read again. Whatever\n\t// comes back must not be an index below what the actual leader committed.\n\tbefore := len(n3.readStates)\n\tif err := n3.Step(&pb.Message{\n\t\tFrom:    new(uint64(3)),\n\t\tTo:      new(uint64(3)),\n\t\tType:    pb.MsgReadIndex.Enum(),\n\t\tEntries: []*pb.Entry{{Data: []byte(\"R2\")}},\n\t}); err != nil {\n\t\tt.Fatalf(\"second read index on the requester: %v\", err)\n\t}\n\theld2 := n3.readMessages()\n\tanswers2 := 0\n\tfor _, heldMsg := range held2 {\n\t\tif err := n1.Step(heldMsg); err != nil {\n\t\t\tt.Fatalf(\"step second held request: %v\", err)\n\t\t}\n\t}\n\tfor _, answer := range n1.readMessages() {\n\t\tanswers2++\n\t\tif err := n3.Step(answer); err != nil {\n\t\t\tt.Fatalf(\"step second answer: %v\", err)\n\t\t}\n\t}\n\tretryIndex := uint64(0)\n\tif len(n3.readStates) > before {\n\t\tretryIndex = n3.readStates[len(n3.readStates)-1].Index\n\t}\n\tanswered := len(n3.readStates) > before\n\tassurance6Emit(t, map[string]any{\n\t\t\"scenario\":                  scenario,\n\t\t\"event\":                     \"e_after_stepdown_read_state\",\n\t\t\"step\":                      \"requester-asks-again-after-stepdown\",\n\t\t\"node\":                      3,\n\t\t\"read_states_before\":        before,\n\t\t\"read_states\":               len(n3.readStates),\n\t\t\"new_read_states\":           len(n3.readStates) - before,\n\t\t\"read_answered\":             answered,\n\t\t\"forwarded_again\":           len(held2) > 0,\n\t\t\"answers_from_removed_node\": answers2,\n\t\t\"read_index\":                retryIndex,\n\t\t\"other_committed_index\":     otherCommitted,\n\t\t\"removed_leader_state\":      n1.state.String(),\n\t\t\"removed_leader_lead\":       n1.lead,\n\t\t// The read is either refused or answered with an index that covers what\n\t\t// the actual leader has committed.\n\t\t\"safe_outcome\": !answered || retryIndex >= otherCommitted,\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "esetup",
+          "event": "c_setup",
+          "conditions": []
+        },
+        {
+          "alias": "eremoved",
+          "event": "e_leader_removed",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "esetup.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "enewlead",
+          "event": "e_new_leader_committed",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "eremoved.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "ereq",
+          "event": "e_forwarded_request",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "enewlead.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "estale",
+          "event": "e_forwarded_read_state",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "ereq.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "econtrol",
+          "event": "e_leader_control",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "estale.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "estep",
+          "event": "e_stepdown",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "econtrol.scenario"
+            }
+          ]
+        },
+        {
+          "alias": "eafter",
+          "event": "e_after_stepdown_read_state",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": null,
+              "reference": "estep.scenario"
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "tracker-singleton",
+      "readindex-singleton-branch",
+      "readindex-follower-forward",
+      "readindex-forwarded-response",
+      "prop-removed-leader",
+      "switchtoconfig-removal",
+      "config-stepdown-doc",
+      "readonlysafe-doc",
+      "node-readindex-contract",
+      "readme-linearizable"
+    ],
+    "anchors": [
+      {
+        "material_id": "tracker-singleton",
+        "symbol": "IsSingleton",
+        "start_line": 160,
+        "end_line": 160,
+        "anchor": {
+          "source_ids": [
+            "tracker-singleton"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "tracker-singleton",
+          "start_line": 160,
+          "end_line": 160,
+          "symbol": "IsSingleton"
+        }
+      },
+      {
+        "material_id": "readindex-forwarded-response",
+        "symbol": "responseToReadIndexReq",
+        "start_line": 2074,
+        "end_line": 2074,
+        "anchor": {
+          "source_ids": [
+            "readindex-forwarded-response"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "readindex-forwarded-response",
+          "start_line": 2074,
+          "end_line": 2074,
+          "symbol": "responseToReadIndexReq"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Observe the forwarded route into the same missing membership check. The group's voters are {1,2} and node 3 is its learner; node 1 is elected leader of {1,2}; the learner's application issues a read, which the follower path forwards to node 1; that forwarded request is held; the application proposes and applies the committed removal of node 1 on the two voters; node 2 becomes leader of {2} and commits one entry the removed leader never sees; the held request is then delivered to node 1 and its answer back to the learner, which consumes it; the actual leader's own read is taken as a control; one heartbeat tick is delivered to the removed leader and the learner asks again.",
+      "assumptions": [
+        "The initial group has voters {1,2} and learner 3 (withLearners(3)), PreVote is enabled on every node and CheckQuorum is disabled, the election tick is 10 and the heartbeat tick is 1, and node 1 is elected with a real MsgHup/MsgPreVote/MsgVote round so that every node, the learner included, knows node 1 as its leader.",
+        "The learner's application issues the read while node 1 is still the leader it knows, so raft forwards the request to node 1; the forwarded request and its answer are delivered by hand after the removal has been applied, standing for a delay that outlasts the reconfiguration.",
+        "The messages of node 2 are drained rather than delivered, so the requester has not yet heard from the new leader and still routes its read to node 1."
+      ],
+      "excluded": [
+        "CheckQuorum and lease-based reads.",
+        "Snapshots, asynchronous storage writes, and any state machine behind the read index."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Elect node 1 in a group of voters {1,2} and learner 3 with a real MsgHup/MsgPreVote/MsgVote round, let the learner's application issue a read that raft forwards to node 1 and hold that request, apply the committed removal of node 1 on the two voters, elect node 2 in {2} and commit one proposal, deliver the held request to node 1 and its answer to the learner, take the actual leader's own read as a control, deliver one heartbeat tick of node 1 and pump its messages, then let the learner ask again.",
+    "requirement": "A ReadIndex answer must let the application serve a linearizable read (raft.go:233-244 and README.md:27-32 state that ReadOnlySafe achieves linearizability by communicating with the quorum, and node.go:218-224 states that once the application advances past the returned read index, linearizable reads issued before the request can be processed safely). A forwarded request is answered from the same singleton shortcut, but the answer leaves the node as a MsgReadIndexResp for the requester (raft.go:1354-1361, 2072-2087), so a stale index is consumed as another node's read state.",
+    "responsibility": "raft (target): the singleton shortcut in the ReadIndex path decides the answer for a remote requester, and the follower's forwarding path decides which node that requester asks.",
+    "comparisons": [
+      {
+        "event": "e_leader_removed",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "esetup",
+        "assertion": {
+          "field": "singleton",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: after the removal node 1 still leads and its configuration has exactly one voter, which is not node 1."
+      },
+      {
+        "event": "e_new_leader_committed",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "eremoved",
+        "assertion": {
+          "field": "actual_leader_ahead",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: the new leader of {2} has committed an entry the removed leader's commit index does not cover."
+      },
+      {
+        "event": "e_forwarded_request",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "enewlead",
+        "assertion": {
+          "field": "forwarded_to_removed_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Premise: the learner's read was forwarded to node 1, the leader it knows, and node 1 answered it; the requester holds no read state of its own."
+      },
+      {
+        "event": "e_forwarded_read_state",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "ereq",
+        "assertion": {
+          "field": "read_index_at_least_other_committed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Witness: the answer the requester consumed carries an index below the committed index of the actual leader, so the requester would serve a read that misses that entry."
+      },
+      {
+        "event": "e_leader_control",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "estale",
+        "assertion": {
+          "field": "read_index_at_least_own_committed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: the node that is the configuration's only voter answers its own read with an index that covers its commit index."
+      },
+      {
+        "event": "e_stepdown",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "econtrol",
+        "assertion": {
+          "field": "ticks_until_stepdown",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Bound: one heartbeat tick is enough for the removed leader to learn of the new term and leave the leader state, matching the (checkQuorum || preVote) guard."
+      },
+      {
+        "event": "e_after_stepdown_read_state",
+        "identity_fields": [
+          "scenario"
+        ],
+        "admission_alias": "estep",
+        "assertion": {
+          "field": "safe_outcome",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "After the window closed the same request is either not answered at all or answered with an index that covers the actual leader's commit index, so the exposure ended."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "58d590a4e84744e08ee4d0473cd5f863",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "6b71731acf2441de9145c5c6f1d03f8b",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

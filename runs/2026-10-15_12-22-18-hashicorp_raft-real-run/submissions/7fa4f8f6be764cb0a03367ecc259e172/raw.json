@@ -1,0 +1,67 @@
+{
+  "rationale": "Followed up the one weak point in the new account - that the request the follower refused was supplied by the probe rather than built by a live leader - by reading the leader's own request builder. The builder takes the peer's nextIndex: at nextIndex one it sets the previous index and term to zero, and it copies the leader's own entries from nextIndex up to nextIndex plus MaxAppendEntries minus one or the last index, whichever is smaller, so a peer whose rejections have walked nextIndex back to one is sent the leader's log from index one, which is the same shape the probe sent for a three-entry log. I recorded that as a behavior entry with a new source anchor, rewrote the account's counterevidence so the reachability of that request by the leader's own path is credited while the walk itself stays unmeasured, and changed nothing else.",
+  "sources": [
+    {
+      "id": "repl_request_builder",
+      "file": "replication.go",
+      "start_line": 570,
+      "end_line": 628,
+      "kind": "code_observation"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "1b3fce74c01648f7a4d2f39a7e6f9439-question-0",
+      "experiment_id": "4ada98775bb942b188b910463816baec-experiment",
+      "source_ids": [
+        "append_store_failure_window",
+        "truncation_reset_latest",
+        "append_conflict_loop",
+        "append_failure_response",
+        "append_success_tail",
+        "set_last_log_state",
+        "repl_reject_next_index",
+        "repl_request_builder",
+        "repl_log_not_found_snapshot",
+        "log_cache_write_through"
+      ],
+      "executions": {
+        "bd46b877825a4476b23bcc394778c324": [0, 1, 2, 3, 4, 5]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "The question has two halves and the execution answers both for the sequence it exercises. After the conflicting append with the store failure armed (receipt bd46b877825a4476b23bcc394778c324, injected case, conflict event index 1) the follower's own last log index was 3 while its store's last index was 1 and index 2 was no longer stored, and the handler answered that RPC with Success false, the stale LastLog of 3 and no rpc error, because it had deleted the suffix, failed to store the replacement and returned before setLastLog. The repair half is the decisive one: the next AppendEntries carried the whole log from index 1, which is the request a leader builds once its rejections have walked the peer's nextIndex back to one, and the follower rejected it too (index 2, Success false, store still at index 1), because the conflict loop treats index 2 as present while the stale in-memory last index stands at 3 and then fails to read it from the store. The control case, same requests and same settings with the store failure not armed, accepted both appends and ended with the store at index 3 (indices 4 and 5), so the rejection is caused by the failure and not by the request sequence. The reachability of the refused request is now source-backed as well: the leader's builder takes nextIndex, sets the previous index to zero at nextIndex one, and copies its own entries from that point, so the shape the probe sent is the shape the leader produces at that point of the stair. What remains inferred rather than measured is the walk itself - that a live leader's rejections actually descend to one, the interval that takes, and the effect of the stale index on the follower's own vote responses.",
+      "counterevidence": [
+        "The trigger is a store error on one RPC, and the library's leader path treats the same error as a reason to step down and to fail the caller, so a store error may be intended as a condition that takes a node out of service rather than one a follower must survive in place.",
+        "The repair request in the receipt is supplied by the probe, and although the leader's own builder produces that same request at nextIndex one, the receipt does not show a live leader walking its nextIndex down to one or how long that takes.",
+        "The state need not be permanent: the snapshot path fires once the leader's log no longer holds the follower's nextIndex, and a restart rebuilds the in-memory last log from the store.",
+        "The follower keeps answering, its rejections carry the leader's term, and it stays outside the leader's commitment accounting either way, so no committed entry of the cluster is decided by the stale index."
+      ],
+      "limitations": [
+        "One execution of six events, two cases and one request shape each; the rejection was uniform but the probe does not vary the failure point, the number of retries, or the timeout settings, which were two seconds for heartbeat, election and lease.",
+        "The account depends on a supplied fault - a store whose StoreLogs returns an injected error for the append that follows a truncation in the same RPC - and says nothing about torn writes, a lost acknowledged write, or a monotonic store.",
+        "The contract is disputed in the counterevidence above: the same store error leads the leader path to step down, so an operator may be expected to restart the node instead of relying on in-place repair.",
+        "The effect of the stale index on the follower's own vote responses is still unmeasured, as is a live leader's retry sequence and the point at which a snapshot would repair the follower."
+      ],
+      "knowledge": [
+        {
+          "entry_id": "1b3fce74c01648f7a4d2f39a7e6f9439-knowledge-0",
+          "revision": 2,
+          "assertion": "The aborts that can follow a suffix deletion in the same RPC return without advancing the in-memory last log, so the follower keeps an index its store has lost."
+        }
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "behavior",
+      "statement": "The leader builds every AppendEntries request for a peer from that peer's nextIndex. setPreviousLog sets the previous index and term to zero when nextIndex is one, to the last snapshot's index and term when nextIndex minus one is the snapshot point, and otherwise to the entry at nextIndex minus one read from the leader's own log; setNewLogs then copies the leader's entries from nextIndex up to nextIndex plus MaxAppendEntries minus one or the leader's last index, whichever is smaller, and a request whose previous index is no longer in the leader's log is what sends the replication loop into its snapshot path. A peer whose rejections have walked nextIndex back to one is therefore sent the leader's whole log from index one with a previous index of zero.",
+      "conditions": "Leader replicating to a configured peer with a known nextIndex, with MaxAppendEntries at its configured value; the peer's nextIndex is what the rejection branch of the replication loop lowers.",
+      "source_ids": [
+        "repl_request_builder",
+        "repl_reject_next_index",
+        "repl_log_not_found_snapshot"
+      ]
+    }
+  ]
+}

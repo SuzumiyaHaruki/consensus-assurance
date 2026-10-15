@@ -1,0 +1,308 @@
+{
+  "id": "d704b04e706144dc964ff451359eda19-experiment",
+  "investigation_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+  "version": 2,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceProbeNode is one real Raft instance in this process, with its own\n// store, snapshot store and in-memory transport.\ntype assuranceProbeNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\traft  *Raft\n}\n\nfunc assuranceProbeConfig(t *testing.T, tag string, localID ServerID) *Config {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = 200 * time.Millisecond\n\tconf.ElectionTimeout = 200 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 200 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.LocalID = localID\n\tconf.Logger = newTestLoggerWithPrefix(t, tag)\n\treturn conf\n}\n\n// assuranceNewNode only allocates a transport; starting the Raft instance is a\n// separate step so that every transport can be wired first.\nfunc assuranceNewNode(t *testing.T) *assuranceProbeNode {\n\taddr, trans := NewInmemTransport(\"\")\n\treturn &assuranceProbeNode{\n\t\taddr:  addr,\n\t\ttrans: trans,\n\t\tid:    ServerID(\"server-\" + string(addr)),\n\t}\n}\n\nfunc assuranceStartNode(t *testing.T, n *assuranceProbeNode, bootstrap *Configuration) {\n\tpc := assuranceProbeConfig(t, string(n.id), n.id)\n\tstore := NewInmemStore()\n\tsnap := NewInmemSnapshotStore()\n\tif bootstrap != nil {\n\t\tif err := BootstrapCluster(pc, store, store, snap, n.trans, *bootstrap); err != nil {\n\t\t\tt.Fatalf(\"BootstrapCluster failed: %v\", err)\n\t\t}\n\t}\n\tr, err := NewRaft(pc, &MockFSM{}, store, store, snap, n.trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft failed: %v\", err)\n\t}\n\tn.raft = r\n}\n\nfunc assuranceWaitLeader(t *testing.T, nodes []*assuranceProbeNode, limit time.Duration) *assuranceProbeNode {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\treturn n\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no leader elected within %s\", limit)\n\treturn nil\n}\n\nfunc assuranceHasServer(c Configuration, id ServerID) bool {\n\tfor _, s := range c.Servers {\n\t\tif s.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc assurancePartition(nodes []*assuranceProbeNode, near map[ServerAddress]bool) {\n\tfor _, a := range nodes {\n\t\tfor _, b := range nodes {\n\t\t\tif a == b {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif near[a.addr] != near[b.addr] {\n\t\t\t\ta.trans.Disconnect(b.addr)\n\t\t\t}\n\t\t}\n\t}\n}\n\n// assuranceVerify observes VerifyLeader() at the leader, capturing the actual\n// returned endpoint (nil error, a concrete error string, or still pending).\nfunc assuranceVerify(leader *Raft, wait time.Duration) string {\n\tf := leader.VerifyLeader()\n\tdone := make(chan error, 1)\n\tgo func() { done <- f.Error() }()\n\tselect {\n\tcase err := <-done:\n\t\tif err == nil {\n\t\t\treturn \"nil\"\n\t\t}\n\t\treturn err.Error()\n\tcase <-time.After(wait):\n\t\treturn \"pending\"\n\t}\n}\n\n// assuranceRunCase builds a real cluster of three voters plus one non-voter,\n// joins the non-voter through the leader's AddNonvoter API, then partitions the\n// leader so that only the peers listed in keep can be reached, and observes\n// VerifyLeader() on the leader.\nfunc assuranceRunCase(t *testing.T, tag string, keepNonvoter bool, keepVoter bool) {\n\tvar voters Configuration\n\tvar nodes []*assuranceProbeNode\n\tfor i := 0; i < 3; i++ {\n\t\tn := assuranceNewNode(t)\n\t\tnodes = append(nodes, n)\n\t\tvoters.Servers = append(voters.Servers, Server{Suffrage: Voter, ID: n.id, Address: n.addr})\n\t}\n\t// Fourth node joins as a non-voter later, started without a configuration.\n\tnv := assuranceNewNode(t)\n\tnodes = append(nodes, nv)\n\t// Wire every transport to every other transport before starting anything.\n\tfor _, a := range nodes {\n\t\tfor _, b := range nodes {\n\t\t\tif a != b {\n\t\t\t\ta.trans.Connect(b.addr, b.trans)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, n := range nodes[:3] {\n\t\tassuranceStartNode(t, n, &voters)\n\t}\n\tassuranceStartNode(t, nv, nil)\n\n\tconf := assuranceProbeConfig(t, tag, \"\")\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t_ = n.trans.Close()\n\t\t}\n\t}()\n\n\tleader := assuranceWaitLeader(t, nodes[:3], 10*time.Second)\n\n\tif err := leader.raft.AddNonvoter(nv.id, nv.addr, 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter failed: %v\", err)\n\t}\n\t// Wait until the leader's latest configuration carries the non-voter and\n\t// the non-voter has been contacted at least once.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif assuranceHasServer(leader.raft.getLatestConfiguration(), nv.id) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif !assuranceHasServer(leader.raft.getLatestConfiguration(), nv.id) {\n\t\tt.Fatalf(\"non-voter %v never appeared in the leader configuration\", nv.id)\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// Identify a surviving voter and the non-voter by ID, and build the\n\t// partition around the leader.\n\tvar keptVoter *assuranceProbeNode\n\tfor _, n := range nodes[:3] {\n\t\tif n != leader {\n\t\t\tkeptVoter = n\n\t\t\tbreak\n\t\t}\n\t}\n\tnear := map[ServerAddress]bool{leader.addr: true}\n\tif keepNonvoter {\n\t\tnear[nv.addr] = true\n\t}\n\tif keepVoter {\n\t\tnear[keptVoter.addr] = true\n\t}\n\n\tlatest := leader.raft.getLatestConfiguration()\n\tvar voterIDs, nonvoterIDs []string\n\tfor _, s := range latest.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoterIDs = append(voterIDs, string(s.ID))\n\t\t} else {\n\t\t\tnonvoterIDs = append(nonvoterIDs, string(s.ID))\n\t\t}\n\t}\n\tquorum := (len(voterIDs) / 2) + 1\n\n\t// The setup event records the partition and the configuration that is in\n\t// force, separately from the observed result, and is emitted before the\n\t// observation so it can act as an admission for the result comparison.\n\tsetup := map[string]interface{}{\n\t\t\"event\":              \"assurance_partition_setup\",\n\t\t\"case\":               tag,\n\t\t\"leader_id\":          string(leader.id),\n\t\t\"leader_addr\":        string(leader.addr),\n\t\t\"leader_term\":        leader.raft.getCurrentTerm(),\n\t\t\"kept_nonvoter\":      keepNonvoter,\n\t\t\"kept_voter\":         keepVoter,\n\t\t\"kept_nonvoter_id\":   string(nv.id),\n\t\t\"nonvoter_reachable\": keepNonvoter,\n\t\t\"voter_reachable\":    keepVoter,\n\t\t\"voters\":             voterIDs,\n\t\t\"voter_count\":        len(voterIDs),\n\t\t\"nonvoters\":          nonvoterIDs,\n\t\t\"quorum_size\":        quorum,\n\t\t\"leader_lease\":       conf.LeaderLeaseTimeout.String(),\n\t}\n\tassuranceEmit(t, setup)\n\n\tassurancePartition(nodes, near)\n\tstart := time.Now()\n\tverifyErr := assuranceVerify(leader.raft, 900*time.Millisecond)\n\telapsed := time.Since(start)\n\n\tmaxOtherTerm := uint64(0)\n\totherStates := []string{}\n\tfor _, n := range nodes {\n\t\tif n == leader {\n\t\t\tcontinue\n\t\t}\n\t\tif t2 := n.raft.getCurrentTerm(); t2 > maxOtherTerm {\n\t\t\tmaxOtherTerm = t2\n\t\t}\n\t\totherStates = append(otherStates, string(n.id)+\"=\"+n.raft.State().String())\n\t}\n\n\tresult := map[string]interface{}{\n\t\t\"event\":               \"assurance_verify_leader_result\",\n\t\t\"case\":                tag,\n\t\t\"leader_id\":           string(leader.id),\n\t\t\"leader_addr\":         string(leader.addr),\n\t\t\"leader_term\":         leader.raft.getCurrentTerm(),\n\t\t\"kept_nonvoter\":       keepNonvoter,\n\t\t\"kept_voter\":          keepVoter,\n\t\t\"kept_nonvoter_id\":    string(nv.id),\n\t\t\"nonvoter_reachable\":  keepNonvoter,\n\t\t\"voter_reachable\":     keepVoter,\n\t\t\"voters\":              voterIDs,\n\t\t\"voter_count\":         len(voterIDs),\n\t\t\"nonvoters\":           nonvoterIDs,\n\t\t\"quorum_size\":         quorum,\n\t\t\"other_max_term\":      maxOtherTerm,\n\t\t\"other_states\":        otherStates,\n\t\t\"leader_state_after\":  leader.raft.State().String(),\n\t\t\"verify_error\":        verifyErr,\n\t\t\"elapsed_ms\":          elapsed.Milliseconds(),\n\t\t\"leader_lease_timeout\": conf.LeaderLeaseTimeout.String(),\n\t}\n\tassuranceEmit(t, result)\n}\n\n// assuranceEmit writes one named CA_EVENT object; the controller rejects\n// events without a name.\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceVerifyLeaderNonvoterQuorum probes whether VerifyLeader on a\n// leader that can only reach a non-voter reports success, compared with the\n// same partition keeping one voter, and with no reachable peer at all.\nfunc TestAssuranceVerifyLeaderNonvoterQuorum(t *testing.T) {\n\tassuranceRunCase(t, \"keep-nonvoter\", true, false)\n\tassuranceRunCase(t, \"keep-voter\", false, true)\n\tassuranceRunCase(t, \"keep-none\", false, false)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "setup",
+          "event": "assurance_partition_setup",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "verify_leader",
+      "quorum_size",
+      "start_stop_repl",
+      "notify_all",
+      "update_last_appended",
+      "heartbeat_ack",
+      "verify_vote",
+      "api_verify_leader"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Observe VerifyLeader's returned endpoint at the leader of a four-server cluster (three voters plus one non-voter) after partitioning the leader away from the voter majority, comparing a partition that keeps only the non-voter reachable, one that keeps one voter reachable, and one that keeps no peer reachable. Each case emits a setup event with the leader ID and address, the voters and non-voters read from the leader's latest configuration, the voter count, the quorum size and the reachable-peer flags, and a result event with the leader's state, term, the VerifyLeader result and the elapsed time.",
+      "assumptions": [
+        "Three voters plus one non-voter is a supported configuration; the non-voter is added through the leader's AddNonvoter API rather than by constructing configuration state directly.",
+        "HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms and CommitTimeout = 5ms satisfy Config.Validate.",
+        "Disconnecting both directions across the partition boundary models a network split rather than closing a node, so the leader keeps running and its lease timer still fires."
+      ],
+      "excluded": [
+        "The stale-read half of the consequence: no successor election is expected to complete inside the observation window at these timeouts."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Each case builds four real Raft instances in one process, each with its own InmemStore, InmemSnapshotStore and InmemTransport; the transports are fully connected before any node is started. The three voters are bootstrapped with BootstrapCluster from a configuration naming all three as Voter; the fourth node is started without a configuration and joined through the elected leader's own AddNonvoter(id, address, 0, 5s) call, and the case waits until the leader's latest configuration reports the non-voter before proceeding. After a 300ms settling period the case emits assurance_partition_setup, then disconnects the transports in both directions across the chosen boundary, so only the listed peers remain reachable from the leader. The observation then calls VerifyLeader() on the leader and reports nil, a concrete error string, or pending after a 900ms wait, followed by assurance_verify_leader_result carrying the same case and leader identity. The peer kept reachable as a voter is chosen by position in the bootstrap configuration and the non-voter by its join identity, never by a measured result. Each case runs in a fresh cluster; the harness is TestAssuranceVerifyLeaderNonvoterQuorum.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "assurance_verify_leader_result",
+        "identity_fields": [
+          "case",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "eq",
+          "value": "nil",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "voter_reachable",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Non-voter only reachable: the leader succeeds even though no other voter acknowledged. Holds means the predicted success was observed, which supports the defect account rather than contradicting it."
+      },
+      {
+        "event": "assurance_verify_leader_result",
+        "identity_fields": [
+          "case",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "eq",
+          "value": "nil",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "voter_reachable",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "One voter reachable: positive control that a voter acknowledgement also produces success."
+      },
+      {
+        "event": "assurance_verify_leader_result",
+        "identity_fields": [
+          "case",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "ne",
+          "value": "nil",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "nonvoter_reachable",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "voter_reachable",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "No peer reachable: control showing that success requires some acknowledged peer, so the non-voter-only success is not available to the leader on its own vote."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "b8981977dfd34fbfa3028112c3fae84d",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "d704b04e706144dc964ff451359eda19",
+  "previous_id": "3b823834c8cb46da98e77d8e988bf5d9-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceProbeNode is one real Raft instance in this process, with its own\n// store, snapshot store and in-memory transport.\ntype assuranceProbeNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\traft  *Raft\n}\n\nfunc assuranceProbeConfig(t *testing.T, tag string, localID ServerID) *Config {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = 200 * time.Millisecond\n\tconf.ElectionTimeout = 200 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 200 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.LocalID = localID\n\tconf.Logger = newTestLoggerWithPrefix(t, tag)\n\treturn conf\n}\n\n// assuranceNewNode only allocates a transport; starting the Raft instance is a\n// separate step so that every transport can be wired first.\nfunc assuranceNewNode(t *testing.T) *assuranceProbeNode {\n\taddr, trans := NewInmemTransport(\"\")\n\treturn &assuranceProbeNode{\n\t\taddr:  addr,\n\t\ttrans: trans,\n\t\tid:    ServerID(\"server-\" + string(addr)),\n\t}\n}\n\nfunc assuranceStartNode(t *testing.T, n *assuranceProbeNode, bootstrap *Configuration) {\n\tpc := assuranceProbeConfig(t, string(n.id), n.id)\n\tstore := NewInmemStore()\n\tsnap := NewInmemSnapshotStore()\n\tif bootstrap != nil {\n\t\tif err := BootstrapCluster(pc, store, store, snap, n.trans, *bootstrap); err != nil {\n\t\t\tt.Fatalf(\"BootstrapCluster failed: %v\", err)\n\t\t}\n\t}\n\tr, err := NewRaft(pc, &MockFSM{}, store, store, snap, n.trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft failed: %v\", err)\n\t}\n\tn.raft = r\n}\n\nfunc assuranceWaitLeader(t *testing.T, nodes []*assuranceProbeNode, limit time.Duration) *assuranceProbeNode {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\treturn n\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no leader elected within %s\", limit)\n\treturn nil\n}\n\nfunc assuranceHasServer(c Configuration, id ServerID) bool {\n\tfor _, s := range c.Servers {\n\t\tif s.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc assurancePartition(nodes []*assuranceProbeNode, near map[ServerAddress]bool) {\n\tfor _, a := range nodes {\n\t\tfor _, b := range nodes {\n\t\t\tif a == b {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif near[a.addr] != near[b.addr] {\n\t\t\t\ta.trans.Disconnect(b.addr)\n\t\t\t}\n\t\t}\n\t}\n}\n\n// assuranceVerify observes VerifyLeader() at the leader, capturing the actual\n// returned endpoint (nil error, a concrete error string, or still pending).\nfunc assuranceVerify(leader *Raft, wait time.Duration) string {\n\tf := leader.VerifyLeader()\n\tdone := make(chan error, 1)\n\tgo func() { done <- f.Error() }()\n\tselect {\n\tcase err := <-done:\n\t\tif err == nil {\n\t\t\treturn \"nil\"\n\t\t}\n\t\treturn err.Error()\n\tcase <-time.After(wait):\n\t\treturn \"pending\"\n\t}\n}\n\n// assuranceRunCase builds a real cluster of three voters plus one non-voter,\n// joins the non-voter through the leader's AddNonvoter API, then partitions the\n// leader so that only the peers listed in keep can be reached, and observes\n// VerifyLeader() on the leader.\nfunc assuranceRunCase(t *testing.T, tag string, keepNonvoter bool, keepVoter bool) {\n\tvar voters Configuration\n\tvar nodes []*assuranceProbeNode\n\tfor i := 0; i < 3; i++ {\n\t\tn := assuranceNewNode(t)\n\t\tnodes = append(nodes, n)\n\t\tvoters.Servers = append(voters.Servers, Server{Suffrage: Voter, ID: n.id, Address: n.addr})\n\t}\n\t// Fourth node joins as a non-voter later, started without a configuration.\n\tnv := assuranceNewNode(t)\n\tnodes = append(nodes, nv)\n\t// Wire every transport to every other transport before starting anything.\n\tfor _, a := range nodes {\n\t\tfor _, b := range nodes {\n\t\t\tif a != b {\n\t\t\t\ta.trans.Connect(b.addr, b.trans)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, n := range nodes[:3] {\n\t\tassuranceStartNode(t, n, &voters)\n\t}\n\tassuranceStartNode(t, nv, nil)\n\n\tconf := assuranceProbeConfig(t, tag, \"\")\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t_ = n.trans.Close()\n\t\t}\n\t}()\n\n\tleader := assuranceWaitLeader(t, nodes[:3], 10*time.Second)\n\n\tif err := leader.raft.AddNonvoter(nv.id, nv.addr, 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter failed: %v\", err)\n\t}\n\t// Wait until the leader's latest configuration carries the non-voter and\n\t// the non-voter has been contacted at least once.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif assuranceHasServer(leader.raft.getLatestConfiguration(), nv.id) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif !assuranceHasServer(leader.raft.getLatestConfiguration(), nv.id) {\n\t\tt.Fatalf(\"non-voter %v never appeared in the leader configuration\", nv.id)\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// Identify a surviving voter and the non-voter by ID, and build the\n\t// partition around the leader.\n\tvar keptVoter *assuranceProbeNode\n\tfor _, n := range nodes[:3] {\n\t\tif n != leader {\n\t\t\tkeptVoter = n\n\t\t\tbreak\n\t\t}\n\t}\n\tnear := map[ServerAddress]bool{leader.addr: true}\n\tif keepNonvoter {\n\t\tnear[nv.addr] = true\n\t}\n\tif keepVoter {\n\t\tnear[keptVoter.addr] = true\n\t}\n\n\tlatest := leader.raft.getLatestConfiguration()\n\tvar voterIDs, nonvoterIDs []string\n\tfor _, s := range latest.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoterIDs = append(voterIDs, string(s.ID))\n\t\t} else {\n\t\t\tnonvoterIDs = append(nonvoterIDs, string(s.ID))\n\t\t}\n\t}\n\tquorum := (len(voterIDs) / 2) + 1\n\n\tassurancePartition(nodes, near)\n\tstart := time.Now()\n\tverifyErr := assuranceVerify(leader.raft, 900*time.Millisecond)\n\telapsed := time.Since(start)\n\n\tmaxOtherTerm := uint64(0)\n\totherStates := []string{}\n\tfor _, n := range nodes {\n\t\tif n == leader {\n\t\t\tcontinue\n\t\t}\n\t\tif t2 := n.raft.getCurrentTerm(); t2 > maxOtherTerm {\n\t\t\tmaxOtherTerm = t2\n\t\t}\n\t\totherStates = append(otherStates, string(n.id)+\"=\"+n.raft.State().String())\n\t}\n\n\tevent := map[string]interface{}{\n\t\t\"case\":                tag,\n\t\t\"leader_id\":           string(leader.id),\n\t\t\"leader_addr\":         string(leader.addr),\n\t\t\"kept_nonvoter\":       keepNonvoter,\n\t\t\"kept_voter\":          keepVoter,\n\t\t\"kept_nonvoter_id\":    string(nv.id),\n\t\t\"voters\":              voterIDs,\n\t\t\"nonvoters\":           nonvoterIDs,\n\t\t\"quorum_size\":         quorum,\n\t\t\"leader_term\":         leader.raft.getCurrentTerm(),\n\t\t\"other_max_term\":      maxOtherTerm,\n\t\t\"other_states\":        otherStates,\n\t\t\"leader_state_after\":  leader.raft.State().String(),\n\t\t\"verify_error\":        verifyErr,\n\t\t\"elapsed_ms\":          elapsed.Milliseconds(),\n\t\t\"leader_lease_timeout\": conf.LeaderLeaseTimeout.String(),\n\t}\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceVerifyLeaderNonvoterQuorum probes whether VerifyLeader on a\n// leader that can only reach a non-voter reports success, compared with the\n// same partition keeping one voter, and with no reachable peer at all.\nfunc TestAssuranceVerifyLeaderNonvoterQuorum(t *testing.T) {\n\tassuranceRunCase(t, \"keep-nonvoter\", true, false)\n\tassuranceRunCase(t, \"keep-voter\", false, true)\n\tassuranceRunCase(t, \"keep-none\", false, false)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": []
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceProbeNode is one real Raft instance in this process, with its own\n// store, snapshot store and in-memory transport.\ntype assuranceProbeNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\traft  *Raft\n}\n\nfunc assuranceProbeConfig(t *testing.T, tag string, localID ServerID) *Config {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = 200 * time.Millisecond\n\tconf.ElectionTimeout = 200 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 200 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.LocalID = localID\n\tconf.Logger = newTestLoggerWithPrefix(t, tag)\n\treturn conf\n}\n\n// assuranceNewNode only allocates a transport; starting the Raft instance is a\n// separate step so that every transport can be wired first.\nfunc assuranceNewNode(t *testing.T) *assuranceProbeNode {\n\taddr, trans := NewInmemTransport(\"\")\n\treturn &assuranceProbeNode{\n\t\taddr:  addr,\n\t\ttrans: trans,\n\t\tid:    ServerID(\"server-\" + string(addr)),\n\t}\n}\n\nfunc assuranceStartNode(t *testing.T, n *assuranceProbeNode, bootstrap *Configuration) {\n\tpc := assuranceProbeConfig(t, string(n.id), n.id)\n\tstore := NewInmemStore()\n\tsnap := NewInmemSnapshotStore()\n\tif bootstrap != nil {\n\t\tif err := BootstrapCluster(pc, store, store, snap, n.trans, *bootstrap); err != nil {\n\t\t\tt.Fatalf(\"BootstrapCluster failed: %v\", err)\n\t\t}\n\t}\n\tr, err := NewRaft(pc, &MockFSM{}, store, store, snap, n.trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft failed: %v\", err)\n\t}\n\tn.raft = r\n}\n\nfunc assuranceWaitLeader(t *testing.T, nodes []*assuranceProbeNode, limit time.Duration) *assuranceProbeNode {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\treturn n\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no leader elected within %s\", limit)\n\treturn nil\n}\n\nfunc assuranceHasServer(c Configuration, id ServerID) bool {\n\tfor _, s := range c.Servers {\n\t\tif s.ID == id {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc assurancePartition(nodes []*assuranceProbeNode, near map[ServerAddress]bool) {\n\tfor _, a := range nodes {\n\t\tfor _, b := range nodes {\n\t\t\tif a == b {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif near[a.addr] != near[b.addr] {\n\t\t\t\ta.trans.Disconnect(b.addr)\n\t\t\t}\n\t\t}\n\t}\n}\n\n// assuranceVerify observes VerifyLeader() at the leader, capturing the actual\n// returned endpoint (nil error, a concrete error string, or still pending).\nfunc assuranceVerify(leader *Raft, wait time.Duration) string {\n\tf := leader.VerifyLeader()\n\tdone := make(chan error, 1)\n\tgo func() { done <- f.Error() }()\n\tselect {\n\tcase err := <-done:\n\t\tif err == nil {\n\t\t\treturn \"nil\"\n\t\t}\n\t\treturn err.Error()\n\tcase <-time.After(wait):\n\t\treturn \"pending\"\n\t}\n}\n\n// assuranceRunCase builds a real cluster of three voters plus one non-voter,\n// joins the non-voter through the leader's AddNonvoter API, then partitions the\n// leader so that only the peers listed in keep can be reached, and observes\n// VerifyLeader() on the leader.\nfunc assuranceRunCase(t *testing.T, tag string, keepNonvoter bool, keepVoter bool) {\n\tvar voters Configuration\n\tvar nodes []*assuranceProbeNode\n\tfor i := 0; i < 3; i++ {\n\t\tn := assuranceNewNode(t)\n\t\tnodes = append(nodes, n)\n\t\tvoters.Servers = append(voters.Servers, Server{Suffrage: Voter, ID: n.id, Address: n.addr})\n\t}\n\t// Fourth node joins as a non-voter later, started without a configuration.\n\tnv := assuranceNewNode(t)\n\tnodes = append(nodes, nv)\n\t// Wire every transport to every other transport before starting anything.\n\tfor _, a := range nodes {\n\t\tfor _, b := range nodes {\n\t\t\tif a != b {\n\t\t\t\ta.trans.Connect(b.addr, b.trans)\n\t\t\t}\n\t\t}\n\t}\n\tfor _, n := range nodes[:3] {\n\t\tassuranceStartNode(t, n, &voters)\n\t}\n\tassuranceStartNode(t, nv, nil)\n\n\tconf := assuranceProbeConfig(t, tag, \"\")\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t_ = n.trans.Close()\n\t\t}\n\t}()\n\n\tleader := assuranceWaitLeader(t, nodes[:3], 10*time.Second)\n\n\tif err := leader.raft.AddNonvoter(nv.id, nv.addr, 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"AddNonvoter failed: %v\", err)\n\t}\n\t// Wait until the leader's latest configuration carries the non-voter and\n\t// the non-voter has been contacted at least once.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif assuranceHasServer(leader.raft.getLatestConfiguration(), nv.id) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif !assuranceHasServer(leader.raft.getLatestConfiguration(), nv.id) {\n\t\tt.Fatalf(\"non-voter %v never appeared in the leader configuration\", nv.id)\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// Identify a surviving voter and the non-voter by ID, and build the\n\t// partition around the leader.\n\tvar keptVoter *assuranceProbeNode\n\tfor _, n := range nodes[:3] {\n\t\tif n != leader {\n\t\t\tkeptVoter = n\n\t\t\tbreak\n\t\t}\n\t}\n\tnear := map[ServerAddress]bool{leader.addr: true}\n\tif keepNonvoter {\n\t\tnear[nv.addr] = true\n\t}\n\tif keepVoter {\n\t\tnear[keptVoter.addr] = true\n\t}\n\n\tlatest := leader.raft.getLatestConfiguration()\n\tvar voterIDs, nonvoterIDs []string\n\tfor _, s := range latest.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoterIDs = append(voterIDs, string(s.ID))\n\t\t} else {\n\t\t\tnonvoterIDs = append(nonvoterIDs, string(s.ID))\n\t\t}\n\t}\n\tquorum := (len(voterIDs) / 2) + 1\n\n\t// The setup event records the partition and the configuration that is in\n\t// force, separately from the observed result, and is emitted before the\n\t// observation so it can act as an admission for the result comparison.\n\tsetup := map[string]interface{}{\n\t\t\"event\":              \"assurance_partition_setup\",\n\t\t\"case\":               tag,\n\t\t\"leader_id\":          string(leader.id),\n\t\t\"leader_addr\":        string(leader.addr),\n\t\t\"leader_term\":        leader.raft.getCurrentTerm(),\n\t\t\"kept_nonvoter\":      keepNonvoter,\n\t\t\"kept_voter\":         keepVoter,\n\t\t\"kept_nonvoter_id\":   string(nv.id),\n\t\t\"nonvoter_reachable\": keepNonvoter,\n\t\t\"voter_reachable\":    keepVoter,\n\t\t\"voters\":             voterIDs,\n\t\t\"voter_count\":        len(voterIDs),\n\t\t\"nonvoters\":          nonvoterIDs,\n\t\t\"quorum_size\":        quorum,\n\t\t\"leader_lease\":       conf.LeaderLeaseTimeout.String(),\n\t}\n\tassuranceEmit(t, setup)\n\n\tassurancePartition(nodes, near)\n\tstart := time.Now()\n\tverifyErr := assuranceVerify(leader.raft, 900*time.Millisecond)\n\telapsed := time.Since(start)\n\n\tmaxOtherTerm := uint64(0)\n\totherStates := []string{}\n\tfor _, n := range nodes {\n\t\tif n == leader {\n\t\t\tcontinue\n\t\t}\n\t\tif t2 := n.raft.getCurrentTerm(); t2 > maxOtherTerm {\n\t\t\tmaxOtherTerm = t2\n\t\t}\n\t\totherStates = append(otherStates, string(n.id)+\"=\"+n.raft.State().String())\n\t}\n\n\tresult := map[string]interface{}{\n\t\t\"event\":               \"assurance_verify_leader_result\",\n\t\t\"case\":                tag,\n\t\t\"leader_id\":           string(leader.id),\n\t\t\"leader_addr\":         string(leader.addr),\n\t\t\"leader_term\":         leader.raft.getCurrentTerm(),\n\t\t\"kept_nonvoter\":       keepNonvoter,\n\t\t\"kept_voter\":          keepVoter,\n\t\t\"kept_nonvoter_id\":    string(nv.id),\n\t\t\"nonvoter_reachable\":  keepNonvoter,\n\t\t\"voter_reachable\":     keepVoter,\n\t\t\"voters\":              voterIDs,\n\t\t\"voter_count\":         len(voterIDs),\n\t\t\"nonvoters\":           nonvoterIDs,\n\t\t\"quorum_size\":         quorum,\n\t\t\"other_max_term\":      maxOtherTerm,\n\t\t\"other_states\":        otherStates,\n\t\t\"leader_state_after\":  leader.raft.State().String(),\n\t\t\"verify_error\":        verifyErr,\n\t\t\"elapsed_ms\":          elapsed.Milliseconds(),\n\t\t\"leader_lease_timeout\": conf.LeaderLeaseTimeout.String(),\n\t}\n\tassuranceEmit(t, result)\n}\n\n// assuranceEmit writes one named CA_EVENT object; the controller rejects\n// events without a name.\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceVerifyLeaderNonvoterQuorum probes whether VerifyLeader on a\n// leader that can only reach a non-voter reports success, compared with the\n// same partition keeping one voter, and with no reachable peer at all.\nfunc TestAssuranceVerifyLeaderNonvoterQuorum(t *testing.T) {\n\tassuranceRunCase(t, \"keep-nonvoter\", true, false)\n\tassuranceRunCase(t, \"keep-voter\", false, true)\n\tassuranceRunCase(t, \"keep-none\", false, false)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "setup",
+            "event": "assurance_partition_setup",
+            "conditions": []
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Observe VerifyLeader's returned endpoint at the leader of a four-server cluster (three voters plus one non-voter) after partitioning the leader away from the voter majority, comparing a partition that keeps only the non-voter reachable, one that keeps one voter reachable, and one that keeps no peer reachable. Each case emits one CA_EVENT with the leader ID and address, the voters and non-voters read from the leader's latest configuration, the quorum size, the leader term, the other servers' terms and states, the leader's state after the call, the VerifyLeader result and the elapsed time.",
+        "assumptions": [],
+        "excluded": [],
+        "parameters": {}
+      },
+      "after": {
+        "description": "Observe VerifyLeader's returned endpoint at the leader of a four-server cluster (three voters plus one non-voter) after partitioning the leader away from the voter majority, comparing a partition that keeps only the non-voter reachable, one that keeps one voter reachable, and one that keeps no peer reachable. Each case emits a setup event with the leader ID and address, the voters and non-voters read from the leader's latest configuration, the voter count, the quorum size and the reachable-peer flags, and a result event with the leader's state, term, the VerifyLeader result and the elapsed time.",
+        "assumptions": [
+          "Three voters plus one non-voter is a supported configuration; the non-voter is added through the leader's AddNonvoter API rather than by constructing configuration state directly.",
+          "HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms and CommitTimeout = 5ms satisfy Config.Validate.",
+          "Disconnecting both directions across the partition boundary models a network split rather than closing a node, so the leader keeps running and its lease timer still fires."
+        ],
+        "excluded": [
+          "The stale-read half of the consequence: no successor election is expected to complete inside the observation window at these timeouts."
+        ],
+        "parameters": {}
+      }
+    },
+    "prefix": {
+      "before": "Each case builds four real Raft instances in one process, each with its own InmemStore, InmemSnapshotStore and InmemTransport; the transports are fully connected before any node is started. The three voters are bootstrapped with BootstrapCluster from a configuration naming all three as Voter; the fourth node is started without a configuration and joined through the elected leader's own AddNonvoter(id, address, 0, 5s) call, and the case waits until the leader's latest configuration reports the non-voter before proceeding. Configuration: HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms, CommitTimeout = 5ms, default ProtocolVersion, which satisfies Config.Validate. After a 300ms settling period the transports are disconnected in both directions across the chosen boundary, so only the listed peers remain reachable from the leader; the observation then calls VerifyLeader() on the leader and reports nil, a concrete error, or pending after a 900ms wait. The peer kept reachable as a voter is chosen by position in the bootstrap configuration, and the non-voter by its join identity, never by a measured result.",
+      "after": "Each case builds four real Raft instances in one process, each with its own InmemStore, InmemSnapshotStore and InmemTransport; the transports are fully connected before any node is started. The three voters are bootstrapped with BootstrapCluster from a configuration naming all three as Voter; the fourth node is started without a configuration and joined through the elected leader's own AddNonvoter(id, address, 0, 5s) call, and the case waits until the leader's latest configuration reports the non-voter before proceeding. After a 300ms settling period the case emits assurance_partition_setup, then disconnects the transports in both directions across the chosen boundary, so only the listed peers remain reachable from the leader. The observation then calls VerifyLeader() on the leader and reports nil, a concrete error string, or pending after a 900ms wait, followed by assurance_verify_leader_result carrying the same case and leader identity. The peer kept reachable as a voter is chosen by position in the bootstrap configuration and the non-voter by its join identity, never by a measured result. Each case runs in a fresh cluster; the harness is TestAssuranceVerifyLeaderNonvoterQuorum."
+    },
+    "comparisons": {
+      "before": [],
+      "after": [
+        {
+          "event": "assurance_verify_leader_result",
+          "identity_fields": [
+            "case",
+            "leader_id"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "verify_error",
+            "op": "eq",
+            "value": "nil",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "voter_reachable",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Non-voter only reachable: the leader succeeds even though no other voter acknowledged. Holds means the predicted success was observed, which supports the defect account rather than contradicting it."
+        },
+        {
+          "event": "assurance_verify_leader_result",
+          "identity_fields": [
+            "case",
+            "leader_id"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "verify_error",
+            "op": "eq",
+            "value": "nil",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "voter_reachable",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "One voter reachable: positive control that a voter acknowledgement also produces success."
+        },
+        {
+          "event": "assurance_verify_leader_result",
+          "identity_fields": [
+            "case",
+            "leader_id"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "verify_error",
+            "op": "ne",
+            "value": "nil",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "nonvoter_reachable",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "voter_reachable",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "No peer reachable: control showing that success requires some acknowledged peer, so the non-voter-only success is not available to the leader on its own vote."
+        }
+      ]
+    }
+  },
+  "revision_reason": "The previous harness emitted CA_EVENT objects without an event name, so the controller rejected all three as invalid_observation and no observation could be interpreted. This revision only changes the observation format: each case now emits a named assurance_partition_setup event before the partition and a named assurance_verify_leader_result event afterwards, carrying the same measured fields, and declares the setup event as a prerequisite admission with one comparison per partition case."
+}

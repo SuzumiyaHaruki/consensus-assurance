@@ -1,0 +1,498 @@
+{
+  "id": "60915351a519403a9c3ee2b96fae7ce2-experiment",
+  "investigation_id": "1995fd2023c948c99b650dce1b597cd6-question-0",
+  "version": 3,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceRecorder counts the callbacks an application FSM receives.\ntype assuranceRecorder struct {\n\tmu                 sync.Mutex\n\tstoreConfigCalls   []uint64\n\tapplyBatchConfigs  int\n\tapplyBatchCommands int\n\tapplyCommands      int\n}\n\nfunc (r *assuranceRecorder) record(name string, log *Log) {\n\tr.mu.Lock()\n\tdefer r.mu.Unlock()\n\tswitch name {\n\tcase \"store\":\n\t\tr.storeConfigCalls = append(r.storeConfigCalls, log.Index)\n\tcase \"apply\":\n\t\tif log.Type == LogConfiguration {\n\t\t\tr.applyBatchConfigs++\n\t\t} else {\n\t\t\tr.applyBatchCommands++\n\t\t}\n\t}\n}\n\nfunc (r *assuranceRecorder) snapshot() map[string]interface{} {\n\tr.mu.Lock()\n\tdefer r.mu.Unlock()\n\treturn map[string]interface{}{\n\t\t\"store_configuration_calls\": len(r.storeConfigCalls),\n\t\t\"apply_batch_config_logs\":   r.applyBatchConfigs,\n\t\t\"apply_batch_commands\":      r.applyBatchCommands,\n\t}\n}\n\n// assuranceFSM implements FSM and ConfigurationStore, recording both.\ntype assuranceFSM struct{ rec *assuranceRecorder }\n\nfunc (f *assuranceFSM) Apply(l *Log) interface{} {\n\tf.rec.record(\"apply\", l)\n\treturn nil\n}\nfunc (f *assuranceFSM) Snapshot() (FSMSnapshot, error) { return &MockSnapshot{}, nil }\nfunc (f *assuranceFSM) Restore(io.ReadCloser) error    { return nil }\nfunc (f *assuranceFSM) StoreConfiguration(index uint64, c Configuration) {\n\tf.rec.record(\"store\", &Log{Type: LogConfiguration, Index: index})\n}\n\n// assuranceBatchingFSM additionally implements BatchingFSM, so the same FSM\n// satisfies both public interfaces.\ntype assuranceBatchingFSM struct{ assuranceFSM }\n\nfunc (f *assuranceBatchingFSM) ApplyBatch(logs []*Log) []interface{} {\n\tout := make([]interface{}, len(logs))\n\tfor _, l := range logs {\n\t\tf.rec.record(\"apply\", l)\n\t}\n\treturn out\n}\n\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tt.Log(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceConfigurationStoreWithBatching asks whether an FSM that\n// implements both BatchingFSM and ConfigurationStore receives a committed\n// configuration change through StoreConfiguration, which its own documentation\n// promises unconditionally, or only through ApplyBatch.\nfunc TestAssuranceConfigurationStoreWithBatching(t *testing.T) {\n\tassuranceRunConfigStoreTrial(t, false, \"move-voter-address\")\n\tassuranceRunConfigStoreTrial(t, true, \"move-voter-address\")\n\t// Other configuration commands take the same apply path; this checks that\n\t// the missing callback is not specific to one kind of change.\n\tassuranceRunConfigStoreTrial(t, true, \"add-nonvoter\")\n\tassuranceRunConfigStoreTrial(t, true, \"remove-follower\")\n}\n\nfunc assuranceRunConfigStoreTrial(t *testing.T, batching bool, trigger string) {\n\trec := &assuranceRecorder{}\n\tconf := inmemConfig(t)\n\tmakeFSM := func() FSM {\n\t\tif batching {\n\t\t\treturn &assuranceBatchingFSM{assuranceFSM{rec: rec}}\n\t\t}\n\t\treturn &assuranceFSM{rec: rec}\n\t}\n\tc := MakeClusterCustom(t, &MakeClusterOpts{Peers: 3, Bootstrap: true, Conf: conf, MakeFSMFunc: makeFSM})\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tvar target *Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader {\n\t\t\ttarget = r\n\t\t\tbreak\n\t\t}\n\t}\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":        \"assurance_config_store_setup\",\n\t\t\"batching_fsm\": batching,\n\t\t\"trigger\":      trigger,\n\t\t\"leader_id\":    string(leader.localID),\n\t\t\"target_id\":    string(target.localID),\n\t\t\"peer_count\":   len(c.rafts),\n\t})\n\n\t// Trigger one configuration change: move an existing voter's address.\n\tchangeErr := \"nil\"\n\tswitch trigger {\n\tcase \"add-nonvoter\":\n\t\tif err := leader.AddNonvoter(ServerID(\"assurance-join-\"+string(target.localID)), ServerAddress(\"assurance-join-addr-\"+string(target.localID)), 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\tcase \"remove-follower\":\n\t\tif err := leader.RemoveServer(target.localID, 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\tdefault:\n\t\tif err := leader.AddVoter(target.localID, ServerAddress(\"assurance-moved-\"+string(target.localID)), 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\t}\n\n\t// Wait for the configuration change to reach the FSM.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tst := rec.snapshot()\n\t\tif st[\"store_configuration_calls\"].(int) > 0 || st[\"apply_batch_config_logs\"].(int) > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\ttime.Sleep(200 * time.Millisecond)\n\n\tevent := map[string]interface{}{\n\t\t\"event\":        \"assurance_config_store_result\",\n\t\t\"batching_fsm\": batching,\n\t\t\"trigger\":      trigger,\n\t\t\"leader_id\":    string(leader.localID),\n\t\t\"target_id\":    string(target.localID),\n\t\t\"change_error\": changeErr,\n\t}\n\tfor k, v := range rec.snapshot() {\n\t\tevent[k] = v\n\t}\n\tassuranceEmit(t, event)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "setup",
+          "event": "assurance_config_store_setup",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "batching_fsm_iface",
+      "config_store_iface",
+      "fsm_single_apply",
+      "fsm_batch_apply",
+      "next_configuration_commands"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Four cases as in the previous revision - a ConfigurationStore-only control and three dual-interface cases triggered by a voter address change, an AddNonvoter and a RemoveServer - each reporting the StoreConfiguration and ApplyBatch configuration counts, with the setup event now carrying the same trigger identifier as the result event so the admission can be matched.",
+      "assumptions": [
+        "All three commands are legal on a three-voter cluster, as before.",
+        "The setup and result events now share batching_fsm and trigger, which is the identity the comparisons use.",
+        "The recorder is still shared across the cluster's FSMs."
+      ],
+      "excluded": [
+        "DemoteVoter and the deprecated Promote command."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Each case calls MakeClusterCustom with three peers, bootstrapping and the in-memory test configuration, and a MakeFSMFunc returning either an FSM implementing FSM and ConfigurationStore or one that also implements ApplyBatch, all recording into a shared recorder. The case emits assurance_config_store_setup with the batching flag, the trigger name, the leader and target identities and the peer count, issues exactly one configuration command according to the trigger (AddVoter with a new address for the target voter, AddNonvoter for a fresh identity, or RemoveServer of the target follower), waits up to five seconds for a callback counter to become non-zero, waits a further 200ms, and emits assurance_config_store_result with the same trigger and batching flags plus the command's error and the counts. The harness is TestAssuranceConfigurationStoreWithBatching.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "assurance_config_store_result",
+        "identity_fields": [
+          "batching_fsm",
+          "trigger"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "store_configuration_calls",
+          "op": "ne",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "batching_fsm",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "trigger",
+            "op": "eq",
+            "value": "add-nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "Dual-interface FSM after an AddNonvoter: whether the documented callback arrives."
+      },
+      {
+        "event": "assurance_config_store_result",
+        "identity_fields": [
+          "batching_fsm",
+          "trigger"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "store_configuration_calls",
+          "op": "ne",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "batching_fsm",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "trigger",
+            "op": "eq",
+            "value": "remove-follower",
+            "reference": null
+          }
+        ],
+        "description": "Dual-interface FSM after a RemoveServer: whether the documented callback arrives."
+      },
+      {
+        "event": "assurance_config_store_result",
+        "identity_fields": [
+          "batching_fsm",
+          "trigger"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "store_configuration_calls",
+          "op": "ne",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "batching_fsm",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "trigger",
+            "op": "eq",
+            "value": "move-voter-address",
+            "reference": null
+          }
+        ],
+        "description": "The standing dual-interface case, re-measured with the others."
+      },
+      {
+        "event": "assurance_config_store_result",
+        "identity_fields": [
+          "batching_fsm",
+          "trigger"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "store_configuration_calls",
+          "op": "ne",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "batching_fsm",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "trigger",
+            "op": "eq",
+            "value": "move-voter-address",
+            "reference": null
+          }
+        ],
+        "description": "Control: the ConfigurationStore-only FSM receives the callback."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "b8981977dfd34fbfa3028112c3fae84d",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "60915351a519403a9c3ee2b96fae7ce2",
+  "previous_id": "0c2ccd3e54bd41d385d13c33edaec69f-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceRecorder counts the callbacks an application FSM receives.\ntype assuranceRecorder struct {\n\tmu                 sync.Mutex\n\tstoreConfigCalls   []uint64\n\tapplyBatchConfigs  int\n\tapplyBatchCommands int\n\tapplyCommands      int\n}\n\nfunc (r *assuranceRecorder) record(name string, log *Log) {\n\tr.mu.Lock()\n\tdefer r.mu.Unlock()\n\tswitch name {\n\tcase \"store\":\n\t\tr.storeConfigCalls = append(r.storeConfigCalls, log.Index)\n\tcase \"apply\":\n\t\tif log.Type == LogConfiguration {\n\t\t\tr.applyBatchConfigs++\n\t\t} else {\n\t\t\tr.applyBatchCommands++\n\t\t}\n\t}\n}\n\nfunc (r *assuranceRecorder) snapshot() map[string]interface{} {\n\tr.mu.Lock()\n\tdefer r.mu.Unlock()\n\treturn map[string]interface{}{\n\t\t\"store_configuration_calls\": len(r.storeConfigCalls),\n\t\t\"apply_batch_config_logs\":   r.applyBatchConfigs,\n\t\t\"apply_batch_commands\":      r.applyBatchCommands,\n\t}\n}\n\n// assuranceFSM implements FSM and ConfigurationStore, recording both.\ntype assuranceFSM struct{ rec *assuranceRecorder }\n\nfunc (f *assuranceFSM) Apply(l *Log) interface{} {\n\tf.rec.record(\"apply\", l)\n\treturn nil\n}\nfunc (f *assuranceFSM) Snapshot() (FSMSnapshot, error) { return &MockSnapshot{}, nil }\nfunc (f *assuranceFSM) Restore(io.ReadCloser) error    { return nil }\nfunc (f *assuranceFSM) StoreConfiguration(index uint64, c Configuration) {\n\tf.rec.record(\"store\", &Log{Type: LogConfiguration, Index: index})\n}\n\n// assuranceBatchingFSM additionally implements BatchingFSM, so the same FSM\n// satisfies both public interfaces.\ntype assuranceBatchingFSM struct{ assuranceFSM }\n\nfunc (f *assuranceBatchingFSM) ApplyBatch(logs []*Log) []interface{} {\n\tout := make([]interface{}, len(logs))\n\tfor _, l := range logs {\n\t\tf.rec.record(\"apply\", l)\n\t}\n\treturn out\n}\n\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tt.Log(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceConfigurationStoreWithBatching asks whether an FSM that\n// implements both BatchingFSM and ConfigurationStore receives a committed\n// configuration change through StoreConfiguration, which its own documentation\n// promises unconditionally, or only through ApplyBatch.\nfunc TestAssuranceConfigurationStoreWithBatching(t *testing.T) {\n\tassuranceRunConfigStoreTrial(t, false, \"move-voter-address\")\n\tassuranceRunConfigStoreTrial(t, true, \"move-voter-address\")\n\t// Other configuration commands take the same apply path; this checks that\n\t// the missing callback is not specific to one kind of change.\n\tassuranceRunConfigStoreTrial(t, true, \"add-nonvoter\")\n\tassuranceRunConfigStoreTrial(t, true, \"remove-follower\")\n}\n\nfunc assuranceRunConfigStoreTrial(t *testing.T, batching bool, trigger string) {\n\trec := &assuranceRecorder{}\n\tconf := inmemConfig(t)\n\tmakeFSM := func() FSM {\n\t\tif batching {\n\t\t\treturn &assuranceBatchingFSM{assuranceFSM{rec: rec}}\n\t\t}\n\t\treturn &assuranceFSM{rec: rec}\n\t}\n\tc := MakeClusterCustom(t, &MakeClusterOpts{Peers: 3, Bootstrap: true, Conf: conf, MakeFSMFunc: makeFSM})\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tvar target *Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader {\n\t\t\ttarget = r\n\t\t\tbreak\n\t\t}\n\t}\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":        \"assurance_config_store_setup\",\n\t\t\"batching_fsm\": batching,\n\t\t\"leader_id\":    string(leader.localID),\n\t\t\"target_id\":    string(target.localID),\n\t\t\"peer_count\":   len(c.rafts),\n\t})\n\n\t// Trigger one configuration change: move an existing voter's address.\n\tchangeErr := \"nil\"\n\tswitch trigger {\n\tcase \"add-nonvoter\":\n\t\tif err := leader.AddNonvoter(ServerID(\"assurance-join-\"+string(target.localID)), ServerAddress(\"assurance-join-addr-\"+string(target.localID)), 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\tcase \"remove-follower\":\n\t\tif err := leader.RemoveServer(target.localID, 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\tdefault:\n\t\tif err := leader.AddVoter(target.localID, ServerAddress(\"assurance-moved-\"+string(target.localID)), 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\t}\n\n\t// Wait for the configuration change to reach the FSM.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tst := rec.snapshot()\n\t\tif st[\"store_configuration_calls\"].(int) > 0 || st[\"apply_batch_config_logs\"].(int) > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\ttime.Sleep(200 * time.Millisecond)\n\n\tevent := map[string]interface{}{\n\t\t\"event\":        \"assurance_config_store_result\",\n\t\t\"batching_fsm\": batching,\n\t\t\"trigger\":      trigger,\n\t\t\"leader_id\":    string(leader.localID),\n\t\t\"target_id\":    string(target.localID),\n\t\t\"change_error\": changeErr,\n\t}\n\tfor k, v := range rec.snapshot() {\n\t\tevent[k] = v\n\t}\n\tassuranceEmit(t, event)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "setup",
+            "event": "assurance_config_store_setup",
+            "conditions": []
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "// Copyright IBM Corp. 2013, 2026\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceRecorder counts the callbacks an application FSM receives.\ntype assuranceRecorder struct {\n\tmu                 sync.Mutex\n\tstoreConfigCalls   []uint64\n\tapplyBatchConfigs  int\n\tapplyBatchCommands int\n\tapplyCommands      int\n}\n\nfunc (r *assuranceRecorder) record(name string, log *Log) {\n\tr.mu.Lock()\n\tdefer r.mu.Unlock()\n\tswitch name {\n\tcase \"store\":\n\t\tr.storeConfigCalls = append(r.storeConfigCalls, log.Index)\n\tcase \"apply\":\n\t\tif log.Type == LogConfiguration {\n\t\t\tr.applyBatchConfigs++\n\t\t} else {\n\t\t\tr.applyBatchCommands++\n\t\t}\n\t}\n}\n\nfunc (r *assuranceRecorder) snapshot() map[string]interface{} {\n\tr.mu.Lock()\n\tdefer r.mu.Unlock()\n\treturn map[string]interface{}{\n\t\t\"store_configuration_calls\": len(r.storeConfigCalls),\n\t\t\"apply_batch_config_logs\":   r.applyBatchConfigs,\n\t\t\"apply_batch_commands\":      r.applyBatchCommands,\n\t}\n}\n\n// assuranceFSM implements FSM and ConfigurationStore, recording both.\ntype assuranceFSM struct{ rec *assuranceRecorder }\n\nfunc (f *assuranceFSM) Apply(l *Log) interface{} {\n\tf.rec.record(\"apply\", l)\n\treturn nil\n}\nfunc (f *assuranceFSM) Snapshot() (FSMSnapshot, error) { return &MockSnapshot{}, nil }\nfunc (f *assuranceFSM) Restore(io.ReadCloser) error    { return nil }\nfunc (f *assuranceFSM) StoreConfiguration(index uint64, c Configuration) {\n\tf.rec.record(\"store\", &Log{Type: LogConfiguration, Index: index})\n}\n\n// assuranceBatchingFSM additionally implements BatchingFSM, so the same FSM\n// satisfies both public interfaces.\ntype assuranceBatchingFSM struct{ assuranceFSM }\n\nfunc (f *assuranceBatchingFSM) ApplyBatch(logs []*Log) []interface{} {\n\tout := make([]interface{}, len(logs))\n\tfor _, l := range logs {\n\t\tf.rec.record(\"apply\", l)\n\t}\n\treturn out\n}\n\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tt.Log(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceConfigurationStoreWithBatching asks whether an FSM that\n// implements both BatchingFSM and ConfigurationStore receives a committed\n// configuration change through StoreConfiguration, which its own documentation\n// promises unconditionally, or only through ApplyBatch.\nfunc TestAssuranceConfigurationStoreWithBatching(t *testing.T) {\n\tassuranceRunConfigStoreTrial(t, false, \"move-voter-address\")\n\tassuranceRunConfigStoreTrial(t, true, \"move-voter-address\")\n\t// Other configuration commands take the same apply path; this checks that\n\t// the missing callback is not specific to one kind of change.\n\tassuranceRunConfigStoreTrial(t, true, \"add-nonvoter\")\n\tassuranceRunConfigStoreTrial(t, true, \"remove-follower\")\n}\n\nfunc assuranceRunConfigStoreTrial(t *testing.T, batching bool, trigger string) {\n\trec := &assuranceRecorder{}\n\tconf := inmemConfig(t)\n\tmakeFSM := func() FSM {\n\t\tif batching {\n\t\t\treturn &assuranceBatchingFSM{assuranceFSM{rec: rec}}\n\t\t}\n\t\treturn &assuranceFSM{rec: rec}\n\t}\n\tc := MakeClusterCustom(t, &MakeClusterOpts{Peers: 3, Bootstrap: true, Conf: conf, MakeFSMFunc: makeFSM})\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tvar target *Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader {\n\t\t\ttarget = r\n\t\t\tbreak\n\t\t}\n\t}\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":        \"assurance_config_store_setup\",\n\t\t\"batching_fsm\": batching,\n\t\t\"trigger\":      trigger,\n\t\t\"leader_id\":    string(leader.localID),\n\t\t\"target_id\":    string(target.localID),\n\t\t\"peer_count\":   len(c.rafts),\n\t})\n\n\t// Trigger one configuration change: move an existing voter's address.\n\tchangeErr := \"nil\"\n\tswitch trigger {\n\tcase \"add-nonvoter\":\n\t\tif err := leader.AddNonvoter(ServerID(\"assurance-join-\"+string(target.localID)), ServerAddress(\"assurance-join-addr-\"+string(target.localID)), 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\tcase \"remove-follower\":\n\t\tif err := leader.RemoveServer(target.localID, 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\tdefault:\n\t\tif err := leader.AddVoter(target.localID, ServerAddress(\"assurance-moved-\"+string(target.localID)), 0, 5*time.Second).Error(); err != nil {\n\t\t\tchangeErr = err.Error()\n\t\t}\n\t}\n\n\t// Wait for the configuration change to reach the FSM.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tst := rec.snapshot()\n\t\tif st[\"store_configuration_calls\"].(int) > 0 || st[\"apply_batch_config_logs\"].(int) > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\ttime.Sleep(200 * time.Millisecond)\n\n\tevent := map[string]interface{}{\n\t\t\"event\":        \"assurance_config_store_result\",\n\t\t\"batching_fsm\": batching,\n\t\t\"trigger\":      trigger,\n\t\t\"leader_id\":    string(leader.localID),\n\t\t\"target_id\":    string(target.localID),\n\t\t\"change_error\": changeErr,\n\t}\n\tfor k, v := range rec.snapshot() {\n\t\tevent[k] = v\n\t}\n\tassuranceEmit(t, event)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "setup",
+            "event": "assurance_config_store_setup",
+            "conditions": []
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Four cases, each a three-voter cluster built with the repository's own helper whose FSMs share a recorder: a ConfigurationStore-only FSM with a voter address change as the control, and three dual-interface FSMs whose single configuration change is a voter address change, an AddNonvoter, or a RemoveServer of a follower. Each case reports the StoreConfiguration and ApplyBatch configuration counts together with the command's result.",
+        "assumptions": [
+          "All three commands are legal on a three-voter cluster: moving a voter's address keeps three voters, AddNonvoter adds a non-voter, and removing one follower leaves two voters, which is still a quorum.",
+          "Each case produces exactly one committed configuration entry, so the counts are comparable across cases.",
+          "As before, the recorder is shared across the cluster's FSMs so the counts answer whether the callback fires anywhere."
+        ],
+        "excluded": [
+          "DemoteVoter and the deprecated Promote/AddStaging commands, and any multi-command sequence."
+        ],
+        "parameters": {}
+      },
+      "after": {
+        "description": "Four cases as in the previous revision - a ConfigurationStore-only control and three dual-interface cases triggered by a voter address change, an AddNonvoter and a RemoveServer - each reporting the StoreConfiguration and ApplyBatch configuration counts, with the setup event now carrying the same trigger identifier as the result event so the admission can be matched.",
+        "assumptions": [
+          "All three commands are legal on a three-voter cluster, as before.",
+          "The setup and result events now share batching_fsm and trigger, which is the identity the comparisons use.",
+          "The recorder is still shared across the cluster's FSMs."
+        ],
+        "excluded": [
+          "DemoteVoter and the deprecated Promote command."
+        ],
+        "parameters": {}
+      }
+    },
+    "prefix": {
+      "before": "Each case calls MakeClusterCustom with three peers, bootstrapping and the in-memory test configuration, and a MakeFSMFunc returning either an FSM implementing FSM and ConfigurationStore or one that also implements ApplyBatch, all recording into a shared recorder. The case emits assurance_config_store_setup with the batching flag, the trigger name, the leader and target identities and the peer count, then issues exactly one configuration command according to the trigger: AddVoter with a new address for the target voter, AddNonvoter for a fresh address-based identity, or RemoveServer of the target follower. It waits up to five seconds for either callback counter to become non-zero, waits a further 200ms, and emits assurance_config_store_result with the trigger, the batching flag, the command's error and the call counts. The harness is TestAssuranceConfigurationStoreWithBatching.",
+      "after": "Each case calls MakeClusterCustom with three peers, bootstrapping and the in-memory test configuration, and a MakeFSMFunc returning either an FSM implementing FSM and ConfigurationStore or one that also implements ApplyBatch, all recording into a shared recorder. The case emits assurance_config_store_setup with the batching flag, the trigger name, the leader and target identities and the peer count, issues exactly one configuration command according to the trigger (AddVoter with a new address for the target voter, AddNonvoter for a fresh identity, or RemoveServer of the target follower), waits up to five seconds for a callback counter to become non-zero, waits a further 200ms, and emits assurance_config_store_result with the same trigger and batching flags plus the command's error and the counts. The harness is TestAssuranceConfigurationStoreWithBatching."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "add-nonvoter",
+              "reference": null
+            }
+          ],
+          "description": "Dual-interface FSM after an AddNonvoter: whether the documented callback arrives."
+        },
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "remove-follower",
+              "reference": null
+            }
+          ],
+          "description": "Dual-interface FSM after a RemoveServer: whether the documented callback arrives."
+        },
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "move-voter-address",
+              "reference": null
+            }
+          ],
+          "description": "The standing case for the dual-interface FSM, re-measured alongside the new triggers."
+        },
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "move-voter-address",
+              "reference": null
+            }
+          ],
+          "description": "Control: the ConfigurationStore-only FSM receives the callback, so any missing count is attributable to the batching interface rather than to the command."
+        }
+      ],
+      "after": [
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "add-nonvoter",
+              "reference": null
+            }
+          ],
+          "description": "Dual-interface FSM after an AddNonvoter: whether the documented callback arrives."
+        },
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "remove-follower",
+              "reference": null
+            }
+          ],
+          "description": "Dual-interface FSM after a RemoveServer: whether the documented callback arrives."
+        },
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "move-voter-address",
+              "reference": null
+            }
+          ],
+          "description": "The standing dual-interface case, re-measured with the others."
+        },
+        {
+          "event": "assurance_config_store_result",
+          "identity_fields": [
+            "batching_fsm",
+            "trigger"
+          ],
+          "admission_alias": "setup",
+          "assertion": {
+            "field": "store_configuration_calls",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "batching_fsm",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "trigger",
+              "op": "eq",
+              "value": "move-voter-address",
+              "reference": null
+            }
+          ],
+          "description": "Control: the ConfigurationStore-only FSM receives the callback."
+        }
+      ]
+    }
+  },
+  "revision_reason": "The previous revision added two triggers but emitted the setup event without the trigger field, so the identity built from batching_fsm and trigger could not be matched and all four comparisons came back unresolved. This revision adds trigger to the setup event; cases, counters and comparisons are otherwise identical."
+}

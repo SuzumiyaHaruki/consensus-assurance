@@ -1,0 +1,56 @@
+{
+  "rationale": "Traced the new lead to a negative result and recorded the premise that carries it. Two facts close the question for a compliant leader. First, configuration entries are appended only when the leader has no uncommitted configuration: configurationChangeChIfStable returns the change channel solely while latestIndex equals committedIndex and the term's no-op has committed, so a configuration entry at index J can only exist after the configuration entry at the lower index I was committed. Second, the follower's fallback after truncation is safe because the committed configuration it falls back to sits at index I below the first conflicting index X: entries below a conflict are identical to the leader's, and a genuinely committed configuration must appear in the log of the leader that won afterwards, so X > I and the entry at I survives the DeleteRange. The follower can therefore hold a committed configuration whose own commit index has not caught up, which is what the field naming suggests, but not one without an entry behind it, and it cannot fall back to one either. The residual condition is a leader that appends two uncommitted configurations, which this implementation's own gate prevents; I record that as the assumption rather than a defect. No execution is requested.",
+  "sources": [
+    {
+      "id": "config_change_if_stable",
+      "file": "raft.go",
+      "start_line": 654,
+      "end_line": 666,
+      "kind": "code_observation"
+    },
+    {
+      "id": "leader_commit_handling",
+      "file": "raft.go",
+      "start_line": 788,
+      "end_line": 812,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@leader_one_uncommitted_config",
+      "kind": "behavior",
+      "statement": "A leader appends a configuration entry only when it holds no uncommitted configuration. configurationChangeChIfStable returns the configuration-change channel only while configurations.latestIndex equals configurations.committedIndex and the leader's commit index is at least the commitment's start index, which is the index of the first entry it created in its term; leaderLoop reads configuration change requests from that channel and nowhere else, and a leader that has no committed entry of its own term cannot pass the second test. The consequence is that whenever a configuration entry exists at some index, the configuration entry below it was committed before it was appended, which is what lets a follower treat the previous latest configuration as committed when it installs a new one.",
+      "conditions": "A leader of this implementation, with configuration changes arriving through the Raft configuration-change API rather than being written into the log by some other means; a follower that receives the entries in index order.",
+      "source_ids": [
+        "config_change_if_stable",
+        "process_config_committed",
+        "leader_commit_handling"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "0bf310835ed043eca09a1668b327ab7b-question-0",
+      "source_ids": [
+        "process_config_committed",
+        "truncation_reset_latest",
+        "append_commit_update",
+        "config_change_if_stable",
+        "leader_commit_handling"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "The question was whether a follower can hold a committed configuration that was never committed and then truncate its log so that its latest configuration names a server with no entry behind it. The trace answers no for a leader that uses this library's configuration API, and the reason is the leader's own gate rather than the follower's care: configurationChangeChIfStable returns the change channel only while latestIndex equals committedIndex and the leader's commit index has reached the first entry of its term, so the library never lets a leader append a second configuration entry while the first is uncommitted. That makes processConfigurationLogEntry's shortcut - advancing the committed configuration to the previous latest one before installing the new entry - sound, because the previous latest configuration is precisely the one that must have committed for the new entry to exist. The follower's state can therefore read as committed while the follower's own commit index lags, but it does not name a configuration the cluster never committed. The truncation half is closed by geometry rather than by the shortcut: the fallback sets the latest configuration to the committed one at index I, and the truncation starts at the first conflicting index X where the follower's entry differs in term from the leader's. Entries below X are identical to the leader's, and a configuration that was genuinely committed must be present in the log of whichever server won the election afterwards, so X cannot be at or below I and the entry at I survives the DeleteRange. What would break this is a leader that appends two uncommitted configuration entries, which the gate above prevents in this implementation; I record that as the assumption the negative result rests on rather than as a second finding.",
+      "counterevidence": [
+        "The negative result rests on the leader gate rather than on anything the follower verifies: a leader that wrote configuration entries outside that gate, or a log that already contained two uncommitted configurations, would make the shortcut unsound.",
+        "The appendEntries commit handling only advances the follower's committed configuration when the leader's commit index has reached its latest configuration index, so the follower's committed field can lag or lead its own commit index depending on which path set it last."
+      ],
+      "limitations": [
+        "The account is source-based: no execution traced a follower through an append of a configuration entry, a withheld commit and a forced truncation, so the reasoning about index ordering is not measured.",
+        "The argument about identical entries below the conflict index relies on Raft's log-matching property rather than on an observation in this snapshot.",
+        "It covers the library's own configuration API and does not consider a user writing LogConfiguration entries into the log directly."
+      ]
+    }
+  ]
+}

@@ -374,7 +374,10 @@ def submission_effects(before, state, submission, operation_id):
                                      for index, item in enumerate(requested)]
             effects.append(effect)
     if submission.repeat_experiment_id:
-        effects.append({'object': 'experiments', 'action': 'repeat_execution', 'target': submission.repeat_experiment_id})
+        from .experiments import artifact, fixed_experiment_locator
+        effects.append({'object': 'experiments', 'action': 'repeat_execution', 'target': submission.repeat_experiment_id,
+                        'fixed_experiment': fixed_experiment_locator(artifact(state, submission.repeat_experiment_id)),
+                        'input_source': 'Retained fixed inputs; the current draft is not read.'})
     if submission.stop:
         effects.append({'object': 'run', 'action': 'stop', 'reason': submission.stop.reason})
     return effects

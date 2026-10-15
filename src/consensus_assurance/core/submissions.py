@@ -20,7 +20,7 @@ class QuestionUpdate(Record):
     question: str | None = None
     source_ids: list[str] | None = None
     hypothesis: str | None = None
-    discriminator: str | None = None
+    discriminator: str | None = Field(default=None, description="For continued inquiry, the source or observation that could change the judgment; completed comparisons belong in Interpretation. Answered questions need no invented next discriminator.")
     disposition: Literal["active", "paused", "explained", "closed"] | None = None
     parent_id: str | None = None
     knowledge: list[KnowledgeUse] | None = None
@@ -48,7 +48,7 @@ class GapUpdate(Record):
 
 class InterpretationUpdate(Record):
     investigation_id: str
-    experiment_id: str | None = None
+    experiment_id: str | None = Field(default=None, description="Fixed experiment being interpreted, requiring its receipt; omit for a question-level explained/conditional/unresolved account reusing applicable receipts without a dedicated execution.")
     source_ids: list[str] = Field(min_length=1)
     executions: dict[str, list[StrictInt]] = {}
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
@@ -97,5 +97,5 @@ class AuditSubmission(Record):
     interpretations: list[InterpretationUpdate] = []
     experiment: ExperimentRequest | None = None
     repeat_experiment_id: str | None = Field(default=None, min_length=1,
-        description="Explicitly execute an existing fixed experiment again; rationale explains the purpose; mutually exclusive with experiment and stop")
+        description="Execute the selected fixed experiment's saved inputs, not current drafts; rationale explains the reproduction question; mutually exclusive with experiment and stop")
     stop: StopRequest | None = None

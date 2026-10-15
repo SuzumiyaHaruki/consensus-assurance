@@ -1,0 +1,148 @@
+{
+  "rationale": "Opened a child question on the one route the verify question's gap still leaves open. The source analysis shows the stale-read consequence needs a successor elected while the old leader still reports verify success, and that the leader's own lease case becomes ready no later than LeaderLeaseTimeout, so a leader whose main loop is stalled past that point is the remaining legal route: its lease check cannot run while it is blocked. This probe models exactly that condition with a wrapping log store whose StoreLogs blocks on the caller (the leader's main loop) while a client Apply is in flight, partitions the leader so only a non-voter stays reachable, and queues a VerifyLeader call during the stall. Eight fresh-cluster trials report, per trial, whether any other server held leadership while the old leader was still in Leader state, the verify endpoint, the term reached, and the stall counters. The probe is submitted for formal execution; no observation is claimed until its receipt exists.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@stall_route",
+      "question": "When a leader's main loop is stalled past its lease while a voter majority elects a successor, can a VerifyLeader request queued during the stall still report success by counting the reachable non-voter's acknowledgement?",
+      "source_ids": [
+        "verify_leader",
+        "quorum_size",
+        "lease_check",
+        "lease_check_granularity",
+        "start_stop_repl",
+        "notify_all",
+        "update_last_appended",
+        "verify_vote"
+      ],
+      "hypothesis": "During the stall the leader keeps Leader state and its replication goroutines keep running, so a successor can be elected while the old leader still believes itself leader. The queued VerifyLeader cannot be served while the main loop is blocked; once the stall ends both the lease case and the verify case are ready, so the verify either registers and is answered nil after the non-voter's acknowledgement arrives, or the lease case is served first and the request is answered with leadership loss.",
+      "discriminator": "The VerifyLeader endpoint of each trial alongside whether a different server was observed in Leader state while the stalled leader was still Leader, and the terms those servers held.",
+      "disposition": null,
+      "parent_id": "3b823834c8cb46da98e77d8e988bf5d9-question-0",
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@stall_route",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "verify_leader",
+      "quorum_size",
+      "lease_check",
+      "lease_check_granularity",
+      "start_stop_repl",
+      "notify_all",
+      "update_last_appended",
+      "verify_vote"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Run eight independent trials that each build a three-voter plus one-non-voter cluster, arm a 600ms stall in the leader's log store, partition the leader so that only the non-voter remains reachable, drive a client Apply to block the leader's main loop on that store, queue VerifyLeader during the stall, and report the verify endpoint together with a 1ms leadership sampler over all four servers.",
+      "assumptions": [
+        "The stalling log store models a leader whose disk stalls; StoreLogs then blocks the leader's main loop, which is the goroutine that also serves the lease case and verify requests. The store is a supplied dependency, not a change to production logic.",
+        "HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout = 200ms and CommitTimeout = 5ms satisfy Config.Validate; the stall is 600ms, three times the lease.",
+        "Only the elected leader's store is armed, so follower writes and their election timers behave as they would without the stall.",
+        "In-memory transports are used in one process, so RPC round trips are much faster than in a networked cluster."
+      ],
+      "excluded": [
+        "A leader blocked inside its own lease check rather than inside a store write, and host-level suspensions or clock jumps, which this probe does not reproduce."
+      ],
+      "parameters": {}
+    },
+    "prefix": "Each trial builds four real Raft instances in one process, each with its own InmemStore, InmemSnapshotStore and InmemTransport, fully connected before any node starts; the three voters get a log store that wraps InmemStore and sleeps for 600ms inside StoreLogs while armed, and only the elected leader's store is armed. The three voters are bootstrapped with BootstrapCluster as Voter and the fourth node joins through the leader's own AddNonvoter call, with the trial waiting until the leader's latest configuration reports it. The trial then emits assurance_stall_setup, disconnects the transports in both directions across the partition so that only the leader and the non-voter remain mutually reachable, starts a 1ms sampler that records every server's Leader state and the maximum term, arms the leader's stall, drives one Apply to make the leader write, queues VerifyLeader 300ms later, and reports assurance_stall_trial with the verify endpoint, the sample counters, the term reached, and the stall counters. The harness is TestAssuranceVerifyLeaderDuringLeaderStall.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "assurance_stall_setup",
+        "conditions": []
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "assurance_stall_trial",
+        "identity_fields": [
+          "trial",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "other_leader_seen",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stalls_triggered",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The stall was exercised and a different server was observed in Leader state at some point during or after it. Holds means the intended condition was reached."
+      },
+      {
+        "event": "assurance_stall_trial",
+        "identity_fields": [
+          "trial",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "eq",
+          "value": "nil",
+          "reference": null
+        },
+        "antecedent": {
+          "field": "other_leader_seen",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "Conditional on a successor having been observed: whether the queued VerifyLeader still reported success. Holds means the stale-read precondition was witnessed."
+      },
+      {
+        "event": "assurance_stall_trial",
+        "identity_fields": [
+          "trial",
+          "leader_id"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "verify_error",
+          "op": "eq",
+          "value": "nil",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "leader_never_left_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Restricted to trials where the stalled leader was never sampled outside Leader state: whether VerifyLeader reported success."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

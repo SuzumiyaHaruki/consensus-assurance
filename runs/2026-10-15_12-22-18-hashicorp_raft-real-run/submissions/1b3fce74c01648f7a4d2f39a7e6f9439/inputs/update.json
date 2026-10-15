@@ -1,0 +1,97 @@
+{
+  "rationale": "The turn's action was to follow the one state-update window the source itself flags, in the follower's log-conflict path, and to register it as a sourced question instead of asserting a verdict. The AppendEntries handler deletes a conflicting suffix, stages the commit index, and if the store rejects the append it logs and returns before setLastLog, so the in-memory last log keeps naming entries the store no longer holds; the comment on that same block admits the wrong state. Following the consequence into the leader's replication loop shows why it can persist: an error from the RPC is counted as a contact failure and the loop retries without touching nextIndex, while only a rejection response lowers it, and the snapshot path is entered only when the leader's own log no longer holds the predecessor index. I recorded the mechanism as a new behavior entry with its anchors, and left the question's consequence unmeasured rather than claiming it. No execution was requested in the time left.",
+  "sources": [
+    {
+      "id": "append_store_failure_window",
+      "file": "raft.go",
+      "start_line": 1561,
+      "end_line": 1583,
+      "kind": "code_observation"
+    },
+    {
+      "id": "set_last_log_state",
+      "file": "state.go",
+      "start_line": 105,
+      "end_line": 110,
+      "kind": "code_observation"
+    },
+    {
+      "id": "repl_rpc_error_no_index_adjust",
+      "file": "replication.go",
+      "start_line": 229,
+      "end_line": 235,
+      "kind": "code_observation"
+    },
+    {
+      "id": "repl_reject_next_index",
+      "file": "replication.go",
+      "start_line": 255,
+      "end_line": 263,
+      "kind": "code_observation"
+    },
+    {
+      "id": "repl_log_not_found_snapshot",
+      "file": "replication.go",
+      "start_line": 222,
+      "end_line": 226,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@append_store_failure",
+      "question": "When the AppendEntries handler has already deleted a conflicting log suffix and the following StoreLogs returns an error, does the follower keep an in-memory last log index that its own store no longer holds, and can ordinary AppendEntries bring that follower back in line afterwards, or does only an installed snapshot or a restart repair it?",
+      "source_ids": [
+        "append_store_failure_window",
+        "set_last_log_state",
+        "truncation_reset_latest",
+        "repl_rpc_error_no_index_adjust",
+        "repl_reject_next_index",
+        "repl_log_not_found_snapshot"
+      ],
+      "hypothesis": "The handler deletes the conflicting range, then returns on a store error before setLastLog, so lastLogIndex and lastLogTerm still name entries the store has lost; the handler's error reaches the leader as an RPC failure, which the replication loop counts as a failed contact and retries with an unchanged previous-log index, so the follower keeps failing to read that predecessor and never receives the entries. Only the SEND_SNAP path, entered when the leader's own log no longer holds the follower's nextIndex, or a restart that rebuilds the in-memory last log from the store, ends the state.",
+      "discriminator": "A follower whose log store is wrapped to fail one StoreLogs call on the append that follows a truncated suffix: its lastLogIndex, lastLogTerm and store contents immediately after the failed call, the leader's retry sequence and nextIndex for that peer over the next interval, whether the follower catches up without a snapshot, and the last log index it reports while the state persists."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@append_store_failure",
+      "source_ids": [
+        "append_store_failure_window",
+        "set_last_log_state",
+        "truncation_reset_latest",
+        "repl_rpc_error_no_index_adjust",
+        "repl_reject_next_index",
+        "repl_log_not_found_snapshot"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": "unresolved",
+      "rationale": "Registered as a sourced lead rather than a verdict, so the conclusion is conditional on a single store error and the defect judgment stays unresolved. The handler stages the future commit index, calls StoreLogs, logs the failure and returns; the comment in the same block records that the last log is left wrong after a truncation, and only the stored path calls setLastLog, so within that window the follower's lastLogIndex and lastLogTerm name entries its store no longer holds. The leader side explains why the window can outlast the RPC: an error from AppendEntries is counted as a failed contact and the loop retries without touching nextIndex, only a rejection response lowers it, and the snapshot path is entered when the leader's own log no longer holds the predecessor. What the follower then does with the stale index is inferred, not measured - its own vote responses carry its last log and its AppendEntries predecessor reads fail against a store that lacks the range - so this account names the mechanism and the trigger and leaves the endpoint open.",
+      "counterevidence": [
+        "The trigger is the store's own error return on one RPC, and the library's leader path treats the same error as a reason to step down and to fail the caller, so a store error may be intended as a condition that takes a node out of service rather than one the follower must survive in place.",
+        "The state need not be permanent: once the leader's log has been compacted past the follower's nextIndex the SEND_SNAP path installs a snapshot, and a restart rebuilds the in-memory last log from the store.",
+        "The follower still answers that RPC with a failure and stays outside the leader's commitment accounting either way, so no committed entry of the cluster is decided by the stale index."
+      ],
+      "limitations": [
+        "The account is source-based: no execution wrapped a log store to fail inside this window, so both the retained stale index and the retry sequence are read from the code rather than observed.",
+        "It depends on a supplied fault - a store whose StoreLogs returns an error for the append that follows a truncation in the same RPC - and says nothing about torn writes or about a lost acknowledged write.",
+        "Which path an operator would see first is not established: the same index feeds the follower's vote responses and its own compaction decisions, and neither was traced.",
+        "Nothing here covers a monotonic log store, or a peer whose replication state is reset by an intervening configuration change."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "behavior",
+      "statement": "The follower's in-memory last log advances only on the success paths of a log change: setLastLog writes lastLogIndex and lastLogTerm, and the AppendEntries handler calls it only after StoreLogs succeeded and every new entry was offered to processConfigurationLogEntry. The aborts that can follow a suffix deletion in the same RPC return without it - a store error logs and returns, and a configuration decode error answers with an error and returns - while the deleted range is already gone from the store. On the leader's side the same error arrives as an RPC failure that increments the replication failure counter and returns without adjusting nextIndex; only a rejection response lowers nextIndex.",
+      "conditions": "Follower whose AppendEntries conflict loop deleted a log suffix and then hit a store error or a configuration decode error in the same RPC, with a leader replicating to that follower; the leader-side behavior applies whenever the AppendEntries RPC itself returns an error rather than a response.",
+      "source_ids": [
+        "append_store_failure_window",
+        "set_last_log_state",
+        "truncation_reset_latest",
+        "repl_rpc_error_no_index_adjust",
+        "repl_reject_next_index"
+      ]
+    }
+  ]
+}
