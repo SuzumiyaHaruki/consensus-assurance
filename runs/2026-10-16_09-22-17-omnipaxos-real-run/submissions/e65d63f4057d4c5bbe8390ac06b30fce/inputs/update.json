@@ -1,0 +1,233 @@
+{
+ "rationale": "Record the repeated-rounds receipt, which changes the impact from a one-off shift to an unbounded drift. Three consecutive two-follower reconnection rounds took the followers' reported accepted index from 6 to 7, 8 and 9 over unchanged content and the leader's decided index tracked the same values while its own accepted index stayed 6, so its decided-log read stayed unusable and its reconfiguration endpoint false in every round (receipt 6c879304cdde4ddd8e1640207cdbf94d events 38-49). The parent interpretation now states the drift with its same-run baseline and with the honest note that the baseline comparison of that run is unknown under a shared admission event name, the inflation behaviour records that each further re-synchronization adds an index, and a new behaviour records the cluster-level drift of the reported accepted and decided indices. The limitations say plainly that the drift was exercised for three rounds with no bound established and that trim/snapshot were not exercised.",
+ "investigations": [
+  {
+   "id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+   "disposition": "active",
+   "discriminator": "Whether the drift is bounded by anything in the sealed configuration (a counter or storage limit, or a repair triggered by a later leader change) and whether it carries into the instances started for the next configuration from the StopSign's metadata; the decisive observation would be the reported accepted and decided indices after many more rounds and across the reconfiguration handoff."
+  }
+ ],
+ "knowledge": [
+  {
+   "id": "27bf7fc0875c4342966bd3dc15df80ec-knowledge-0",
+   "kind": "behavior",
+   "statement": "InternalStorage::sync_log sets accepted_idx = LogSync.sync_idx + LogSync.suffix.len() and, when LogSync.stopsign is Some, adds one further index for that StopSign before returning; it does not subtract the LogSync's prefix, so when sync_idx already addresses the StopSign's own index the replica's accepted index ends up one larger than the entries it holds, and each further re-synchronization of the same replica adds one more index while its content is unchanged. SequencePaxos::create_log_sync does not adjust sync_idx for a StopSign already present on the sender: it uses its caller's common_prefix_idx unchanged and attaches the sender's stored StopSign.",
+   "conditions": "Reached when a replica applies an AcceptSync or a leader applies a Promise whose LogSync carries stopsign = Some; the accounting is unconditional with respect to whether the resumed prefix already contained a StopSign. Exercised in six receipts, including three consecutive rounds of two-follower reconnection in receipt 6c879304cdde4ddd8e1640207cdbf94d, where the two followers went from six indices of content to reported accepted index 7, then 8, then 9 (events 41, 42; 44, 45; 47, 48) while their decided-log read stayed at one element and the leader's decided index followed the same values (events 43, 46, 49).",
+   "source_ids": [
+    "sync_log_accounting",
+    "set_stopsign_index",
+    "create_log_sync",
+    "send_accsync_valid_entries"
+   ],
+   "executions": {
+    "6c879304cdde4ddd8e1640207cdbf94d": [
+     38,
+     39,
+     40,
+     41,
+     42,
+     43,
+     44,
+     45,
+     46,
+     47,
+     48,
+     49
+    ]
+   }
+  },
+  {
+   "id": "3ed5ddd94bce4e94a2dc5b7bb417c18a-knowledge-1",
+   "kind": "behavior",
+   "statement": "On a replica that already holds the accepted StopSign, applying an AcceptSync whose LogSync carries that StopSign leaves the stored log unchanged while the reported accepted index rises by one; the replica's read of the StopSign's previous index returns None, its read of the next index returns the StopSign until the index drifts past it, and read_decided_suffix(0) returns a decided log that omits the entries: one element (the StopSign) once the replica's decided index has been pushed past that index, and an empty list while the decided index still stops there.",
+   "conditions": "Three-node cluster, five decided entries plus a StopSign, default batch size, the re-synchronized replica having already accepted the StopSign. Observed for both entry configurations and both producers, and repeatedly: after three consecutive reconnection rounds the followers' read of index 5 stayed None, their read of index 6 returned the StopSign only in the first round and then None, and the decided-log read stayed at one element (receipt 6c879304cdde4ddd8e1640207cdbf94d events 41, 42, 44, 45, 47, 48).",
+   "source_ids": [
+    "sync_log_accounting",
+    "create_log_sync",
+    "internal_get_entry_type",
+    "internal_read_range",
+    "create_read_log_entries",
+    "read_decided_suffix_public",
+    "memory_storage_read_helpers"
+   ],
+   "executions": {
+    "6c879304cdde4ddd8e1640207cdbf94d": [
+     38,
+     39,
+     40,
+     41,
+     42,
+     44,
+     45,
+     47,
+     48
+    ]
+   }
+  },
+  {
+   "ref": "@index_drift_unbounded",
+   "kind": "behavior",
+   "statement": "Repeated re-synchronizations of replicas that already hold the StopSign make the cluster's reported accepted and decided indices drift one further index per round while the log content stays fixed: the leader keeps adopting the maximum reported accepted index as its decided index, so the reported decided index follows the drift while the leader's own accepted index does not, leaving its decided index above the entries it holds and its decided-log read unusable.",
+   "conditions": "Three-node cluster after a decided StopSign, each round being a pair of public reconnected() calls and nothing else; observed over three rounds in receipt 6c879304cdde4ddd8e1640207cdbf94d: followers' accepted and decided 7 then 8 then 9 (events 41, 42, 44, 45, 47, 48) and the leader's decided 7 then 8 then 9 with accepted 6 and is_reconfigured false each round (events 43, 46, 49). No bound on the number of rounds, on the counter values or on any repair inside the sealed configuration was observed; the run stopped after three rounds by construction.",
+   "source_ids": [
+    "send_accsync_valid_entries",
+    "create_log_sync",
+    "sync_log_accounting",
+    "leader_decision_on_accepted",
+    "is_reconfigured_endpoint"
+   ],
+   "executions": {
+    "6c879304cdde4ddd8e1640207cdbf94d": [
+     41,
+     43,
+     44,
+     46,
+     47,
+     49
+    ]
+   }
+  }
+ ],
+ "interpretations": [
+  {
+   "investigation_id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+   "experiment_id": "6f9f0adaec774fc288adf47c6e280c27-experiment",
+   "source_ids": [
+    "sync_log_accounting",
+    "create_log_sync",
+    "send_accsync_valid_entries",
+    "handle_promise_accept_resync",
+    "handle_preparereq",
+    "leader_decision_on_accepted",
+    "stopsign_is_decided_predicate",
+    "is_reconfigured_endpoint",
+    "logentry_stopsign_contract",
+    "reconfig_user_flow",
+    "accepted_idx_public_doc",
+    "internal_read_range",
+    "internal_get_entry_type",
+    "create_read_log_entries",
+    "memory_storage_read_helpers",
+    "create_diff_snapshot",
+    "no_stopsign_decided_idx"
+   ],
+   "executions": {
+    "8b314551f1e049fcbf73a358f8ddf2c8": [
+     19,
+     20,
+     21,
+     22,
+     23,
+     24,
+     9,
+     10,
+     11
+    ],
+    "9125b6a531234e7d9d2fa8cbb817df63": [
+     19,
+     22,
+     23,
+     24,
+     35,
+     36,
+     37
+    ],
+    "6cdcff36336646859bffb9e8c3e39789": [
+     6,
+     7,
+     8,
+     9,
+     10,
+     11
+    ],
+    "dda5bb4179154e3abe90e69f5267b3ea": [
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     12,
+     13,
+     14
+    ],
+    "fd0b8be59c8f466fbf7768abb08f93b5": [
+     48,
+     49,
+     50,
+     51,
+     52,
+     53
+    ],
+    "6c879304cdde4ddd8e1640207cdbf94d": [
+     38,
+     39,
+     40,
+     41,
+     42,
+     43,
+     44,
+     45,
+     46,
+     47,
+     48,
+     49
+    ]
+   },
+   "conclusion": "violated",
+   "defect_claim": "asserted",
+   "rationale": "Six receipts support one index-space confusion whose consequence drifts rather than staying fixed. (1) A replica that already accepted the configuration's StopSign and receives a resume point covering it ends one index past its content, and every further re-synchronization adds one more: after three consecutive reconnection rounds the two followers reported accepted index 7, then 8, then 9 over the same six indices of content (receipt 6c879304cdde4ddd8e1640207cdbf94d events 41, 42; 44, 45; 47, 48) while their decided-log read stayed at one element and their read of index 6 returned the StopSign only in the first round. The same effect appeared for a follower re-promising in an ordinary new term (6cdcff36336646859bffb9e8c3e39789 event 11), for the leader that took over from such a follower (dda5bb4179154e3abe90e69f5267b3ea event 13) and under a snapshot-capable entry type (fd0b8be59c8f466fbf7768abb08f93b5 events 51, 52). (2) The leader adopts the drifted maximum as its decided index, so the cluster's reported decided index drifts too: 7, then 8, then 9 across the rounds while the leader's own accepted index stayed 6, its reconfiguration endpoint stayed false and its decided-log read stayed unusable (events 43, 46, 49); the decision at each drifted index is formed because handle_accepted accepts any reported index covered by a write quorum. (3) A single inflated reporter does not reach that quorum in a three-node cluster, so the leader-side decision needs two inflated replicas (9125b6a531234e7d9d2fa8cbb817df63 events 36, 37; 6cdcff36336646859bffb9e8c3e39789 event 9). Controls: the pre-round baseline reported 6/6 with the StopSign at index 5 and a six-element decided read on all three nodes (events 38-40), and the no-reconnect control of the first receipt stayed consistent; the baseline *comparison* of this run is cited as unknown because its admission event name is shared with another case in the same execution, so the baseline is cited from the sampled operands. No bound on the drift was observed inside the sealed configuration; the run stopped after three rounds by construction.",
+   "counterevidence": [
+    "The no-reconnect control kept every endpoint consistent (accepted 6, decided 6, is_reconfigured true, six-element decided read: 8b314551f1e049fcbf73a358f8ddf2c8 events 9-11), and in the newterm case the new leader and the node that received nothing stayed consistent (6cdcff36336646859bffb9e8c3e39789 events 9, 10), so the deviation follows a re-synchronization whose resume point covers the StopSign rather than the reconfiguration or the harness.",
+    "The leader-side decision at the drifted index requires a write quorum of inflated reporters in one term (two of three nodes); a single inflated follower, or one inflated follower plus a node that received nothing, left the leader consistent (9125b6a531234e7d9d2fa8cbb817df63 event 37; 6cdcff36336646859bffb9e8c3e39789 event 9).",
+    "The baseline comparison of the repeated-rounds receipt is unknown because its admission event name is shared with another case in the same execution; the pre-round state is therefore asserted from the sampled operands (events 38-40) rather than from a comparison outcome.",
+    "The documented reconfiguration flow (agent-source/docs/omnipaxos/reconfiguration.md 25-34) expects a new instance once a node observes LogEntry::StopSign(ss, true), which narrows the window in which a user reads the old instance, but the leader never observes the decision after the corruption and the followers keep reporting it while their decided log silently loses the entries."
+   ],
+   "limitations": [
+    "The drift was exercised for three rounds by construction; no bound on the number of rounds, on the counter values or on any automatic repair was established.",
+    "Compaction itself was not exercised, and it is not established whether an inflated minimum accepted index would change what trim accepts.",
+    "Loss-triggered and timer-triggered re-synchronization were not exercised; the observed producers are explicit reconnected() calls and ordinary leader changes with one node cut off.",
+    "The consequence remains bounded to index accounting and readability: the sealed configuration accepts no further entries, so the drifted decided indices carry no values and no value is mis-assigned.",
+    "All three nodes used in-memory storage; persistence across a restart and other storages' behaviour on out-of-range reads were not exercised, and only three-node clusters were used."
+   ],
+   "joint_history": "Six successive invocations of one harness lineage, read separately and never combined: 8b314551f1e049fcbf73a358f8ddf2c8 (resync, control), 9125b6a531234e7d9d2fa8cbb817df63 (plus single resync and a read of index 6), 6cdcff36336646859bffb9e8c3e39789 (plus newterm), dda5bb4179154e3abe90e69f5267b3ea (plus the staleleader stage), fd0b8be59c8f466fbf7768abb08f93b5 (plus a snapshot-capable entry type) and 6c879304cdde4ddd8e1640207cdbf94d (plus three consecutive reconnection rounds). Same three-node setup and public endpoints; each successor reproduces the earlier witnesses and adds one case.",
+   "knowledge": [
+    {
+     "entry_id": "27bf7fc0875c4342966bd3dc15df80ec-knowledge-0",
+     "revision": 5,
+     "assertion": "each further re-synchronization adds one more index while the content is unchanged"
+    },
+    {
+     "entry_id": "3ed5ddd94bce4e94a2dc5b7bb417c18a-knowledge-1",
+     "revision": 5,
+     "assertion": "the decided-log read loses the entries"
+    },
+    {
+     "entry_id": "e40cd046de9e4f37b5761260b8dc599e-knowledge-1",
+     "revision": 4,
+     "assertion": "the condition is the resume point covering the StopSign's index"
+    },
+    {
+     "entry_id": "e40cd046de9e4f37b5761260b8dc599e-knowledge-2",
+     "revision": 2,
+     "assertion": "the leader decides the reported accepted index without bounding it to its own log"
+    },
+    {
+     "entry_id": "fa5a6edbbfe243c7a66eb9f3eed7433b-knowledge-1",
+     "revision": 1,
+     "assertion": "a candidate leader syncing from a follower is inflated in its own accepted index"
+    },
+    {
+     "entry_id": "8274beb23814401e9a0191012e1a73b3-knowledge-0",
+     "revision": 1,
+     "assertion": "the candidate's post-sync accepted index equals the adopted promise's accepted count when the resume point is inside its content"
+    },
+    {
+     "entry_id": "@index_drift_unbounded",
+     "revision": 1,
+     "assertion": "the reported accepted and decided indices drift one index per re-synchronization round"
+    }
+   ]
+  }
+ ]
+}

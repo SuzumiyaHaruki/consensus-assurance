@@ -63,8 +63,9 @@ def test_go_event_runner_times_preserve_interleaved_comparisons_and_legacy_outpu
     middle='2026-10-12T02:31:56.481Z'
     completed='2026-10-12T02:31:57.503Z'
     envelopes=[
-        {'Package':'p','Test':'A','Time':first,'Output':'CA_EVENT {"event":"input","operation":"same",'},
+        {'Package':'p','Test':'A','Time':first,'Output':'CA_'},
         {'Package':'p','Test':'B','Time':middle,'Output':'CA_EVENT {"event":"input","operation":"same","state":{"value":2}}\n'},
+        {'Package':'p','Test':'A','Time':middle,'Output':'EVENT {"event":"input","operation":"same",'},
         {'Package':'p','Test':'A','Time':completed,'Output':'"state":{"value":1},"t_ms":0}\n'},
         {'Package':'p','Test':'B','Time':completed,'Output':'CA_EVENT {"event":"output","operation":"same","state":{"value":2}}\n'},
         {'Package':'p','Test':'A','Output':'CA_EVENT {"event":"output","operation":"same","state":{"value":1}}\n'},
@@ -79,7 +80,7 @@ def test_go_event_runner_times_preserve_interleaved_comparisons_and_legacy_outpu
     assert [e['_ca_stream'] for e in events[:4]]==['["p","B"]','["p","A"]','["p","B"]','["p","A"]']
     assert events[0]['_ca_observation']['runner_time']==middle
     assert events[1]['_ca_observation']=={
-        'stream':'["p","A"]','location':{'line':3,'stream':'["p","A"]'},'runner_time':completed}
+        'stream':'["p","A"]','location':{'line':4,'stream':'["p","A"]'},'runner_time':completed}
     assert events[1]['t_ms']==0
     assert events[2]['_ca_observation']['runner_time']==completed
     assert 'runner_time' not in events[3]['_ca_observation']

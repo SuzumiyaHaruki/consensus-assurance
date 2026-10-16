@@ -413,14 +413,6 @@ def operation_summary(state, root):
         summary['correction_guidance'] = (
             'Recorded premise corrections and explicit uses are above; full history is at each record. '
             'Review the identified uses under their original investigations; necessary gaps remain in research.json.')
-    summary['questions'] = [record_preview({'id':q.id, 'version':q.version, 'question_state':'current',
-        'question':q.question, 'hypothesis':q.hypothesis, 'disposition':q.disposition, 'parent_id':q.parent_id,
-        'discriminator':q.discriminator, 'knowledge':[u.model_dump() for u in q.knowledge],
-        'latest_interpretation':interpretation_view(latest.get(q.id))}, 'investigations')
-        for q in state.investigations if q.id in owners]
-    if fixed and current.get('experiment_id') == fixed.id and executed:
-        question = next(q for q in summary['questions'] if q['id'] == fixed.investigation_id)
-        question['execution'] = execution_feedback(state, root, fixed, check)
     previous, updates, changes = {}, {}, []
     remaining = {'events':8, 'chars':6000, 'shown':{}}  # Shared by interpretation and knowledge citations.
     for opinion in state.interpretations:
@@ -459,12 +451,20 @@ def operation_summary(state, root):
         summary['knowledge_changes'] = knowledge_changes
     if changes or knowledge_changes:
         summary['account_guidance'] = (
-            'Relate changed explanations and knowledge to their cited basis and conditions. '
+            'Relate changed or merged explanations to the evidence and conditions of each retained mechanism. '
             'Saving knowledge does not strengthen its evidence. '
             'Old and new reasons include removed citations. Other current citations and historical locators are '
             'review candidates, not automatically affected conclusions; event overlap alone does not establish impact. '
             'Correct identified premises and uses, preserving independent support. Withdrawing a witness does not '
             'refute the question. Unrecorded code reuse remains for investigation. No separate confirmation is required.')
+    summary['questions'] = [record_preview({'id':q.id, 'version':q.version, 'question_state':'current',
+        'question':q.question, 'hypothesis':q.hypothesis, 'disposition':q.disposition, 'parent_id':q.parent_id,
+        'discriminator':q.discriminator, 'knowledge':[u.model_dump() for u in q.knowledge],
+        'latest_interpretation':interpretation_view(latest.get(q.id))}, 'investigations')
+        for q in state.investigations if q.id in owners]
+    if fixed and current.get('experiment_id') == fixed.id and executed:
+        question = next(q for q in summary['questions'] if q['id'] == fixed.investigation_id)
+        question['execution'] = execution_feedback(state, root, fixed, check)
     summary['necessary_gaps'] = necessary_gaps
     summary['reselection'] = reselection_view(state)
     action = ('Check the proposed inference against its cited basis and conditions. For execution-based claims, '

@@ -407,7 +407,7 @@ def submission_effects(before, state, submission, operation_id):
 
 
 def prepare_submission(engine, submission, inputs, operation_id):
-    from .knowledge import (update_knowledge, validate_knowledge_receipts, update_questions, add_gap, interpret,
+    from .knowledge import (update_knowledge, validate_knowledge_receipts, validate_receipt_references, update_questions, add_gap, interpret,
                             resolve, investigation, resolved_uses, open_gaps)
     from .experiments import validate_basis, artifact, fixed_files
     from consensus_assurance.core.types import ExperimentBasis, Harness, FixedExperiment
@@ -424,6 +424,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
     update_questions(state, submission.investigations, operation_id, aliases)
     for gap in submission.gaps:
         add_gap(state, resolve(gap.investigation_id, aliases), gap.question, operation_id, gap.experiment_id)
+    validate_receipt_references(state, submission.knowledge, submission.interpretations, aliases)
     interpret(state, engine.root, submission.interpretations, operation_id, aliases)
     validate_knowledge_receipts(state, engine.root, submission.knowledge)
     fixed = None
@@ -541,15 +542,13 @@ def accept_received(engine):
 
 
 def execute_accepted(engine):
-    from .experiments import artifact, execute, observed
+    from .experiments import artifact, execute
     current = engine.state.current_submission
     check = None
     if current.get('experiment_id'):
         fixed = artifact(engine.state, current['experiment_id'])
         try:
             check = execute(engine, fixed, current['operation_id'])
-            engine.phase = 'experiment_execute:save_observations'
-            write_json(engine.root / 'logs' / check.id / 'observations.json', observed(fixed, check))
         except (ValueError, Blocked, BudgetExhausted) as exc:
             check = None
             current['execution_gap'] = str(exc)

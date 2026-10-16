@@ -1,0 +1,877 @@
+//! Generated assurance harness (audit draft).
+//!
+//! Question: after a replica has accepted a StopSign, does re-synchronizing it with the leader
+//! preserve the observable "reconfiguration decided" endpoint and the consistency between the
+//! reported accepted index and the actual log content?
+//!
+//! Two cases share one execution:
+//!  * `case = "resync"`: both followers report a re-established connection to the leader.
+//!  * `case = "control"`: identical prefix, no reconnect.
+//!
+//! The protocol is driven by hand (no Kompact, no wall-clock waits): a deterministic FIFO network
+//! queue in one process, BLE messages dropped, leadership obtained via `try_become_leader`.
+use omnipaxos::{
+    messages::Message,
+    storage::{Entry, NoSnapshot},
+    util::{LogEntry, NodeId},
+    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
+};
+use omnipaxos_storage::memory_storage::MemoryStorage;
+use std::collections::VecDeque;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Value(pub u64);
+
+impl Entry for Value {
+    type Snapshot = NoSnapshot;
+}
+
+type Op = OmniPaxos<Value, MemoryStorage<Value>>;
+
+const NUM_ENTRIES: usize = 5;
+const STOPSIGN_IDX: usize = NUM_ENTRIES; // 0-based index occupied by the StopSign of 5 entries
+
+fn cluster_nodes() -> Vec<NodeId> {
+    vec![1, 2, 3]
+}
+
+fn build_node(pid: NodeId) -> Op {
+    let config = OmniPaxosConfig {
+        cluster_config: ClusterConfig {
+            configuration_id: 1,
+            nodes: cluster_nodes(),
+            flexible_quorum: None,
+        },
+        server_config: ServerConfig {
+            pid,
+            ..Default::default()
+        },
+    };
+    config
+        .build(MemoryStorage::default())
+        .expect("node should build from a valid config")
+}
+
+struct Cluster {
+    nodes: Vec<Op>,
+    queue: VecDeque<Message<Value>>,
+    delivered: usize,
+    dropped_ble: usize,
+    blocked: Vec<NodeId>,
+}
+
+impl Cluster {
+    fn new() -> Self {
+        Self {
+            // index pid-1 for pid in 1..=3
+            nodes: cluster_nodes().into_iter().map(build_node).collect(),
+            queue: VecDeque::new(),
+            delivered: 0,
+            dropped_ble: 0,
+            blocked: Vec::new(),
+        }
+    }
+
+    fn node(&mut self, pid: NodeId) -> &mut Op {
+        &mut self.nodes[(pid - 1) as usize]
+    }
+
+    fn collect_outgoing(&mut self) {
+        let mut buf: Vec<Message<Value>> = Vec::new();
+        for n in self.nodes.iter_mut() {
+            n.take_outgoing_messages(&mut buf);
+        }
+        for m in buf {
+            match m {
+                Message::BLE(_) => self.dropped_ble += 1,
+                other => self.queue.push_back(other),
+            }
+        }
+    }
+
+    fn block(&mut self, pid: NodeId) {
+        if !self.blocked.contains(&pid) {
+            self.blocked.push(pid);
+        }
+    }
+
+    fn unblock(&mut self, pid: NodeId) {
+        self.blocked.retain(|p| *p != pid);
+    }
+
+    /// Deliver queued messages in FIFO order until the queue drains.
+    fn pump(&mut self, max_steps: usize) {
+        let mut steps = 0usize;
+        loop {
+            self.collect_outgoing();
+            match self.queue.pop_front() {
+                None => break,
+                Some(m) => {
+                    let to = m.get_receiver();
+                    if !self.blocked.contains(&to) {
+                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {
+                            n.handle_incoming(m);
+                            self.delivered += 1;
+                        }
+                    }
+                }
+            }
+            steps += 1;
+            if steps >= max_steps {
+                println!(
+                    "CA_EVENT {{\"event\":\"PUMP_CAP_HIT\",\"steps\":{}}}",
+                    steps
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Emits one distinct event name per lifecycle stage so that a result event is admitted by an
+/// earlier, separately named event.
+fn emit_sample(c: &mut Cluster, case: &str, event: &str, pids: &[NodeId]) {
+    for pid in pids {
+        let n = c.node(*pid);
+        let accepted_idx = n.get_accepted_idx();
+        let decided_idx = n.get_decided_idx();
+        let reconfig = n.is_reconfigured().is_some();
+        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {
+            Some(LogEntry::StopSign(_, decided)) => ("stop_sign", decided),
+            Some(LogEntry::Decided(_)) => ("decided_entry", false),
+            Some(LogEntry::Undecided(_)) => ("undecided_entry", false),
+            Some(LogEntry::Trimmed(_)) => ("trimmed", false),
+            Some(LogEntry::Snapshotted(_)) => ("snapshotted", false),
+            None => ("none", false),
+        };
+        // One index past the StopSign: shows where the index accounting places the StopSign.
+        let read6 = match n.read(STOPSIGN_IDX + 1) {
+            Some(LogEntry::StopSign(..)) => "stop_sign",
+            Some(LogEntry::Decided(_)) => "decided_entry",
+            Some(LogEntry::Undecided(_)) => "undecided_entry",
+            Some(LogEntry::Trimmed(_)) => "trimmed",
+            Some(LogEntry::Snapshotted(_)) => "snapshotted",
+            None => "none",
+        };
+        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {
+            None => ("none", -1i64),
+            Some(v) => ("ok", v.len() as i64),
+        };
+        println!(
+            "CA_EVENT {{\"event\":\"{}\",\"case\":\"{}\",\"node\":{},\
+\"accepted_idx\":{},\"decided_idx\":{},\"decided_eq_accepted\":{},\"is_reconfigured\":{},\
+\"read_idx5\":\"{}\",\"read_idx6\":\"{}\",\"stopsign_entry_decided\":{},\"suffix_read_state\":\"{}\",\
+\"suffix_entries\":{}}}",
+            event,
+            case,
+            pid,
+            accepted_idx,
+            decided_idx,
+            decided_idx == accepted_idx,
+            reconfig,
+            read5,
+            read6,
+            ss_decided,
+            suffix_read_state,
+            suffix_entries
+        );
+    }
+}
+
+/// Shared prefix: node 3 leads, five entries are decided, then a StopSign is decided.
+fn run_prefix(case: &str) -> Cluster {
+    let tag = match case {
+        "resync" => "RESYNC",
+        "single" => "SINGLE",
+        "newterm" => "NEWTERM",
+        "bound" => "BOUND",
+        "over" => "OVER",
+        "snapcontrol" => "SNAPCONTROL",
+        _ => "CONTROL",
+    };
+    let mut c = Cluster::new();
+    c.node(3).try_become_leader();
+    c.pump(2_000);
+    emit_sample(&mut c, case, &format!("{}_LEADER_ELECTED", tag), &[1, 2, 3]);
+
+    for i in 0..NUM_ENTRIES as u64 {
+        c.node(3)
+            .append(Value(i))
+            .expect("leader in accept phase accepts appends");
+    }
+    c.pump(4_000);
+    emit_sample(&mut c, case, &format!("{}_ENTRIES_DECIDED", tag), &[1, 2, 3]);
+
+    let next_config = ClusterConfig {
+        configuration_id: 2,
+        nodes: cluster_nodes(),
+        flexible_quorum: None,
+    };
+    c.node(3)
+        .reconfigure(next_config, None)
+        .expect("leader accepts a reconfiguration proposal");
+    c.pump(4_000);
+    emit_sample(&mut c, case, &format!("{}_STOPSIGN_DECIDED", tag), &[1, 2, 3]);
+    c
+}
+
+#[test]
+fn stopsign_resync_inflates_accepted_index() {
+    let case = "resync";
+    let mut c = run_prefix(case);
+
+    // Both followers signal that their connection to the leader has been re-established.
+    c.node(1).reconnected(3);
+    c.node(2).reconnected(3);
+    c.pump(4_000);
+    emit_sample(&mut c, case, "RESYNC_AFTER", &[1, 2, 3]);
+
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"{}\",\"delivered\":{},\"dropped_ble\":{}}}",
+        case, c.delivered, c.dropped_ble
+    );
+}
+
+#[test]
+fn stopsign_no_resync_control() {
+    let case = "control";
+    let mut c = run_prefix(case);
+    // No reconnect: the leader is simply given more opportunities to make progress.
+    c.pump(4_000);
+    emit_sample(&mut c, case, "CONTROL_AFTER", &[1, 2, 3]);
+
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"{}\",\"delivered\":{},\"dropped_ble\":{}}}",
+        case, c.delivered, c.dropped_ble
+    );
+}
+
+/// Only one follower reports a re-established connection: separates the follower-local index
+/// inflation from any decision the leader forms on a quorum of inflated reports.
+#[test]
+fn stopsign_single_resync() {
+    let case = "single";
+    let mut c = run_prefix(case);
+    c.node(1).reconnected(3);
+    c.pump(4_000);
+    emit_sample(&mut c, case, "SINGLE_AFTER", &[1, 2, 3]);
+
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"{}\",\"delivered\":{},\"dropped_ble\":{}}}",
+        case, c.delivered, c.dropped_ble
+    );
+}
+
+/// A plain leader change after the StopSign was accepted and decided, with no reconnected() call:
+/// node 2 is cut off, so node 1 takes the lead in a new term with only node 3's promise.
+#[test]
+fn stopsign_newterm_leader_change() {
+    let case = "newterm";
+    let mut c = run_prefix(case);
+    c.block(2);
+    c.node(1).try_become_leader();
+    c.pump(4_000);
+    emit_sample(&mut c, case, "NEWTERM_AFTER", &[1, 2, 3]);
+
+    // Stage 3: node 2 (older accepted round, six indices of content) now takes the lead, so the
+    // followers' Promise log_sync becomes the input to the new leader's own sync.
+    c.unblock(2);
+    c.node(2).try_become_leader();
+    c.pump(4_000);
+    emit_sample(&mut c, case, "STALELEADER_AFTER", &[1, 2, 3]);
+
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"{}\",\"delivered\":{},\"dropped_ble\":{}}}",
+        case, c.delivered, c.dropped_ble
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot-capable entry type: does the same inflation occur when
+// T::Snapshot::use_snapshots() is true?
+// ---------------------------------------------------------------------------
+use omnipaxos::storage::Snapshot;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapEntry {
+    pub id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapState {
+    pub ids: Vec<u64>,
+}
+
+impl Snapshot<SnapEntry> for SnapState {
+    fn create(entries: &[SnapEntry]) -> Self {
+        SnapState { ids: entries.iter().map(|e| e.id).collect() }
+    }
+    fn merge(&mut self, delta: Self) {
+        self.ids.extend(delta.ids);
+    }
+    fn use_snapshots() -> bool {
+        true
+    }
+}
+
+impl Entry for SnapEntry {
+    type Snapshot = SnapState;
+}
+
+type SnapOp = OmniPaxos<SnapEntry, MemoryStorage<SnapEntry>>;
+
+struct SnapCluster {
+    nodes: Vec<SnapOp>,
+    queue: VecDeque<Message<SnapEntry>>,
+    delivered: usize,
+    blocked: Vec<NodeId>,
+}
+
+impl SnapCluster {
+    fn new() -> Self {
+        let nodes = cluster_nodes()
+            .into_iter()
+            .map(|pid| {
+                OmniPaxosConfig {
+                    cluster_config: ClusterConfig {
+                        configuration_id: 1,
+                        nodes: cluster_nodes(),
+                        flexible_quorum: None,
+                    },
+                    server_config: ServerConfig { pid, ..Default::default() },
+                }
+                .build(MemoryStorage::default())
+                .expect("snapshot node builds")
+            })
+            .collect();
+        SnapCluster { nodes, queue: VecDeque::new(), delivered: 0, blocked: Vec::new() }
+    }
+
+    fn node(&mut self, pid: NodeId) -> &mut SnapOp {
+        &mut self.nodes[(pid - 1) as usize]
+    }
+
+    fn pump(&mut self, max_steps: usize) {
+        let mut steps = 0usize;
+        loop {
+            let mut buf: Vec<Message<SnapEntry>> = Vec::new();
+            for n in self.nodes.iter_mut() {
+                n.take_outgoing_messages(&mut buf);
+            }
+            for m in buf {
+                if let Message::SequencePaxos(_) = m {
+                    self.queue.push_back(m);
+                }
+            }
+            match self.queue.pop_front() {
+                None => break,
+                Some(m) => {
+                    let to = m.get_receiver();
+                    if !self.blocked.contains(&to) {
+                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {
+                            n.handle_incoming(m);
+                            self.delivered += 1;
+                        }
+                    }
+                }
+            }
+            steps += 1;
+            if steps >= max_steps {
+                break;
+            }
+        }
+    }
+}
+
+fn emit_snap_sample(c: &mut SnapCluster, event: &str, pids: &[NodeId]) {
+    for pid in pids {
+        let n = c.node(*pid);
+        let accepted_idx = n.get_accepted_idx();
+        let decided_idx = n.get_decided_idx();
+        let reconfig = n.is_reconfigured().is_some();
+        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {
+            Some(LogEntry::StopSign(_, decided)) => ("stop_sign", decided),
+            _ => ("none", false),
+        };
+        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {
+            None => ("none", -1i64),
+            Some(v) => ("ok", v.len() as i64),
+        };
+        println!(
+            "CA_EVENT {{\"event\":\"{}\",\"case\":\"snap\",\"node\":{},\"accepted_idx\":{},\"decided_idx\":{},\"decided_eq_accepted\":{},\"is_reconfigured\":{},\"read_idx5\":\"{}\",\"stopsign_entry_decided\":{},\"suffix_read_state\":\"{}\",\"suffix_entries\":{}}}",
+            event, pid, accepted_idx, decided_idx, decided_idx == accepted_idx, reconfig, read5, ss_decided,
+            suffix_read_state, suffix_entries
+        );
+    }
+}
+
+/// Reports whether the replica `from` can re-synchronize with the current leader of the
+/// snapshot-capable cluster after a compaction; the drain and the samples are guarded separately so
+/// that a panic inside a handler is reported and the sampled state is still emitted.
+fn snap_resync_guarded(c: &mut SnapCluster, from: u64) -> bool {
+    c.node(from).reconnected(1);
+    let pumped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.pump(4_000))).is_ok();
+    let sampled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for pid in [1u64, 2, 3] {
+            emit_snap_sample(c, &format!("SNAPROBE_RESYNC_{}_N{}", from, pid), &[pid]);
+        }
+    }))
+    .is_ok();
+    pumped && sampled
+}
+
+/// Same prefix and reconnection as the fixed resync case, but with an Entry whose
+/// Snapshot::use_snapshots() is true.
+#[test]
+fn stopsign_resync_with_snapshots() {
+    let mut c = SnapCluster::new();
+    c.node(3).try_become_leader();
+    c.pump(2_000);
+    emit_snap_sample(&mut c, "SNAP_LEADER_ELECTED", &[1, 2, 3]);
+    for i in 0..NUM_ENTRIES as u64 {
+        c.node(3).append(SnapEntry { id: i }).expect("append");
+    }
+    c.pump(4_000);
+    emit_snap_sample(&mut c, "SNAP_ENTRIES_DECIDED", &[1, 2, 3]);
+    let next = ClusterConfig { configuration_id: 2, nodes: cluster_nodes(), flexible_quorum: None };
+    c.node(3).reconfigure(next, None).expect("reconfigure");
+    c.pump(4_000);
+    emit_snap_sample(&mut c, "SNAP_STOPSIGN_DECIDED", &[1, 2, 3]);
+    c.node(1).reconnected(3);
+    c.node(2).reconnected(3);
+    c.pump(4_000);
+    emit_snap_sample(&mut c, "SNAP_AFTER", &[1, 2, 3]);
+    println!("CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"snap\",\"delivered\":{}}}", c.delivered);
+}
+
+/// Repeated re-synchronizations of the same two followers: does the reported accepted index
+/// keep rising by one per round while the content stays at six indices?
+#[test]
+fn stopsign_repeated_resync() {
+    let case = "resync";
+    let mut c = run_prefix(case);
+    emit_sample(&mut c, case, "REPEAT_BASELINE", &[1, 2, 3]);
+    for round in 1..=3 {
+        c.node(1).reconnected(3);
+        c.node(2).reconnected(3);
+        c.pump(4_000);
+        emit_sample(&mut c, case, &format!("REPEAT_ROUND{}", round), &[1, 2, 3]);
+    }
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"{}\",\"delivered\":{}}}",
+        case, c.delivered
+    );
+}
+
+/// Drift the recorded accepted indexes, then ask the leader to compact: the documented trim path
+/// derives its index from those recorded values.
+#[test]
+fn stopsign_drift_then_trim() {
+    let case = "resync";
+    let mut c = run_prefix(case);
+    for _ in 0..3 {
+        c.node(1).reconnected(3);
+        c.node(2).reconnected(3);
+        c.pump(4_000);
+    }
+    // A leader change, so every node's recorded accepted index is above the six indices it holds.
+    c.node(2).try_become_leader();
+    c.pump(4_000);
+    emit_sample(&mut c, case, "DRIFTTRIM_BEFORE", &[1, 2, 3]);
+
+    let outcome = {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.node(2).trim(None)));
+        match r {
+            Ok(Ok(())) => "ok",
+            Ok(Err(_)) => "err",
+            Err(_) => "panic",
+        }
+    };
+    let compacted = c.node(2).get_compacted_idx();
+    let accepted = c.node(2).get_accepted_idx();
+    let decided = c.node(2).get_decided_idx();
+    println!(
+        "CA_EVENT {{\"event\":\"DRIFTTRIM_TRIM\",\"case\":\"{}\",\"node\":2,\"trim_outcome\":\"{}\",\"compacted_idx\":{},\"accepted_idx\":{},\"decided_idx\":{}}}",
+        case, outcome, compacted, accepted, decided
+    );
+    emit_sample(&mut c, case, "DRIFTTRIM_AFTER", &[1, 2, 3]);
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"{}\",\"delivered\":{}}}",
+        case, c.delivered
+    );
+}
+
+/// Drift the recorded indexes with a snapshot-capable entry type, then request a snapshot inside
+/// the drifted decided index and report what the resulting snapshot contains.
+#[test]
+fn stopsign_drift_then_snapshot() {
+    let mut c = SnapCluster::new();
+    c.node(3).try_become_leader();
+    c.pump(2_000);
+    for i in 0..NUM_ENTRIES as u64 {
+        c.node(3).append(SnapEntry { id: i }).expect("append");
+    }
+    c.pump(4_000);
+    let next = ClusterConfig { configuration_id: 2, nodes: cluster_nodes(), flexible_quorum: None };
+    c.node(3).reconfigure(next, None).expect("reconfigure");
+    c.pump(4_000);
+    for _ in 0..3 {
+        c.node(1).reconnected(3);
+        c.node(2).reconnected(3);
+        c.pump(4_000);
+    }
+    emit_snap_sample(&mut c, "DRSNAP_BEFORE", &[1, 2, 3]);
+
+    let outcome = {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.node(3).snapshot(Some(8), false)
+        }));
+        match r {
+            Ok(Ok(())) => "ok",
+            Ok(Err(_)) => "err",
+            Err(_) => "panic",
+        }
+    };
+    let compacted = c.node(3).get_compacted_idx();
+    let accepted = c.node(3).get_accepted_idx();
+    let decided = c.node(3).get_decided_idx();
+    let snap_ids: i64 = match c.node(3).read(0) {
+        Some(LogEntry::Snapshotted(s)) => s.snapshot.ids.len() as i64,
+        _ => -1,
+    };
+    println!(
+        "CA_EVENT {{\"event\":\"DRSNAP_SNAP\",\"case\":\"snap\",\"node\":3,\"snap_outcome\":\"{}\",\"compacted_idx\":{},\"accepted_idx\":{},\"decided_idx\":{},\"snap_ids\":{}}}",
+        outcome, compacted, accepted, decided, snap_ids
+    );
+    emit_snap_sample(&mut c, "DRSNAP_AFTER", &[1, 2, 3]);
+    println!(
+        "CA_EVENT {{\"event\":\"RUN_END\",\"case\":\"snapdrift\",\"delivered\":{}}}",
+        c.delivered
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Drift-bound probe: does anything inside the sealed configuration bound or
+// repair the reported accepted/decided index drift after many further
+// re-synchronization rounds and a leader change?
+// ---------------------------------------------------------------------------
+
+/// Drains the queue and then samples the three nodes, all under one panic guard, so that a panic
+/// raised inside a message handler or inside a storage read is reported as a stage outcome instead
+/// of aborting the whole run.
+fn drive_round(c: &mut Cluster, case: &str, label: &str) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.pump(4_000);
+        for pid in [1u64, 2, 3] {
+            emit_sample(c, case, &format!("{}{}", label, pid), &[pid]);
+        }
+    }))
+    .is_ok()
+}
+
+/// Samples the three nodes under a panic guard.
+fn sample_guarded(c: &mut Cluster, case: &str, event: &str) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        emit_sample(c, case, event, &[1, 2, 3])
+    }))
+    .is_ok()
+}
+
+/// Eight further re-synchronization rounds of the two followers, then a leader change to one of
+/// those inflated followers, then three more rounds in which the remaining two replicas
+/// re-synchronize with that new leader. Every stage samples all three nodes, and every pump is
+/// panic-guarded so a crash inside a handler is reported rather than aborting the run.
+#[test]
+fn stopsign_drift_bound_probe() {
+    let case = "bound";
+    let mut c = run_prefix(case);
+    emit_sample(&mut c, case, "BOUND_BASE", &[1, 2, 3]);
+
+    let mut panics = 0usize;
+    for round in 1..=8 {
+        c.node(1).reconnected(3);
+        c.node(2).reconnected(3);
+        if !drive_round(&mut c, case, &format!("BOUND_R{}_N", round)) {
+            panics += 1;
+        }
+    }
+
+    // Leader change: node 1, one of the two inflated followers, takes the lead in a new term.
+    let elevated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.node(1).try_become_leader();
+        c.pump(4_000);
+    }))
+    .is_ok();
+    if !elevated {
+        panics += 1;
+    }
+    if !sample_guarded(&mut c, case, "BOUND_AFTER_LEADER_CHANGE") {
+        panics += 1;
+    }
+
+    // The two remaining replicas report a re-established connection to the new leader.
+    for round in 9..=11 {
+        c.node(2).reconnected(1);
+        c.node(3).reconnected(1);
+        if !drive_round(&mut c, case, &format!("BOUND_R{}_N", round)) {
+            panics += 1;
+        }
+    }
+
+    println!(
+        "CA_EVENT {{\"event\":\"BOUND_STAGES\",\"case\":\"{}\",\"rounds\":11,\"panics\":{},\"delivered\":{}}}",
+        case, panics, c.delivered
+    );
+    println!(
+        "CA_EVENT {{\"event\":\"BOUND_RUN_END\",\"case\":\"{}\",\"delivered\":{}}}",
+        case, c.delivered
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Over-compaction probe: can a compaction whose bound comes from the drifted
+// decided index move the compacted index past a live replica's reported
+// accepted index, so that the replica's next re-synchronization asks the
+// leader for a prefix below the compacted index?
+// ---------------------------------------------------------------------------
+
+/// Reports whether the replica `from` can re-synchronize with the current leader after a
+/// compaction: the drain and the samples are guarded separately, so a panic inside a handler is
+/// reported and the sampled state is still emitted.
+fn resync_guarded(c: &mut Cluster, case: &str, from: u64) -> bool {
+    c.node(from).reconnected(1);
+    let pumped =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.pump(4_000))).is_ok();
+    let sampled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for pid in [1u64, 2, 3] {
+            emit_sample(c, case, &format!("OVER_RESYNC_{}_N", from), &[pid]);
+        }
+    }))
+    .is_ok();
+    pumped && sampled
+}
+
+/// Three re-synchronization rounds, a leader change onto one of the inflated followers, then a
+/// snapshot on that new leader inside its drifted decided index, and finally the
+/// re-synchronization of the replica whose reported accepted index is below the resulting
+/// compacted index, with a replica whose reported index is above it as a control.
+#[test]
+fn stopsign_overcompaction_then_resync() {
+    let case = "over";
+    let mut c = run_prefix(case);
+    emit_sample(&mut c, case, "OVER_BASE", &[1, 2, 3]);
+
+    for round in 1..=3 {
+        c.node(1).reconnected(3);
+        c.node(2).reconnected(3);
+        if !drive_round(&mut c, case, &format!("OVER_R{}_N", round)) {
+            println!(
+                "CA_EVENT {{\"event\":\"OVER_R{}_PANIC\",\"case\":\"{}\"}}",
+                round, case
+            );
+        }
+    }
+
+    // Leader change onto node 1, one of the two inflated followers.
+    let elevated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.node(1).try_become_leader();
+        c.pump(4_000);
+    }))
+    .is_ok();
+    println!(
+        "CA_EVENT {{\"event\":\"OVER_LEADER_CHANGE\",\"case\":\"{}\",\"node\":1,\"panicked\":{}}}",
+        case, !elevated
+    );
+    if !sample_guarded(&mut c, case, "OVER_AFTER_CHANGE") {
+        println!(
+            "CA_EVENT {{\"event\":\"OVER_AFTER_CHANGE_PANIC\",\"case\":\"{}\",\"node\":1}}",
+            case
+        );
+    }
+
+    // Compact inside the drifted decided index, local to the new leader.
+    let decided_before = c.node(1).get_decided_idx();
+    let snap_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = c.node(1).snapshot(Some(decided_before), true);
+    }))
+    .is_err();
+    println!(
+        "CA_EVENT {{\"event\":\"OVER_SNAP\",\"case\":\"{}\",\"node\":1,\"decided_before\":{},\"panicked\":{},\"compacted_idx\":{},\"accepted_idx\":{},\"decided_idx\":{}}}",
+        case,
+        decided_before,
+        snap_panicked,
+        c.node(1).get_compacted_idx(),
+        c.node(1).get_accepted_idx(),
+        c.node(1).get_decided_idx()
+    );
+
+    // The replica whose reported accepted index is below the new compacted index.
+    let lag_ok = resync_guarded(&mut c, case, 3);
+    println!(
+        "CA_EVENT {{\"event\":\"OVER_LAG_RESULT\",\"case\":\"{}\",\"node\":3,\"panicked\":{}}}",
+        case, !lag_ok
+    );
+    // Control: a replica whose reported accepted index is at or above it.
+    let ahead_ok = resync_guarded(&mut c, case, 2);
+    println!(
+        "CA_EVENT {{\"event\":\"OVER_AHEAD_RESULT\",\"case\":\"{}\",\"node\":2,\"panicked\":{}}}",
+        case, !ahead_ok
+    );
+
+    println!(
+        "CA_EVENT {{\"event\":\"OVER_RUN_END\",\"case\":\"{}\",\"delivered\":{}}}",
+        case, c.delivered
+    );
+}
+
+/// Healthy-state control for the snapshot-call panic: with the default NoSnapshot entry type and
+/// a cluster that has decided its StopSign and never drifted, does a public snapshot() call for an
+/// index that is legal per the documentation panic?
+#[test]
+fn stopsign_snapshot_on_nosnapshot_control() {
+    let case = "snapcontrol";
+    let mut c = run_prefix(case);
+    emit_sample(&mut c, case, "SNAPCONTROL_BASE", &[1, 2, 3]);
+
+    let decided = c.node(3).get_decided_idx();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = c.node(3).snapshot(Some(decided), true);
+    }))
+    .is_err();
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPCONTROL_SNAP\",\"case\":\"{}\",\"node\":3,\"decided_before\":{},\"panicked\":{},\"compacted_idx\":{},\"accepted_idx\":{},\"decided_idx\":{}}}",
+        case,
+        decided,
+        panicked,
+        c.node(3).get_compacted_idx(),
+        c.node(3).get_accepted_idx(),
+        c.node(3).get_decided_idx()
+    );
+    if !sample_guarded(&mut c, case, "SNAPCONTROL_AFTER") {
+        println!(
+            "CA_EVENT {{\"event\":\"SNAPCONTROL_AFTER_PANIC\",\"case\":\"{}\",\"node\":3}}",
+            case
+        );
+    }
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPCONTROL_RUN_END\",\"case\":\"{}\",\"delivered\":{}}}",
+        case, c.delivered
+    );
+}
+
+/// Snapshot-capable variant of the over-compaction probe: the drifted values are produced with the
+/// snapshot-capable entry type (where the snapshot path works), the new leader compacts inside its
+/// drifted decided index, and then the replica whose reported accepted index is below the resulting
+/// compacted index re-synchronizes, with a replica at or above it as a control.
+#[test]
+fn stopsign_overcompaction_then_resync_snap() {
+    let mut c = SnapCluster::new();
+    c.node(3).try_become_leader();
+    c.pump(2_000);
+    emit_snap_sample(&mut c, "SNAPROBE_LEADER_ELECTED", &[1, 2, 3]);
+    for i in 0..NUM_ENTRIES as u64 {
+        c.node(3).append(SnapEntry { id: i }).expect("append");
+    }
+    c.pump(4_000);
+    emit_snap_sample(&mut c, "SNAPROBE_ENTRIES_DECIDED", &[1, 2, 3]);
+    let next = ClusterConfig {
+        configuration_id: 2,
+        nodes: cluster_nodes(),
+        flexible_quorum: None,
+    };
+    c.node(3).reconfigure(next, None).expect("reconfigure");
+    c.pump(4_000);
+    emit_snap_sample(&mut c, "SNAPROBE_STOPSIGN_DECIDED", &[1, 2, 3]);
+
+    for _ in 0..3 {
+        c.node(1).reconnected(3);
+        c.node(2).reconnected(3);
+        c.pump(4_000);
+    }
+    emit_snap_sample(&mut c, "SNAPROBE_DRIFTED", &[1, 2, 3]);
+
+    let elevated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.node(1).try_become_leader();
+        c.pump(4_000);
+    }))
+    .is_ok();
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPROBE_LEADER_CHANGE\",\"case\":\"snapprobe\",\"node\":1,\"panicked\":{}}}",
+        !elevated
+    );
+    emit_snap_sample(&mut c, "SNAPROBE_AFTER_CHANGE", &[1, 2, 3]);
+
+    let decided = c.node(1).get_decided_idx();
+    let snap_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = c.node(1).snapshot(Some(decided), true);
+    }))
+    .is_err();
+    let snap_ids: i64 = match c.node(1).read(0) {
+        Some(LogEntry::Snapshotted(s)) => s.snapshot.ids.len() as i64,
+        _ => -1,
+    };
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPROBE_SNAP\",\"case\":\"snapprobe\",\"node\":1,\"decided_before\":{},\"panicked\":{},\"compacted_idx\":{},\"accepted_idx\":{},\"decided_idx\":{},\"snap_ids\":{}}}",
+        decided,
+        snap_panicked,
+        c.node(1).get_compacted_idx(),
+        c.node(1).get_accepted_idx(),
+        c.node(1).get_decided_idx(),
+        snap_ids
+    );
+    emit_snap_sample(&mut c, "SNAPROBE_AFTER_SNAP", &[1, 2, 3]);
+
+    let lag_ok = snap_resync_guarded(&mut c, 3);
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPROBE_LAG_RESULT\",\"case\":\"snapprobe\",\"node\":3,\"panicked\":{}}}",
+        !lag_ok
+    );
+    let ahead_ok = snap_resync_guarded(&mut c, 2);
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPROBE_AHEAD_RESULT\",\"case\":\"snapprobe\",\"node\":2,\"panicked\":{}}}",
+        !ahead_ok
+    );
+    println!(
+        "CA_EVENT {{\"event\":\"SNAPROBE_RUN_END\",\"case\":\"snapprobe\",\"delivered\":{}}}",
+        c.delivered
+    );
+}
+// ---------------------------------------------------------------------------
+// Storage-level probe: what does the shipped in-memory storage do when a caller
+// asks for a prefix below the index it has already trimmed to?
+// ---------------------------------------------------------------------------
+
+/// Drives the in-memory storage directly through the public Storage trait: append four entries,
+/// sample the initial state, trim past the second entry, then ask for a suffix and a range below
+/// the trimmed index, each under a panic guard, and finally read at the trimmed index itself.
+#[test]
+fn memory_storage_below_trimmed_request() {
+    use omnipaxos::storage::Storage;
+    let mut st: MemoryStorage<Value> = MemoryStorage::default();
+    st.append_entries(vec![Value(1), Value(2), Value(3), Value(4)])
+        .expect("append four entries");
+    println!(
+        "CA_EVENT {{\"event\":\"STORPROBE_BASE\",\"case\":\"storage\",\"log_len\":{}}}",
+        st.get_log_len().unwrap_or(999)
+    );
+    st.trim(2).expect("trim two entries");
+
+    let suffix_below_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = st.get_suffix(1);
+    }))
+    .is_err();
+    let entries_below_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = st.get_entries(0, 1);
+    }))
+    .is_err();
+    let log_len = st.get_log_len().unwrap_or(999);
+    let (at_state, at_len) = match st.get_suffix(2) {
+        Ok(v) => ("ok", v.len() as i64),
+        Err(_) => ("err", -1i64),
+    };
+    println!(
+        "CA_EVENT {{\"event\":\"STORPROBE_RESULT\",\"case\":\"storage\",\"log_len\":{},\"suffix_below_panicked\":{},\"entries_below_panicked\":{},\"suffix_at_state\":\"{}\",\"suffix_at_len\":{}}}",
+        log_len, suffix_below_panicked, entries_below_panicked, at_state, at_len
+    );
+}

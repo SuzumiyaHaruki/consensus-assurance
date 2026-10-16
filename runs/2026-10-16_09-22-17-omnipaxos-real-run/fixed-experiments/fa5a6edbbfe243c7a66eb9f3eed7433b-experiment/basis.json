@@ -1,0 +1,743 @@
+{
+  "id": "fa5a6edbbfe243c7a66eb9f3eed7433b-experiment",
+  "investigation_id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+  "version": 5,
+  "basis": {
+    "harness": {
+      "kind": "rust_test",
+      "source": "//! Generated assurance harness (audit draft).\n//!\n//! Question: after a replica has accepted a StopSign, does re-synchronizing it with the leader\n//! preserve the observable \"reconfiguration decided\" endpoint and the consistency between the\n//! reported accepted index and the actual log content?\n//!\n//! Two cases share one execution:\n//!  * `case = \"resync\"`: both followers report a re-established connection to the leader.\n//!  * `case = \"control\"`: identical prefix, no reconnect.\n//!\n//! The protocol is driven by hand (no Kompact, no wall-clock waits): a deterministic FIFO network\n//! queue in one process, BLE messages dropped, leadership obtained via `try_become_leader`.\nuse omnipaxos::{\n    messages::Message,\n    storage::{Entry, NoSnapshot},\n    util::{LogEntry, NodeId},\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse std::collections::VecDeque;\n\n#[derive(Clone, Debug, PartialEq)]\npub struct Value(pub u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Op = OmniPaxos<Value, MemoryStorage<Value>>;\n\nconst NUM_ENTRIES: usize = 5;\nconst STOPSIGN_IDX: usize = NUM_ENTRIES; // 0-based index occupied by the StopSign of 5 entries\n\nfn cluster_nodes() -> Vec<NodeId> {\n    vec![1, 2, 3]\n}\n\nfn build_node(pid: NodeId) -> Op {\n    let config = OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes: cluster_nodes(),\n            flexible_quorum: None,\n        },\n        server_config: ServerConfig {\n            pid,\n            ..Default::default()\n        },\n    };\n    config\n        .build(MemoryStorage::default())\n        .expect(\"node should build from a valid config\")\n}\n\nstruct Cluster {\n    nodes: Vec<Op>,\n    queue: VecDeque<Message<Value>>,\n    delivered: usize,\n    dropped_ble: usize,\n    blocked: Vec<NodeId>,\n}\n\nimpl Cluster {\n    fn new() -> Self {\n        Self {\n            // index pid-1 for pid in 1..=3\n            nodes: cluster_nodes().into_iter().map(build_node).collect(),\n            queue: VecDeque::new(),\n            delivered: 0,\n            dropped_ble: 0,\n            blocked: Vec::new(),\n        }\n    }\n\n    fn node(&mut self, pid: NodeId) -> &mut Op {\n        &mut self.nodes[(pid - 1) as usize]\n    }\n\n    fn collect_outgoing(&mut self) {\n        let mut buf: Vec<Message<Value>> = Vec::new();\n        for n in self.nodes.iter_mut() {\n            n.take_outgoing_messages(&mut buf);\n        }\n        for m in buf {\n            match m {\n                Message::BLE(_) => self.dropped_ble += 1,\n                other => self.queue.push_back(other),\n            }\n        }\n    }\n\n    fn block(&mut self, pid: NodeId) {\n        if !self.blocked.contains(&pid) {\n            self.blocked.push(pid);\n        }\n    }\n\n    fn unblock(&mut self, pid: NodeId) {\n        self.blocked.retain(|p| *p != pid);\n    }\n\n    /// Deliver queued messages in FIFO order until the queue drains.\n    fn pump(&mut self, max_steps: usize) {\n        let mut steps = 0usize;\n        loop {\n            self.collect_outgoing();\n            match self.queue.pop_front() {\n                None => break,\n                Some(m) => {\n                    let to = m.get_receiver();\n                    if !self.blocked.contains(&to) {\n                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {\n                            n.handle_incoming(m);\n                            self.delivered += 1;\n                        }\n                    }\n                }\n            }\n            steps += 1;\n            if steps >= max_steps {\n                println!(\n                    \"CA_EVENT {{\\\"event\\\":\\\"PUMP_CAP_HIT\\\",\\\"steps\\\":{}}}\",\n                    steps\n                );\n                break;\n            }\n        }\n    }\n}\n\n/// Emits one distinct event name per lifecycle stage so that a result event is admitted by an\n/// earlier, separately named event.\nfn emit_sample(c: &mut Cluster, case: &str, event: &str, pids: &[NodeId]) {\n    for pid in pids {\n        let n = c.node(*pid);\n        let accepted_idx = n.get_accepted_idx();\n        let decided_idx = n.get_decided_idx();\n        let reconfig = n.is_reconfigured().is_some();\n        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {\n            Some(LogEntry::StopSign(_, decided)) => (\"stop_sign\", decided),\n            Some(LogEntry::Decided(_)) => (\"decided_entry\", false),\n            Some(LogEntry::Undecided(_)) => (\"undecided_entry\", false),\n            Some(LogEntry::Trimmed(_)) => (\"trimmed\", false),\n            Some(LogEntry::Snapshotted(_)) => (\"snapshotted\", false),\n            None => (\"none\", false),\n        };\n        // One index past the StopSign: shows where the index accounting places the StopSign.\n        let read6 = match n.read(STOPSIGN_IDX + 1) {\n            Some(LogEntry::StopSign(..)) => \"stop_sign\",\n            Some(LogEntry::Decided(_)) => \"decided_entry\",\n            Some(LogEntry::Undecided(_)) => \"undecided_entry\",\n            Some(LogEntry::Trimmed(_)) => \"trimmed\",\n            Some(LogEntry::Snapshotted(_)) => \"snapshotted\",\n            None => \"none\",\n        };\n        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {\n            None => (\"none\", -1i64),\n            Some(v) => (\"ok\", v.len() as i64),\n        };\n        println!(\n            \"CA_EVENT {{\\\"event\\\":\\\"{}\\\",\\\"case\\\":\\\"{}\\\",\\\"node\\\":{},\\\n\\\"accepted_idx\\\":{},\\\"decided_idx\\\":{},\\\"decided_eq_accepted\\\":{},\\\"is_reconfigured\\\":{},\\\n\\\"read_idx5\\\":\\\"{}\\\",\\\"read_idx6\\\":\\\"{}\\\",\\\"stopsign_entry_decided\\\":{},\\\"suffix_read_state\\\":\\\"{}\\\",\\\n\\\"suffix_entries\\\":{}}}\",\n            event,\n            case,\n            pid,\n            accepted_idx,\n            decided_idx,\n            decided_idx == accepted_idx,\n            reconfig,\n            read5,\n            read6,\n            ss_decided,\n            suffix_read_state,\n            suffix_entries\n        );\n    }\n}\n\n/// Shared prefix: node 3 leads, five entries are decided, then a StopSign is decided.\nfn run_prefix(case: &str) -> Cluster {\n    let tag = match case {\n        \"resync\" => \"RESYNC\",\n        \"single\" => \"SINGLE\",\n        \"newterm\" => \"NEWTERM\",\n        _ => \"CONTROL\",\n    };\n    let mut c = Cluster::new();\n    c.node(3).try_become_leader();\n    c.pump(2_000);\n    emit_sample(&mut c, case, &format!(\"{}_LEADER_ELECTED\", tag), &[1, 2, 3]);\n\n    for i in 0..NUM_ENTRIES as u64 {\n        c.node(3)\n            .append(Value(i))\n            .expect(\"leader in accept phase accepts appends\");\n    }\n    c.pump(4_000);\n    emit_sample(&mut c, case, &format!(\"{}_ENTRIES_DECIDED\", tag), &[1, 2, 3]);\n\n    let next_config = ClusterConfig {\n        configuration_id: 2,\n        nodes: cluster_nodes(),\n        flexible_quorum: None,\n    };\n    c.node(3)\n        .reconfigure(next_config, None)\n        .expect(\"leader accepts a reconfiguration proposal\");\n    c.pump(4_000);\n    emit_sample(&mut c, case, &format!(\"{}_STOPSIGN_DECIDED\", tag), &[1, 2, 3]);\n    c\n}\n\n#[test]\nfn stopsign_resync_inflates_accepted_index() {\n    let case = \"resync\";\n    let mut c = run_prefix(case);\n\n    // Both followers signal that their connection to the leader has been re-established.\n    c.node(1).reconnected(3);\n    c.node(2).reconnected(3);\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"RESYNC_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n#[test]\nfn stopsign_no_resync_control() {\n    let case = \"control\";\n    let mut c = run_prefix(case);\n    // No reconnect: the leader is simply given more opportunities to make progress.\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"CONTROL_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n/// Only one follower reports a re-established connection: separates the follower-local index\n/// inflation from any decision the leader forms on a quorum of inflated reports.\n#[test]\nfn stopsign_single_resync() {\n    let case = \"single\";\n    let mut c = run_prefix(case);\n    c.node(1).reconnected(3);\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"SINGLE_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n/// A plain leader change after the StopSign was accepted and decided, with no reconnected() call:\n/// node 2 is cut off, so node 1 takes the lead in a new term with only node 3's promise.\n#[test]\nfn stopsign_newterm_leader_change() {\n    let case = \"newterm\";\n    let mut c = run_prefix(case);\n    c.block(2);\n    c.node(1).try_become_leader();\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"NEWTERM_AFTER\", &[1, 2, 3]);\n\n    // Stage 3: node 2 (older accepted round, six indices of content) now takes the lead, so the\n    // followers' Promise log_sync becomes the input to the new leader's own sync.\n    c.unblock(2);\n    c.node(2).try_become_leader();\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"STALELEADER_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n// ---------------------------------------------------------------------------\n// Snapshot-capable entry type: does the same inflation occur when\n// T::Snapshot::use_snapshots() is true?\n// ---------------------------------------------------------------------------\nuse omnipaxos::storage::Snapshot;\nuse serde::{Deserialize, Serialize};\n\n#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]\npub struct SnapEntry {\n    pub id: u64,\n}\n\n#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]\npub struct SnapState {\n    pub ids: Vec<u64>,\n}\n\nimpl Snapshot<SnapEntry> for SnapState {\n    fn create(entries: &[SnapEntry]) -> Self {\n        SnapState { ids: entries.iter().map(|e| e.id).collect() }\n    }\n    fn merge(&mut self, delta: Self) {\n        self.ids.extend(delta.ids);\n    }\n    fn use_snapshots() -> bool {\n        true\n    }\n}\n\nimpl Entry for SnapEntry {\n    type Snapshot = SnapState;\n}\n\ntype SnapOp = OmniPaxos<SnapEntry, MemoryStorage<SnapEntry>>;\n\nstruct SnapCluster {\n    nodes: Vec<SnapOp>,\n    queue: VecDeque<Message<SnapEntry>>,\n    delivered: usize,\n    blocked: Vec<NodeId>,\n}\n\nimpl SnapCluster {\n    fn new() -> Self {\n        let nodes = cluster_nodes()\n            .into_iter()\n            .map(|pid| {\n                OmniPaxosConfig {\n                    cluster_config: ClusterConfig {\n                        configuration_id: 1,\n                        nodes: cluster_nodes(),\n                        flexible_quorum: None,\n                    },\n                    server_config: ServerConfig { pid, ..Default::default() },\n                }\n                .build(MemoryStorage::default())\n                .expect(\"snapshot node builds\")\n            })\n            .collect();\n        SnapCluster { nodes, queue: VecDeque::new(), delivered: 0, blocked: Vec::new() }\n    }\n\n    fn node(&mut self, pid: NodeId) -> &mut SnapOp {\n        &mut self.nodes[(pid - 1) as usize]\n    }\n\n    fn pump(&mut self, max_steps: usize) {\n        let mut steps = 0usize;\n        loop {\n            let mut buf: Vec<Message<SnapEntry>> = Vec::new();\n            for n in self.nodes.iter_mut() {\n                n.take_outgoing_messages(&mut buf);\n            }\n            for m in buf {\n                if let Message::SequencePaxos(_) = m {\n                    self.queue.push_back(m);\n                }\n            }\n            match self.queue.pop_front() {\n                None => break,\n                Some(m) => {\n                    let to = m.get_receiver();\n                    if !self.blocked.contains(&to) {\n                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {\n                            n.handle_incoming(m);\n                            self.delivered += 1;\n                        }\n                    }\n                }\n            }\n            steps += 1;\n            if steps >= max_steps {\n                break;\n            }\n        }\n    }\n}\n\nfn emit_snap_sample(c: &mut SnapCluster, event: &str, pids: &[NodeId]) {\n    for pid in pids {\n        let n = c.node(*pid);\n        let accepted_idx = n.get_accepted_idx();\n        let decided_idx = n.get_decided_idx();\n        let reconfig = n.is_reconfigured().is_some();\n        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {\n            Some(LogEntry::StopSign(_, decided)) => (\"stop_sign\", decided),\n            _ => (\"none\", false),\n        };\n        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {\n            None => (\"none\", -1i64),\n            Some(v) => (\"ok\", v.len() as i64),\n        };\n        println!(\n            \"CA_EVENT {{\\\"event\\\":\\\"{}\\\",\\\"case\\\":\\\"snap\\\",\\\"node\\\":{},\\\"accepted_idx\\\":{},\\\"decided_idx\\\":{},\\\"decided_eq_accepted\\\":{},\\\"is_reconfigured\\\":{},\\\"read_idx5\\\":\\\"{}\\\",\\\"stopsign_entry_decided\\\":{},\\\"suffix_read_state\\\":\\\"{}\\\",\\\"suffix_entries\\\":{}}}\",\n            event, pid, accepted_idx, decided_idx, decided_idx == accepted_idx, reconfig, read5, ss_decided,\n            suffix_read_state, suffix_entries\n        );\n    }\n}\n\n/// Same prefix and reconnection as the fixed resync case, but with an Entry whose\n/// Snapshot::use_snapshots() is true.\n#[test]\nfn stopsign_resync_with_snapshots() {\n    let mut c = SnapCluster::new();\n    c.node(3).try_become_leader();\n    c.pump(2_000);\n    emit_snap_sample(&mut c, \"SNAP_LEADER_ELECTED\", &[1, 2, 3]);\n    for i in 0..NUM_ENTRIES as u64 {\n        c.node(3).append(SnapEntry { id: i }).expect(\"append\");\n    }\n    c.pump(4_000);\n    emit_snap_sample(&mut c, \"SNAP_ENTRIES_DECIDED\", &[1, 2, 3]);\n    let next = ClusterConfig { configuration_id: 2, nodes: cluster_nodes(), flexible_quorum: None };\n    c.node(3).reconfigure(next, None).expect(\"reconfigure\");\n    c.pump(4_000);\n    emit_snap_sample(&mut c, \"SNAP_STOPSIGN_DECIDED\", &[1, 2, 3]);\n    c.node(1).reconnected(3);\n    c.node(2).reconnected(3);\n    c.pump(4_000);\n    emit_snap_sample(&mut c, \"SNAP_AFTER\", &[1, 2, 3]);\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"snap\\\",\\\"delivered\\\":{}}}\", c.delivered);\n}\n",
+      "files": {},
+      "execution_package": "./omnipaxos",
+      "test_names": null,
+      "description": "",
+      "semantic_changes": [
+        "Adds a snapshot-capable entry type and the snap case; every previously generated case is unchanged.",
+        "No production code was modified."
+      ],
+      "prerequisites": [
+        {
+          "alias": "snap_entries",
+          "event": "SNAP_ENTRIES_DECIDED",
+          "conditions": []
+        },
+        {
+          "alias": "snap_stopsign",
+          "event": "SNAP_STOPSIGN_DECIDED",
+          "conditions": []
+        },
+        {
+          "alias": "snap_after",
+          "event": "SNAP_AFTER",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "sync_log_accounting",
+      "create_log_sync",
+      "send_accsync_valid_entries",
+      "handle_promise_accept_resync",
+      "internal_get_entry_type",
+      "read_decided_suffix_public",
+      "create_diff_snapshot",
+      "no_stopsign_decided_idx",
+      "is_reconfigured_endpoint"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Six cases in one execution over three real OmniPaxos instances in one process: the resync, single, control and newterm cases over the NoSnapshot entry type, plus a snap case over an entry type whose Snapshot::use_snapshots() is true and whose snapshot derives from the entry ids. The snap case repeats the resync scenario (node 3 leads, five entries decided, StopSign decided, then node 1 and node 2 call reconnected(3)) and samples the same public endpoints under the SNAP_* event names.",
+      "assumptions": [
+        "The snap case uses SnapEntry with SnapState implementing Snapshot<SnapEntry>, create/merge over the entry ids, and use_snapshots() returning true; serde derives satisfy the feature-gated Snapshot bounds.",
+        "No snapshot or trim call is issued, so the snapshot branch of create_log_sync is only evaluated, not exercised with a non-empty snapshot.",
+        "ClusterConfig { configuration_id: 1, nodes: [1,2,3], flexible_quorum: None } and default ServerConfig (batch_size 1).",
+        "Leadership is obtained with try_become_leader() and all SequencePaxos messages are delivered in FIFO order without loss."
+      ],
+      "excluded": [
+        "Compaction (trim/snapshot) itself is not exercised.",
+        "No crate or package test suite is executed; only the generated test file."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "entries_before_stopsign": 5
+      }
+    },
+    "prefix": "All previously submitted cases are unchanged. The snap case builds three OmniPaxos<SnapEntry, MemoryStorage<SnapEntry>> instances with the same cluster config, makes node 3 leader with try_become_leader(), appends SnapEntry{id: 0..4} and drains the queue, proposes a StopSign with reconfigure() and drains the queue, then has node 1 and node 2 call reconnected(3) and drains again; SNAP_LEADER_ELECTED, SNAP_ENTRIES_DECIDED, SNAP_STOPSIGN_DECIDED and SNAP_AFTER sample get_accepted_idx, get_decided_idx, is_reconfigured, read(5) and read_decided_suffix(0) for all three nodes.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "SNAP_STOPSIGN_DECIDED",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "read_idx5",
+          "op": "eq",
+          "value": "stop_sign",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Baseline before the reconnection with snapshots enabled: the StopSign is reported at its own index 5."
+      },
+      {
+        "event": "SNAP_STOPSIGN_DECIDED",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "suffix_entries",
+          "op": "eq",
+          "value": 6,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Baseline before the reconnection with snapshots enabled: the decided log read from index 0 has six elements."
+      },
+      {
+        "event": "SNAP_STOPSIGN_DECIDED",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "is_reconfigured",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Baseline before the reconnection with snapshots enabled: every replica reports the reconfiguration as decided."
+      },
+      {
+        "event": "SNAP_AFTER",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "read_idx5",
+          "op": "eq",
+          "value": "stop_sign",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "ne",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "With snapshots enabled, a re-synchronized replica still reports the StopSign at its own index 5."
+      },
+      {
+        "event": "SNAP_AFTER",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "suffix_entries",
+          "op": "eq",
+          "value": 6,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "ne",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "With snapshots enabled, a re-synchronized replica's decided log read still has six elements."
+      },
+      {
+        "event": "SNAP_AFTER",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "decided_eq_accepted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "With snapshots enabled, the leader's decided index stays covered by the entries it holds."
+      },
+      {
+        "event": "SNAP_AFTER",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "snap_entries",
+        "assertion": {
+          "field": "is_reconfigured",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "With snapshots enabled, the leader still reports the reconfiguration as decided."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "13723e01dbdb4426bc163b2a771e0f87",
+  "configuration": {
+    "backend": "cargo",
+    "target": {
+      "expected_module": null,
+      "variant": "omnipaxos",
+      "analysis_roots": [],
+      "execution_package": "omnipaxos",
+      "harness_path": "omnipaxos/tests/assurance_generated.rs"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+    }
+  },
+  "harness_filename": "omnipaxos/tests/assurance_generated.rs",
+  "operation_id": "fa5a6edbbfe243c7a66eb9f3eed7433b",
+  "previous_id": "c29512939dc747b596ef34a0756327aa-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "rust_test",
+        "source": "//! Generated assurance harness (audit draft).\n//!\n//! Question: after a replica has accepted a StopSign, does re-synchronizing it with the leader\n//! preserve the observable \"reconfiguration decided\" endpoint and the consistency between the\n//! reported accepted index and the actual log content?\n//!\n//! Two cases share one execution:\n//!  * `case = \"resync\"`: both followers report a re-established connection to the leader.\n//!  * `case = \"control\"`: identical prefix, no reconnect.\n//!\n//! The protocol is driven by hand (no Kompact, no wall-clock waits): a deterministic FIFO network\n//! queue in one process, BLE messages dropped, leadership obtained via `try_become_leader`.\nuse omnipaxos::{\n    messages::Message,\n    storage::{Entry, NoSnapshot},\n    util::{LogEntry, NodeId},\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse std::collections::VecDeque;\n\n#[derive(Clone, Debug, PartialEq)]\npub struct Value(pub u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Op = OmniPaxos<Value, MemoryStorage<Value>>;\n\nconst NUM_ENTRIES: usize = 5;\nconst STOPSIGN_IDX: usize = NUM_ENTRIES; // 0-based index occupied by the StopSign of 5 entries\n\nfn cluster_nodes() -> Vec<NodeId> {\n    vec![1, 2, 3]\n}\n\nfn build_node(pid: NodeId) -> Op {\n    let config = OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes: cluster_nodes(),\n            flexible_quorum: None,\n        },\n        server_config: ServerConfig {\n            pid,\n            ..Default::default()\n        },\n    };\n    config\n        .build(MemoryStorage::default())\n        .expect(\"node should build from a valid config\")\n}\n\nstruct Cluster {\n    nodes: Vec<Op>,\n    queue: VecDeque<Message<Value>>,\n    delivered: usize,\n    dropped_ble: usize,\n    blocked: Vec<NodeId>,\n}\n\nimpl Cluster {\n    fn new() -> Self {\n        Self {\n            // index pid-1 for pid in 1..=3\n            nodes: cluster_nodes().into_iter().map(build_node).collect(),\n            queue: VecDeque::new(),\n            delivered: 0,\n            dropped_ble: 0,\n            blocked: Vec::new(),\n        }\n    }\n\n    fn node(&mut self, pid: NodeId) -> &mut Op {\n        &mut self.nodes[(pid - 1) as usize]\n    }\n\n    fn collect_outgoing(&mut self) {\n        let mut buf: Vec<Message<Value>> = Vec::new();\n        for n in self.nodes.iter_mut() {\n            n.take_outgoing_messages(&mut buf);\n        }\n        for m in buf {\n            match m {\n                Message::BLE(_) => self.dropped_ble += 1,\n                other => self.queue.push_back(other),\n            }\n        }\n    }\n\n    fn block(&mut self, pid: NodeId) {\n        if !self.blocked.contains(&pid) {\n            self.blocked.push(pid);\n        }\n    }\n\n    fn unblock(&mut self, pid: NodeId) {\n        self.blocked.retain(|p| *p != pid);\n    }\n\n    /// Deliver queued messages in FIFO order until the queue drains.\n    fn pump(&mut self, max_steps: usize) {\n        let mut steps = 0usize;\n        loop {\n            self.collect_outgoing();\n            match self.queue.pop_front() {\n                None => break,\n                Some(m) => {\n                    let to = m.get_receiver();\n                    if !self.blocked.contains(&to) {\n                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {\n                            n.handle_incoming(m);\n                            self.delivered += 1;\n                        }\n                    }\n                }\n            }\n            steps += 1;\n            if steps >= max_steps {\n                println!(\n                    \"CA_EVENT {{\\\"event\\\":\\\"PUMP_CAP_HIT\\\",\\\"steps\\\":{}}}\",\n                    steps\n                );\n                break;\n            }\n        }\n    }\n}\n\n/// Emits one distinct event name per lifecycle stage so that a result event is admitted by an\n/// earlier, separately named event.\nfn emit_sample(c: &mut Cluster, case: &str, event: &str, pids: &[NodeId]) {\n    for pid in pids {\n        let n = c.node(*pid);\n        let accepted_idx = n.get_accepted_idx();\n        let decided_idx = n.get_decided_idx();\n        let reconfig = n.is_reconfigured().is_some();\n        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {\n            Some(LogEntry::StopSign(_, decided)) => (\"stop_sign\", decided),\n            Some(LogEntry::Decided(_)) => (\"decided_entry\", false),\n            Some(LogEntry::Undecided(_)) => (\"undecided_entry\", false),\n            Some(LogEntry::Trimmed(_)) => (\"trimmed\", false),\n            Some(LogEntry::Snapshotted(_)) => (\"snapshotted\", false),\n            None => (\"none\", false),\n        };\n        // One index past the StopSign: shows where the index accounting places the StopSign.\n        let read6 = match n.read(STOPSIGN_IDX + 1) {\n            Some(LogEntry::StopSign(..)) => \"stop_sign\",\n            Some(LogEntry::Decided(_)) => \"decided_entry\",\n            Some(LogEntry::Undecided(_)) => \"undecided_entry\",\n            Some(LogEntry::Trimmed(_)) => \"trimmed\",\n            Some(LogEntry::Snapshotted(_)) => \"snapshotted\",\n            None => \"none\",\n        };\n        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {\n            None => (\"none\", -1i64),\n            Some(v) => (\"ok\", v.len() as i64),\n        };\n        println!(\n            \"CA_EVENT {{\\\"event\\\":\\\"{}\\\",\\\"case\\\":\\\"{}\\\",\\\"node\\\":{},\\\n\\\"accepted_idx\\\":{},\\\"decided_idx\\\":{},\\\"decided_eq_accepted\\\":{},\\\"is_reconfigured\\\":{},\\\n\\\"read_idx5\\\":\\\"{}\\\",\\\"read_idx6\\\":\\\"{}\\\",\\\"stopsign_entry_decided\\\":{},\\\"suffix_read_state\\\":\\\"{}\\\",\\\n\\\"suffix_entries\\\":{}}}\",\n            event,\n            case,\n            pid,\n            accepted_idx,\n            decided_idx,\n            decided_idx == accepted_idx,\n            reconfig,\n            read5,\n            read6,\n            ss_decided,\n            suffix_read_state,\n            suffix_entries\n        );\n    }\n}\n\n/// Shared prefix: node 3 leads, five entries are decided, then a StopSign is decided.\nfn run_prefix(case: &str) -> Cluster {\n    let tag = match case {\n        \"resync\" => \"RESYNC\",\n        \"single\" => \"SINGLE\",\n        \"newterm\" => \"NEWTERM\",\n        _ => \"CONTROL\",\n    };\n    let mut c = Cluster::new();\n    c.node(3).try_become_leader();\n    c.pump(2_000);\n    emit_sample(&mut c, case, &format!(\"{}_LEADER_ELECTED\", tag), &[1, 2, 3]);\n\n    for i in 0..NUM_ENTRIES as u64 {\n        c.node(3)\n            .append(Value(i))\n            .expect(\"leader in accept phase accepts appends\");\n    }\n    c.pump(4_000);\n    emit_sample(&mut c, case, &format!(\"{}_ENTRIES_DECIDED\", tag), &[1, 2, 3]);\n\n    let next_config = ClusterConfig {\n        configuration_id: 2,\n        nodes: cluster_nodes(),\n        flexible_quorum: None,\n    };\n    c.node(3)\n        .reconfigure(next_config, None)\n        .expect(\"leader accepts a reconfiguration proposal\");\n    c.pump(4_000);\n    emit_sample(&mut c, case, &format!(\"{}_STOPSIGN_DECIDED\", tag), &[1, 2, 3]);\n    c\n}\n\n#[test]\nfn stopsign_resync_inflates_accepted_index() {\n    let case = \"resync\";\n    let mut c = run_prefix(case);\n\n    // Both followers signal that their connection to the leader has been re-established.\n    c.node(1).reconnected(3);\n    c.node(2).reconnected(3);\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"RESYNC_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n#[test]\nfn stopsign_no_resync_control() {\n    let case = \"control\";\n    let mut c = run_prefix(case);\n    // No reconnect: the leader is simply given more opportunities to make progress.\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"CONTROL_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n/// Only one follower reports a re-established connection: separates the follower-local index\n/// inflation from any decision the leader forms on a quorum of inflated reports.\n#[test]\nfn stopsign_single_resync() {\n    let case = \"single\";\n    let mut c = run_prefix(case);\n    c.node(1).reconnected(3);\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"SINGLE_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n/// A plain leader change after the StopSign was accepted and decided, with no reconnected() call:\n/// node 2 is cut off, so node 1 takes the lead in a new term with only node 3's promise.\n#[test]\nfn stopsign_newterm_leader_change() {\n    let case = \"newterm\";\n    let mut c = run_prefix(case);\n    c.block(2);\n    c.node(1).try_become_leader();\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"NEWTERM_AFTER\", &[1, 2, 3]);\n\n    // Stage 3: node 2 (older accepted round, six indices of content) now takes the lead, so the\n    // followers' Promise log_sync becomes the input to the new leader's own sync.\n    c.unblock(2);\n    c.node(2).try_become_leader();\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"STALELEADER_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n",
+        "files": {},
+        "execution_package": "./omnipaxos",
+        "test_names": null,
+        "description": "",
+        "semantic_changes": [
+          "The newterm case gains a third stage that unblocks node 2 and lets it take the lead; the other cases and the compared fields are unchanged.",
+          "No production code was modified."
+        ],
+        "prerequisites": [
+          {
+            "alias": "newterm_entries",
+            "event": "NEWTERM_ENTRIES_DECIDED",
+            "conditions": []
+          },
+          {
+            "alias": "newterm_stopsign",
+            "event": "NEWTERM_STOPSIGN_DECIDED",
+            "conditions": []
+          },
+          {
+            "alias": "newterm_after",
+            "event": "NEWTERM_AFTER",
+            "conditions": []
+          },
+          {
+            "alias": "staleleader_after",
+            "event": "STALELEADER_AFTER",
+            "conditions": []
+          }
+        ]
+      },
+      "after": {
+        "kind": "rust_test",
+        "source": "//! Generated assurance harness (audit draft).\n//!\n//! Question: after a replica has accepted a StopSign, does re-synchronizing it with the leader\n//! preserve the observable \"reconfiguration decided\" endpoint and the consistency between the\n//! reported accepted index and the actual log content?\n//!\n//! Two cases share one execution:\n//!  * `case = \"resync\"`: both followers report a re-established connection to the leader.\n//!  * `case = \"control\"`: identical prefix, no reconnect.\n//!\n//! The protocol is driven by hand (no Kompact, no wall-clock waits): a deterministic FIFO network\n//! queue in one process, BLE messages dropped, leadership obtained via `try_become_leader`.\nuse omnipaxos::{\n    messages::Message,\n    storage::{Entry, NoSnapshot},\n    util::{LogEntry, NodeId},\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse std::collections::VecDeque;\n\n#[derive(Clone, Debug, PartialEq)]\npub struct Value(pub u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Op = OmniPaxos<Value, MemoryStorage<Value>>;\n\nconst NUM_ENTRIES: usize = 5;\nconst STOPSIGN_IDX: usize = NUM_ENTRIES; // 0-based index occupied by the StopSign of 5 entries\n\nfn cluster_nodes() -> Vec<NodeId> {\n    vec![1, 2, 3]\n}\n\nfn build_node(pid: NodeId) -> Op {\n    let config = OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes: cluster_nodes(),\n            flexible_quorum: None,\n        },\n        server_config: ServerConfig {\n            pid,\n            ..Default::default()\n        },\n    };\n    config\n        .build(MemoryStorage::default())\n        .expect(\"node should build from a valid config\")\n}\n\nstruct Cluster {\n    nodes: Vec<Op>,\n    queue: VecDeque<Message<Value>>,\n    delivered: usize,\n    dropped_ble: usize,\n    blocked: Vec<NodeId>,\n}\n\nimpl Cluster {\n    fn new() -> Self {\n        Self {\n            // index pid-1 for pid in 1..=3\n            nodes: cluster_nodes().into_iter().map(build_node).collect(),\n            queue: VecDeque::new(),\n            delivered: 0,\n            dropped_ble: 0,\n            blocked: Vec::new(),\n        }\n    }\n\n    fn node(&mut self, pid: NodeId) -> &mut Op {\n        &mut self.nodes[(pid - 1) as usize]\n    }\n\n    fn collect_outgoing(&mut self) {\n        let mut buf: Vec<Message<Value>> = Vec::new();\n        for n in self.nodes.iter_mut() {\n            n.take_outgoing_messages(&mut buf);\n        }\n        for m in buf {\n            match m {\n                Message::BLE(_) => self.dropped_ble += 1,\n                other => self.queue.push_back(other),\n            }\n        }\n    }\n\n    fn block(&mut self, pid: NodeId) {\n        if !self.blocked.contains(&pid) {\n            self.blocked.push(pid);\n        }\n    }\n\n    fn unblock(&mut self, pid: NodeId) {\n        self.blocked.retain(|p| *p != pid);\n    }\n\n    /// Deliver queued messages in FIFO order until the queue drains.\n    fn pump(&mut self, max_steps: usize) {\n        let mut steps = 0usize;\n        loop {\n            self.collect_outgoing();\n            match self.queue.pop_front() {\n                None => break,\n                Some(m) => {\n                    let to = m.get_receiver();\n                    if !self.blocked.contains(&to) {\n                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {\n                            n.handle_incoming(m);\n                            self.delivered += 1;\n                        }\n                    }\n                }\n            }\n            steps += 1;\n            if steps >= max_steps {\n                println!(\n                    \"CA_EVENT {{\\\"event\\\":\\\"PUMP_CAP_HIT\\\",\\\"steps\\\":{}}}\",\n                    steps\n                );\n                break;\n            }\n        }\n    }\n}\n\n/// Emits one distinct event name per lifecycle stage so that a result event is admitted by an\n/// earlier, separately named event.\nfn emit_sample(c: &mut Cluster, case: &str, event: &str, pids: &[NodeId]) {\n    for pid in pids {\n        let n = c.node(*pid);\n        let accepted_idx = n.get_accepted_idx();\n        let decided_idx = n.get_decided_idx();\n        let reconfig = n.is_reconfigured().is_some();\n        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {\n            Some(LogEntry::StopSign(_, decided)) => (\"stop_sign\", decided),\n            Some(LogEntry::Decided(_)) => (\"decided_entry\", false),\n            Some(LogEntry::Undecided(_)) => (\"undecided_entry\", false),\n            Some(LogEntry::Trimmed(_)) => (\"trimmed\", false),\n            Some(LogEntry::Snapshotted(_)) => (\"snapshotted\", false),\n            None => (\"none\", false),\n        };\n        // One index past the StopSign: shows where the index accounting places the StopSign.\n        let read6 = match n.read(STOPSIGN_IDX + 1) {\n            Some(LogEntry::StopSign(..)) => \"stop_sign\",\n            Some(LogEntry::Decided(_)) => \"decided_entry\",\n            Some(LogEntry::Undecided(_)) => \"undecided_entry\",\n            Some(LogEntry::Trimmed(_)) => \"trimmed\",\n            Some(LogEntry::Snapshotted(_)) => \"snapshotted\",\n            None => \"none\",\n        };\n        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {\n            None => (\"none\", -1i64),\n            Some(v) => (\"ok\", v.len() as i64),\n        };\n        println!(\n            \"CA_EVENT {{\\\"event\\\":\\\"{}\\\",\\\"case\\\":\\\"{}\\\",\\\"node\\\":{},\\\n\\\"accepted_idx\\\":{},\\\"decided_idx\\\":{},\\\"decided_eq_accepted\\\":{},\\\"is_reconfigured\\\":{},\\\n\\\"read_idx5\\\":\\\"{}\\\",\\\"read_idx6\\\":\\\"{}\\\",\\\"stopsign_entry_decided\\\":{},\\\"suffix_read_state\\\":\\\"{}\\\",\\\n\\\"suffix_entries\\\":{}}}\",\n            event,\n            case,\n            pid,\n            accepted_idx,\n            decided_idx,\n            decided_idx == accepted_idx,\n            reconfig,\n            read5,\n            read6,\n            ss_decided,\n            suffix_read_state,\n            suffix_entries\n        );\n    }\n}\n\n/// Shared prefix: node 3 leads, five entries are decided, then a StopSign is decided.\nfn run_prefix(case: &str) -> Cluster {\n    let tag = match case {\n        \"resync\" => \"RESYNC\",\n        \"single\" => \"SINGLE\",\n        \"newterm\" => \"NEWTERM\",\n        _ => \"CONTROL\",\n    };\n    let mut c = Cluster::new();\n    c.node(3).try_become_leader();\n    c.pump(2_000);\n    emit_sample(&mut c, case, &format!(\"{}_LEADER_ELECTED\", tag), &[1, 2, 3]);\n\n    for i in 0..NUM_ENTRIES as u64 {\n        c.node(3)\n            .append(Value(i))\n            .expect(\"leader in accept phase accepts appends\");\n    }\n    c.pump(4_000);\n    emit_sample(&mut c, case, &format!(\"{}_ENTRIES_DECIDED\", tag), &[1, 2, 3]);\n\n    let next_config = ClusterConfig {\n        configuration_id: 2,\n        nodes: cluster_nodes(),\n        flexible_quorum: None,\n    };\n    c.node(3)\n        .reconfigure(next_config, None)\n        .expect(\"leader accepts a reconfiguration proposal\");\n    c.pump(4_000);\n    emit_sample(&mut c, case, &format!(\"{}_STOPSIGN_DECIDED\", tag), &[1, 2, 3]);\n    c\n}\n\n#[test]\nfn stopsign_resync_inflates_accepted_index() {\n    let case = \"resync\";\n    let mut c = run_prefix(case);\n\n    // Both followers signal that their connection to the leader has been re-established.\n    c.node(1).reconnected(3);\n    c.node(2).reconnected(3);\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"RESYNC_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n#[test]\nfn stopsign_no_resync_control() {\n    let case = \"control\";\n    let mut c = run_prefix(case);\n    // No reconnect: the leader is simply given more opportunities to make progress.\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"CONTROL_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n/// Only one follower reports a re-established connection: separates the follower-local index\n/// inflation from any decision the leader forms on a quorum of inflated reports.\n#[test]\nfn stopsign_single_resync() {\n    let case = \"single\";\n    let mut c = run_prefix(case);\n    c.node(1).reconnected(3);\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"SINGLE_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n/// A plain leader change after the StopSign was accepted and decided, with no reconnected() call:\n/// node 2 is cut off, so node 1 takes the lead in a new term with only node 3's promise.\n#[test]\nfn stopsign_newterm_leader_change() {\n    let case = \"newterm\";\n    let mut c = run_prefix(case);\n    c.block(2);\n    c.node(1).try_become_leader();\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"NEWTERM_AFTER\", &[1, 2, 3]);\n\n    // Stage 3: node 2 (older accepted round, six indices of content) now takes the lead, so the\n    // followers' Promise log_sync becomes the input to the new leader's own sync.\n    c.unblock(2);\n    c.node(2).try_become_leader();\n    c.pump(4_000);\n    emit_sample(&mut c, case, \"STALELEADER_AFTER\", &[1, 2, 3]);\n\n    println!(\n        \"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"{}\\\",\\\"delivered\\\":{},\\\"dropped_ble\\\":{}}}\",\n        case, c.delivered, c.dropped_ble\n    );\n}\n\n// ---------------------------------------------------------------------------\n// Snapshot-capable entry type: does the same inflation occur when\n// T::Snapshot::use_snapshots() is true?\n// ---------------------------------------------------------------------------\nuse omnipaxos::storage::Snapshot;\nuse serde::{Deserialize, Serialize};\n\n#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]\npub struct SnapEntry {\n    pub id: u64,\n}\n\n#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]\npub struct SnapState {\n    pub ids: Vec<u64>,\n}\n\nimpl Snapshot<SnapEntry> for SnapState {\n    fn create(entries: &[SnapEntry]) -> Self {\n        SnapState { ids: entries.iter().map(|e| e.id).collect() }\n    }\n    fn merge(&mut self, delta: Self) {\n        self.ids.extend(delta.ids);\n    }\n    fn use_snapshots() -> bool {\n        true\n    }\n}\n\nimpl Entry for SnapEntry {\n    type Snapshot = SnapState;\n}\n\ntype SnapOp = OmniPaxos<SnapEntry, MemoryStorage<SnapEntry>>;\n\nstruct SnapCluster {\n    nodes: Vec<SnapOp>,\n    queue: VecDeque<Message<SnapEntry>>,\n    delivered: usize,\n    blocked: Vec<NodeId>,\n}\n\nimpl SnapCluster {\n    fn new() -> Self {\n        let nodes = cluster_nodes()\n            .into_iter()\n            .map(|pid| {\n                OmniPaxosConfig {\n                    cluster_config: ClusterConfig {\n                        configuration_id: 1,\n                        nodes: cluster_nodes(),\n                        flexible_quorum: None,\n                    },\n                    server_config: ServerConfig { pid, ..Default::default() },\n                }\n                .build(MemoryStorage::default())\n                .expect(\"snapshot node builds\")\n            })\n            .collect();\n        SnapCluster { nodes, queue: VecDeque::new(), delivered: 0, blocked: Vec::new() }\n    }\n\n    fn node(&mut self, pid: NodeId) -> &mut SnapOp {\n        &mut self.nodes[(pid - 1) as usize]\n    }\n\n    fn pump(&mut self, max_steps: usize) {\n        let mut steps = 0usize;\n        loop {\n            let mut buf: Vec<Message<SnapEntry>> = Vec::new();\n            for n in self.nodes.iter_mut() {\n                n.take_outgoing_messages(&mut buf);\n            }\n            for m in buf {\n                if let Message::SequencePaxos(_) = m {\n                    self.queue.push_back(m);\n                }\n            }\n            match self.queue.pop_front() {\n                None => break,\n                Some(m) => {\n                    let to = m.get_receiver();\n                    if !self.blocked.contains(&to) {\n                        if let Some(n) = self.nodes.get_mut((to - 1) as usize) {\n                            n.handle_incoming(m);\n                            self.delivered += 1;\n                        }\n                    }\n                }\n            }\n            steps += 1;\n            if steps >= max_steps {\n                break;\n            }\n        }\n    }\n}\n\nfn emit_snap_sample(c: &mut SnapCluster, event: &str, pids: &[NodeId]) {\n    for pid in pids {\n        let n = c.node(*pid);\n        let accepted_idx = n.get_accepted_idx();\n        let decided_idx = n.get_decided_idx();\n        let reconfig = n.is_reconfigured().is_some();\n        let (read5, ss_decided) = match n.read(STOPSIGN_IDX) {\n            Some(LogEntry::StopSign(_, decided)) => (\"stop_sign\", decided),\n            _ => (\"none\", false),\n        };\n        let (suffix_read_state, suffix_entries) = match n.read_decided_suffix(0) {\n            None => (\"none\", -1i64),\n            Some(v) => (\"ok\", v.len() as i64),\n        };\n        println!(\n            \"CA_EVENT {{\\\"event\\\":\\\"{}\\\",\\\"case\\\":\\\"snap\\\",\\\"node\\\":{},\\\"accepted_idx\\\":{},\\\"decided_idx\\\":{},\\\"decided_eq_accepted\\\":{},\\\"is_reconfigured\\\":{},\\\"read_idx5\\\":\\\"{}\\\",\\\"stopsign_entry_decided\\\":{},\\\"suffix_read_state\\\":\\\"{}\\\",\\\"suffix_entries\\\":{}}}\",\n            event, pid, accepted_idx, decided_idx, decided_idx == accepted_idx, reconfig, read5, ss_decided,\n            suffix_read_state, suffix_entries\n        );\n    }\n}\n\n/// Same prefix and reconnection as the fixed resync case, but with an Entry whose\n/// Snapshot::use_snapshots() is true.\n#[test]\nfn stopsign_resync_with_snapshots() {\n    let mut c = SnapCluster::new();\n    c.node(3).try_become_leader();\n    c.pump(2_000);\n    emit_snap_sample(&mut c, \"SNAP_LEADER_ELECTED\", &[1, 2, 3]);\n    for i in 0..NUM_ENTRIES as u64 {\n        c.node(3).append(SnapEntry { id: i }).expect(\"append\");\n    }\n    c.pump(4_000);\n    emit_snap_sample(&mut c, \"SNAP_ENTRIES_DECIDED\", &[1, 2, 3]);\n    let next = ClusterConfig { configuration_id: 2, nodes: cluster_nodes(), flexible_quorum: None };\n    c.node(3).reconfigure(next, None).expect(\"reconfigure\");\n    c.pump(4_000);\n    emit_snap_sample(&mut c, \"SNAP_STOPSIGN_DECIDED\", &[1, 2, 3]);\n    c.node(1).reconnected(3);\n    c.node(2).reconnected(3);\n    c.pump(4_000);\n    emit_snap_sample(&mut c, \"SNAP_AFTER\", &[1, 2, 3]);\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"RUN_END\\\",\\\"case\\\":\\\"snap\\\",\\\"delivered\\\":{}}}\", c.delivered);\n}\n",
+        "files": {},
+        "execution_package": "./omnipaxos",
+        "test_names": null,
+        "description": "",
+        "semantic_changes": [
+          "Adds a snapshot-capable entry type and the snap case; every previously generated case is unchanged.",
+          "No production code was modified."
+        ],
+        "prerequisites": [
+          {
+            "alias": "snap_entries",
+            "event": "SNAP_ENTRIES_DECIDED",
+            "conditions": []
+          },
+          {
+            "alias": "snap_stopsign",
+            "event": "SNAP_STOPSIGN_DECIDED",
+            "conditions": []
+          },
+          {
+            "alias": "snap_after",
+            "event": "SNAP_AFTER",
+            "conditions": []
+          }
+        ]
+      }
+    },
+    "source_ids": {
+      "before": [
+        "sync_log_accounting",
+        "create_log_sync",
+        "send_accsync_valid_entries",
+        "handle_promise_accept_resync",
+        "handle_preparereq",
+        "leader_decision_on_accepted",
+        "is_reconfigured_endpoint",
+        "read_decided_suffix_public",
+        "internal_read_range",
+        "internal_get_entry_type",
+        "create_diff_snapshot",
+        "no_stopsign_decided_idx"
+      ],
+      "after": [
+        "sync_log_accounting",
+        "create_log_sync",
+        "send_accsync_valid_entries",
+        "handle_promise_accept_resync",
+        "internal_get_entry_type",
+        "read_decided_suffix_public",
+        "create_diff_snapshot",
+        "no_stopsign_decided_idx",
+        "is_reconfigured_endpoint"
+      ]
+    },
+    "scope": {
+      "before": {
+        "description": "Five cases in one execution over three real OmniPaxos instances in one process with MemoryStorage and a deterministic FIFO in-process network: resync, single, control, newterm (with the added STALELEADER stage). In newterm node 2 is cut off while node 1 leads in a new term; then node 2 is unblocked and takes the lead itself, so its prepare collects promises whose log_sync carries the StopSign. Public API only; each lifecycle stage emits its own CA_EVENT name.",
+        "assumptions": [
+          "Entry type Value has Snapshot = NoSnapshot, so create_log_sync takes its no-snapshot branch.",
+          "ClusterConfig { configuration_id: 1, nodes: [1,2,3], flexible_quorum: None } (majority 2) and default ServerConfig (batch_size 1).",
+          "Leadership is obtained with try_become_leader(); node 2's promise is still the original leader's ballot, so its new ballot outranks node 1's current ballot.",
+          "Cutting off node 2 means dropping messages addressed to it; unblocking restores ordinary FIFO delivery."
+        ],
+        "excluded": [
+          "Snapshots, trimming, compaction and batching are not exercised.",
+          "No crate or package test suite is executed; only the generated test file."
+        ],
+        "parameters": {
+          "nodes": 3,
+          "entries_before_stopsign": 5
+        }
+      },
+      "after": {
+        "description": "Six cases in one execution over three real OmniPaxos instances in one process: the resync, single, control and newterm cases over the NoSnapshot entry type, plus a snap case over an entry type whose Snapshot::use_snapshots() is true and whose snapshot derives from the entry ids. The snap case repeats the resync scenario (node 3 leads, five entries decided, StopSign decided, then node 1 and node 2 call reconnected(3)) and samples the same public endpoints under the SNAP_* event names.",
+        "assumptions": [
+          "The snap case uses SnapEntry with SnapState implementing Snapshot<SnapEntry>, create/merge over the entry ids, and use_snapshots() returning true; serde derives satisfy the feature-gated Snapshot bounds.",
+          "No snapshot or trim call is issued, so the snapshot branch of create_log_sync is only evaluated, not exercised with a non-empty snapshot.",
+          "ClusterConfig { configuration_id: 1, nodes: [1,2,3], flexible_quorum: None } and default ServerConfig (batch_size 1).",
+          "Leadership is obtained with try_become_leader() and all SequencePaxos messages are delivered in FIFO order without loss."
+        ],
+        "excluded": [
+          "Compaction (trim/snapshot) itself is not exercised.",
+          "No crate or package test suite is executed; only the generated test file."
+        ],
+        "parameters": {
+          "nodes": 3,
+          "entries_before_stopsign": 5
+        }
+      }
+    },
+    "prefix": {
+      "before": "Same prefix and cases as the fixed 3641dc6df2ae4993b82175d7b24cb702-experiment (node 3 leads, five entries decided, StopSign proposed and decided, then resync/single/control/newterm stages with samples of get_accepted_idx, get_decided_idx, is_reconfigured, read(5), read(6), read_decided_suffix(0)). The newterm case now continues after NEWTERM_AFTER: node 2 is unblocked and calls try_become_leader(), the queue is drained to quiet, and all three nodes are sampled as STALELEADER_AFTER.",
+      "after": "All previously submitted cases are unchanged. The snap case builds three OmniPaxos<SnapEntry, MemoryStorage<SnapEntry>> instances with the same cluster config, makes node 3 leader with try_become_leader(), appends SnapEntry{id: 0..4} and drains the queue, proposes a StopSign with reconfigure() and drains the queue, then has node 1 and node 2 call reconnected(3) and drains again; SNAP_LEADER_ELECTED, SNAP_ENTRIES_DECIDED, SNAP_STOPSIGN_DECIDED and SNAP_AFTER sample get_accepted_idx, get_decided_idx, is_reconfigured, read(5) and read_decided_suffix(0) for all three nodes."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "NEWTERM_STOPSIGN_DECIDED",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "read_idx5",
+            "op": "eq",
+            "value": "stop_sign",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Baseline before the leader change: the StopSign is reported at its own index 5 by every replica."
+        },
+        {
+          "event": "NEWTERM_STOPSIGN_DECIDED",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "suffix_entries",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Baseline before the leader change: every replica's decided log read from index 0 has six elements."
+        },
+        {
+          "event": "NEWTERM_STOPSIGN_DECIDED",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "is_reconfigured",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Baseline before the leader change: every replica reports the reconfiguration as decided."
+        },
+        {
+          "event": "NEWTERM_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "accepted_idx",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "Reproduction: a follower that merely re-promised in a new term still reports at most the six indices it holds."
+        },
+        {
+          "event": "NEWTERM_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "is_reconfigured",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "Reproduction: that follower still reports the reconfiguration as decided."
+        },
+        {
+          "event": "NEWTERM_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "suffix_entries",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ],
+          "description": "The new leader's decided log read stays intact after the leader change."
+        },
+        {
+          "event": "NEWTERM_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "suffix_entries",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "The cut-off node's decided log read stays intact while it receives nothing."
+        },
+        {
+          "event": "STALELEADER_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "accepted_idx",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "A leader that syncs from followers still holds only the six indices of content, so its own accepted index stays 6."
+        },
+        {
+          "event": "STALELEADER_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "read_idx5",
+            "op": "eq",
+            "value": "stop_sign",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "That leader still reports the StopSign at its own index 5."
+        },
+        {
+          "event": "STALELEADER_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "suffix_entries",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "That leader's decided log read from index 0 still has six elements."
+        },
+        {
+          "event": "STALELEADER_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "newterm_entries",
+          "assertion": {
+            "field": "decided_idx",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ],
+          "description": "That leader still reports six decided indices rather than a decided index past its content."
+        }
+      ],
+      "after": [
+        {
+          "event": "SNAP_STOPSIGN_DECIDED",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "read_idx5",
+            "op": "eq",
+            "value": "stop_sign",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Baseline before the reconnection with snapshots enabled: the StopSign is reported at its own index 5."
+        },
+        {
+          "event": "SNAP_STOPSIGN_DECIDED",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "suffix_entries",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Baseline before the reconnection with snapshots enabled: the decided log read from index 0 has six elements."
+        },
+        {
+          "event": "SNAP_STOPSIGN_DECIDED",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "is_reconfigured",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Baseline before the reconnection with snapshots enabled: every replica reports the reconfiguration as decided."
+        },
+        {
+          "event": "SNAP_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "read_idx5",
+            "op": "eq",
+            "value": "stop_sign",
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "ne",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "With snapshots enabled, a re-synchronized replica still reports the StopSign at its own index 5."
+        },
+        {
+          "event": "SNAP_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "suffix_entries",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "ne",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "With snapshots enabled, a re-synchronized replica's decided log read still has six elements."
+        },
+        {
+          "event": "SNAP_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "decided_eq_accepted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "With snapshots enabled, the leader's decided index stays covered by the entries it holds."
+        },
+        {
+          "event": "SNAP_AFTER",
+          "identity_fields": [
+            "node"
+          ],
+          "admission_alias": "snap_entries",
+          "assertion": {
+            "field": "is_reconfigured",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ],
+          "description": "With snapshots enabled, the leader still reports the reconfiguration as decided."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Adds a snapshot-capable Entry (Snapshot::use_snapshots() returns true) and a case that repeats the two-follower reconnection after a decided StopSign, to test whether the snapshot option changes the inflation."
+}

@@ -136,19 +136,72 @@ def resolved_uses(uses, aliases):
     return [u.model_copy(update={'entry_id': resolve(u.entry_id, aliases)}) for u in uses]
 
 
+def target_receipt(state, id, *, owner_id=None, experiment_id=None, joint_history='', path='/executions'):
+    """Resolve receipt identity and associations without reading execution output."""
+    from .experiments import artifact
+    field = path + '/' + id.replace('~', '~0').replace('/', '~1')
+    check = next((c for c in state.checks if c.id == id), None)
+    details = {'actual_kind': 'CheckRun' if check else 'not_found',
+               'execution_index': {'path': 'state.json', 'collection': 'checks'},
+               'navigation': 'research.json'}
+
+    def reject(message):
+        raise DiagnosticError([Diagnostic(code='execution_reference', category='association', object_ids=[id],
+            paths=[field], details=details, message=f'{field}: {message}. '
+                'Inspect target CheckRun IDs in state.json checks or research.json experiment results; '
+                'this is a reference identity or association error, not a judgment about the observation.')])
+
+    if check is None:
+        for collection in ('interpretations', 'experiments', 'knowledge', 'investigations', 'materials'):
+            record = next((value for value in getattr(state, collection) if value.id == id), None)
+            if record is not None:
+                details.update(actual_kind=type(record).__name__,
+                               actual_record={'path': 'state.json', 'collection': collection, 'id': id})
+                break
+        reject(f'No target CheckRun has ID {id!r}; actual object: {details["actual_kind"]}')
+    details.update(action=check.action, experiment_id=check.experiment_id,
+                   snapshot_id=check.snapshot_id, record=f'logs/{id}/check.json')
+    if check.action != 'experiment' or not check.experiment_id:
+        reject(f'CheckRun {id!r} is action {check.action!r}, not a target experiment receipt')
+    if not any(a.id == check.experiment_id for a in state.experiments):
+        reject(f'Target CheckRun {id!r} names an unknown fixed experiment {check.experiment_id!r}')
+    fixed = artifact(state, check.experiment_id)
+    details.update(investigation_id=fixed.investigation_id, expected_investigation_id=owner_id,
+                   expected_experiment_id=experiment_id, expected_snapshot_id=state.snapshot.id,
+                   experiment_snapshot_id=fixed.snapshot_id, observations=f'logs/{id}/observations.json')
+    if check.snapshot_id != state.snapshot.id or check.snapshot_id != fixed.snapshot_id:
+        reject('Referenced execution uses a different source snapshot')
+    if ((experiment_id and fixed.id != experiment_id) or (owner_id and fixed.investigation_id != owner_id)) and not joint_history.strip():
+        reject('A separate producer receipt needs explicit joint-history compatibility reasoning')
+    return check, fixed
+
+
+def validate_receipt_references(state, knowledge, interpretations, aliases):
+    """Check the whole update before any citation requires potentially large measurements."""
+    from .experiments import artifact
+    for number, change in enumerate(knowledge):
+        for id in change.executions:
+            target_receipt(state, id, path=f'/knowledge/{number}/executions')
+    for number, change in enumerate(interpretations):
+        owner = investigation(state, resolve(change.investigation_id, aliases))
+        for id in change.executions:
+            target_receipt(state, id, owner_id=owner.id, experiment_id=change.experiment_id,
+                           joint_history=change.joint_history, path=f'/interpretations/{number}/executions')
+        if change.experiment_id:
+            if artifact(state, change.experiment_id).investigation_id != owner.id:
+                raise ValueError('Interpretation must identify its investigation and fixed experiment')
+            if not any(c.experiment_id == change.experiment_id and c.id in change.executions for c in state.checks):
+                raise ValueError('When experiment_id is set, cite an actual execution of that fixed experiment; '
+                    'omit it for a question-level explained/conditional/unresolved account reusing applicable receipts')
+
+
 def target_receipts(state, root, executions, *, owner_id=None, experiment_id=None, joint_history='', failure=None, support=True,
                     path='/executions', reuse_failure=False):
-    from .experiments import artifact, observed, validate_failure, fixed_files
+    from .experiments import observed, validate_failure, fixed_files
     from consensus_assurance.core.types import ExecutionStatus
     for id, indices in executions.items():
-        c = next((c for c in state.checks if c.id == id), None)
-        if c is None or c.action != 'experiment' or not c.experiment_id:
-            raise ValueError('Cite actual target CheckRun IDs, not Agent or interpretation IDs')
-        a = artifact(state, c.experiment_id)
-        if c.snapshot_id != state.snapshot.id or c.snapshot_id != a.snapshot_id:
-            raise ValueError('Referenced execution uses a different source snapshot')
-        if ((experiment_id and a.id != experiment_id) or (owner_id and a.investigation_id != owner_id)) and not joint_history.strip():
-            raise ValueError('A separate producer receipt needs explicit joint-history compatibility reasoning')
+        c, a = target_receipt(state, id, owner_id=owner_id, experiment_id=experiment_id,
+                              joint_history=joint_history, path=path)
         measured = observed(a, c, root)
         events = measured['events']
         invalid = list(dict.fromkeys(i for i in indices if type(i) is not int or not 0 <= i < len(events)))
@@ -301,13 +354,6 @@ def interpret(state, root, changes, operation, aliases):
         data['knowledge'] = resolved_uses(change.knowledge, aliases)
         require_sources(state, change.source_ids)
         require_uses(state, data['knowledge'])
-        if change.experiment_id:
-            from .experiments import artifact
-            if artifact(state, change.experiment_id).investigation_id != owner.id:
-                raise ValueError('Interpretation must identify its investigation and fixed experiment')
-            if not any(c.experiment_id == change.experiment_id and c.id in change.executions for c in state.checks):
-                raise ValueError('When experiment_id is set, cite an actual execution of that fixed experiment; '
-                    'omit it for a question-level explained/conditional/unresolved account reusing applicable receipts')
         target_receipts(state, root, change.executions, owner_id=owner.id, experiment_id=change.experiment_id,
                         joint_history=change.joint_history, failure=change.failure_attribution,
                         support=change.conclusion in {'violated', 'holds'}, path=f'/interpretations/{number}/executions')

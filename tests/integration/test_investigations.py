@@ -90,7 +90,7 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
         assert summary['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
         assert 'execution' not in summary['questions'][0]
         change=summary['interpretation_changes'][0]
-        assert list(summary).index('interpretation_changes') < list(summary).index('reselection')
+        assert list(summary).index('interpretation_changes') < list(summary).index('questions') < list(summary).index('reselection')
         assert change['previous'] is None and change['current']['id']==state['interpretations'][0]['id']
         citation=change['executions'][0]
         assert citation['event_indices']==citation['current_event_indices']==[1]
@@ -221,6 +221,7 @@ def test_knowledge_and_interpretation_changes_share_observations_without_losing_
     def revise(state):
         summary=operation_summary(e.state,e.root)
         new,=summary['knowledge_changes']
+        assert list(summary).index('knowledge_changes') < list(summary).index('questions')
         assert new['previous'] is None and not new['intermediate_revisions']
         assert new['current']['conditions']=='At the selected capacity'
         assert not new['executions'][0]['cited_events'] and len(new['executions'][0]['shared_cited_events'])==2
@@ -261,6 +262,69 @@ def test_knowledge_and_interpretation_changes_share_observations_without_losing_
         assert state['knowledge'][0]['revision']==3 and state['usage']['experiments']==1
         return stop(state)
     e,repo=engine_for(tmp_path,[start,seed,revise,duplicate,finish])
+    e.start(repo)
+
+
+def test_schema_projected_local_revision_preserves_support_and_allows_withdrawal(tmp_path):
+    from consensus_assurance.workflow.audit import validate_submission
+    saved={}
+    def repeat(state):
+        return {'rationale':'Check the same invocation again',
+            'repeat_experiment_id':state['experiments'][0]['id']},{}
+    def seed(state):
+        receipts={c['id']:[1] for c in state['checks'] if c.get('experiment_id')}
+        sub,files=opinion(state,conclusion='conditional',executions=receipts,
+            counterevidence=['The admitted contract allows this return'],limitations=['Two local invocations'])
+        sub['knowledge']=[dict(kind='fact',statement='The two boundary invocations returned zero',
+            conditions='At the admitted capacity',source_ids=['code','doc'],executions=receipts)]
+        saved['receipts']=receipts
+        saved['files']={p:p.read_bytes() for folder in ('fixed-experiments','logs')
+            for p in (e.root/folder).rglob('*') if p.is_file()}
+        return sub,files
+    def projected():
+        state=json.loads((e.root/'state.json').read_text())
+        schema=json.loads((e.root/'submission.schema.json').read_text())['$defs']
+        return {'rationale':'Correct only the current wording', **{
+            collection:[{k:v for k,v in state[collection][-1].items() if k in schema[name]['properties']}]
+            for collection,name in [('knowledge','KnowledgeUpdate'),('interpretations','InterpretationUpdate')]}}
+    def revise(state):
+        saved['knowledge']=state['knowledge'][0]
+        saved['interpretation']=state['interpretations'][-1]
+        sub=projected()
+        sub['knowledge'][0]['statement']='The observed return is zero in each of the two admitted invocations'
+        sub['interpretations'][0]['rationale']='Both retained invocations return zero; the contract permits it'
+        (e.root/'draft'/'local.json').write_text(json.dumps(sub))
+        result=validate_submission(e.state,e.root,'local.json',e.implementation)
+        assert result['valid'] and not result['execution_requested']
+        assert {v['object']:v['changed_fields'] for v in result['effects']}=={
+            'knowledge':['statement'],'interpretations':['rationale']}
+        assert e.state.knowledge[0].model_dump(mode='json')==saved['knowledge']
+        assert e.state.interpretations[-1].model_dump(mode='json')==saved['interpretation']
+        return sub,{}
+    def withdraw(state):
+        for collection in ('knowledge','interpretations'):
+            current=state[collection][-1]
+            assert current['executions']==saved['receipts'] and current['source_ids']==['code','doc']
+        assert state['knowledge'][0]['conditions']==saved['knowledge']['conditions']
+        assert state['interpretations'][-1]['counterevidence']==saved['interpretation']['counterevidence']
+        assert state['interpretations'][-1]['limitations']==saved['interpretation']['limitations']
+        sub=projected()
+        sub['rationale']='Restrict the account to the first invocation and deliberately withdraw the repeat citation'
+        sub['knowledge'][0]['statement']='The first admitted invocation returned zero'
+        sub['interpretations'][0]['rationale']='The first retained invocation returns zero; the contract permits it'
+        sub['interpretations'][0]['limitations']=['One local invocation']
+        for collection in ('knowledge','interpretations'):
+            sub[collection][0]['executions'].pop(next(reversed(saved['receipts'])))
+        return sub,{}
+    def finish(state):
+        assert state['usage']['experiments']==2 and len(state['interpretations'])==3
+        for collection in ('knowledge','interpretations'):
+            assert state[collection][-1]['executions']=={next(iter(saved['receipts'])):[1]}
+        assert all(h['executions']==saved['receipts'] for h in state['knowledge'][0]['history'])
+        assert state['interpretations'][0]==saved['interpretation']
+        assert all(p.read_bytes()==content for p,content in saved['files'].items())
+        return stop(state)
+    e,repo=engine_for(tmp_path,[combined,repeat,seed,revise,withdraw,finish])
     e.start(repo)
 
 

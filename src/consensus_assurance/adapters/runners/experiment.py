@@ -146,24 +146,25 @@ def extract_events(check):
             events.append({"event":"invalid_observation","raw":raw,"reason":str(exc),
                 "_ca_stream":stream,"_ca_observation":provenance})
 
-    for physical, line in enumerate(Path(check.stdout).read_text().splitlines(keepends=True), 1):
-        try:
-            outer = json.loads(line)
-        except (ValueError, TypeError):
-            parse_line(line.rstrip('\r\n'), location={'line':physical})
-            continue
-        if not isinstance(outer,dict) or not isinstance(outer.get('Output'),str):
-            continue
-        # Package-level output is a real, separate stream. Never guess that it
-        # belongs to a concurrently reported test stream.
-        stream = json.dumps([outer.get('Package'),outer.get('Test') if 'Test' in outer else None],
-            ensure_ascii=False,separators=(',',':'))
-        buffers[stream] = buffers.get(stream,'') + outer['Output']
-        if outer['Output']:
-            runner_times[stream] = outer.get('Time')
-        while '\n' in buffers[stream]:
-            complete,buffers[stream] = buffers[stream].split('\n',1)
-            parse_line(complete.rstrip('\r'),stream,{'line':physical,'stream':stream},outer.get('Time'))
+    with Path(check.stdout).open() as output:
+        for physical, line in enumerate(output, 1):
+            try:
+                outer = json.loads(line)
+            except (ValueError, TypeError):
+                parse_line(line.rstrip('\r\n'), location={'line':physical})
+                continue
+            if not isinstance(outer,dict) or not isinstance(outer.get('Output'),str):
+                continue
+            # Package-level output is a real, separate stream. Never guess that it
+            # belongs to a concurrently reported test stream.
+            stream = json.dumps([outer.get('Package'),outer.get('Test') if 'Test' in outer else None],
+                ensure_ascii=False,separators=(',',':'))
+            buffers[stream] = buffers.get(stream,'') + outer['Output']
+            if outer['Output']:
+                runner_times[stream] = outer.get('Time')
+            while '\n' in buffers[stream]:
+                complete,buffers[stream] = buffers[stream].split('\n',1)
+                parse_line(complete.rstrip('\r'),stream,{'line':physical,'stream':stream},outer.get('Time'))
     for stream,tail in buffers.items():
         if marker in tail:
             parse_line(tail,stream,{'line':'end-of-stream','stream':stream},runner_times.get(stream))

@@ -1,0 +1,162 @@
+{
+  "rationale": "Records the executed follow-up receipt 0b9c22ae5fb043588aa7efa3ad009b25 (experiment 40ab66a5c5c847619ae2ff68b85641e7-experiment, twelve generated tests passed) and closes the two questions it was launched for. It confirms the snapshot-call panic independent of the drift: on a healthy, never-re-synchronized NoSnapshot cluster (six indices of content, accepted 6 / decided 6, a readable six-element decided log, events 238-240) snapshot(Some(6), true) panicked with the compacted index unchanged at 0 (event 241), exactly as it did on the drifted leader (2cb2a3f1e43b4942b5bb3f42bad11091 event 129). It also reaches the below-compacted state for the first time with the snapshot-capable entry type: after the drift, the leader change and a local snapshot inside the drifted decided index (compacted 8, a snapshot holding zero ids, event 155), the re-synchronization of the replica whose reported accepted index lay below the compacted index did not panic (event 162) but the leader handed it a complete snapshot built from the empty part of the log and no suffix, so that replica then reported accepted 10 / decided 10 with a decided-log read of two entries instead of six (event 161), and the same exchange moved the leader's decided index from 9 to 10 (events 159-162). This update therefore (a) gives the new question 40ab66a5c5c847619ae2ff68b85641e7-question-1 its interpretation with the panic as the defect, (b) revises the parent drift account to include the lagging-replica loss as part of the compaction consequence and to record that the drift itself does not crash a replica while the non-snapshot compaction call does, (c) corrects the knowledge entry for the snapshot-call panic so that the independence from the drift is observed rather than pending, and adds a new knowledge entry for the below-compacted re-synchronization loss, and (d) rewrites both discriminators, since the parent's below-compacted question is now answered and only the peer-side forwarded-compaction route and the trim-side variant remain. Incomplete after this turn: whether a forwarded Compaction::Snapshot message can reach a NoSnapshot instance from a peer, whether a trim over-compaction followed by such a re-synchronization behaves the same way, and the trim child's gap b26c13954e184cd2b9fdfda975aff136-gap-4.",
+  "investigations": [
+    {
+      "id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+      "discriminator": "Only the peer-side and trim-side variants remain. The below-compacted re-synchronization is now executed for the snapshot-capable entry type: it does not panic, but the lagging replica receives a complete snapshot built from the empty part of the log and a shortened decided log (receipt 0b9c22ae5fb043588aa7efa3ad009b25 events 152-162). What could still change the judgment is whether a peer that receives the forwarded Compaction::Snapshot message of a compacting leader ends in the same loss or is repaired by its own compaction, and whether the trim path produces the same lagging-replica outcome after its over-compaction.",
+      "source_ids": [
+        "send_accsync_valid_entries",
+        "create_log_sync",
+        "create_diff_snapshot",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "memory_storage_read_helpers",
+        "trim_derives_from_min_accepted"
+      ]
+    },
+    {
+      "id": "40ab66a5c5c847619ae2ff68b85641e7-question-1",
+      "discriminator": "Whether a forwarded Compaction::Snapshot message can reach a NoSnapshot instance from a peer, so that the same panic is raised inside message handling rather than in the caller's own thread; the healthy-state item of this question was answered by receipt 0b9c22ae5fb043588aa7efa3ad009b25 (event 241), which shows the panic occurs on an undrifted cluster too.",
+      "source_ids": [
+        "no_snapshot_create_panics",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "stopsign_is_decided_predicate"
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "id": "40ab66a5c5c847619ae2ff68b85641e7-knowledge-0",
+      "kind": "behavior",
+      "statement": "SequencePaxos::snapshot never consults T::Snapshot::use_snapshots(): it passes the caller's index to InternalStorage::try_snapshot, which resolves the bound through the decided index and then, whenever that bound exceeds the current compacted index, calls create_snapshot and hence T::Snapshot::create; for T::Snapshot = NoSnapshot that call reaches the crate's own panic stub, so a public snapshot() request on a configuration that does not use snapshots aborts the caller instead of being refused or reported as a CompactionErr. The panic does not depend on the index drift or on any prior fault: it was observed both on a drifted leader (snapshot(Some(9), true) with accepted 9 and decided 9) and on a healthy cluster that had never been re-synchronized (snapshot(Some(6), true) with accepted 6 and decided 6 and a readable six-element decided log), in both cases with the compacted index left unchanged.",
+      "conditions": "Any instance whose Entry::Snapshot is NoSnapshot, with a requested index within the decided index and above the current compacted index, so that try_snapshot takes the compaction branch; observed in receipt 2cb2a3f1e43b4942b5bb3f42bad11091 event 129 (panicked true, compacted index 0) and in receipt 0b9c22ae5fb043588aa7efa3ad009b25 event 241 (panicked true, compacted index 0, the three nodes sampled at accepted 6 / decided 6 with a six-element decided read at events 238-240 and unchanged at events 242-244). The process reports omnipaxos/src/storage/mod.rs:205 with the NoSnapshot::create message in both cases. No execution has yet produced a forwarded Compaction::Snapshot message that reaches such an instance from a peer.",
+      "source_ids": [
+        "no_snapshot_create_panics",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "stopsign_is_decided_predicate",
+        "snapshot_decided_bound_doc"
+      ],
+      "executions": {
+        "2cb2a3f1e43b4942b5bb3f42bad11091": [126, 129],
+        "0b9c22ae5fb043588aa7efa3ad009b25": [238, 241, 242]
+      },
+      "changed_premise": "Removes the open question from the conditions: the panic was previously observed only on a drifted instance and the independence from the drift was argued from the source path and the snapshot-capable success. The healthy NoSnapshot control now shows the same panic on a cluster that has never been re-synchronized and whose decided log reads all six entries, so the panic follows from the entry type and the call alone.",
+      "affected_uses": []
+    },
+    {
+      "ref": "@snapshot_below_compacted_resync_loss",
+      "kind": "behavior",
+      "statement": "With the snapshot-capable entry type, a replica whose reported accepted index lies below the leader's compacted index is re-synchronized without error but receives a complete snapshot built from the entries above its resume point and no suffix: create_log_sync takes its snapshot branch, create_diff_snapshot returns a Complete snapshot with the compacted index the leader currently holds, and the receiving replica installs that snapshot, sets its compacted index to it and reports an accepted index one past it. Where the leader's log held nothing above the compacted index, the installed snapshot is empty, so the replica presented as holding the decided log in fact holds an empty snapshot, its decided-log read drops from the six decided entries to the snapshot entry plus the StopSign, and the same exchange moves the leader's decided index up to the replica's reported (drifted) accepted index.",
+      "conditions": "Snapshot-capable entry type (Snapshot::use_snapshots() true) and a leader whose compacted index exceeds a live replica's reported accepted index, reached after three re-synchronization rounds plus a leader change onto an inflated follower and a local snapshot inside the drifted decided index. Observed in receipt 0b9c22ae5fb043588aa7efa3ad009b25: before the compaction the nodes reported accepted 9 / decided 9, accepted 10 / decided 9 and accepted 9 / decided 9 with decided-log reads of 1, 0 and 2 entries (events 152-154); the snapshot completed with panicked false, compacted index 8, accepted 9, decided 9 and a snapshot holding zero ids (event 155); the re-synchronization of the replica with the lower reported index then left it at accepted 10 / decided 10 with a decided-log read of two entries (event 161) and moved the leader to decided 10 (event 159). No panic was raised (events 162, 166).",
+      "source_ids": [
+        "create_log_sync",
+        "create_diff_snapshot",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "send_accsync_valid_entries"
+      ],
+      "executions": {
+        "0b9c22ae5fb043588aa7efa3ad009b25": [152, 154, 155, 159, 161, 162]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "40ab66a5c5c847619ae2ff68b85641e7-question-1",
+      "experiment_id": null,
+      "source_ids": [
+        "no_snapshot_create_panics",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "snapshot_decided_bound_doc",
+        "stopsign_is_decided_predicate"
+      ],
+      "executions": {
+        "0b9c22ae5fb043588aa7efa3ad009b25": [238, 239, 240, 241, 242, 243, 244],
+        "2cb2a3f1e43b4942b5bb3f42bad11091": [126, 129]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "The public snapshot() path reaches a panicking constructor on the crate's own placeholder snapshot type, and it does so on any instance of that type, not only on a drifted one. SequencePaxos::snapshot forwards the caller's index to InternalStorage::try_snapshot, which resolves the bound through the decided index and then, whenever that bound exceeds the current compacted index, calls create_snapshot and hence T::Snapshot::create; nothing on the path consults T::Snapshot::use_snapshots(), and for T::Snapshot = NoSnapshot that body is panic!(\"NoSnapshot should not be created\"). The documentation for snapshot() bounds the index only by the decided index, and the Entry trait lets a configuration name NoSnapshot as its placeholder for not using snapshots, so no caller-side marker distinguishes the call as invalid. Witness on a healthy cluster: all three nodes reported accepted 6 / decided 6 with is_reconfigured true and a readable six-element decided log (receipt 0b9c22ae5fb043588aa7efa3ad009b25 events 238-240), and snapshot(Some(6), true) on the leader panicked with panicked true, the compacted index still 0 and accepted and decided still 6 (event 241), the process naming omnipaxos/src/storage/mod.rs:205 and NoSnapshot should not be created; the three nodes were still consistent afterwards (events 242-244). Witness on a drifted instance: the same call with the drifted decided bound on a leader reporting accepted 9 / decided 9 panicked in the same way (receipt 2cb2a3f1e43b4942b5bb3f42bad11091 event 129). Because both witnesses raise the panic before any storage write, the failure mode is an aborted caller with no state change and no error return; the same snapshot entry is used by the compaction-forwarding handler, so a forwarded Snapshot compaction arriving at such an instance would unwind inside message handling, which remains a source-level consequence because no execution produced such a message.",
+      "counterevidence": [
+        "The crate documents NoSnapshot as a placeholder for configurations that do not use snapshots and implements create and merge as panicking stubs, so the panic is that type's declared behaviour when invoked; the deviation is that the documented public path invokes it instead of refusing or erroring, and the caller receives no CompactionErr.",
+        "The call is a user-initiated snapshot request, so a caller that knows its entry type cannot use snapshots could avoid it; the defect is the abort rather than a silent wrong result, and no data is lost because the unwind happens before the storage write (compacted index 0 and unchanged indices in both witnesses).",
+        "The drift is not required: the healthy control shows the same panic with a consistent six-entry decided log, so this account does not depend on the parent investigation's index accounting."
+      ],
+      "limitations": [
+        "Only one entry type was used for the witnesses (the harness's Value with Snapshot = NoSnapshot); whether a derive-macro-generated Snapshot type defaults to NoSnapshot and therefore inherits the panic was not established.",
+        "No forwarded Compaction::Snapshot message was ever delivered to such an instance, because one cluster in this harness uses one entry type and the leader that would send it panics first, so the handler-side abort is argued from source.",
+        "The panic is observed through catch_unwind, which reports the abort of the call but not the state a process without the guard would be in; no restart or supervision behaviour was exercised.",
+        "Whether the crate considers snapshot() valid for non-snapshot configurations is not settled by documentation: the snapshot() doc comment bounds the index by the decided index and does not mention use_snapshots(), which is the basis for treating the abort as a defect rather than a caller error."
+      ],
+      "joint_history": "The own receipt is 0b9c22ae5fb043588aa7efa3ad009b25 from experiment 40ab66a5c5c847619ae2ff68b85641e7-experiment, whose two new cases are the healthy NoSnapshot control and the snapshot-capable over-compaction probe. The second witness, receipt 2cb2a3f1e43b4942b5bb3f42bad11091 from the parent's experiment ebbec352695d43beb398bb1b239cda41-experiment, sampled the same call on a drifted leader; it is a separate producer and is read on its own samples, and its own case was added for the parent investigation's discriminator about over-compaction. Both receipts ran the same harness file with all cases sharing one execution.",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+      "experiment_id": "40ab66a5c5c847619ae2ff68b85641e7-experiment",
+      "source_ids": [
+        "sync_log_accounting",
+        "create_log_sync",
+        "send_accsync_valid_entries",
+        "handle_promise_accept_resync",
+        "handle_preparereq",
+        "reconnected_transition",
+        "leader_decision_on_accepted",
+        "handle_majority_promises",
+        "stopsign_is_decided_predicate",
+        "is_reconfigured_endpoint",
+        "accepted_reconfiguration_guard",
+        "logentry_stopsign_contract",
+        "reconfig_user_flow",
+        "accepted_idx_public_doc",
+        "internal_read_range",
+        "internal_get_entry_type",
+        "create_read_log_entries",
+        "memory_storage_read_helpers",
+        "create_diff_snapshot",
+        "no_stopsign_decided_idx",
+        "trim_derives_from_min_accepted",
+        "get_min_all_accepted_idx",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range"
+      ],
+      "executions": {
+        "8b314551f1e049fcbf73a358f8ddf2c8": [19, 20, 21, 22, 23, 24, 9, 10, 11],
+        "9125b6a531234e7d9d2fa8cbb817df63": [19, 22, 23, 24, 35, 36, 37],
+        "6cdcff36336646859bffb9e8c3e39789": [6, 7, 8, 9, 10, 11],
+        "dda5bb4179154e3abe90e69f5267b3ea": [6, 7, 8, 9, 10, 11, 12, 13, 14],
+        "fd0b8be59c8f466fbf7768abb08f93b5": [48, 49, 50, 51, 52, 53],
+        "6c879304cdde4ddd8e1640207cdbf94d": [38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+        "ec3329dc273e452aa92bcd44652c116a": [9, 10, 11, 12, 13, 14, 15],
+        "e70b8baa087246c78ea3a64f24b8e97c": [0, 1, 2, 3, 4, 5],
+        "2993c16874454f86a3f8b04364a00ef4": [9, 10, 11, 12, 13, 14, 20, 33, 34, 35, 36, 37, 38, 39, 45, 46, 47, 48],
+        "0b9c22ae5fb043588aa7efa3ad009b25": [148, 150, 152, 153, 154, 155, 159, 161, 162]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "One index-space error in the StopSign accounting, six witnessed classes of consequence in ten receipts of one lineage, and the drift is neither bounded nor repaired inside the sealed configuration. Cause: sync_log adds the StopSign carried by a LogSync on top of sync_idx plus the suffix length while the sender's resume point may already count that StopSign, and create_log_sync never shifts sync_idx for a StopSign the sender already holds. (1) A replica that already accepted the configuration's StopSign and is given a resume point that covers it ends one index past its content: follower after reconnected() (9125b6a531234e7d9d2fa8cbb817df63 event 35), follower re-promising in an ordinary new term with no reconnected() call (6cdcff36336646859bffb9e8c3e39789 event 11), the leader that takes over from such a follower (dda5bb4179154e3abe90e69f5267b3ea event 13), and two followers under a snapshot-capable entry type (fd0b8be59c8f466fbf7768abb08f93b5 events 51, 52). Each such replica stops reporting its reconfiguration as decided and its decided-log read loses the entries (one element or nothing against six before). (2) The index drifts one step per re-synchronization round rather than settling: three consecutive reconnection rounds took the followers from 7 to 8 to 9 over unchanged content and the leader's decided index followed (6c879304cdde4ddd8e1640207cdbf94d events 41-49). (3) A write quorum of drifted reports makes the leader decide the reported index although it holds fewer entries (8b314551f1e049fcbf73a358f8ddf2c8 and 9125b6a531234e7d9d2fa8cbb817df63 event 24; snapshot-capable: fd0b8be59c8f466fbf7768abb08f93b5 event 53), after which the leader no longer reports the reconfiguration as decided and its decided log is unreadable. This decision needs two drifted reporters in a three-node cluster: with one, the leader stayed consistent (9125b6a531234e7d9d2fa8cbb817df63 event 37; 6cdcff36336646859bffb9e8c3e39789 event 9). (4) Both compaction paths inherit the drifted values and act on them: trim(None) took the minimum recorded accepted index, which had drifted above the leader's content, and compacted index 7 for a log of six indices, with the region then reported trimmed (ec3329dc273e452aa92bcd44652c116a events 9-15); snapshot(Some(8), false) was accepted inside the drifted decided index, advanced the compacted index to 8 and produced a snapshot holding none of the five decided entries the log contained, so the entries are no longer reachable and the snapshot that represents them is empty (e70b8baa087246c78ea3a64f24b8e97c events 0-5). Both calls returned success on input the documentation allows. (5) The drift neither saturates nor is repaired, and it does not crash the replicas (2993c16874454f86a3f8b04364a00ef4). From the healthy baseline of accepted 6 / decided 6 with a readable six-element decided log on all three nodes (events 9-11), eight further rounds of the same two-follower re-synchronization took both followers to accepted 14 / decided 14, one index per round with no saturation (events 12, 13, 18, 19, 33, 34), while the leader's own accepted index stayed 6 and its decided index followed to 14 with its decided-log read returning nothing in every round, from the first round on (events 14, 20, 35). A leader change was then performed onto node 1, one of the inflated followers: it took the lead in a new term and still reported accepted 14 and decided 14 instead of re-deriving its six indices of content (event 36), node 2 reported accepted 15 against decided 14 and node 3 -- the previously truthful leader, which held six indices -- was itself re-synchronized to accepted 7 (events 37, 38), so the drift spread to the replica that had stayed honest rather than being repaired. The three following rounds left the new leader at accepted 14 / decided 14 and took node 2 to accepted 16, 17, 18 and node 3 to accepted 8, 9, 10 while the decided index stayed at 14 (events 39-47): once no write quorum of recorded accepted indexes covers the further reports the decided index stops following, so the later drift appears as accepted indexes that never reach a decision, and the leader's decided index remains thirteen indices above the content it holds and its decided-log read remains unusable (node 2 read an empty decided log at events 45, 46, 47). No guarded drain, sample or leader change panicked over the eleven rounds (event 48: rounds 11, panics 0, 154 messages delivered). Comparisons 0-4 of that receipt are violated with witnesses 33, 34, 35 and 36 (the fifth additionally records nodes 2 and 3 as outside its applicability); comparisons 5-7 came out unknown because their declared admissions put a node condition on the prerequisite and a node-less identity on the panic event, so those states are asserted from the sampled events named above rather than from comparison outcomes. (6) With the snapshot-capable entry type the compaction consequence reaches a lagging replica as an installed but empty snapshot (0b9c22ae5fb043588aa7efa3ad009b25). After three re-synchronization rounds the nodes reported accepted 9 / decided 9, accepted 10 / decided 9 and accepted 6 / decided 9, with decided-log reads of 1, 0 and nothing (events 148-150); the leader change onto node 1 left the decided index at 9 (events 152-154), the local snapshot inside that drifted decided index completed with compacted index 8 and a snapshot holding zero ids (event 155), and the re-synchronization of the replica whose reported accepted index lay below the compacted index raised no panic (event 162) but installed that complete snapshot and no suffix, leaving the replica at accepted 10 / decided 10 with a decided-log read of two entries where the configuration decided six, while the same exchange moved the leader's decided index from 9 to 10 (events 159-161). Reading only that case's own samples: the drift-driven compaction turned into a silent property loss on a replica rather than into an error or a crash. Controls: the pre-change samples and the no-reconnect control kept six indices of content, a six-element decided log, the StopSign at its own index and the reconfiguration reported as decided (8b314551f1e049fcbf73a358f8ddf2c8 events 9-11, 19-21; 6c879304cdde4ddd8e1640207cdbf94d events 38-40; fd0b8be59c8f466fbf7768abb08f93b5 events 48-50; 2993c16874454f86a3f8b04364a00ef4 events 9-11; 0b9c22ae5fb043588aa7efa3ad009b25 events 238-240).",
+      "counterevidence": [
+        "The no-reconnect control kept every endpoint consistent (accepted 6, decided 6, is_reconfigured true, six-element decided read: 8b314551f1e049fcbf73a358f8ddf2c8 events 9-11; 2993c16874454f86a3f8b04364a00ef4 events 9-11; 0b9c22ae5fb043588aa7efa3ad009b25 events 238-240), and in the newterm case the new leader and the node that received nothing stayed consistent (6cdcff36336646859bffb9e8c3e39789 events 9, 10), so the deviation follows a re-synchronization whose resume point covers the StopSign.",
+        "The leader-side decision at a drifted index requires a write quorum of drifted reporters in one term (two of three nodes); one drifted reporter left the leader consistent (9125b6a531234e7d9d2fa8cbb817df63 event 37; 6cdcff36336646859bffb9e8c3e39789 event 9), and in the drift-bound receipt the decided index stopped advancing once the reports outran every write quorum (2993c16874454f86a3f8b04364a00ef4 events 46, 47 against decided 14).",
+        "The compaction consequences need the drift to cover every node the bound is derived from: trim's bound is the minimum recorded value, so a truthful replica would keep it honest (76cabb0efc3b4eda8eda8c9c79025550-interpretation-0), and the snapshot witness used a request strictly inside the drifted decided index because the StopSign equal case lowers the bound.",
+        "The documented reconfiguration flow expects a new instance once a node observes StopSign(ss, true), narrowing the window in which a user reads the old instance; the drift still hides that observation from the leader and, once compaction acts, removes the entries themselves.",
+        "The drift cannot be turned into new client values through the append path: append() refuses with PendingReconfigEntry while a StopSign is stored, which is the case throughout every observed drifted state, so the consequence set stays with index accounting, readability and compaction rather than with mis-assigned entries.",
+        "The lagging-replica loss of class (6) requires a snapshot-capable entry type whose snapshot can be built from an empty range; the non-snapshot variant of the same probe could not be executed at all, because snapshot() panics on that type for reasons independent of the drift (recorded under 40ab66a5c5c847619ae2ff68b85641e7-question-1)."
+      ],
+      "limitations": [
+        "The drift was exercised for eleven rounds with one mid-run leader change; that range found no bound and no repair, but the decided index stopped following once the reports outran every write quorum, so how far the decided index can keep following is a quorum property that was observed with one three-node pattern rather than characterised in general.",
+        "Loss-triggered and timer-triggered re-synchronization were not exercised; the producers observed are explicit reconnected() calls and an ordinary leader change onto a node that had already drifted.",
+        "Only three-node clusters were used, with in-memory storage, no persistence across restarts and one snapshot-capable entry type; the compaction witnesses depend on that entry type's snapshot semantics, and the entry type that cannot carry a snapshot aborts the compaction call instead of losing entries.",
+        "Several comparisons across the repeated-rounds, trim, snapshot, drift-bound and over-compaction receipts came out unknown because their admissions shared event names across cases in one execution or put a node condition on the prerequisite; those states are asserted from the sampled operands, with the violated comparisons cited above.",
+        "The cases sample after each drained round, so they do not show intermediate states inside a round, and no case exercises the forwarded compaction messages that a snapshot or trim call would send to peers.",
+        "The lagging-replica loss was observed once, with the leader's log empty above the compacted index, so whether a non-empty remainder would be handed over instead of an empty snapshot is not established; the receipt's own snapshot held zero ids.",
+        "The consequence set stays within index accounting, readability and compaction; the sealed configuration admits no further entries and refuses appends while the StopSign is stored, so no value is mis-assigned."
+      ],
+      "joint_history": "Ten receipts of one harness lineage, each read on its own samples and never combined arithmetically: 8b314551f1e049fcbf73a358f8ddf2c8 (resync, control), 9125b6a531234e7d9d2fa8cbb817df63 (single resync, read of index 6), 6cdcff36336646859bffb9e8c3e39789 (newterm), dda5bb4179154e3abe90e69f5267b3ea (staleleader), fd0b8be59c8f466fbf7768abb08f93b5 (snapshot-capable resync), 6c879304cdde4ddd8e1640207cdbf94d (three reconnection rounds), ec3329dc273e452aa92bcd44652c116a (drift then trim), e70b8baa087246c78ea3a64f24b8e97c (drift then snapshot), 2993c16874454f86a3f8b04364a00ef4 (drift-bound probe) and 0b9c22ae5fb043588aa7efa3ad009b25 (snapshot-capable over-compaction and the healthy NoSnapshot control). Each successor reproduces the earlier witnesses and adds cases; the two newest receipts come from the parent's own experiment 40ab66a5c5c847619ae2ff68b85641e7-experiment, which also carries the healthy control whose panic is recorded under 40ab66a5c5c847619ae2ff68b85641e7-question-1.",
+      "failure_attribution": null
+    }
+  ]
+}

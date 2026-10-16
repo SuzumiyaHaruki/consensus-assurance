@@ -1,5 +1,6 @@
 """Fixed inputs and finite observations; interpretations never rewrite executions."""
 from pathlib import Path
+import json
 import time
 from consensus_assurance.core.types import FixedExperiment, FailureAttribution
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin, now
@@ -137,13 +138,60 @@ def execute(engine, fixed, operation_id):
 
     check = CheckRun.model_validate(engine.action('experiment_execute', 'experiments', perform,
                                                  {'experiment_id': fixed.id, 'operation_id':operation_id}))
+    engine.phase = 'experiment_execute:save_observations'
+    inputs = measurement_inputs(fixed, check, engine.root)
+    measurement = observed(fixed, check, engine.root)
+    if inputs != measurement_inputs(fixed, check, engine.root):
+        inputs = None
+    write_json(engine.root / 'logs' / check.id / 'observations.json', {**measurement, '_inputs':inputs})
     engine.record(check)
     return check
 
 
+def measurement_inputs(fixed, check, root):
+    """Cheap identity of finalized, controller-owned bytes; current judgments are excluded."""
+    from .audit import draft_file
+    from .engine import FRAMEWORK_REVISION
+    path = root / 'logs' / check.id / 'stdout.log'
+    if not path.exists() and not path.is_symlink():
+        return None
+    info = draft_file(root, f'logs/{check.id}/stdout.log').stat()
+    if (not check.ended_at or check.status in {ExecutionStatus.RUNNING, ExecutionStatus.NOT_SCHEDULED}
+            or check.action != 'experiment' or check.experiment_id != fixed.id
+            or check.snapshot_id != fixed.snapshot_id):
+        return None
+    return {'method':FRAMEWORK_REVISION, 'experiment':[fixed.id, fixed.version, fixed.snapshot_id],
+            'receipt':[check.id, check.ended_at, check.status.value],
+            'stdout':[info.st_size, info.st_mtime_ns, info.st_ctime_ns]}
+
+
 def observed(fixed, check, root=None):
     if root is not None:
+        from .audit import draft_bytes
         check = check.model_copy(update={'stdout': str(root / 'logs' / check.id / 'stdout.log')})
+        inputs = measurement_inputs(fixed, check, root)
+        if inputs is not None:
+            try:
+                saved = json.loads(draft_bytes(root, f'logs/{check.id}/observations.json'))
+                if saved.pop('_inputs', None) == inputs:
+                    comparison_fields = {'comparison_index':int, 'outcome':str, 'witness_complete':bool,
+                        'comparison_complete':bool, 'correlations':dict, 'reason':str,
+                        **dict.fromkeys(('witness_indices', 'valid_witness_indices', 'missing_indices',
+                            'evaluated_indices', 'outside_applicability_indices', 'diagnostics', 'limitations'), list)}
+                    if (set(saved) == {'events', 'prerequisites', 'comparisons', 'parsing_errors'}
+                            and all(isinstance(saved[k], list) and all(isinstance(v, dict) for v in saved[k])
+                                    for k in ('events', 'comparisons', 'parsing_errors'))
+                            and all(isinstance(e.get('event'), str) for e in saved['events'])
+                            and len(saved['comparisons']) == len(fixed.basis.comparisons)
+                            and all(isinstance(r.get(k), kind) for r in saved['comparisons']
+                                    for k, kind in comparison_fields.items())
+                            and (saved['prerequisites'] is None if fixed.basis.comparisons else
+                                 isinstance(saved['prerequisites'], dict) and
+                                 all(isinstance(saved['prerequisites'].get(k), kind) for k, kind in
+                                     {'status':str, 'reason':str, 'matched_indices':list, 'alias_indices':dict}.items()))):
+                        return saved
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass  # Read-only consumers reconstruct missing or incompatible derived data.
     events = extract_events(check)
     return {'events': events,
             'prerequisites': None if fixed.basis.comparisons else match_prerequisites(events, fixed.basis.harness.prerequisites),

@@ -1,0 +1,222 @@
+{
+  "rationale": "Records and interprets the executed over-compaction probe (experiment ebbec352695d43beb398bb1b239cda41-experiment, receipt 2cb2a3f1e43b4942b5bb3f42bad11091, all ten generated tests passed) and launches the two follow-ups it makes necessary. The probe reproduced the drift and the leader change as intended (OVER_BASE accepted 6 / decided 6 on all three nodes at events 113-115; three rounds took the followers to accepted 9 at events 122, 123; the change left node 1 leading at accepted 9 / decided 9, node 2 at accepted 10 and node 3 at accepted 7, events 126-128). The intended compaction then failed for a reason unrelated to the drift: snapshot(Some(9), true) on the new leader panicked inside NoSnapshot::create at storage/mod.rs:205, so the compacted index stayed 0 (event 129, panicked true) and the two guarded re-synchronizations that followed completed without a panic (events 133, 137) precisely because nothing had been compacted. The panic is the crate's own placeholder implementation: SequencePaxos::snapshot passes the index to try_snapshot, which calls create_snapshot and hence T::Snapshot::create without ever consulting T::Snapshot::use_snapshots(), so on the default NoSnapshot entry type a public, documentation-legal snapshot call aborts the caller instead of returning a CompactionErr. This update therefore (a) creates a child investigation for that panic with its own interpretation and defect claim, (b) rewrites the parent discriminator to record that its first attempt was blocked before compacting and that the snapshot-capable variant is the remaining route, and (c) requests one successor experiment carrying two new cases: a healthy-state control that calls snapshot() on an undrifted NoSnapshot cluster (to establish that the panic does not depend on the drift) and the same over-compaction probe over the snapshot-capable entry type, where the snapshot path works, so the below-compacted re-synchronization becomes observable. No existing account is rewritten: the parent drift account and its five consequence classes stand, and the trim and snapshot child accounts are untouched. Still open after this turn: the below-compacted route itself (now requested), the trim child's gap b26c13954e184cd2b9fdfda975aff136-gap-4 and the new gap answers raised by the narrowed drift knowledge.",
+  "sources": [
+    {
+      "id": "no_snapshot_create_panics",
+      "file": "omnipaxos/src/storage/mod.rs",
+      "start_line": 198,
+      "end_line": 213,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+      "discriminator": "Whether the snapshot-capable over-compaction probe reaches the below-compacted state and what the re-synchronization of the lagging replica does there: a panic, a silently empty suffix, or a snapshot-installed re-sync. The first attempt with the default entry type could not reach it at all, because snapshot(Some(9), true) panicked inside NoSnapshot::create before the compacted index moved (receipt 2cb2a3f1e43b4942b5bb3f42bad11091 event 129), and the drift drift-bound question itself is already answered. The decisive observation is the state of the lagging replica after the re-synchronization against a control replica whose reported index is at or above the compacted index.",
+      "source_ids": [
+        "send_accsync_valid_entries",
+        "create_log_sync",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "create_diff_snapshot",
+        "memory_storage_read_helpers",
+        "no_snapshot_create_panics"
+      ]
+    },
+    {
+      "ref": "@nosnapshot_snapshot_panic",
+      "question": "Does a public snapshot() call on an OmniPaxos instance whose Entry::Snapshot is NoSnapshot refuse the request or return an error, or does it reach NoSnapshot::create and panic? The crate ships NoSnapshot as the placeholder for configurations that do not use snapshots and implements its create and merge as panicking stubs, while SequencePaxos::snapshot passes the requested index to try_snapshot, which creates the snapshot without consulting Snapshot::use_snapshots(); the documented contract for snapshot() bounds the index only by the decided index.",
+      "hypothesis": "It panics: with NoSnapshot, try_snapshot's create_snapshot call reaches NoSnapshot::create, whose body is panic!(\"NoSnapshot should not be created\"), so a call that the documentation allows aborts the caller instead of being refused or reported as a CompactionErr.",
+      "source_ids": [
+        "no_snapshot_create_panics",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "snapshot_decided_bound_doc",
+        "stopsign_is_decided_predicate"
+      ],
+      "discriminator": "Whether the same call also panics in a healthy, never-drifted cluster with the same entry type, and whether a forwarded Compaction::Snapshot message can reach a NoSnapshot instance from a peer (its handle_compaction path calls the same snapshot entry) so that a panic can be raised inside message handling rather than only in the caller's own thread.",
+      "parent_id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@nosnapshot_snapshot_creation_panics",
+      "kind": "behavior",
+      "statement": "SequencePaxos::snapshot never consults T::Snapshot::use_snapshots(): it passes the caller's index to InternalStorage::try_snapshot, which resolves the bound through the decided index and then, whenever that bound exceeds the current compacted index, calls create_snapshot and hence T::Snapshot::create; for T::Snapshot = NoSnapshot that call reaches the crate's own panic stub, so a public snapshot() request on a configuration that does not use snapshots aborts the caller instead of being refused or reported as a CompactionErr.",
+      "conditions": "Any instance whose Entry::Snapshot is NoSnapshot, with a requested index that is within the decided index and above the current compacted index, so that try_snapshot takes the compaction branch; observed in receipt 2cb2a3f1e43b4942b5bb3f42bad11091, where snapshot(Some(9), true) on a node reporting accepted 9 and decided 9 panicked (event 129: panicked true, compacted index unchanged at 0), with the process reporting omnipaxos/src/storage/mod.rs:205 and the NoSnapshot::create message. The same path is taken for any index above the compacted index, so the drifted decided index in that receipt supplied the index rather than the cause; whether the panic also occurs on a healthy instance is the control requested in experiment ebbec352695d43beb398bb1b239cda41-experiment's successor.",
+      "source_ids": [
+        "no_snapshot_create_panics",
+        "try_snapshot_decided_bound",
+        "create_snapshot_range",
+        "stopsign_is_decided_predicate",
+        "snapshot_decided_bound_doc"
+      ],
+      "executions": {
+        "2cb2a3f1e43b4942b5bb3f42bad11091": [126, 129, 133, 137]
+      }
+    }
+  ],
+  "experiment": {
+    "investigation_id": "27bf7fc0875c4342966bd3dc15df80ec-question-0",
+    "previous_id": "ebbec352695d43beb398bb1b239cda41-experiment",
+    "revision_reason": "Adds two cases: stopsign_snapshot_on_nosnapshot_control, which calls snapshot() on a healthy, never-drifted NoSnapshot cluster to separate the snapshot-call panic from the drift, and stopsign_overcompaction_then_resync_snap, which repeats the over-compaction probe over the snapshot-capable entry type so that the below-compacted re-synchronization is actually reached. Every drain and sample is panic-guarded; previously generated cases are unchanged.",
+    "harness_path": "omnipaxos/tests/assurance_generated.rs",
+    "execution_package": "./omnipaxos",
+    "files": {},
+    "test_names": null,
+    "source_ids": [
+      "no_snapshot_create_panics",
+      "try_snapshot_decided_bound",
+      "create_snapshot_range",
+      "create_diff_snapshot",
+      "snapshot_decided_bound_doc",
+      "send_accsync_valid_entries",
+      "create_log_sync",
+      "memory_storage_read_helpers"
+    ],
+    "scope": {
+      "description": "Twelve cases in one execution over three real OmniPaxos instances in one process with MemoryStorage and a deterministic FIFO in-process network; two new cases are added, one that calls the public snapshot() path on a healthy NoSnapshot cluster and one that drives the same drift and leader change as the previous over-compaction probe over the snapshot-capable entry type, compacts the new leader inside its drifted decided index and then re-synchronizes the replica whose reported accepted index is below the resulting compacted index, with a replica at or above it as control.",
+      "assumptions": [
+        "Entry type Value has Snapshot = NoSnapshot for the healthy control; the snapshot-capable case uses SnapEntry with SnapState (use_snapshots() true, snapshot records the ids of its input entries), the same type the snapshot child investigation already exercised.",
+        "The healthy control calls snapshot(Some(decided_idx), true) on the leader of a cluster that has decided five entries plus its StopSign and has never been re-synchronized.",
+        "For the snapshot-capable case, three rounds of node1.reconnected(3) plus node2.reconnected(3) reproduce the drift, node1.try_become_leader() makes node 1 the leader, and the snapshot is requested with the leader's own decided index as the bound and local_only = true.",
+        "reconnected(pid) is always called with the current leader; every drain and every sample runs inside catch_unwind, so a panic inside a handler or a storage call becomes an event field instead of aborting the run."
+      ],
+      "excluded": [
+        "No forwarded compaction message is produced, because the snapshot is requested with local_only = true and both cases use one entry type per cluster.",
+        "No load, timer, message loss, restart or persistence is exercised.",
+        "No crate or package test suite is executed; only the generated test file."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "entries_before_stopsign": 5,
+        "content_indices_including_stopsign": 6,
+        "rounds_before_leader_change": 3,
+        "compaction_bound": "the leader's own decided index at the time of the call"
+      }
+    },
+    "prefix": "Two new cases. The healthy control uses the lineage prefix (node 3 leads, five entries decided, StopSign decided) with the default NoSnapshot entry type, samples all three nodes as SNAPCONTROL_BASE, reads the leader's decided index, calls node3.snapshot(Some(decided), true) inside catch_unwind, emits SNAPCONTROL_SNAP with the decided bound, the panicked flag, the compacted, accepted and decided indexes, then samples SNAPCONTROL_AFTER and emits SNAPCONTROL_RUN_END. The snapshot-capable case builds the same prefix out of SnapEntry values, emits SNAPROBE_LEADER_ELECTED, SNAPROBE_ENTRIES_DECIDED and SNAPROBE_STOPSIGN_DECIDED, performs three rounds of node1.reconnected(3) plus node2.reconnected(3) and samples SNAPROBE_DRIFTED, elects node 1 with try_become_leader() and samples SNAPROBE_AFTER_CHANGE, calls node1.snapshot(Some(decided), true) and emits SNAPROBE_SNAP with the panicked flag, the compacted, accepted and decided indexes and the number of ids in the snapshot reachable at index 0, samples SNAPROBE_AFTER_SNAP, then re-synchronizes node 3 (the replica whose reported accepted index is below the compacted index) and emits SNAPROBE_LAG_RESULT with the panicked flag after sampling SNAPROBE_RESYNC_3_N{pid}, repeats the same for node 2 as the control and emits SNAPROBE_AHEAD_RESULT, and finally emits SNAPROBE_RUN_END.",
+    "semantic_changes": [
+      "Adds the cases stopsign_snapshot_on_nosnapshot_control and stopsign_overcompaction_then_resync_snap together with the snap_resync_guarded helper; every previously generated case is unchanged apart from sharing one execution.",
+      "No production code was modified."
+    ],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "snapcontrol_baseline",
+        "event": "SNAPCONTROL_BASE",
+        "conditions": []
+      },
+      {
+        "alias": "snapprobe_change",
+        "event": "SNAPROBE_AFTER_CHANGE",
+        "conditions": []
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "SNAPCONTROL_SNAP",
+        "identity_fields": ["node"],
+        "admission_alias": "snapcontrol_baseline",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 3
+          }
+        ],
+        "description": "A public snapshot() call on a healthy cluster whose entry type uses NoSnapshot completes without panicking, so any panic seen in a drifted state is not a property of the drift."
+      },
+      {
+        "event": "SNAPROBE_SNAP",
+        "identity_fields": ["node"],
+        "admission_alias": "snapprobe_change",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "With the snapshot-capable entry type the same compaction call inside the drifted decided index completes without panicking, so the below-compacted state is reached."
+      },
+      {
+        "event": "SNAPROBE_LAG_RESULT",
+        "identity_fields": ["node"],
+        "admission_alias": "snapprobe_change",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 3
+          }
+        ],
+        "description": "The re-synchronization of the replica whose reported accepted index lies below the compacted index is handled without a panic."
+      },
+      {
+        "event": "SNAPROBE_RESYNC_3_N3",
+        "identity_fields": ["node"],
+        "admission_alias": "snapprobe_change",
+        "assertion": {
+          "field": "suffix_entries",
+          "op": "eq",
+          "value": 6,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 3
+          }
+        ],
+        "description": "After re-synchronizing below the compacted index the replica still exposes the six decided entries of the configuration rather than a shortened or snapshotted decided log."
+      },
+      {
+        "event": "SNAPROBE_AHEAD_RESULT",
+        "identity_fields": ["node"],
+        "admission_alias": "snapprobe_change",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 2
+          }
+        ],
+        "description": "Control: the replica whose reported accepted index is at or above the compacted index re-synchronizes without a panic, so any deviation in the other stage is attributable to the below-compacted prefix request."
+      }
+    ],
+    "knowledge": []
+  }
+}

@@ -9,6 +9,93 @@ from consensus_assurance.workflow.experiments import assessment, observed, valid
 from consensus_assurance.workflow.knowledge import target_receipts
 
 
+@pytest.mark.parametrize('collection', ['knowledge', 'interpretations'])
+def test_receipt_identity_precheck_precedes_measurement_and_repairs_atomically(tmp_path, monkeypatch, collection):
+    from copy import deepcopy
+    from consensus_assurance.workflow.audit import validate_submission
+    retained = {}
+
+    def product(state):
+        sub, _ = opinion(state)
+        sub['knowledge'] = [dict(kind='fact', statement='The selected call returned zero.',
+            conditions='The recorded admitted operation', source_ids=['code'],
+            executions=deepcopy(sub['interpretations'][0]['executions']))]
+        return sub
+
+    def preflight(sub, state=None, *, cheap=False):
+        (engine.root / 'draft' / 'references.json').write_text(json.dumps(sub))
+        state = state if state is not None else engine.state
+        before = state.model_dump(mode='json')
+        with monkeypatch.context() as patch:
+            if cheap:
+                patch.setattr('consensus_assurance.workflow.experiments.observed',
+                              lambda *a, **kw: pytest.fail('Identity errors must precede all measurement reads'))
+            result = validate_submission(state, engine.root, 'references.json', engine.implementation)
+        assert state.model_dump(mode='json') == before
+        return result
+
+    def reject(state):
+        sub = product(state)
+        check_id = next(iter(sub['knowledge'][0]['executions']))
+        retained['receipt'] = check_id
+        retained['evidence'] = {p: p.read_bytes() for folder in ('fixed-experiments', f'logs/{check_id}')
+            for p in (engine.root / folder).rglob('*') if p.is_file()}
+        # The first item in both collections is valid; an error at the end must still be cheap.
+        sub[collection].append(deepcopy(sub[collection][0]))
+        cases = [(check_id[:-1], 'not_found'),
+            (next(c['id'] for c in state['checks'] if c['action'] == 'agent_turn'), 'CheckRun'),
+            (state['interpretations'][0]['id'], 'Interpretation'),
+            (state['experiments'][0]['id'], 'FixedExperiment')]
+        for id, kind in cases:
+            sub[collection][-1]['executions'] = {id: [1]}
+            diagnostic, = preflight(sub, cheap=True)['diagnostics']
+            assert diagnostic['code'] == 'execution_reference' and diagnostic['category'] == 'association'
+            assert diagnostic['paths'] == [f'/{collection}/1/executions/{id}']
+            assert diagnostic['object_ids'] == [id] and diagnostic['details']['actual_kind'] == kind
+            assert diagnostic['details']['execution_index'] == {'path': 'state.json', 'collection': 'checks'}
+            assert 'observations' not in diagnostic['details']
+        changed = engine.state.model_copy(deep=True)
+        next(c for c in changed.checks if c.id == check_id).snapshot_id = 'another-snapshot'
+        diagnostic, = preflight(product(state), changed, cheap=True)['diagnostics']
+        assert 'different source snapshot' in diagnostic['message']
+        assert diagnostic['details']['snapshot_id'] == 'another-snapshot'
+        assert diagnostic['details']['expected_snapshot_id'] == state['snapshot']['id']
+        alias = product(state)
+        alias['investigations'] = [dict(ref='@related', question='Can this observation inform a related question?',
+                                        source_ids=['code'])]
+        alias['interpretations'].append({**alias['interpretations'][0], 'investigation_id': '@related',
+                                        'experiment_id': None, 'conclusion': 'explained'})
+        diagnostic, = preflight(alias, cheap=True)['diagnostics']
+        assert diagnostic['paths'] == [f'/interpretations/1/executions/{check_id}']
+        assert 'joint-history' in diagnostic['message']
+        alias['interpretations'][1]['joint_history'] = 'Reuse the same recorded local operation, not a new execution.'
+        assert preflight(alias)['valid']
+        alias['interpretations'][1]['experiment_id'] = state['experiments'][0]['id']
+        diagnostic, = preflight(alias, cheap=True)['diagnostics']
+        assert 'its investigation and fixed experiment' in diagnostic['message']
+        sub[collection][-1]['executions'] = {check_id[:-1]: [1]}
+        retained['diagnostic'], = preflight(sub, cheap=True)['diagnostics']
+        retained['repair'] = deepcopy(sub)
+        retained['repair'][collection][-1]['executions'] = {check_id: [1]}
+        assert preflight(retained['repair'])['valid']
+        return sub, {}
+
+    def repair(state):
+        assert state['current_submission']['rejected']['diagnostics'] == [retained['diagnostic']]
+        assert not state['knowledge'] and len(state['interpretations']) == 1
+        return retained['repair'], {}
+
+    def finish(state):
+        assert state['knowledge'][0]['executions'] == state['interpretations'][-1]['executions'] == {
+            retained['receipt']: [1]}
+        assert state['usage']['experiments'] == 1
+        assert all(p.read_bytes() == data for p, data in retained['evidence'].items())
+        return stop(state)
+
+    engine, repo = engine_for(tmp_path, [combined, opinion, reject, repair, finish])
+    engine.start(repo)
+
+
 @pytest.mark.parametrize('collection',['knowledge','interpretations'])
 def test_event_reference_diagnostic_locates_array_and_reuses_receipt(tmp_path,collection):
     from consensus_assurance.workflow.audit import validate_submission
@@ -719,10 +806,10 @@ def test_repeat_rejection_preserves_existing_evidence(tmp_path,case):
     assert state.usage['experiments']==1
 
 
-@pytest.mark.parametrize('raw_receipt', [False, True])
+@pytest.mark.parametrize('boundary', ['raw_receipt', 'action_result', 'observations'])
 @pytest.mark.parametrize('repeat', [False, True])
 @pytest.mark.parametrize('expired', [False, True])
-def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt, repeat, expired):
+def test_completed_action_recovery_never_reexecutes_target(tmp_path, monkeypatch, boundary, repeat, expired):
     steps=[combined,*([repeat_existing] if repeat else []),opinion,stop]
     engine, repo = engine_for(tmp_path, steps)
     expected=2 if repeat else 1
@@ -733,7 +820,7 @@ def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt
     def checkpoint(event):
         nonlocal interrupted
         original(event)
-        if (not raw_receipt and event == 'action_result_saved' and
+        if (boundary == 'action_result' and event == 'action_result_saved' and
                 engine.state.pending_action.kind == 'experiment_execute' and
                 engine.state.usage['experiments']==expected and not interrupted):
             interrupted = True
@@ -745,18 +832,28 @@ def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt
     def interrupted_run(*args, **kwargs):
         nonlocal interrupted
         receipt = run(*args, **kwargs)
-        if raw_receipt and receipt.action == 'experiment' and engine.state.usage['experiments']==expected and not interrupted:
+        if boundary == 'raw_receipt' and receipt.action == 'experiment' and engine.state.usage['experiments']==expected and not interrupted:
             interrupted = True
             raise KeyboardInterrupt('Raw process receipt durable, action result missing')
         return receipt
 
     engine.runner.run = interrupted_run
+    record = engine.record
+    def interrupted_record(check):
+        nonlocal interrupted
+        if (boundary == 'observations' and check.action == 'experiment' and
+                engine.state.usage['experiments'] == expected and not interrupted):
+            assert (engine.root/'logs'/check.id/'observations.json').is_file()
+            interrupted = True
+            raise KeyboardInterrupt('Measurement saved before the first execution checkpoint')
+        record(check)
+    engine.record = interrupted_record
     with pytest.raises(KeyboardInterrupt):
         engine.start(repo)
     assert engine.state.current_submission['phase'] == 'accepted'
     action_id=engine.state.pending_action.id
     result_path = engine.root / 'actions' / action_id / 'result.json'
-    if raw_receipt:
+    if boundary == 'raw_receipt':
         assert not result_path.exists()
         receipt_id = next(value['id'] for p in (engine.root / 'logs').glob('*/check.json')
                           if (value:=json.loads(p.read_text())).get('pending_action_id')==action_id and value['action']=='experiment')
@@ -766,6 +863,9 @@ def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt
     old_receipts={id:(engine.root/'logs'/id/'check.json').read_bytes() for id in old_ids}
     assert len(old_ids)==int(repeat) and receipt_id not in old_ids
     engine.checkpoint = original
+    if boundary == 'observations':
+        monkeypatch.setattr('consensus_assurance.workflow.experiments.extract_events',
+                            lambda check: pytest.fail('Recovery must reuse the saved measurement'))
     if expired:
         engine.state.elapsed_seconds=engine.config.budget.total_seconds
         engine.store.save(engine.state,'test_deadline_elapsed')

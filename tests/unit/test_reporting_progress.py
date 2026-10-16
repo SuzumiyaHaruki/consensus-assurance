@@ -9,6 +9,130 @@ from consensus_assurance.workflow.experiments import assessment
 from consensus_assurance.reporting.report import render_report
 
 
+def test_measurement_reused_across_current_views_and_readonly_validation(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from consensus_assurance.workflow import experiments
+    from consensus_assurance.workflow.knowledge import target_receipts
+    from consensus_assurance.workflow.research import current_view
+    parsed, retained = [], {}
+    extract = experiments.extract_events
+    def counted(check):
+        parsed.append(check.id)
+        return extract(check)
+    monkeypatch.setattr(experiments, 'extract_events', counted)
+    def start(state):
+        value, files = combined(state)
+        value['gaps'] = [dict(investigation_id='@q', question='Which caller duty applies?')]
+        return value, files
+    def revise(state):
+        fixed = e.state.experiments[0]
+        check = next(c for c in e.state.checks if c.experiment_id)
+        retained['before'] = assessment(e.state, e.root, fixed, check)
+        retained['bytes'] = (e.root/'logs'/check.id/'observations.json').read_bytes()
+        return opinion(state, experiment_id=None, executions={}, conclusion='conditional', defect_claim='unresolved',
+            rationale='Source research narrows the duty; withdraw the earlier execution-based claim.',
+            answers={state['investigations'][0]['gaps'][0]['id']:
+                dict(resolved=True, explanation='The defining source supplies the caller duty.')})
+    e, repo = engine_for(tmp_path, [start, opinion, revise, stop])
+    state = e.start(repo)
+    fixed = state.experiments[0]
+    check = next(c for c in state.checks if c.experiment_id)
+    after = assessment(state, e.root, fixed, check)
+    assert retained['before']['gap_ids'] and not after['gap_ids']
+    assert retained['before']['interpretation_citations']['current'] and not after['interpretation_citations']['current']
+    assert after['comparisons'] == retained['before']['comparisons']
+    e.checkpoint('test_reuse')
+    current_view(state, e.root)
+    render_report(state, e.root)
+    target_receipts(state, e.root, {check.id:[1]})
+    sub, _ = opinion(state.model_dump(mode='json'))
+    (e.root/'draft'/'reuse.json').write_text(json.dumps(sub))
+    code = '''import json, sys
+from pathlib import Path
+from consensus_assurance.workflow import experiments
+from consensus_assurance.workflow.audit import validate_submission
+from consensus_assurance.workflow.history import load_analysis
+from consensus_assurance.adapters.runners.python import PythonBackend
+def unexpected(check):
+    raise AssertionError('Independent validation reparsed finalized stdout')
+experiments.extract_events = unexpected
+root = Path(sys.argv[1])
+print(json.dumps(validate_submission(load_analysis(root/'state.json'), root, 'reuse.json', PythonBackend())))
+'''
+    result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(e.root)],
+                            capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout)['valid']
+    assert parsed == [check.id] and state.usage['experiments'] == 1
+    assert (e.root/'logs'/check.id/'observations.json').read_bytes() == retained['bytes']
+
+
+@pytest.mark.parametrize('change', ['missing_cache', 'invalid_json', 'invalid_shape', 'invalid_comparison', 'method',
+    'fixed_version', 'raw_replaced', 'raw_missing', 'unfinished', 'timeout', 'cache_symlink', 'raw_symlink'])
+def test_measurement_fallback_never_writes_or_reuses_stale_observations(tmp_path, monkeypatch, change):
+    import os
+    from consensus_assurance.workflow import experiments
+    e, repo = engine_for(tmp_path, [combined, stop])
+    state = e.start(repo)
+    fixed = state.experiments[0]
+    check = next(c for c in state.checks if c.experiment_id)
+    raw = e.root/'logs'/check.id/'stdout.log'
+    cache = raw.with_name('observations.json')
+    if change == 'missing_cache':
+        cache.unlink()
+    elif change == 'invalid_json':
+        cache.write_text('{')
+    elif change in {'invalid_shape', 'invalid_comparison', 'method'}:
+        value = json.loads(cache.read_text())
+        if change == 'invalid_shape':
+            value['events'] = None
+        elif change == 'invalid_comparison':
+            value['comparisons'] = [{}]
+        else:
+            value['_inputs']['method'] = 'different-parser'
+        cache.write_text(json.dumps(value))
+    elif change == 'fixed_version':
+        fixed = fixed.model_copy(update={'version':fixed.version + 1})
+    elif change == 'raw_replaced':
+        original = raw.stat()
+        replacement = raw.with_name('replacement')
+        replacement.write_text(raw.read_text().replace('"value": 0', '"value": 9'))
+        os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+        replacement.replace(raw)
+        assert raw.stat().st_size == original.st_size and raw.stat().st_mtime_ns == original.st_mtime_ns
+    elif change == 'raw_missing':
+        raw.unlink()
+    elif change == 'unfinished':
+        check = check.model_copy(update={'ended_at':None, 'status':ExecutionStatus.RUNNING})
+    elif change == 'timeout':
+        check = check.model_copy(update={'status':ExecutionStatus.TIMEOUT})
+    else:
+        path = cache if change == 'cache_symlink' else raw
+        retained = path.with_name('retained')
+        path.rename(retained)
+        path.symlink_to(retained)
+    before = {p:p.read_bytes() for p in (e.root/'logs').rglob('*') if p.is_file()}
+    extract, calls = experiments.extract_events, []
+    def counted(check):
+        calls.append(check.id)
+        return extract(check)
+    monkeypatch.setattr(experiments, 'extract_events', counted)
+    if change == 'raw_symlink':
+        with pytest.raises(ValueError, match='symlink'):
+            experiments.observed(fixed, check, e.root)
+        assert not calls
+    else:
+        measured = experiments.observed(fixed, check, e.root)
+        assert calls == [check.id]
+        if change == 'raw_missing':
+            assert not measured['events'] and measured['comparisons'][0]['outcome'] == 'unknown'
+        else:
+            assert measured['events'][1]['value'] == (9 if change == 'raw_replaced' else 0)
+        if change == 'timeout':
+            assert 'Execution did not complete: timeout' in assessment(state, e.root, fixed, check)['blockers']
+    assert {p:p.read_bytes() for p in (e.root/'logs').rglob('*') if p.is_file()} == before
+
+
 def test_costs_keep_missing_data_and_do_not_double_count_children(tmp_path):
     c=CheckRun(id='parent',action='experiment',cwd=str(tmp_path),snapshot_id='fixture',
         started_at='2026-10-04T00:00:01+00:00',ended_at='2026-10-04T00:00:05.300000+00:00',
