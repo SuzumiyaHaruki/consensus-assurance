@@ -2,7 +2,7 @@
 
 baseline 保持 [task.md](task.md) 的普通自主调查；CA 保留自己的研究对象、执行证据与知识反馈。两侧共享中性的工具环境，不共享方法提示或历史答案。
 
-当前配置可直接通过各自 schema 加载：[HashiCorp baseline](configs/hashicorp.deepseek-pair.baseline.yaml)／[CA](configs/hashicorp.deepseek-pair.full.yaml)。baseline 从同一 CA 配置读取目标信息，不继承其模型、预算或研究设置。模板关闭材料发送和执行授权；实际运行使用本地 `*.run.yaml`。
+当前配置可直接通过各自 schema 加载：[HashiCorp baseline](../configs/baseline/deepseek.yaml)／[CA](../configs/ca/deepseek.yaml)。两侧引用 `configs/targets/` 中的同一中性目标定义，分别配置模型、预算与授权。模板关闭材料发送和执行授权；实际运行使用本地 `configs/local/` 配置。
 
 | 条件 | 当前做法 |
 |---|---|

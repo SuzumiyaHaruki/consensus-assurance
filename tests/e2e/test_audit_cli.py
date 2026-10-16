@@ -9,7 +9,7 @@ from consensus_assurance.workflow.engine import Engine
 
 
 def test_cli_fixed_execution_and_fresh_run_are_independent(tmp_path, capsys):
-    from audit_support import combined
+    from support.audit import combined
     repo = tmp_path / 'source'
     repo.mkdir()
     (repo / 'target.py').write_text('def step(value, limit):\n    return value + 1 if value < limit else 0\n')
@@ -89,8 +89,9 @@ def test_estimate_reports_explicit_long_limits_without_tools(tmp_path,capsys,mon
     def forbidden(*args,**kwargs):raise AssertionError('Estimate must not assemble or create a run')
     monkeypatch.setattr(cli,'assemble',forbidden)
     monkeypatch.setattr(cli,'create_run_directory',forbidden)
-    config=cli.load_config(Path(__file__).parents[2]/'configs/targets/deepseek.example.yaml')
+    config=cli.load_config(Path(__file__).parents[2]/'configs/ca/deepseek.yaml')
     config.budget.total_seconds=4800
+    config.budget.experiments=16
     example=tmp_path/'long.yaml';example.write_text(config.model_dump_json())
     assert main(['estimate','--config',str(example),'--repo',str(tmp_path)])==0
     result=json.loads(capsys.readouterr().out)
@@ -129,7 +130,7 @@ def test_real_codex_local_permissions(codex_workspace,monkeypatch,custom):
     from consensus_assurance.adapters.runners.process import output
     from consensus_assurance.adapters.agents.backend import CodexAgent
     runner,draft=codex_workspace
-    cfg=load_config('configs/targets/deepseek.example.yaml')
+    cfg=load_config('configs/ca/deepseek.yaml')
     provider=cfg.codex_provider.model_copy(update={'env_key':'CA_PROVIDER_CANARY'}) if custom else None
     monkeypatch.setenv('CA_PROVIDER_CANARY','unlabelled-local-canary-987654321')
     agent=CodexAgent('low','deepseek-flash' if custom else None,provider)
@@ -159,7 +160,7 @@ def test_deepseek_two_turn_acceptance(request):
     from consensus_assurance.adapters.agents.backend import codex_events
     from consensus_assurance.adapters.storage.files import write_json
     runner,draft=request.getfixturevalue('codex_workspace')
-    cfg=load_config('configs/targets/deepseek.example.yaml')
+    cfg=load_config('configs/ca/deepseek.yaml')
     assert cfg.codex_provider.base_url=='https://api.deepseek.com' and cfg.agent_model=='deepseek-flash'
     agent=CodexAgent(cfg.agent_reasoning_effort,cfg.agent_model,cfg.codex_provider)
     agent.client_environment()

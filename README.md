@@ -8,9 +8,9 @@
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 export PATH="$HOME/.local/bin:$PATH"
-.venv/bin/consensus-assurance doctor --config configs/targets/deepseek.example.yaml
+.venv/bin/consensus-assurance doctor --config configs/ca/deepseek.yaml
 .venv/bin/consensus-assurance inspect \
-  --config configs/targets/deepseek.example.yaml --repo /实际路径/Go模块仓库
+  --config configs/ca/deepseek.yaml --repo /实际路径/hashicorp-raft
 ```
 
 真实运行需要现有认证、材料发送及隔离执行授权；具体运行命令、工具路径和开发测试见环境文档。工具不会自动下载目标或提高预算。
@@ -25,13 +25,19 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## 目标配置
 
-configs/targets 保留 DeepSeek 接入示例和本地 DeepSeek 运行配置；公开的 HashiCorp 配对配置位于 baseline/configs。示例默认关闭材料发送和执行授权；获权后使用本地 `*.run.yaml`，不提交。同一目标、模型及预算复用已有配置，不按实验轮次或方法版本复制；新配置以目标、模型和预算命名。实际方法版本由运行时记录，每次运行独立保存所用配置。目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。tests/fixtures/toy_protocol 仅用于隔离回归，不是实验目标或默认选题答案。
+`configs/targets/` 只描述七个目标的执行后端、模块、分析范围和测试路径；不绑定模型、预算、本机路径或授权。`configs/ca/` 与 `configs/baseline/` 分别保存两种入口的公共运行配置，均默认关闭授权。`configs/providers/` 保存模型目录；本机运行配置保存在忽略的 `configs/local/ca/` 和 `configs/local/baseline/`。
+
+两个入口通过 `target_config` 引用同一目标；命令行 `--target-config configs/targets/zookeeper.yaml` 可选择另一目标。YAML 引用相对于所在文件解析，命令行路径相对于当前目录解析。CA 的目标文件提供默认值，运行配置中的显式 `target` 字段覆盖对应默认值；模型、预算与授权只取运行配置。保存到每次运行中的配置已经展开，不依赖目标模板后续是否移动。
+
+baseline 保持仓库级入口 `python -m baseline`，CA 提供可安装的 `consensus-assurance` 命令。两者共享工具和配置读取，不合并研究流程。使用 `pip install -e '.[test,baseline]'` 安装开发依赖；所有测试位于 `tests/`，`pytest -m 'not real'` 选择普通离线测试，`real` 标记的外部工具检查按环境单独运行。
+
+历史 `runs/`、`baseline/runs/`、`baseline/acceptance/` 和开发用 `AGENTS.md` 保留在本地但不进入发布文件；已有 Git 历史不改写。
 
 ## 文档与记录
 
 - [审计方法](docs/审计方法.md)：选择性理解、因果调查、证据与方法来源。
 - [运行工作流](docs/运行工作流.md)：继续、暂停、知识回流及代码入口。
 - [环境要求](docs/环境要求.md)：安装、运行、目标接入、隔离与测试。
-- [运行索引](runs/README.md)：用户指定归档及其实际结果。
+- [历史运行索引](https://github.com/SuzumiyaHaruki/consensus-assurance/blob/7458957eccbac5b2f4a9178b6a4ca3108bb67231/runs/README.md)：此前提交保留的实验档案。
 
 v62 将语义责任收敛到调查、固定实验和解释；共享知识保留明确版本引用。旧图协调及重复裁决存储已退出。新实验使用英文研究记录和报告，直接展示当前问题、解释及证据限制，不生成另一份中文摘要。

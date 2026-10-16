@@ -10,25 +10,28 @@ from consensus_assurance.core.config import Config, locate_repo
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine, FRAMEWORK_REVISION
 from consensus_assurance.adapters.storage.files import Store, write_json
+from consensus_assurance.adapters.storage.configuration import read_yaml, read_target, relative_path
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.reporting.report import render_report
 
 
 def load_config(path=None, overrides=None):
-    data = yaml.safe_load(Path(path).read_text()) or {} if path else {}
-    if not isinstance(data, dict):
-        raise ValueError("Configuration must be an object")
+    data = read_yaml(path) if path else {}
+    directory = Path(path).resolve().parent if path else Path.cwd()
+    overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
+    reference = overrides.pop('target_config', None)
+    configured = data.pop('target_config', None)
+    if reference or configured:
+        target = read_target(relative_path(reference or configured, Path.cwd() if reference else directory))
+        target['target'].update(data.get('target', {}))
+        data = {**target, **{k: v for k, v in data.items() if k != 'target'}}
     for name in ("repo_path", "runs_dir", "fixture", "cargo_seed_cache_dir", "maven_dependency_cache_dir"):
         if data.get(name):
-            p = Path(data[name]).expanduser()
-            if not p.is_absolute():
-                p = (Path(path).resolve().parent if path else Path.cwd()) / p
-            data[name] = str(p.absolute() if name == 'cargo_seed_cache_dir' else p.resolve())
+            data[name] = relative_path(data[name], directory, resolve=name != 'cargo_seed_cache_dir')
     provider=data.get('codex_provider')
     if isinstance(provider,dict) and provider.get('model_catalog_path'):
-        p=Path(provider['model_catalog_path']).expanduser()
-        provider['model_catalog_path']=str((p if p.is_absolute() else (Path(path).resolve().parent if path else Path.cwd())/p).resolve())
-    data.update({k: v for k, v in (overrides or {}).items() if v is not None})
+        provider['model_catalog_path'] = relative_path(provider['model_catalog_path'], directory)
+    data.update(overrides)
     return Config.model_validate(data)
 
 
@@ -64,6 +67,7 @@ def main(argv=None):
     for name in ("doctor", "run", "inspect", "plan", "estimate"):
         p = sub.add_parser(name)
         p.add_argument("--config"); p.add_argument("--repo")
+        p.add_argument("--target-config", help="Neutral target definition; relative to the current directory")
         p.add_argument("--agent-backend", choices=["codex", "mock"])
         p.add_argument("--runs-dir")
         p.add_argument("--question", help="可选定向问题；默认不指定目标")
@@ -111,7 +115,7 @@ def main(argv=None):
             config = Config.model_validate(state.config)
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend,
-                "runs_dir": args.runs_dir, "directed_question": args.question})
+                "runs_dir": args.runs_dir, "directed_question": args.question, "target_config": args.target_config})
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget
@@ -161,7 +165,7 @@ def main(argv=None):
         print(f"Stop reason: {state.stop_reason}")
         if state.run_stop and state.run_stop['reason']=='user_stop':return 130
         return 0 if state.stop_reason.startswith(("Scoped stop (", "Snapshot prepared")) else 2
-    except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:
+    except (ValueError, FileNotFoundError, BlockingIOError, OSError, yaml.YAMLError) as exc:
         print(f"无法继续：{exc}", file=sys.stderr)
         return 2
 

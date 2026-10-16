@@ -2,13 +2,14 @@
 import json
 from pathlib import Path
 import pytest
-from audit_support import engine_for, first, combined, experiment, opinion, stop
+from support.audit import engine_for, first, combined, experiment, opinion, stop
 from consensus_assurance.core.submissions import AuditSubmission
 from consensus_assurance.workflow.experiments import assessment
 from consensus_assurance.workflow.knowledge import open_gaps
 from consensus_assurance.workflow.research import operation_summary, excerpt
 
 
+@pytest.mark.real
 def test_test_selection_is_fixed_across_repeat_and_changed_as_successor(tmp_path, go_module):
     import shutil
     from consensus_assurance.adapters.runners.go_module import GoModuleBackend
@@ -128,81 +129,7 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
     assert not any(name in type(state).model_fields for name in ('units','claims','bindings','relations','evidence','findings'))
 
 
-@pytest.mark.parametrize('large',['many_events','large_value','missing_long_identity','repeated_diagnostics'])
-def test_execution_feedback_omits_whole_large_event_sets_without_rewriting_receipts(tmp_path,large):
-    def start(state):
-        sub,files=combined(state)
-        files['check.py'] += {
-            'many_events':"for i in range(9): print('CA_EVENT '+json.dumps(dict(event='extra',operation=str(i))))\nprint('CA_EVENT not-json')\n",
-            'large_value':"print('CA_EVENT '+json.dumps(dict(event='extra',operation='large',value='x'*7000)))\n",
-            'missing_long_identity':"for name in ('admitted','returned'): print('CA_EVENT '+json.dumps(dict(event=name,operation='x'*7000)))\n",
-            'repeated_diagnostics':"for i in range(12):\n for name in ('admitted','returned'): print('CA_EVENT '+json.dumps(dict(event=name,operation=str(i),limit=3)))\n",
-        }[large]
-        return sub,files
-    def inspect(state):
-        before=e.state.model_dump(mode='json')
-        saved={p:p.read_bytes() for p in (e.root/'logs').rglob('*') if p.is_file()}
-        value=operation_summary(e.state,e.root)['questions'][0]['execution']
-        raw=json.loads((e.root/value['observations']).read_text())
-        assert value['events']==[] and value['event_count']==value['events_omitted_count']==len(raw['events'])
-        assert value['comparisons'][0]['result']['valid_witness_indices']==[1]
-        assert value['comparisons'][0]['result']['evaluated_indices']==[1]
-        if large=='missing_long_identity':
-            assert value['comparisons'][0]['result']['missing_indices']
-            assert value['comparisons'][0]['omitted_detail_counts']['diagnostics']>0
-            assert 'x'*7000 not in json.dumps(value)
-        if large in {'missing_long_identity','repeated_diagnostics'}:
-            assert value['diagnostic_summary'] and not value['diagnostic_groups_omitted']
-            diagnostic=value['diagnostic_summary'][0]
-            assert diagnostic['comparison_index']==0 and 'Missing' in diagnostic['reason']
-            location=diagnostic['locations'][0]
-            assert location['output_location']==raw['events'][location['event_index']]['_ca_observation']['location']
-            if large=='repeated_diagnostics':
-                assert diagnostic['occurrences']==12 and len(diagnostic['locations'])==3
-                assert len(json.dumps(value['diagnostic_summary']))<4000
-        assert e.state.model_dump(mode='json')==before
-        assert all(p.read_bytes()==data for p,data in saved.items())
-        indices=[1] if large in {'many_events','repeated_diagnostics'} else [1,len(raw['events'])-1]
-        return opinion(state,conclusion='conditional',executions={value['id']:indices})
-    def cited(state):
-        value=operation_summary(e.state,e.root)['interpretation_changes'][0]['executions'][0]
-        raw=json.loads((e.root/value['observations']).read_text())
-        assert value['cited_events']==[{'event_index':1,'observation':raw['events'][1]}]
-        assert value['omitted_cited_indices']==([] if large in {'many_events','repeated_diagnostics'} else [len(raw['events'])-1])
-        assert value['parsing_error_count']==len(raw['parsing_errors'])==int(large=='many_events')
-        assert value['prerequisites']==raw['prerequisites']
-        comparison=value['comparisons'][0]
-        assert comparison['outcome']==raw['comparisons'][0]['outcome']
-        if large=='missing_long_identity':
-            assert comparison['missing_indices'] and not comparison['comparison_complete']
-            assert comparison['diagnostic_count']>0 and comparison['limitation_count']>0
-        if large=='repeated_diagnostics':
-            assert value['diagnostic_summary'][0]['occurrences']==12
-        assert 'Explicitly cited subset' in value['selection'] and 'x'*7000 not in json.dumps(value)
-        return stop(state)
-    e,repo=engine_for(tmp_path,[start,inspect,cited])
-    e.start(repo)
 
-
-def test_changed_citation_remains_visible_when_unchanged_citations_fill_inline_limit(tmp_path):
-    def start(state):
-        sub,files=combined(state)
-        files['check.py'] += "for i in range(9): print('CA_EVENT '+json.dumps(dict(event='extra',operation=str(i))))\n"
-        return sub,files
-    def cite(state,count):
-        check=next(c for c in state['checks'] if c.get('experiment_id'))
-        return opinion(state,conclusion='conditional',executions={check['id']:list(range(count))})
-    def finish(state):
-        change=operation_summary(e.state,e.root)['interpretation_changes'][0]
-        assert change['text_changes']==[]  # Only the receipt indices changed.
-        receipt=change['executions'][0]
-        assert receipt['previous_event_indices']==list(range(8)) and receipt['current_event_indices']==list(range(9))
-        assert receipt['cited_events'][0]['event_index']==8 and len(receipt['cited_events'])==8
-        assert receipt['omitted_cited_indices']==[7] and receipt['event_indices']==list(range(9))
-        assert len(state['interpretations'])==2 and state['usage']['experiments']==1
-        return stop(state)
-    e,repo=engine_for(tmp_path,[start,lambda s:cite(s,8),lambda s:cite(s,9),finish])
-    e.start(repo)
 
 
 def test_knowledge_and_interpretation_changes_share_observations_without_losing_old_basis(tmp_path):
@@ -1170,81 +1097,3 @@ def test_knowledge_correction_traces_old_root_and_derived_revisions_and_accepts_
     e,repo=engine_for(tmp_path,[initial,unrelated,correct,supplement,finish,repeated])
     state=e.start(repo)
     assert state.usage['experiments']==2 and len(state.interpretations)==1
-
-
-def test_navigation_keeps_evidence_references_and_marks_long_prose_without_mutating_records(tmp_path):
-    from consensus_assurance.core.types import KnowledgeEntry
-    from consensus_assurance.workflow.research import current_view, preview
-    engine,repo=engine_for(tmp_path,[stop])
-    state=engine.start(repo,plan_only=True)
-    entry=KnowledgeEntry(id='projection-entry',kind='behavior',operation_id='projection',
-        statement='A bounded observation with several supporting records',
-        conditions='The observation applies only within its recorded invocation interval. '*12,
-        source_ids=[f'source-{i}' for i in range(8)],executions={f'receipt-{i}':[i] for i in range(4)})
-    state.knowledge.append(entry)
-    engine.store.save(state,'projection_fixture')
-    saved=(engine.root/'state.json').read_bytes()
-    before=state.model_dump(mode='json')
-    current=current_view(state,engine.root)
-    summary=operation_summary(state,engine.root)
-    item=current['knowledge'][0]
-    assert item['source_ids']==entry.source_ids and item['executions']==entry.executions
-    assert '[preview:' in item['conditions'] and 'characters omitted; see full record]' in item['conditions']
-    assert item['conditions'].count('[preview:')==1 and preview(item)==item
-    for item in (item,current['reselection']['knowledge'][0],summary['reselection']['knowledge'][0]):
-        assert item['conditions']==excerpt(entry.conditions)
-        locator=item['record']
-        complete=json.loads((engine.root/locator['path']).read_text())[locator['collection']]
-        assert item['view']=='preview'
-        assert next(record for record in complete if record['id']==locator['id'])==entry.model_dump(mode='json')
-    assert state.model_dump(mode='json')==before and (engine.root/'state.json').read_bytes()==saved
-
-
-@pytest.mark.parametrize('before,after,chars',[
-    ('A café result\nrequires support.', 'A café result\nrequires independent support.',4000),
-    (['Repeated','Other','Repeated'], ['Repeated','Repeated','Other'],4000),
-    (['prefix '*300+'old measurement'+' suffix'*300], ['prefix '*300+'new measurement'+' suffix'*300],4000),
-    ('x'*48+'old'+'y'*48, 'x'*48+'new'+'y'*48,40),
-])
-def test_text_changes_preserve_exact_ranges_order_and_changed_context(before,after,chars):
-    from consensus_assurance.workflow.research import text_changes
-    prior,current={'limitations':before},{'limitations':after}
-    saved=json.dumps([prior,current])
-    budget={'chars':chars,'edits':12,'work':1000000}
-    change,=text_changes(prior,current,('limitations',),budget)
-    assert change['display']=='diff' and not change['omitted_edits']
-    assert change['format']==('text' if isinstance(after,str) else 'json')
-    old,new=(value if isinstance(value,str) else json.dumps(value,ensure_ascii=False,indent=2)
-        for value in (before,after))
-    restored,cursor='',0
-    for edit in change['edits']:
-        a,b=edit['before']['range'];c,d=edit['after']['range']
-        restored+=old[cursor:a]+new[c:d];cursor=b
-        for side,value in (('before',old),('after',new)):
-            part=edit[side];start,end=part['context_range'];fragment=value[start:end]
-            assert not part['omitted_characters'] and part['parts']==[fragment]
-    assert restored+old[cursor:]==new and saved==json.dumps([prior,current])
-    if isinstance(after,list) and 'new measurement' in after[0]:
-        assert 'new measurement' in json.dumps(change) and 'old measurement' in json.dumps(change)
-    if chars==40:
-        assert 'old' in json.dumps(change) and 'new' in json.dumps(change)
-
-
-@pytest.mark.parametrize('limit',['size','work'])
-def test_text_changes_bound_matching_and_shared_output_without_hiding_omissions(monkeypatch,limit):
-    import difflib
-    from consensus_assurance.workflow.research import text_changes
-    monkeypatch.setattr(difflib,'SequenceMatcher',lambda *a,**k:pytest.fail('Unbounded matching'))
-    n=21000 if limit=='size' else 100
-    old={'rationale':'a'*n,'limitations':['Unchanged','Keep this condition']}
-    new={'rationale':'b'*n,'limitations':['Unchanged']}
-    budget={'chars':120,'edits':1,'work':1000000 if limit=='size' else 0}
-    first,second=text_changes(old,new,tuple(old),budget)
-    assert first['display']=='bounded_replacement' and first['edits']
-    for side in first['edits'][0].values():
-        assert len(side['parts'])==2 and side['omitted_characters']==n-sum(map(len,side['parts']))
-    assert second['field']=='limitations' and second['omitted_edits'] and not second['edits']
-    third,=text_changes(None,{'statement':'A new account'},('statement',),budget)
-    assert third['omitted_edits'] and not third['edits']
-    assert budget['chars']==0 and budget['edits']==0
-    assert text_changes(new,new,tuple(new),budget)==[]

@@ -7,13 +7,13 @@
 需要支持 `pidfd` 的 Linux、Bubblewrap、支持命名权限的 Codex CLI 和目标工具链。依赖在审计前安装，运行中不联网补齐：
 
 ```bash
-.venv/bin/python -m pip install -r baseline/requirements.txt
+.venv/bin/python -m pip install -e '.[baseline]'
 export PATH="$HOME/.local/bin:$PATH"
 .venv/bin/python -m baseline check-env --config /absolute/path/to/local-config.yaml
 .venv/bin/python -m baseline run --config /absolute/path/to/local-config.yaml
 ```
 
-[DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 和 [HashiCorp 配对草案](PAIRING.md) 默认关闭授权。填写 `repo_path`、实际模型和连接；相对路径以 YAML 所在目录为准。`run` 要求 `allow_agent_materials`、`allow_experiments` 同时为 `true`，凭据只放环境变量。目标必须是干净 Git 提交，输出与源仓库分离；不会替用户清理工作树。
+[DeepSeek](../configs/baseline/deepseek.yaml)、[OpenAI](../configs/baseline/openai.yaml)、[自定义服务](../configs/baseline/custom-provider.yaml) 和 [HashiCorp 配对草案](PAIRING.md) 默认关闭授权。填写 `repo_path`、实际模型和连接；相对路径以 YAML 所在目录为准。`run` 要求 `allow_agent_materials`、`allow_experiments` 同时为 `true`，凭据只放环境变量。目标必须是干净 Git 提交，输出与源仓库分离；不会替用户清理工作树。
 
 `check-env` 是独立的本地检查：捕获源码、验证权限、提示隔离、功能设置、工具版本、离线依赖，以及标准 MCP STDIO 工具清单和固定 TCP 收发。它不调用模型、不执行目标测试、不创建 app-server 会话，也不使用真实认证。Go 依赖检查为 `go list -m all`，Rust 为离线 `cargo metadata`，Maven 为所选模块及上游的离线 `test-compile -DskipTests`；不执行测试。`environment_checked` 只证明这些本地项目通过。
 
@@ -23,11 +23,11 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ```bash
 BASELINE_ACCEPTANCE_DIR="$HOME/.cache/consensus-assurance/local-compat-$(date +%Y%m%d-%H%M%S)" \
-.venv/bin/python -m pytest -q baseline/tests/test_environment.py \
+.venv/bin/python -m pytest -q tests/baseline/test_environment.py \
   -k 'request_tools or pairing_uses'
 ```
 
-原 `smoke` 子命令和自动评分已退出。已有真实模型的双回合 TCP 失败／修复证据见 [本次核对](acceptance/2026-10-09-source-review/README.md)。环境变化后才需要有针对性的复验；脚本回复通过不能代替真实服务或模型推理证据。
+原 `smoke` 子命令和自动评分已退出。已有真实模型的双回合 TCP 失败／修复证据见 [本次核对](https://github.com/SuzumiyaHaruki/consensus-assurance/blob/7458957eccbac5b2f4a9178b6a4ca3108bb67231/baseline/acceptance/2026-10-09-source-review/README.md)。环境变化后才需要有针对性的复验；脚本回复通过不能代替真实服务或模型推理证据。
 
 ## 配置与隔离
 
@@ -71,4 +71,4 @@ runs/<run-id>/
 
 报告也在工作区变更中保留，`last_completed_report` 指向实际保留的版本；报告未变时复用该路径，后续超时修改不覆盖它。不再复制 `turns/N/report.md`；历史归档及旧链接不改写。回合末文件不冒充每条命令开始时的快照，模型自行 tee 的内容不冒充宿主原始输出。
 
-结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。保留未完成回合、工作报告、测试和原始输出；历史运行不进入新审计上下文。实际所选运行及停止状态见 [保留运行](runs/)。
+结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。保留未完成回合、工作报告、测试和原始输出；历史运行不进入新审计上下文。历史运行保留在本地 `baseline/runs/` 和原 Git 提交，不随发布工作树分发。

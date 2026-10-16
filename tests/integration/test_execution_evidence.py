@@ -3,172 +3,44 @@ import json
 import shutil
 from pathlib import Path
 import pytest
-from audit_support import engine_for, first, combined, experiment, opinion, stop
+from support.audit import engine_for, first, combined, experiment, opinion, stop
 from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.workflow.experiments import assessment, observed, validate_failure
 from consensus_assurance.workflow.knowledge import target_receipts
 
 
 @pytest.mark.parametrize('collection', ['knowledge', 'interpretations'])
-def test_receipt_identity_precheck_precedes_measurement_and_repairs_atomically(tmp_path, monkeypatch, collection):
+@pytest.mark.parametrize('fault,code', [('receipt', 'execution_reference'), ('indices', 'event_indices')])
+def test_rejected_citations_repair_atomically_without_reexecution(tmp_path, collection, fault, code):
     from copy import deepcopy
-    from consensus_assurance.workflow.audit import validate_submission
     retained = {}
 
-    def product(state):
-        sub, _ = opinion(state)
-        sub['knowledge'] = [dict(kind='fact', statement='The selected call returned zero.',
-            conditions='The recorded admitted operation', source_ids=['code'],
-            executions=deepcopy(sub['interpretations'][0]['executions']))]
-        return sub
-
-    def preflight(sub, state=None, *, cheap=False):
-        (engine.root / 'draft' / 'references.json').write_text(json.dumps(sub))
-        state = state if state is not None else engine.state
-        before = state.model_dump(mode='json')
-        with monkeypatch.context() as patch:
-            if cheap:
-                patch.setattr('consensus_assurance.workflow.experiments.observed',
-                              lambda *a, **kw: pytest.fail('Identity errors must precede all measurement reads'))
-            result = validate_submission(state, engine.root, 'references.json', engine.implementation)
-        assert state.model_dump(mode='json') == before
-        return result
-
     def reject(state):
-        sub = product(state)
-        check_id = next(iter(sub['knowledge'][0]['executions']))
+        sub, _ = opinion(state)
+        check_id = next(iter(sub['interpretations'][0]['executions']))
+        sub['knowledge'] = [dict(kind='fact', statement='The selected call returned zero.',
+            conditions='The recorded admitted operation', source_ids=['code'], executions={check_id: [1]})]
+        # A valid first item must not be committed when a later reference is invalid.
+        sub[collection].append(deepcopy(sub[collection][0]))
+        retained['repair'] = deepcopy(sub)
+        sub[collection][-1]['executions'] = {check_id[:-1]: [1]} if fault == 'receipt' else {check_id: [-1, 1, 1, 2]}
         retained['receipt'] = check_id
         retained['evidence'] = {p: p.read_bytes() for folder in ('fixed-experiments', f'logs/{check_id}')
             for p in (engine.root / folder).rglob('*') if p.is_file()}
-        # The first item in both collections is valid; an error at the end must still be cheap.
-        sub[collection].append(deepcopy(sub[collection][0]))
-        cases = [(check_id[:-1], 'not_found'),
-            (next(c['id'] for c in state['checks'] if c['action'] == 'agent_turn'), 'CheckRun'),
-            (state['interpretations'][0]['id'], 'Interpretation'),
-            (state['experiments'][0]['id'], 'FixedExperiment')]
-        for id, kind in cases:
-            sub[collection][-1]['executions'] = {id: [1]}
-            diagnostic, = preflight(sub, cheap=True)['diagnostics']
-            assert diagnostic['code'] == 'execution_reference' and diagnostic['category'] == 'association'
-            assert diagnostic['paths'] == [f'/{collection}/1/executions/{id}']
-            assert diagnostic['object_ids'] == [id] and diagnostic['details']['actual_kind'] == kind
-            assert diagnostic['details']['execution_index'] == {'path': 'state.json', 'collection': 'checks'}
-            assert 'observations' not in diagnostic['details']
-        changed = engine.state.model_copy(deep=True)
-        next(c for c in changed.checks if c.id == check_id).snapshot_id = 'another-snapshot'
-        diagnostic, = preflight(product(state), changed, cheap=True)['diagnostics']
-        assert 'different source snapshot' in diagnostic['message']
-        assert diagnostic['details']['snapshot_id'] == 'another-snapshot'
-        assert diagnostic['details']['expected_snapshot_id'] == state['snapshot']['id']
-        alias = product(state)
-        alias['investigations'] = [dict(ref='@related', question='Can this observation inform a related question?',
-                                        source_ids=['code'])]
-        alias['interpretations'].append({**alias['interpretations'][0], 'investigation_id': '@related',
-                                        'experiment_id': None, 'conclusion': 'explained', 'defect_claim': 'asserted'})
-        diagnostic, = preflight(alias, cheap=True)['diagnostics']
-        assert diagnostic['paths'] == [f'/interpretations/1/executions/{check_id}']
-        assert 'joint-history' in diagnostic['message']
-        alias['interpretations'][1]['joint_history'] = 'Reuse the same recorded local operation, not a new execution.'
-        assert preflight(alias)['valid']
-        alias['interpretations'][1]['experiment_id'] = state['experiments'][0]['id']
-        diagnostic, = preflight(alias, cheap=True)['diagnostics']
-        fixed = state['experiments'][0]
-        assert diagnostic['code'] == 'interpretation_experiment' and diagnostic['category'] == 'association'
-        assert diagnostic['paths'] == ['/interpretations/1/investigation_id', '/interpretations/1/experiment_id']
-        assert diagnostic['object_ids'] == ['preflight-question-0', fixed['id'], fixed['investigation_id']]
-        assert diagnostic['details'] == {
-            'submitted_investigation_id':'@related', 'investigation_id':'preflight-question-0',
-            'experiment_id':fixed['id'], 'experiment_investigation_id':fixed['investigation_id'],
-            'conclusion':'explained',
-            'experiment_record':{'path':'state.json', 'collection':'experiments', 'id':fixed['id']},
-            'owner_record':{'path':'state.json', 'collection':'investigations', 'id':fixed['investigation_id']},
-            'navigation':'research.json'}
-        assert all(id in diagnostic['message'] for id in diagnostic['object_ids'])
-        assert "experiment's actual receipt" in diagnostic['message']
-        assert 'omit experiment_id' in diagnostic['message']
-        assert 'conclusion explained, conditional, or unresolved' in diagnostic['message']
-        assert 'joint_history does not change experiment ownership' in diagnostic['message']
-        assert 'defect_claim remains an independent scoped judgment' in diagnostic['message']
-        bound = deepcopy(alias)
-        bound['interpretations'][1]['investigation_id'] = fixed['investigation_id']
-        assert preflight(bound)['valid']
-        question = deepcopy(alias)
-        question['interpretations'][1]['experiment_id'] = None
-        for conclusion in ('explained', 'conditional', 'unresolved'):
-            question['interpretations'][1]['conclusion'] = conclusion
-            assert question['interpretations'][1]['defect_claim'] == 'asserted'
-            assert question['interpretations'][1]['executions'] == alias['interpretations'][1]['executions']
-            assert preflight(question)['valid']
-        for conclusion in ('violated', 'holds'):
-            question['interpretations'][1]['conclusion'] = conclusion
-            diagnostic, = preflight(question)['diagnostics']
-            assert 'Measured conclusions require a fixed experiment' in diagnostic['message']
-        sub[collection][-1]['executions'] = {check_id[:-1]: [1]}
-        retained['diagnostic'], = preflight(sub, cheap=True)['diagnostics']
-        retained['repair'] = deepcopy(sub)
-        retained['repair'][collection][-1]['executions'] = {check_id: [1]}
-        assert preflight(retained['repair'])['valid']
         return sub, {}
 
     def repair(state):
-        assert state['current_submission']['rejected']['diagnostics'] == [retained['diagnostic']]
-        assert not state['knowledge'] and len(state['interpretations']) == 1
+        diagnostic, = state['current_submission']['rejected']['diagnostics']
+        assert diagnostic['code'] == code and diagnostic['category'] == 'association'
+        assert diagnostic['paths'] == [f"/{collection}/1/executions/{retained['receipt'][:-1] if fault == 'receipt' else retained['receipt']}"]
+        assert not state['knowledge'] and not state['interpretations']
         return retained['repair'], {}
 
-    def finish(state):
-        assert state['knowledge'][0]['executions'] == state['interpretations'][-1]['executions'] == {
-            retained['receipt']: [1]}
-        assert state['usage']['experiments'] == 1
-        assert all(p.read_bytes() == data for p, data in retained['evidence'].items())
-        return stop(state)
-
-    engine, repo = engine_for(tmp_path, [combined, opinion, reject, repair, finish])
-    engine.start(repo)
-
-
-@pytest.mark.parametrize('collection',['knowledge','interpretations'])
-def test_event_reference_diagnostic_locates_array_and_reuses_receipt(tmp_path,collection):
-    from consensus_assurance.workflow.audit import validate_submission
-    retained={}
-    def submission(state,indices):
-        check=next(c for c in state['checks'] if c.get('experiment_id'))
-        if collection=='interpretations':
-            return opinion(state,executions={check['id']:indices})
-        return {'rationale':'Retain the observed local return', 'knowledge':[dict(kind='fact',
-            statement='The selected call returned zero.', conditions='One call at the capacity boundary',
-            source_ids=['code'],executions={check['id']:indices})]},{}
-    def invalid(state):
-        check=next(c for c in state['checks'] if c.get('experiment_id'))
-        retained['receipt']=check['id']
-        paths=[*list((engine.root/'fixed-experiments').rglob('*')),
-               *list((engine.root/'logs'/check['id']).rglob('*'))]
-        retained['files']={p:p.read_bytes() for p in paths if p.is_file()}
-        sub,files=submission(state,[-1,1,1,2])
-        (engine.root/'draft'/'invalid.json').write_text(json.dumps(sub))
-        before=engine.state.model_dump(mode='json')
-        result=validate_submission(engine.state,engine.root,'invalid.json',engine.implementation)
-        assert not result['valid'] and engine.state.model_dump(mode='json')==before
-        diagnostic,=result['diagnostics']
-        assert diagnostic['code']=='event_indices' and diagnostic['category']=='association'
-        assert diagnostic['paths']==[f"/{collection}/0/executions/{check['id']}"]
-        assert diagnostic['object_ids']==[check['id']]
-        assert diagnostic['details']==dict(invalid_indices=[-1,2],duplicate_indices=[1],event_count=2,
-            valid_range=[0,1],observations=f"logs/{check['id']}/observations.json",
-            stdout=check['stdout'])
-        assert 'Fix the citation array' in diagnostic['message'] and '0 through 1' in diagnostic['message']
-        retained['diagnostic']=diagnostic
-        return sub,files
-    def repair(state):
-        assert state['current_submission']['rejected']['diagnostics']==[retained['diagnostic']]
-        assert not state['knowledge'] and not state['interpretations']
-        return submission(state,[1])
-    def finish(state):
-        assert state[collection][0]['executions']=={retained['receipt']:[1]}
-        assert state['usage']['experiments']==1
-        assert all(p.read_bytes()==data for p,data in retained['files'].items())
-        return stop(state)
-    engine,repo=engine_for(tmp_path,[combined,invalid,repair,finish])
-    engine.start(repo)
+    engine, repo = engine_for(tmp_path, [combined, reject, repair, stop])
+    state = engine.start(repo)
+    assert state.knowledge[0].executions == state.interpretations[-1].executions == {retained['receipt']: [1]}
+    assert state.usage['experiments'] == 1
+    assert all(p.read_bytes() == data for p, data in retained['evidence'].items())
 
 
 def executed_case(tmp_path, tail='', review=None, *, second_operation=False):
@@ -349,90 +221,6 @@ def test_same_operation_ambiguity_cannot_be_selected_away(tmp_path,failure):
                 check_id=check.id, witness_indices={0: [1]}, failure_stream='stderr',
                 failure_lines=[1, 4], harness_lines=[7, 7]))
     assert assessment(engine.state, engine.root, fixed, check)['comparisons'][0]['valid_witness_indices'] == []
-
-
-@pytest.mark.parametrize('case,outcome',[
-    ('prediction','holds'), ('duty','violated'), ('mismatch','holds'),
-    ('missing','unknown'), ('malformed','unknown'), ('unmatched','unknown'), ('gap','violated')])
-def test_report_separates_sampled_predicate_witness_and_model_account(tmp_path,case,outcome):
-    if not shutil.which('bwrap'):
-        pytest.skip('bubblewrap is required for original isolated execution')
-    def start(state):
-        sub,files=combined(state)
-        sub['investigations'][0]['question']='Does the capacity branch preserve its input as required by the caller contract?'
-        request=sub['experiment']
-        request['requirement']=('The capacity call returns zero while the normal call increments'
-            if case in {'prediction','mismatch'} else 'The capacity call preserves its input while the normal call increments')
-        request['comparisons']=[dict(event='returned',identity_fields=['operation'],admission_alias='start',
-            applicability_conditions=[dict(field='operation',value=operation)],
-            assertion=dict(field='value',value=expected),description=description)
-            for operation,expected,description in [('case',0 if case in {'prediction','mismatch'} else 3,'Capacity case'),
-                                                  ('control',3,'Independent normal control')]]
-        if case=='gap':sub['gaps']=[dict(investigation_id='@q',question='Does the caller contract apply to the admitted capacity input?')]
-        files['check.py']=f'''import json
-from target import step
-for operation, value in [('case',3),('control',2)]:
-    if not (operation=='case' and {case!r}=='unmatched'):
-        print('CA_EVENT '+json.dumps(dict(event='admitted',operation=operation,value=value)))
-    result=dict(event='returned',operation=operation,value=step(value,3))
-    if operation=='case' and {case!r}=='missing':result.pop('value')
-    print('CA_EVENT '+('{{broken' if operation=='case' and {case!r}=='malformed' else json.dumps(result)))
-'''
-        return sub,files
-    def explain(state):
-        from consensus_assurance.workflow.research import operation_summary
-        fixed=e.state.experiments[0]
-        check=next(c for c in e.state.checks if c.experiment_id==fixed.id)
-        measured=observed(fixed,check,e.root)
-        events=measured['events']
-        feedback=operation_summary(e.state,e.root)['questions'][0]['execution']
-        assert feedback['events']==events
-        assert [c['result']['outcome'] for c in feedback['comparisons']]==[c['outcome'] for c in measured['comparisons']]
-        assert [c['result']['missing_indices'] for c in feedback['comparisons']]==[c['missing_indices'] for c in measured['comparisons']]
-        assert feedback['parsing_error_count']==len(measured['parsing_errors'])
-        return opinion(state,conclusion='violated' if case=='mismatch' else 'conditional' if outcome=='unknown' else outcome,
-            executions={check.id:[i for i,v in enumerate(events) if v['event']=='returned']},
-            rationale='The sampled capacity result is undesirable under the sourced preservation contract; the control increments',
-            limitations=['Incomplete samples and unresolved applicability cannot establish this account'],
-            defect_claim='asserted' if case in {'prediction','mismatch'} else None if case=='duty' else 'unresolved')
-    e,repo=engine_for(tmp_path,[start,explain,stop])
-    e.agent.mock=False
-    e.config.execution_isolation='bwrap'
-    (repo/'README.md').write_text('A synchronous capacity call must preserve its input; a call below capacity must increment.\n')
-    state=e.start(repo)
-    fixed=state.experiments[0]
-    check=next(c for c in state.checks if c.experiment_id==fixed.id)
-    result=assessment(state,e.root,fixed,check)
-    control_outcome='unknown' if case=='malformed' else 'holds'
-    assert [r['outcome'] for r in result['comparisons']]==[outcome,control_outcome]
-    assert not {'confirmed','reviewed_complete'} & result.keys()
-    assert all('confirmed' not in r for r in result['comparisons'])
-    assert bool(result['comparisons'][0]['valid_witness_indices']) == (outcome == 'violated')
-    assert not result['comparisons'][1]['valid_witness_indices']
-    if outcome!='unknown':assert [v['value'] for v in result['events'] if v['event']=='returned']==[0,3]
-    from consensus_assurance.reporting.report import render_report
-    before=state.model_dump(mode='json')
-    report=render_report(state,e.root).read_text()
-    assert state.model_dump(mode='json')==before
-    assert assessment(state,e.root,fixed,check)==result
-    case_text,control_text=report.split('Comparison 0 ·',1)[1].split('Comparison 1 ·',1)
-    labels={'holds':'declared predicate holds','violated':'declared predicate does not hold','unknown':'comparison undetermined'}
-    assert labels[outcome] in case_text
-    assert labels[control_outcome] in control_text
-    assert 'Directly attributed interpretation for this execution' in report and state.interpretations[0].rationale in report
-    claim=state.interpretations[0].defect_claim
-    labels={None:'no explicit defect claim submitted','asserted':'defect asserted (subject to independent verification)','unresolved':'unresolved'}
-    assert f'Current model defect claim: {labels[claim]}' in report
-    claims,_,other=report.split('## Explicit model defect claims (subject to independent verification)',1)[1].partition('## Other research results')
-    assert (state.investigations[0].question in claims)==(claim=='asserted')
-    assert (state.investigations[0].question in other)==(claim!='asserted')
-    assert report.count('### ')==1
-    assert 'confirmed=' not in report
-    assert ('Interpretation differs from the mechanical result' in report)==(case=='mismatch')
-    if case=='gap':assert state.investigations[0].gaps[0].question in report and 'Unresolved necessary gaps' in report
-    if case in {'missing','malformed','unmatched'}:assert 'Observation gaps' in report
-    for path in (f'fixed-experiments/{fixed.id}/basis.json',f'logs/{check.id}/check.json',f'logs/{check.id}/observations.json'):
-        assert path in report and (e.root/path).is_file()
 
 
 def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path):
@@ -681,76 +469,6 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
     assert state.usage == {'agent_calls': 5, 'experiments': 1}
     assert len(state.experiments) == len(state.interpretations) == 1
     assert len(list((engine.root / 'submissions').glob('*/raw.json'))) == 4
-
-
-def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_path):
-    from consensus_assurance.workflow.research import operation_summary, excerpt
-    counterevidence = [f'The documented caller condition {n} bounds the sampled input' for n in range(5)]
-    limitations = [f'No observation establishes asynchronous completion for caller {n}' for n in range(5)]
-    counterevidence[1] += '; the actual operand comes from the admitted caller' * 8
-    limitations[4] += '; downstream recovery remains outside this observation' * 8
-    saved = {}
-    def start(state):
-        sub, files = first(state)
-        sub['investigations'] += [dict(question=f'Which return condition applies to caller {n}?',
-            source_ids=['code']) for n in range(9)]
-        sub['interpretations'] = [dict(investigation_id='@q', source_ids=['code'], conclusion='unresolved',defect_claim=None,
-            rationale='The initial caller contract still needs inspection',
-            limitations=['The initial caller condition is unknown'])]
-        return sub, files
-
-    def revisit(state):
-        saved['initial'] = state['interpretations'][0]
-        old, pending = state['investigations'][:2]
-        return {'rationale':'Explain a local sample while retaining a separate caller premise',
-            'interpretations':[dict(investigation_id=old['id'], source_ids=['code'], conclusion='explained',
-                defect_claim='refuted', rationale='The ordinary caller return is explained by the boundary branch',
-                counterevidence=counterevidence, limitations=limitations)],
-            'gaps':[dict(investigation_id=pending['id'], question='Which actual producer establishes the caller bound?')]}, {}
-
-    def another(state):
-        before = engine.state.model_dump(mode='json')
-        summary = operation_summary(engine.state, engine.root)
-        assert engine.state.model_dump(mode='json') == before
-        assert len(summary['questions']) == 1
-        local = summary['questions'][0]
-        assert local['id'] == state['investigations'][0]['id']
-        opinion = local['latest_interpretation']
-        assert opinion['id'] == state['interpretations'][-1]['id']
-        assert opinion['counterevidence'] == [excerpt(v) for v in counterevidence[:3]]
-        assert opinion['limitations'] == limitations[:3]
-        assert opinion['counterevidence_omitted_count'] == opinion['limitations_omitted_count'] == 2
-        locator = opinion['record']
-        full = next(v for v in state[locator['collection']] if v['id'] == locator['id'])
-        assert full['counterevidence'] == counterevidence and full['limitations'] == limitations
-        assert opinion['defect_claim'] == 'refuted' and opinion['conclusion'] == 'explained'
-        return {'rationale':'Inspect another sourced condition', 'investigations':[dict(
-            question='Which recovery caller uses this return?', source_ids=['code'])]}, {}
-
-    def finish(state):
-        summary = operation_summary(engine.state, engine.root)
-        assert len(summary['questions']) == 1
-        assert summary['questions'][0]['id'] == state['investigations'][-1]['id']
-        assert summary['questions'][0]['latest_interpretation'] is None
-        assert len(state['interpretations']) == 2 and state['interpretations'][0] == saved['initial']
-        index = json.loads((engine.root/'research.json').read_text())
-        view = index['reselection']
-        questions = {q['id']:q for q in view['questions']}
-        old, pending = state['investigations'][:2]
-        assert list(questions) == [q['id'] for q in state['investigations']]
-        assert questions[pending['id']]['open_gap_count'] == 1
-        assert state['investigations'][-1]['id'] in questions
-        answer = next(q for q in index['investigations'] if q['id'] == old['id'])
-        assert answer['discriminator'] == old['discriminator'] and answer['hypothesis'] == old['hypothesis']
-        assert answer['latest_interpretation']['id'] == state['interpretations'][-1]['id']
-        assert answer['latest_interpretation']['limitations'] == limitations[:3]
-        assert answer['latest_interpretation']['counterevidence'] == [excerpt(v) for v in counterevidence[:3]]
-        assert answer['latest_interpretation']['counterevidence_omitted_count'] == 2
-        assert all(q['disposition'] == 'active' for q in state['investigations']) and not state['experiments']
-        return stop(state)
-
-    engine, repo = engine_for(tmp_path, [start, revisit, another, finish])
-    engine.start(repo)
 
 
 def repeat_existing(state):

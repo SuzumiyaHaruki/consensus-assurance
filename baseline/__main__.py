@@ -10,6 +10,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from consensus_assurance.core.config import CodexProvider, TargetConfig
+from consensus_assurance.adapters.storage.configuration import read_yaml, read_target, relative_path
 
 
 class Budget(BaseModel):
@@ -60,26 +61,6 @@ class Config(BaseModel):
         return self.codex_provider.env_key if self.codex_provider else self.api_key_env
 
 
-def read_yaml(path):
-    class UniqueLoader(yaml.SafeLoader):
-        pass
-
-    def mapping(loader, node):
-        result = {}
-        for key_node, value_node in node.value:
-            key = loader.construct_object(key_node)
-            if key in result:
-                raise ValueError(f"Duplicate configuration key: {key}")
-            result[key] = loader.construct_object(value_node)
-        return result
-
-    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
-    value = yaml.load(Path(path).read_text(), Loader=UniqueLoader)
-    if not isinstance(value, dict):
-        raise ValueError("Configuration must be a mapping")
-    return value
-
-
 def load_config(path):
     path = Path(path).expanduser().resolve()
     raw = read_yaml(path)
@@ -87,16 +68,14 @@ def load_config(path):
     for name in ("target_config", "repo_path", "runs_dir", "go_mod_cache_dir", "cargo_dependency_cache_dir", "maven_dependency_cache_dir"):
         value = getattr(config, name)
         if value is not None:
-            p = Path(value).expanduser()
-            setattr(config, name, str((path.parent / p).resolve()))
+            setattr(config, name, relative_path(value, path.parent))
     if config.codex_provider and config.codex_provider.model_catalog_path:
-        p = Path(config.codex_provider.model_catalog_path).expanduser()
-        config.codex_provider.model_catalog_path = str((path.parent / p).resolve())
+        config.codex_provider.model_catalog_path = relative_path(config.codex_provider.model_catalog_path, path.parent)
     return config
 
 
 def load_target(config):
-    raw = read_yaml(config.target_config)
+    raw = read_target(config.target_config)
     if raw.get("execution_backend") not in {"go_module", "cargo", "maven"}:
         raise ValueError("Only go_module, cargo and maven targets are supported")
     fields = {k: v for k, v in raw.get("target", {}).items()
@@ -128,9 +107,12 @@ def main(argv=None):
     for name in ("check-env", "run"):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
+        command.add_argument("--target-config", help="Neutral target definition; relative to the current directory")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
+        if args.target_config:
+            config.target_config = relative_path(args.target_config, Path.cwd())
         target = validate_selection(config)
         if args.command != "check-env" and not (config.allow_agent_materials and config.allow_experiments):
             raise ValueError("Set allow_agent_materials and allow_experiments explicitly before model use")

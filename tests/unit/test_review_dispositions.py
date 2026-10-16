@@ -1,6 +1,6 @@
 """The existing operation-identity transaction stays atomic across the ownership change."""
 import pytest
-from audit_support import engine_for, first
+from support.audit import engine_for, first
 from consensus_assurance.workflow.transactions import commit_update
 from consensus_assurance.workflow.audit import Inputs, prepare_submission
 from consensus_assurance.core.submissions import AuditSubmission

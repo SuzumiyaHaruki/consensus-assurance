@@ -114,6 +114,7 @@ def test_go_absent_or_skipped_tests_are_not_passed(events, expected):
 
 
 @pytest.mark.parametrize('module,package',[('example.org/first','.'),('example.net/second','./subsystem')])
+@pytest.mark.real
 def test_go_backend_is_toolchain_scoped(tmp_path,module,package):
     from consensus_assurance.core.config import TargetConfig
     from consensus_assurance.adapters.runners.go_module import GoModuleBackend
@@ -152,6 +153,7 @@ def test_target_paths_cannot_escape_relative_namespace(paths):
 
 
 @pytest.mark.parametrize('version',['1.23.5','1.26.7'])
+@pytest.mark.real
 def test_go_actual_failure_phases_in_isolated_copy(tmp_path,go_module,monkeypatch,version):
     import os, shutil
     from consensus_assurance.adapters.runners.go_module import GoModuleBackend
@@ -191,7 +193,7 @@ def test_go_actual_failure_phases_in_isolated_copy(tmp_path,go_module,monkeypatc
 
 @pytest.mark.parametrize('interruption', ['preparation', 'raw_output', 'action_result'])
 def test_target_recovery_retains_reservation_and_never_replays_unknown_outcome(tmp_path, monkeypatch, interruption):
-    from audit_support import engine_for
+    from support.audit import engine_for
     from consensus_assurance.workflow.errors import Blocked
     import consensus_assurance.workflow.engine as module
     engine, repo = engine_for(tmp_path, [])
@@ -247,7 +249,7 @@ def test_target_recovery_retains_reservation_and_never_replays_unknown_outcome(t
 
 
 def test_storage_failure_is_not_rejection_or_budget_stop_and_secondary_write_cannot_mask_it(tmp_path, monkeypatch, capsys):
-    from audit_support import combined, engine_for
+    from support.audit import combined, engine_for
     import consensus_assurance.workflow.audit as audit
     engine, repo = engine_for(tmp_path, [combined])
     write_json, save = audit.write_json, engine.store.save
@@ -281,7 +283,7 @@ def test_storage_failure_is_not_rejection_or_budget_stop_and_secondary_write_can
 
 @pytest.mark.parametrize('failure', [None, 'checkpoint', 'cleanup'])
 def test_private_build_cleanup_follows_durable_evidence_and_preserves_other_outputs(tmp_path, monkeypatch, failure):
-    from audit_support import combined, engine_for
+    from support.audit import combined, engine_for
     from consensus_assurance.adapters.runners.cargo_build import cleanup
     engine, repo = engine_for(tmp_path, [combined])
     run, checkpoint = engine.runner.run, engine.checkpoint
@@ -339,9 +341,10 @@ def test_private_build_cleanup_rejects_linked_ancestor(tmp_path):
 
 
 @pytest.mark.parametrize('raw_receipt', [False, True])
+@pytest.mark.real
 def test_cargo_completed_receipt_recovers_after_deadline_without_reexecution(tmp_path, rust_workspace, monkeypatch, raw_receipt):
     import shutil
-    from audit_support import cargo_engine, combined
+    from support.audit import cargo_engine, combined
     if not shutil.which('cargo') or not shutil.which('bwrap'):
         pytest.skip('Local Cargo and bubblewrap are required; no download')
 

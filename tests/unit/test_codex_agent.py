@@ -67,7 +67,7 @@ def test_transport_diagnostic_keeps_mixed_restrictions_and_completed_reconnects(
     'refusal','permission','permission_recheck','session_lost','empty_error','calls','time'])
 @pytest.mark.parametrize('completed',[False,True])
 def test_turn_deadline_continues_only_saved_session_with_capacity(tmp_path,boundary,completed):
-    from audit_support import ScriptedAgent,engine_for,first,combined
+    from support.audit import ScriptedAgent,engine_for,first,combined
     continuation=combined if boundary=='turn_crash' else first
     engine,repo=engine_for(tmp_path,[first,continuation])
     resumed=boundary in {'turn','turn_no_final','turn_stdout','turn_crash'}
@@ -185,7 +185,7 @@ def test_audit_failure_reason_preserves_schema_diagnostic_and_redacts_secrets():
     '{"submission":"draft.json","summary":12}',
     '{"submission":"draft.json","summary":"Done","extra":true}'])
 def test_invalid_final_response_remains_a_repairable_format_error(tmp_path,final):
-    from audit_support import engine_for, first
+    from support.audit import engine_for, first
     from consensus_assurance.workflow.audit import receive, accept_received
     engine,repo=engine_for(tmp_path,[])
     state=engine.start(repo,plan_only=True)
@@ -353,7 +353,7 @@ def test_source_view_only_exposes_authorized_snapshot_and_rejects_stale_range(tm
 def test_one_audit_runtime_and_methods_match_product_interface(tmp_path):
     from consensus_assurance.workflow.audit import method_text
     from consensus_assurance.workflow.prompts import loaded_resources
-    from audit_support import engine_for, stop
+    from support.audit import engine_for, stop
     paths,text=method_text()
     selection=loaded_resources()
     e,repo=engine_for(tmp_path,[stop]);state=e.start(repo)
@@ -405,7 +405,7 @@ def test_helper_preflight_rejects_aliases_collisions_and_target_replacement(tmp_
 
 
 def test_failed_permission_preflight_spends_no_agent_call(tmp_path):
-    from audit_support import engine_for,first
+    from support.audit import engine_for,first
     engine,repo=engine_for(tmp_path,[first])
     engine.agent.prepare=lambda *args:(False,[])
     state=engine.start(repo)
@@ -414,10 +414,10 @@ def test_failed_permission_preflight_spends_no_agent_call(tmp_path):
 
 
 def test_provider_configuration_and_catalog_inputs_precede_cached_results(tmp_path,monkeypatch):
-    from audit_support import engine_for
+    from support.audit import engine_for
     from consensus_assurance.cli import load_config
     from consensus_assurance.core.config import Config,CodexProvider
-    cfg=load_config('configs/targets/deepseek.example.yaml')
+    cfg=load_config('configs/ca/deepseek.yaml')
     assert not cfg.allow_agent_materials and not cfg.allow_experiments
     assert Path(cfg.codex_provider.model_catalog_path).is_absolute()
     raw=cfg.codex_provider.model_dump(mode='json')

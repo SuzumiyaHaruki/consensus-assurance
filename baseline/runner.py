@@ -28,7 +28,7 @@ WORK_EXCLUDED = EXCLUDED | {".runtime"}
 def implementation_identity(root):
     """Git identifies clean checkout code; retain dirty and external source bytes."""
     project = Path(__file__).resolve().parents[1]
-    paths = (':(glob)baseline/*.py', 'baseline/task.md', 'baseline/requirements.txt', 'src')
+    paths = (':(glob)baseline/*.py', 'baseline/task.md', 'pyproject.toml', 'src')
     dirty = git(project, 'status', '--porcelain', '--untracked-files=all', '--', *paths).decode()
     changed = (git(project, 'diff', '--name-only', '-z', 'HEAD', '--', *paths) +
                git(project, 'ls-files', '--others', '--exclude-standard', '-z', '--', *paths)).decode().split('\0')

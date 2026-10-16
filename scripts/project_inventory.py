@@ -1,31 +1,62 @@
-"""Reproducible footprint and static internal-call inventory; artifacts are not code."""
+"""Count publishable files and physical lines; local archives are not runtime code."""
 import ast
 import json
+import subprocess
 import sys
 from pathlib import Path
 
-root=Path(sys.argv[2]).resolve() if len(sys.argv)>2 else Path(__file__).resolve().parents[1]
-def category(p):
-    s=p.relative_to(root).as_posix()
-    if s.startswith('runs/'):return 'run_artifacts'
-    if s.startswith('tests/'):return 'tests'
-    if s.startswith('src/') and '/resources/' in s:return 'skills_and_resources'
-    if s.startswith(('src/','scripts/')) and p.suffix in {'.py','.go','.sh','.tla'}:return 'production_logic'
-    if s.startswith('docs/') and (p.name.startswith('第') or p.name in {'本次验收.md','最终任务书.md'}):return 'historical_documents'
-    if s.startswith('docs/') or p.name in {'README.md','AGENTS.md'}:return 'current_documents'
+root = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else Path(__file__).resolve().parents[1]
 
-stats={};modules=[]
-for base in ['src','tests','docs','runs','scripts','README.md','AGENTS.md']:
-    path=root/base
-    for p in path.rglob('*') if path.is_dir() else [path]:
-        if not p.is_file() or any(x in p.parts for x in ('__pycache__','.execution')) or '.egg-info' in str(p):continue
-        group=category(p)
-        if not group:continue
-        b=p.read_bytes();entry=stats.setdefault(group,dict(files=0,bytes=0,lines=0,nonblank=0))
-        entry['files']+=1;entry['bytes']+=len(b);entry['lines']+=len(b.splitlines());entry['nonblank']+=sum(bool(line.strip()) for line in b.splitlines())
-        if group=='production_logic' and p.suffix=='.py':
-            tree=ast.parse(b);calls=sorted({ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n,ast.Call)})
-            modules.append(dict(path=str(p.relative_to(root)),lines=len(b.splitlines()),calls=calls))
-result={'categories':stats,'largest_modules':sorted(modules,key=lambda m:m['lines'],reverse=True)[:12],
-        'basis':'Physical bytes and splitlines; run caches excluded; calls are static references, not execution counts'}
-Path(sys.argv[1]).write_text(json.dumps(result,indent=2,ensure_ascii=False))
+
+def category(name):
+    if name.startswith('baseline/runs/'):
+        return 'baseline_run_artifacts'
+    if name.startswith('baseline/acceptance/'):
+        return 'baseline_acceptance'
+    if name.startswith('runs/'):
+        return 'ca_run_artifacts'
+    if name.startswith('tests/baseline/') and name.endswith('.py'):
+        return 'baseline_tests'
+    if name.startswith('tests/support/') and name.endswith('.py'):
+        return 'test_support'
+    if name.startswith('tests/'):
+        return 'ca_tests' if name.endswith('.py') else 'test_fixtures'
+    if name.startswith('baseline/') and name.endswith('.py'):
+        return 'baseline_function'
+    if name.startswith('src/'):
+        return 'ca_function' if name.endswith('.py') else 'method_resources'
+    if name.startswith('configs/'):
+        return 'public_configs'
+    if name.startswith('scripts/'):
+        return 'development_tools'
+    if name.startswith(('docs/', 'baseline/')) or name in {'README.md', 'AGENTS.md'}:
+        return 'documents'
+
+
+# Include new publishable files; honor the same exclusions as Git.
+names = subprocess.check_output(
+    ['git', '-C', str(root), 'ls-files', '-c', '-o', '--exclude-standard', '-z']
+).decode().split('\0')
+stats, modules = {}, []
+for name in sorted(set(names)):
+    path = root / name
+    group = category(name)
+    if not group or not path.is_file():
+        continue
+    data = path.read_bytes()
+    lines = data.splitlines() if b'\0' not in data else []
+    entry = stats.setdefault(group, dict(files=0, bytes=0, lines=0, nonblank=0))
+    entry['files'] += 1
+    entry['bytes'] += len(data)
+    entry['lines'] += len(lines)
+    entry['nonblank'] += sum(bool(line.strip()) for line in lines)
+    if group in {'ca_function', 'baseline_function', 'development_tools'} and path.suffix == '.py':
+        tree = ast.parse(data)
+        calls = sorted({ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)})
+        modules.append(dict(path=name, lines=len(lines), calls=calls))
+result = {
+    'categories': stats,
+    'largest_modules': sorted(modules, key=lambda m: m['lines'], reverse=True)[:12],
+    'basis': 'Git tracked and nonignored files; physical lines, not logical statements; binary lines omitted. Local archives and caches are excluded.',
+}
+Path(sys.argv[1]).write_text(json.dumps(result, indent=2, ensure_ascii=False))
