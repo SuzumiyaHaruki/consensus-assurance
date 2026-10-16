@@ -193,7 +193,9 @@ def test_changed_citation_remains_visible_when_unchanged_citations_fill_inline_l
         check=next(c for c in state['checks'] if c.get('experiment_id'))
         return opinion(state,conclusion='conditional',executions={check['id']:list(range(count))})
     def finish(state):
-        receipt=operation_summary(e.state,e.root)['interpretation_changes'][0]['executions'][0]
+        change=operation_summary(e.state,e.root)['interpretation_changes'][0]
+        assert change['text_changes']==[]  # Only the receipt indices changed.
+        receipt=change['executions'][0]
         assert receipt['previous_event_indices']==list(range(8)) and receipt['current_event_indices']==list(range(9))
         assert receipt['cited_events'][0]['event_index']==8 and len(receipt['cited_events'])==8
         assert receipt['omitted_cited_indices']==[7] and receipt['event_indices']==list(range(9))
@@ -224,6 +226,7 @@ def test_knowledge_and_interpretation_changes_share_observations_without_losing_
         assert list(summary).index('knowledge_changes') < list(summary).index('questions')
         assert new['previous'] is None and not new['intermediate_revisions']
         assert new['current']['conditions']=='At the selected capacity'
+        assert {v['field'] for v in new['text_changes']}=={'statement','conditions'}
         assert not new['executions'][0]['cited_events'] and len(new['executions'][0]['shared_cited_events'])==2
         entry=state['knowledge'][0]
         change={key:entry[key] for key in ('id','kind','statement','conditions','source_ids')}
@@ -241,6 +244,9 @@ def test_knowledge_and_interpretation_changes_share_observations_without_losing_
         assert change['previous']['source_ids']==['code'] and change['current']['source_ids']==['doc']
         assert {s['id'] for s in change['sources']}=={'code','doc'}
         assert change['previous']['record']['revision']==1 and change['current']['record']['revision']==3
+        text,=change['text_changes']
+        assert text['field']=='conditions' and 'At the selected capacity' in json.dumps(text)
+        assert retained['change']['conditions'] in json.dumps(text)
         receipt,=change['executions']
         assert receipt['previous_event_indices']==[0,1] and receipt['current_event_indices']==list(range(1,11))
         assert receipt['event_indices']==list(range(11)) and not receipt['cited_events']
@@ -329,13 +335,17 @@ def test_schema_projected_local_revision_preserves_support_and_allows_withdrawal
 
 
 def test_interpretation_feedback_uses_its_own_receipts_after_another_question_executes(tmp_path):
+    account='One local observation. '+''.join(f'Retained condition {i} concerns the same invocation. ' for i in range(80))
+    extension='The later source explanation narrows the consequence to the admitted caller.'
+    limits=['First boundary','Second boundary','Third boundary','Fourth boundary remains necessary','Fifth boundary']
     def start(state):
         sub,files=combined(state)
         sub['knowledge']=[dict(kind='fact',statement=statement,conditions='Capacity input',source_ids=['code','doc'])
             for statement in ('The return preserves its input','The return stays bounded','An unrelated source fact')]
         return sub,files
     def initial(state):
-        sub,files=opinion(state,defect_claim='asserted',knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=1)])
+        sub,files=opinion(state,defect_claim='asserted',rationale=account,limitations=limits,
+            knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=1)])
         entry=state['knowledge'][2]
         sub['knowledge']=[dict(id=entry['id'],kind=entry['kind'],statement=entry['statement'],
             conditions=entry['conditions'],source_ids=entry['source_ids'],executions=sub['interpretations'][0]['executions'])]
@@ -360,7 +370,7 @@ def test_interpretation_feedback_uses_its_own_receipts_after_another_question_ex
         sub,files=opinion(state,investigation_id=original['investigation_id'],experiment_id=None,
             executions={},source_ids=['doc'],conclusion='explained',defect_claim='refuted',
             knowledge=[dict(entry_id=state['knowledge'][1]['id'],revision=1)],
-            rationale='The receipt is unchanged; the current source interpretation narrows the responsibility')
+            rationale=account.replace('One local','Two local')+extension,limitations=limits[:3]+limits[4:])
         sub['investigations']=[dict(id=original['investigation_id'],hypothesis='The local contract permits the sampled return')]
         other_receipt=next(c['id'] for c in reversed(state['checks']) if c.get('experiment_id')==state['experiments'][1]['id'])
         sub['knowledge']=[dict(kind='behavior',statement='The independent invocation also returns zero',
@@ -376,8 +386,17 @@ def test_interpretation_feedback_uses_its_own_receipts_after_another_question_ex
         old,other,middle,new=state['interpretations']
         assert {k:change['previous'][k] for k in ('id','conclusion','defect_claim')}==dict(
             id=old['id'],conclusion='violated',defect_claim='asserted')
-        assert change['previous']['rationale']==old['rationale'] and change['previous']['record']['id']==old['id']
-        assert change['current']==dict(id=new['id'],conclusion='explained',defect_claim='refuted')
+        assert change['previous']['rationale']==excerpt(old['rationale']) and change['previous']['record']['id']==old['id']
+        assert change['current']==dict(id=new['id'],conclusion='explained',defect_claim='refuted',
+            record=dict(path='state.json',collection='interpretations',id=new['id']))
+        text={v['field']:v for v in change['text_changes']}
+        assert extension not in excerpt(new['rationale']) and extension in json.dumps(text['rationale'])
+        assert 'One local' in json.dumps(text['rationale']) and 'Two local' in json.dumps(text['rationale'])
+        assert limits[3] in json.dumps(text['limitations']) and text['limitations']['format']=='json'
+        for side in ('previous','current'):
+            locator=change[side]['record']
+            records=json.loads((e.root/locator['path']).read_text())[locator['collection']]
+            assert next(v for v in records if v['id']==locator['id'])==(old if side=='previous' else new)
         assert change['intermediate_interpretation_ids']==[middle['id']]
         assert change['previous_source_ids']==['code','doc'] and change['current_source_ids']==['doc']
         assert {s['id'] for s in change['sources']}=={'code','doc'}
@@ -1179,3 +1198,53 @@ def test_navigation_keeps_evidence_references_and_marks_long_prose_without_mutat
         assert item['view']=='preview'
         assert next(record for record in complete if record['id']==locator['id'])==entry.model_dump(mode='json')
     assert state.model_dump(mode='json')==before and (engine.root/'state.json').read_bytes()==saved
+
+
+@pytest.mark.parametrize('before,after,chars',[
+    ('A café result\nrequires support.', 'A café result\nrequires independent support.',4000),
+    (['Repeated','Other','Repeated'], ['Repeated','Repeated','Other'],4000),
+    (['prefix '*300+'old measurement'+' suffix'*300], ['prefix '*300+'new measurement'+' suffix'*300],4000),
+    ('x'*48+'old'+'y'*48, 'x'*48+'new'+'y'*48,40),
+])
+def test_text_changes_preserve_exact_ranges_order_and_changed_context(before,after,chars):
+    from consensus_assurance.workflow.research import text_changes
+    prior,current={'limitations':before},{'limitations':after}
+    saved=json.dumps([prior,current])
+    budget={'chars':chars,'edits':12,'work':1000000}
+    change,=text_changes(prior,current,('limitations',),budget)
+    assert change['display']=='diff' and not change['omitted_edits']
+    assert change['format']==('text' if isinstance(after,str) else 'json')
+    old,new=(value if isinstance(value,str) else json.dumps(value,ensure_ascii=False,indent=2)
+        for value in (before,after))
+    restored,cursor='',0
+    for edit in change['edits']:
+        a,b=edit['before']['range'];c,d=edit['after']['range']
+        restored+=old[cursor:a]+new[c:d];cursor=b
+        for side,value in (('before',old),('after',new)):
+            part=edit[side];start,end=part['context_range'];fragment=value[start:end]
+            assert not part['omitted_characters'] and part['parts']==[fragment]
+    assert restored+old[cursor:]==new and saved==json.dumps([prior,current])
+    if isinstance(after,list) and 'new measurement' in after[0]:
+        assert 'new measurement' in json.dumps(change) and 'old measurement' in json.dumps(change)
+    if chars==40:
+        assert 'old' in json.dumps(change) and 'new' in json.dumps(change)
+
+
+@pytest.mark.parametrize('limit',['size','work'])
+def test_text_changes_bound_matching_and_shared_output_without_hiding_omissions(monkeypatch,limit):
+    import difflib
+    from consensus_assurance.workflow.research import text_changes
+    monkeypatch.setattr(difflib,'SequenceMatcher',lambda *a,**k:pytest.fail('Unbounded matching'))
+    n=21000 if limit=='size' else 100
+    old={'rationale':'a'*n,'limitations':['Unchanged','Keep this condition']}
+    new={'rationale':'b'*n,'limitations':['Unchanged']}
+    budget={'chars':120,'edits':1,'work':1000000 if limit=='size' else 0}
+    first,second=text_changes(old,new,tuple(old),budget)
+    assert first['display']=='bounded_replacement' and first['edits']
+    for side in first['edits'][0].values():
+        assert len(side['parts'])==2 and side['omitted_characters']==n-sum(map(len,side['parts']))
+    assert second['field']=='limitations' and second['omitted_edits'] and not second['edits']
+    third,=text_changes(None,{'statement':'A new account'},('statement',),budget)
+    assert third['omitted_edits'] and not third['edits']
+    assert budget['chars']==0 and budget['edits']==0
+    assert text_changes(new,new,tuple(new),budget)==[]

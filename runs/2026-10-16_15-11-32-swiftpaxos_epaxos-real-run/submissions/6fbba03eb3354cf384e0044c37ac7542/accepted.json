@@ -1,0 +1,331 @@
+{
+  "rationale": "Recorded the first execution of the extended client-completion harness and corrected the admission identity that left its completion comparison unknown; a successor execution is requested. The reply-side gap is answered from the two receipts plus the execution-time reply condition, and the re-propose behavior now cites both receipts' indices. A successor execution with the corrected admission identity is requested in this update.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "602b7dcab8064d2ab9113ac315a40743-knowledge-0",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "handleCommit, for the instance owner only, tests whether the committed command is a single NONE operation and whether the local leader bookkeeping still holds pending client proposals; when both hold it pushes every pending proposal back onto the replica's own ProposeChan and clears lb.clientProposals, so the client request is re-proposed on a new instance instead of being consumed by the committed NOOP. The re-queued proposal carries the same command id and reply writer, so the client's completion is served by the new instance's decision and execution.",
+      "conditions": "A commit that decides a single NOOP for an instance owned by the local replica while that replica still holds client proposals for it (epaxos/epaxos.go:1082-1100, reached after a recovery replaced the owner's accepted command).",
+      "source_ids": [
+        "s-commit-repropose",
+        "s-exec-reply",
+        "s-recovery-init",
+        "s-subcase-dispatch"
+      ],
+      "executions": {
+        "f96da636a32f473280ce82dc0f0a002d": [
+          9,
+          10,
+          11,
+          12
+        ],
+        "e5527cca0ee64fd681d3ec1371f9cca6": [
+          10,
+          11,
+          13,
+          14,
+          15,
+          16,
+          17
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "602b7dcab8064d2ab9113ac315a40743-question-0",
+      "experiment_id": "602b7dcab8064d2ab9113ac315a40743-experiment",
+      "source_ids": [
+        "s-commit-repropose",
+        "s-exec-reply",
+        "s-recovery-init",
+        "s-subcase-dispatch"
+      ],
+      "executions": {
+        "f96da636a32f473280ce82dc0f0a002d": [
+          2,
+          3,
+          6,
+          7,
+          9,
+          10,
+          11,
+          12
+        ],
+        "e5527cca0ee64fd681d3ec1371f9cca6": [
+          10,
+          11,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": null,
+      "rationale": "Current account: the protection around a replacement decision works and the client's request completes, with one measurement still pending a corrected admission. Measured: receipt f96da636a32f473280ce82dc0f0a002d (fixed experiment 602b7dcab806d2ab9113ac315a40743-experiment... corrected name 602b7dcab8064d2ab9113ac315a40743-experiment) shows the owner's command replaced by the recovery's NOOP while the pending proposal is re-queued exactly once (indices 9-12, comparison 0 holds at index 11). Receipt e5527cca0ee64fd681d3ec1371f9cca6 (successor experiment 6ba3fb0618b64be7aa792b0f450b9cbf-experiment) extended the harness past the re-queue: its event stream shows the re-queued proposal creating instance (0,1) (index 13), that instance decided at status COMMITTED (index 14), the package's own execution entry point returning true with 17 reply bytes (index 16), and the decoded reply carrying command id 77 with ok 1 (index 17) - so the client's request is served end-to-end after the replacement. That receipt's declared completion comparison came back unknown because its admission event described instance (0,0) (the re-queue) while the reply observation describes instance (0,1): the events are present and consistent, but the identity they were correlated on differed, which is an observation-construction defect of the harness rather than target behaviour. A successor execution with the corrected admission (the reproposed instance's decided state) was requested in this update, so the measured claim is grounded in the event stream above and awaits its own comparison result. No defect is claimed for this relationship: the replacement decision is paired with a re-offer and a completion, at the cost of a fresh instance and a later reply.",
+      "answers": {
+        "ed76b573b9fe4bde9565d4b4678cda85-gap-1": {
+          "explanation": "The replaced instance itself produces no client-visible reply: replies are emitted only by the execution path and only while the executing replica still holds client proposals for the executed instance (epaxos/exec.go:126-138), and handleCommit cleared the owner's pending list when the replacement decision arrived - measured as pending_proposals 0 and reply_bytes 0 in receipt f96da636a32f473280ce82dc0f0a002d (index 11). The client's completion is instead served by the re-proposed request: the successor receipt e5527cca0ee64fd681d3ec1371f9cca6 shows instance (0,1) decided and its execution writing a 17-byte reply carrying command id 77 (indices 14, 16, 17).",
+          "resolved": true
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The re-propose path is gated on three conditions in handleCommit (owner row, a single NONE command, non-nil pending proposals); a replacement decision carrying a non-NONE command, or an instance owned by a failed replica, leaves the client request un-reproposed, so this protection is narrower than 'every replacement is compensated'.",
+        "The measured re-queue and completion both required the owner to stay alive; when the owner failed (committed-value experiment) its request was re-proposed by nobody, which is the path that documents the value loss.",
+        "The completion measurement depends on the harness invoking the package's own execution entry point directly; no run() loop or executeCommands goroutine existed, so the scheduling of that call is the harness's, not the target's.",
+        "The first execution of the extended harness reported the completion comparison as unknown (admission identity mismatch between the re-queue observation of instance (0,0) and the reply of instance (0,1)) even though the reply event carried the expected command id, which is a harness observation defect and not a target observation."
+      ],
+      "limitations": [
+        "One command shape (single PUT), one key, two instance indices, and one alive owner; the batching case where the re-propose loop pushes several proposals was not exercised.",
+        "The reply was decoded from the proposal's reply writer inside the harness rather than over a client socket, and the entry point was called synchronously instead of by the executor goroutine.",
+        "The completion comparison's result is pending the corrected-admission execution; until that lands, the completion claim rests on the parsed event stream of receipt e5527cca0ee64fd681d3ec1371f9cca6 rather than on a declared comparison outcome."
+      ],
+      "joint_history": "Indices 2, 3, 6, 7 and 9-12 belong to receipt f96da636a32f473280ce82dc0f0a002d (instance (0,0) of the first run) and indices 10, 11, 13-18 belong to receipt e5527cca0ee64fd681d3ec1371f9cca6 (instance (0,0) replaced, then instance (0,1) re-proposed and executed in the successor run); each claim above is grounded in the named receipt, and the two are separate executions of the same harness family.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "602b7dcab8064d2ab9113ac315a40743-question-0",
+    "harness_path": "epaxos/assurance_generated_test.go",
+    "files": {},
+    "execution_package": "./epaxos",
+    "test_names": [
+      "TestAssuranceEPaxosRecoveryReproposesClientRequest"
+    ],
+    "source_ids": [
+      "s-commit-repropose",
+      "s-decl-recovery",
+      "s-recovery-init",
+      "s-subcase-dispatch",
+      "s-exec-reply"
+    ],
+    "anchors": [
+      {
+        "material_id": "s-decl-recovery",
+        "symbol": "startRecoveryForInstance",
+        "start_line": 1127,
+        "end_line": 1141,
+        "anchor": {
+          "source_ids": [
+            "s-decl-recovery"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "s-decl-recovery",
+          "start_line": 1127,
+          "end_line": 1127,
+          "symbol": "startRecoveryForInstance"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Five replicas (F=2) in the existing harness. Owner replica 0 proposes command X with a real defs.GPropose attached (command id 77, reply writer over a local buffer); replica 1 holds a conflicting command so its pre-accept reply is non-equal, and replica 1 fails after replying; replica 3, which holds no command, recovers instance (0,0) while the owner is still alive; the quiescent exchange is completed; the owner's propose channel is then drained and its instance state, pending proposals and reply writer size are recorded. After the replacement decision and the observed re-queue, the harness calls handlePropose with the re-queued proposal (creating instance (0,1)), delivers that instance's pre-accept replies, and invokes the package's own execution entry point for it, recording the execution result, the reply writer size and the decoded reply.",
+      "assumptions": [
+        "Same construction, transport boundary and crash model as the other experiments in this harness.",
+        "The owner stays alive throughout, modelling a slow but reachable owner whose instance is decided by another replica's recovery.",
+        "No executor goroutine runs, so any reply observed would have to come from the recovery/handleCommit paths rather than from the state-machine execution path.",
+        "The execution entry point is invoked directly, as the package's executeCommands goroutine would, because the harness runs no run() loop."
+      ],
+      "excluded": [
+        "No run() loop, no executeCommands goroutine and no client socket; the client request is supplied as the target's own defs.GPropose value."
+      ],
+      "parameters": {
+        "n": 5,
+        "f": 2,
+        "owner": 0,
+        "recoverer": 3,
+        "command_id": 77,
+        "value_key": 1,
+        "reproposed_instance": 1
+      }
+    },
+    "prefix": "The harness attaches a real GPropose to the owner's startPhase1 call, drives the conflicting premise and the owner's non-equal pre-accept reply, fails replica 1, calls startRecoveryForInstance(0,0) at replica 3, delivers the emitted Prepare/PrepareReply/PreAccept traffic and the resulting Commit through the target's handlers, and finally drains the owner's ProposeChan while recording the owner's instance status, committed command, remaining pending proposals and reply buffer size. Then the re-queued proposal is passed to the replica's own handlePropose, its pre-accept exchange is delivered, and Exec.executeCommand is called for instance (0,1); the reply written for command id 77 is decoded from the proposal's reply writer.",
+    "semantic_changes": [],
+    "requirement": "A committed replacement decision for an instance must not silently consume the client request the owner had pending for it: the pending proposal must be re-offered for a new decision, and the client must not be told the original request completed. The re-queued proposal must also be able to complete: after it is decided, the target's execution path must deliver a reply for the same command id.",
+    "responsibility": "The owner's own commit handling (epaxos/epaxos.go:1082-1100) and the recovery that produced the replacement decision (epaxos/epaxos.go:1236-1313); the client request was admitted through the replica's own propose path.",
+    "prerequisites": [
+      {
+        "alias": "owner-proposal",
+        "event": "owner_proposal",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "command_id",
+            "op": "eq",
+            "value": 77,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "owner-held-command",
+        "event": "instance_state",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_preaccept_replies",
+            "reference": null
+          },
+          {
+            "field": "cmd_op",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "recovery-proposed-replacement",
+        "event": "recovery_proposal",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "cmd_op",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "client-request-requeued",
+        "event": "client_request_requeued",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "command_id",
+            "op": "eq",
+            "value": 77,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "reproposed-instance-decided",
+        "event": "instance_state",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "instance_index",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_reproposal_commit",
+            "reference": null
+          },
+          {
+            "field": "status",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "requeue_summary",
+        "identity_fields": [
+          "replica",
+          "instance_row",
+          "instance_index"
+        ],
+        "admission_alias": "owner-proposal",
+        "assertion": {
+          "field": "requeued",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "owner_instance_status",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          },
+          {
+            "field": "owner_cmd_op",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ],
+        "description": "The owner's pending client request is re-queued exactly once after its instance was decided with the replacement NOOP; violated when no proposal arrives on the owner's propose channel."
+      },
+      {
+        "event": "completion_reply",
+        "identity_fields": [
+          "replica",
+          "instance_row",
+          "instance_index"
+        ],
+        "admission_alias": "reproposed-instance-decided",
+        "assertion": {
+          "field": "command_id",
+          "op": "eq",
+          "value": 77,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "instance_index",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "After the re-queued request is decided again at instance (0,1), the target's execution path produces a client reply carrying the same command id (77); violated when no reply is written or it carries a different command id. Admitted on the re-proposed instance's decided state, which shares the identity of the reply observation."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": "6ba3fb0618b64be7aa792b0f450b9cbf-experiment",
+    "revision_reason": "Corrected the admission for the completion comparison. The re-queue observation describes instance (0,0) while the completion reply describes the re-proposed instance (0,1), so the comparison now admits on the reproposed-instance-decided observation of instance (0,1) instead of the re-queue event; the harness, scenario and the re-queue comparison are unchanged."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -37,6 +37,64 @@ def excerpt(text, limit=400):
     return text if len(text) <= limit else text[:limit] + f' [preview: {len(text)-limit} characters omitted; see full record]'
 
 
+def text_changes(previous, current, fields, remaining):
+    """Bounded textual differences, never semantic judgments or additional research state."""
+    import difflib
+    import re
+    changes = []
+    for name in fields:
+        after = current[name]
+        before = previous[name] if previous is not None else ([] if isinstance(after, list) else '')
+        if before == after:
+            continue
+        representation = 'text' if isinstance(after, str) else 'json'
+        if representation == 'json':
+            before, after = (json.dumps(value,ensure_ascii=False,indent=2) for value in (before,after))
+        start, old_end, new_end = 0, len(before), len(after)
+        while start < min(old_end, new_end) and before[start] == after[start]:
+            start += 1
+        while old_end > start and new_end > start and before[old_end-1] == after[new_end-1]:
+            old_end -= 1
+            new_end -= 1
+        ranges = [(start, old_end, start, new_end)]
+        coarse = bool(old_end > start and new_end > start)
+        if (coarse and remaining['edits'] and remaining['chars'] and remaining['work'] > 0
+                and max(old_end-start, new_end-start) <= 20000):
+            left = list(re.finditer(r'\S+\s*|\s+', before[start:old_end]))
+            right = list(re.finditer(r'\S+\s*|\s+', after[start:new_end]))
+            a, b = [m.group() for m in left], [m.group() for m in right]
+            old_offsets = [start+m.start() for m in left] + [old_end]
+            new_offsets = [start+m.start() for m in right] + [new_end]
+            work = len(a)*len(b)
+            if work <= remaining['work']:
+                remaining['work'] -= work
+                ranges = [(old_offsets[i], old_offsets[j], new_offsets[k], new_offsets[l])
+                    for tag,i,j,k,l in difflib.SequenceMatcher(None,a,b,autojunk=False).get_opcodes() if tag != 'equal']
+                coarse = False
+        edits = []
+        for old_start, old_stop, new_start, new_stop in ranges:
+            if remaining['edits'] <= 0 or remaining['chars'] < 2:
+                break
+            sides = []
+            limit = min(800, remaining['chars']//2)
+            for value, first, last in ((before,old_start,old_stop),(after,new_start,new_stop)):
+                context = min(48,max(0,(limit-(last-first))//2))
+                lo, hi = max(0,first-context), min(len(value),last+context)
+                fragment = value[lo:hi]
+                # Separate ends rather than concatenate them into an apparently continuous quote.
+                parts = [fragment] if len(fragment) <= limit else [fragment[:limit//2],fragment[-(limit-limit//2):]]
+                shown = sum(map(len,parts))
+                sides.append({'range':[first,last], 'context_range':[lo,hi], 'parts':parts,
+                    'omitted_characters':len(fragment)-shown})
+                remaining['chars'] -= shown
+            edits.append({'before':sides[0], 'after':sides[1]})
+            remaining['edits'] -= 1
+        changes.append({'field':name, 'format':representation,
+            'display':'bounded_replacement' if coarse else 'diff', 'edits':edits,
+            'omitted_edits':len(ranges)-len(edits)})
+    return changes
+
+
 def preview(value):
     """Shorten prose explicitly; identifiers and evidence references stay complete."""
     if isinstance(value, list):
@@ -413,7 +471,7 @@ def operation_summary(state, root):
         summary['correction_guidance'] = (
             'Recorded premise corrections and explicit uses are above; full history is at each record. '
             'Review the identified uses under their original investigations; necessary gaps remain in research.json.')
-    previous, updates, changes = {}, {}, []
+    previous, updates, changes, text_updates = {}, {}, [], []
     remaining = {'events':8, 'chars':6000, 'shown':{}}  # Shared by interpretation and knowledge citations.
     for opinion in state.interpretations:
         prior = previous.get(opinion.investigation_id)
@@ -424,14 +482,18 @@ def operation_summary(state, root):
                 continue
             changes.append({'investigation_id':opinion.investigation_id,
                 'previous':interpretation_view(prior, compact=True),
-                'current':{'id':opinion.id, 'conclusion':opinion.conclusion, 'defect_claim':opinion.defect_claim},
+                'current':{'id':opinion.id, 'conclusion':opinion.conclusion, 'defect_claim':opinion.defect_claim,
+                    'record':{'path':'state.json', 'collection':'interpretations', 'id':opinion.id}},
                 'record':{'path':'state.json', 'collection':'interpretations'},
+                'text_changes':[],
                 'previous_source_ids':prior.source_ids if prior else [], 'current_source_ids':opinion.source_ids,
                 'sources':source_locations(state, set(opinion.source_ids) | (set(prior.source_ids) if prior else set())),
                 'intermediate_interpretation_ids':batch[:-1],
                 'knowledge_references':interpretation_knowledge(state, prior, opinion),
                 'executions':cited_executions(state,root,prior.executions if prior else {},opinion.executions,
                     opinion.id,remaining,f'/interpretation_changes/{len(changes)}/executions')})
+            text_updates.append((changes[-1],prior.model_dump() if prior else None,opinion.model_dump(),
+                ('rationale','counterevidence','limitations','joint_history')))
         else:
             previous[opinion.investigation_id] = opinion
     if changes:
@@ -443,16 +505,25 @@ def operation_summary(state, root):
         prior = next((r for r in reversed(entry.history) if r['operation_id'] != entry.operation_id), None)
         knowledge_changes.append({'id':entry.id, 'previous':knowledge_revision_view(prior),
             'current':knowledge_revision_view(entry.model_dump(exclude={'history'})),
+            'text_changes':[],
             'intermediate_revisions':[r['revision'] for r in entry.history if r['operation_id'] == entry.operation_id],
             'sources':source_locations(state,set(entry.source_ids) | (set(prior['source_ids']) if prior else set())),
             'executions':cited_executions(state,root,prior['executions'] if prior else {},entry.executions,
                 entry.id,remaining,f'/knowledge_changes/{len(knowledge_changes)}/executions')})
+        text_updates.append((knowledge_changes[-1],prior,entry.model_dump(exclude={'history'}),('statement','conditions')))
     if knowledge_changes:
         summary['knowledge_changes'] = knowledge_changes
     if changes or knowledge_changes:
+        prose = {'chars':4000, 'edits':12, 'work':1000000}
+        # Revisions get the shared prose budget before new accounts; evidence has its own budget.
+        for change, prior, value, fields in sorted(text_updates,key=lambda item:item[1] is None):
+            change['text_changes'] = text_changes(prior,value,fields,prose)
         summary['account_guidance'] = (
-            'Relate changed or merged explanations to the evidence and conditions of each retained mechanism. '
-            'Saving knowledge does not strengthen its evidence. '
+            'Text changes show literal edits, not inferred claims or semantic dependence. Ranges are zero-based, '
+            'end-exclusive character offsets into the text or JSON array (indent=2, ensure_ascii=False). '
+            'Two parts omit the intervening characters. '
+            'Empty text changes concern only the displayed fields, not all submission changes. Full previous/current '
+            'records retain omitted content. Saving knowledge does not strengthen its evidence. '
             'Old and new reasons include removed citations. Other current citations and historical locators are '
             'review candidates, not automatically affected conclusions; event overlap alone does not establish impact. '
             'Correct identified premises and uses, preserving independent support. Withdrawing a witness does not '
@@ -467,10 +538,10 @@ def operation_summary(state, root):
         question['execution'] = execution_feedback(state, root, fixed, check)
     summary['necessary_gaps'] = necessary_gaps
     summary['reselection'] = reselection_view(state)
-    action = ('Check the proposed inference against its cited basis and conditions. For execution-based claims, '
-        'do fixed operations, actual operands and consumers, order and raw observations establish it, '
-        'or also fit a concrete permitted explanation? Use available evidence or inspect the decisive location '
-        'where needed; correct identified errors in explanations and knowledge, preserving independent support. '
+    action = ('For a newly inferred consequence, wider scope or excluded path, check the added premise and link: '
+        'do actual operations and same-object observations before and after them establish it, or fit a concrete '
+        'alternative? Use saved evidence or inspect the decisive source or sampling where needed. Correct unsupported '
+        'extensions and their identified uses, preserving independent findings; no separate review submission is needed. '
         if executed or changes or knowledge_changes or corrections else '')
     summary['next'] = (
         'The unchanged submission is already retained; this call still consumed time and a model turn. '

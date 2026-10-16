@@ -64,7 +64,7 @@ def test_receipt_identity_precheck_precedes_measurement_and_repairs_atomically(t
         alias['investigations'] = [dict(ref='@related', question='Can this observation inform a related question?',
                                         source_ids=['code'])]
         alias['interpretations'].append({**alias['interpretations'][0], 'investigation_id': '@related',
-                                        'experiment_id': None, 'conclusion': 'explained'})
+                                        'experiment_id': None, 'conclusion': 'explained', 'defect_claim': 'asserted'})
         diagnostic, = preflight(alias, cheap=True)['diagnostics']
         assert diagnostic['paths'] == [f'/interpretations/1/executions/{check_id}']
         assert 'joint-history' in diagnostic['message']
@@ -72,7 +72,37 @@ def test_receipt_identity_precheck_precedes_measurement_and_repairs_atomically(t
         assert preflight(alias)['valid']
         alias['interpretations'][1]['experiment_id'] = state['experiments'][0]['id']
         diagnostic, = preflight(alias, cheap=True)['diagnostics']
-        assert 'its investigation and fixed experiment' in diagnostic['message']
+        fixed = state['experiments'][0]
+        assert diagnostic['code'] == 'interpretation_experiment' and diagnostic['category'] == 'association'
+        assert diagnostic['paths'] == ['/interpretations/1/investigation_id', '/interpretations/1/experiment_id']
+        assert diagnostic['object_ids'] == ['preflight-question-0', fixed['id'], fixed['investigation_id']]
+        assert diagnostic['details'] == {
+            'submitted_investigation_id':'@related', 'investigation_id':'preflight-question-0',
+            'experiment_id':fixed['id'], 'experiment_investigation_id':fixed['investigation_id'],
+            'conclusion':'explained',
+            'experiment_record':{'path':'state.json', 'collection':'experiments', 'id':fixed['id']},
+            'owner_record':{'path':'state.json', 'collection':'investigations', 'id':fixed['investigation_id']},
+            'navigation':'research.json'}
+        assert all(id in diagnostic['message'] for id in diagnostic['object_ids'])
+        assert "experiment's actual receipt" in diagnostic['message']
+        assert 'omit experiment_id' in diagnostic['message']
+        assert 'conclusion explained, conditional, or unresolved' in diagnostic['message']
+        assert 'joint_history does not change experiment ownership' in diagnostic['message']
+        assert 'defect_claim remains an independent scoped judgment' in diagnostic['message']
+        bound = deepcopy(alias)
+        bound['interpretations'][1]['investigation_id'] = fixed['investigation_id']
+        assert preflight(bound)['valid']
+        question = deepcopy(alias)
+        question['interpretations'][1]['experiment_id'] = None
+        for conclusion in ('explained', 'conditional', 'unresolved'):
+            question['interpretations'][1]['conclusion'] = conclusion
+            assert question['interpretations'][1]['defect_claim'] == 'asserted'
+            assert question['interpretations'][1]['executions'] == alias['interpretations'][1]['executions']
+            assert preflight(question)['valid']
+        for conclusion in ('violated', 'holds'):
+            question['interpretations'][1]['conclusion'] = conclusion
+            diagnostic, = preflight(question)['diagnostics']
+            assert 'Measured conclusions require a fixed experiment' in diagnostic['message']
         sub[collection][-1]['executions'] = {check_id[:-1]: [1]}
         retained['diagnostic'], = preflight(sub, cheap=True)['diagnostics']
         retained['repair'] = deepcopy(sub)

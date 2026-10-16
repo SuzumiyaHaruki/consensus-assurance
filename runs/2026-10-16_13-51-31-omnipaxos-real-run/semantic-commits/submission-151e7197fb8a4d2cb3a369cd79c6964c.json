@@ -1,0 +1,791 @@
+{
+  "input": {
+    "rationale": "The identity finding is now supported; this update only sharpens its scope question, so the account's outer boundary (does the false completion also apply to an entry that reached a quorum?) is explicit rather than implied by the construction's isolation.",
+    "sources": [
+      {
+        "id": "src_leader_sync_log",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 257,
+        "end_line": 285,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_handle_prepare_logsync",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 13,
+        "end_line": 51,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+        "ref": null,
+        "question": null,
+        "source_ids": null,
+        "hypothesis": "drain_notifiers matches the index-based arm `Some((idx, _)) if idx <= decided` before the ballot-based Superseded arm, so a call whose assigned index becomes decided by a different entry resolves Ok(idx); the actor cannot detect the substitution because Entry is only Clone + Debug, and the Superseded heuristic therefore cannot fire once the decided index covers the assignment.",
+        "discriminator": "Witnessed so far: an entry accepted only locally (isolated node, never replicated) whose assigned index is later covered by a different entry's decision, after which the call resolves Ok(idx) while the entry at idx is not the caller's. The next information that would change the judgment is whether the same false completion is reachable when the caller's entry was actually accepted by a write quorum: the following leader adopts a quorum-accepted value through the prepare-phase Promise log_sync and take_max_promise_sync before it syncs anyone (leader.rs:257-285, follower.rs:13-51), so the expectation is that such an entry cannot be replaced at its index and the Ok arm would then be truthful; that expectation is testable by replicating the entry to a quorum before cutting the leader and letting the next leader sync from a node that accepted it.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 2,
+        "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_subscribe_events",
+          "src_event_capacity_cfg",
+          "src_outgoing_nonblocking",
+          "src_decided_subs_nonblocking",
+          "src_append_notify_contract"
+        ],
+        "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+        "discriminator": "Two runs of the same 3-node in-process cluster that differ only in whether an unread event receiver exists: (A) nobody reads events at all (only the receiver the handle itself holds from spawn_actor); (B) a per-node consumer task reads events until a flag is set and then keeps the receiver but stops reading. The hypothesis predicts both variants park the actor after event_capacity transitions; the construction observations contradict that for (B), so the decisive next information is whether the sender in (B) actually observes a full channel - i.e. the real capacity/state of the event channel (Sender::capacity / try_send from a probe) and whether events are still being produced at that moment, rather than a further variant of the freeze symptom.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "9527b916ba184b74865563c980642d1c-question-0",
+            "version": 1,
+            "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+            "source_ids": [
+              "src_detect_events",
+              "src_run_loop",
+              "src_subscribe_events",
+              "src_event_capacity_cfg",
+              "src_outgoing_nonblocking",
+              "src_decided_subs_nonblocking",
+              "src_append_notify_contract"
+            ],
+            "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+            "discriminator": "An execution that subscribes without draining on every node of a live in-process cluster: if the actor task is parked on the event send, Command round-trips never complete and a fresh append_notify never reaches its 300ms Timeout endpoint, while the same cluster with the same event_capacity but a draining receiver keeps answering commands and decides the same entry.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "9527b916ba184b74865563c980642d1c"
+          }
+        ],
+        "operation_id": "e3721acc7c6a4544a22817c5c4b4b149"
+      },
+      {
+        "id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+        "version": 1,
+        "question": "In the core Sequence Paxos, if a follower's Accepted reply (or the leader's AcceptDecide) is lost, does any timer-driven or self-initiated mechanism restore the leader's knowledge of that acceptance, or does a quorum-accepted entry stay undecided until an unrelated new proposal arrives?",
+        "source_ids": [
+          "src_leader_resend",
+          "src_follower_resend",
+          "src_leader_handle_accepted",
+          "src_follower_reply_accepted",
+          "src_resend_dispatch"
+        ],
+        "hypothesis": "There is no repair for this direction: resend_messages_leader in Phase::Accept only resends a pending StopSign/its decide and re-Prepares peers that are not promised, and resend_messages_follower in Phase::Accept is an empty arm, so a lost Accepted is never retried by either side; the leader's decision only re-evaluates on a later handle_accepted, i.e. only when some follower accepts something new, which requires an unrelated proposal.",
+        "discriminator": "A deterministic in-process simulation (real OmniPaxos instances with a memory storage, manual message delivery and logical ticks): elect a leader, propose one entry, let the follower accept it, drop only that follower's Accepted, then keep ticking and delivering for a fair window with no new proposals, and compare the leader's decided_idx against a control run in which the same message is delivered. If the entry stays undecided in the drop case while both the leader's own acceptance and the follower's accepted_idx show a quorum, the loss is repaired by nothing in that interval; if the entry becomes decided without the message or without a new proposal, the hypothesis is refuted.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052"
+      },
+      {
+        "id": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+        "version": 1,
+        "question": "Can append_notify resolve Ok(idx) for an entry that was never decided at idx - specifically when the index the call was assigned is later occupied by a different entry - and is the documented Superseded heuristic therefore shadowed by the index-only check?",
+        "source_ids": [
+          "src_drain_notifiers_timeout",
+          "src_append_notify_contract",
+          "src_superseded_doc"
+        ],
+        "hypothesis": "drain_notifiers matches on the pending item's assignment in the order `Some((idx, _)) if idx <= decided` first and `Some((idx, ballot)) if ballot < cur_ballot` second, so once the node's decided index covers the assigned index the call resolves Ok(idx) even if leadership moved on and the entry was overwritten; the Ok contract (await its decided log index, and the documented usage 'durably decided at log idx') is then false, and the Superseded heuristic that was written for exactly this leadership-change case never fires.",
+        "discriminator": "Construction that isolates the assigned index from its entry: node A is the leader and accepts its own entry at index 1 with its outgoing and incoming traffic cut, so the entry never leaves A; nodes B and C then elect B and decide index 1 with B's own entry; A is let back in and re-syncs, truncating its log to B's and raising its decided index to 1. If A's pending call resolves Ok(1) while the entry at index 1 on A is B's entry and not A's, the index-only check is a false completion; if it resolves Superseded instead, the hypothesis is refuted.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "dcb373d7a7c843d981030cdf4ec8d37a"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_detect_events",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 169,
+        "end_line": 199,
+        "kind": "code_observation",
+        "text": "    async fn detect_and_emit_events(&mut self) {\n        let cur = self.op.get_current_leader();\n        if cur != self.last_leader {\n            if let Some((pid, accepted)) = cur {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::LeaderElected { pid, accepted })\n                    .await;\n            }\n            self.last_leader = cur;\n        }\n        let d = self.op.get_decided_idx();\n        if d > self.last_decided_idx {\n            let _ = self\n                .event_tx\n                .send(OmniPaxosEvent::Decided { new_decided_idx: d })\n                .await;\n            self.last_decided_idx = d;\n        }\n        if !self.last_reconfigured {\n            if let Some(_ss) = self.op.is_reconfigured() {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::Reconfigured {\n                        stop_sign_idx: self.op.get_decided_idx(),\n                    })\n                    .await;\n                self.last_reconfigured = true;\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_run_loop",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 665,
+        "end_line": 711,
+        "kind": "code_observation",
+        "text": "pub(crate) async fn run<T, B, R>(mut state: ActorState<T, B>, _rt: PhantomData<fn() -> R>)\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let mut tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n    let mut egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n\n    // async_channel::Receiver is !Unpin; keep it in a Pin<Box<...>> so the Stream\n    // impl works under select_biased!.\n    let cmd_rx = std::mem::replace(&mut state.cmd_rx, async_channel::bounded(1).1);\n    let incoming_rx = std::mem::replace(&mut state.incoming_rx, async_channel::bounded(1).1);\n    let mut cmd_rx = Box::pin(cmd_rx);\n    let mut incoming_rx = Box::pin(incoming_rx);\n\n    loop {\n        select_biased! {\n            _ = tick_fut => {\n                state.op.tick();\n                state.detect_and_emit_events().await;\n                state.try_dispatch_undispatched();\n                state.reconcile_unconfirmed();\n                state.drain_notifiers();\n                state.push_to_all_subs();\n                tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n            }\n            _ = egress_fut => {\n                state.flush_outgoing();\n                egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n            }\n            in_msg = incoming_rx.next() => {\n                match in_msg {\n                    Some(Message::AsyncRuntime(arm)) => state.handle_runtime_msg(arm),\n                    Some(m) => state.handle_incoming_tracked(m),\n                    None => break,\n                }\n            }\n            cmd = cmd_rx.next() => {\n                match cmd {\n                    Some(c) => state.handle_command(c).await,\n                    None => break,\n                }\n            }\n        }\n    }\n}",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_outgoing_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 232,
+        "end_line": 273,
+        "kind": "code_observation",
+        "text": "    /// Non-blocking drain of `outgoing_buf` onto `outgoing_tx`. Uses `try_send`\n    /// so a merely-full channel (slow consumer) doesn't block the actor loop;\n    /// unsent messages stay in `outgoing_buf` (in order) for the next attempt.\n    /// If the buffer exceeds [`Self::outgoing_buf_cap`], oldest messages are\n    /// dropped — see [`RuntimeConfig::max_outgoing_buffered`].\n    fn drain_outgoing_buf(&mut self) {\n        let cap = self.outgoing_buf_cap();\n        trim_oldest(&mut self.outgoing_buf, cap);\n\n        let pending = std::mem::take(&mut self.outgoing_buf);\n        let mut iter = pending.into_iter();\n        for msg in iter.by_ref() {\n            match self.outgoing_tx.try_send(msg) {\n                Ok(()) => {}\n                Err(async_channel::TrySendError::Full(msg)) => {\n                    self.outgoing_buf.push(msg);\n                    break;\n                }\n                Err(async_channel::TrySendError::Closed(_)) => {\n                    // Receiver dropped — user is not draining outgoing. Discard\n                    // everything remaining; nothing left to retry against.\n                    return;\n                }\n            }\n        }\n        self.outgoing_buf.extend(iter);\n    }\n\n    /// Enqueue one outgoing message without awaiting. Appends behind any\n    /// already-buffered messages (preserves order), then tries to drain.\n    /// Used for both core protocol traffic (via [`Self::flush_outgoing`]) and\n    /// runtime control-plane messages (`TaggedProposal` / `Assigned`).\n    fn enqueue_outgoing(&mut self, msg: Message<T>) {\n        self.outgoing_buf.push(msg);\n        self.drain_outgoing_buf();\n    }\n\n    /// Pull newly-produced OmniPaxos/BLE messages into `outgoing_buf` and drain.\n    fn flush_outgoing(&mut self) {\n        self.op.take_outgoing_messages(&mut self.outgoing_buf);\n        self.drain_outgoing_buf();\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_decided_subs_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 296,
+        "end_line": 333,
+        "kind": "code_observation",
+        "text": "\n    /// Push newly-decided entries to every subscriber, reading the log suffix\n    /// **once** and fanning out. Each sub keeps its own cursor, so slow subs\n    /// don't block fast ones; the storage read is amortized across all subs\n    /// starting from the trailing sub's position.\n    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_subscribe_events",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 254,
+        "end_line": 259,
+        "kind": "code_observation",
+        "text": "    /// Subscribe to state-transition events. Each event is delivered to exactly one\n    /// receiver: if you clone the returned receiver, the clones share the queue.\n    /// For fan-out to multiple independent subscribers, wrap in a broadcasting task.\n    pub fn subscribe_events(&self) -> async_channel::Receiver<OmniPaxosEvent> {\n        self.events_rx.clone()\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_cfg",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 34,
+        "end_line": 35,
+        "kind": "code_observation",
+        "text": "    /// Bounded capacity for the event channel.\n    pub event_capacity: usize,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_default",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 61,
+        "end_line": 76,
+        "kind": "code_observation",
+        "text": "impl Default for RuntimeConfig {\n    fn default() -> Self {\n        Self {\n            tick_period: Duration::from_millis(10),\n            egress_period: Duration::from_millis(1),\n            cmd_channel_capacity: 1024,\n            outgoing_capacity: 10_000,\n            incoming_capacity: 10_000,\n            event_capacity: 1024,\n            append_notify_timeout: Duration::from_secs(5),\n            decided_channel_capacity: 1024,\n            max_pending_appends: 1024,\n            max_decided_subscribers: 128,\n            max_outgoing_buffered: 10_000,\n        }\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_incoming_awaits_caller",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 288,
+        "end_line": 291,
+        "kind": "code_observation",
+        "text": "    /// Deliver an incoming message from the network to the actor.\n    pub async fn handle_incoming(&self, m: Message<T>) {\n        let _ = self.incoming_tx.send(m).await;\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_declared_no_stall_invariant",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 1040,
+        "end_line": 1082,
+        "kind": "test_expectation",
+        "text": "/// it's closed. Since this runs on the single actor loop, that blocked\n/// tick/election/command processing for the node entirely, not just delayed\n/// egress. Uses a tiny `outgoing_capacity` and never drains it, so it fills\n/// up almost immediately (the node has configured peers and sends BLE\n/// heartbeats regardless of whether anyone's listening).\n///\n/// Notify-path (`TaggedProposal` / `Assigned`) backpressure is covered by\n/// [`notify_egress_does_not_stall_when_outgoing_full`].\n#[tokio::test]\nasync fn full_outgoing_channel_does_not_stall_actor_loop() {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        outgoing_capacity: 2,\n        ..Default::default()\n    };\n    let op = build_op(1, nodes);\n    let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TokioRuntime>(op, cfg);\n\n    // Let the outgoing channel fill up completely without ever draining it.\n    tokio::time::sleep(Duration::from_millis(100)).await;\n\n    // The actor loop must still be responsive to commands -- if\n    // flush_outgoing blocked on a full channel, this would hang.\n    let idx = timeout(Duration::from_millis(500), h.decided_idx())\n        .await\n        .expect(\"actor loop appears stalled with a full outgoing channel\");\n    assert_eq!(idx, 0);\n\n    // Draining now should still deliver messages (not silently and\n    // permanently lost) once the consumer catches up.\n    let out = h.outgoing_messages();\n    timeout(Duration::from_secs(2), out.recv())\n        .await\n        .expect(\"no message ever arrived once draining resumed\")\n        .expect(\"outgoing channel closed unexpectedly\");\n}\n\n/// Like `spawn_cluster`, but each node's outgoing drain can be paused via the\n/// returned per-pid flags. While a node's flag is `true`, its drain task stops\n/// calling `recv`, so that node's bounded `outgoing_messages` channel fills\n/// and further egress hits backpressure -- without tearing down the rest of",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "src_drain_notifiers_timeout",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 201,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_append_notify_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 114,
+        "end_line": 137,
+        "kind": "interface_statement",
+        "text": "    /// Append an entry and await its decided log index.\n    ///\n    /// Works from any node: the actor tags the entry with a unique id, routes it to\n    /// the current leader, and resolves the future when the assigned log index is\n    /// decided. If no leader is known yet, the call waits rather than failing fast --\n    /// it resolves once a leader is elected, or with `Timeout` if none is elected in\n    /// time. Fails with:\n    /// - [`AppendError::Timeout`] if the entry is not decided within\n    ///   [`RuntimeConfig::append_notify_timeout`] (including when no leader was ever\n    ///   elected in that time);\n    /// - [`AppendError::Propose`] if the underlying propose call itself failed (e.g. a\n    ///   reconfiguration is already pending) -- only when this node owns the pending\n    ///   call, otherwise it still resolves via `Timeout`;\n    /// - [`AppendError::Superseded`] if a leader change occurred before decision --\n    ///   a heuristic, not a certainty; see its doc comment for why, and check the\n    ///   returned index yourself if you need to know for sure;\n    /// - [`AppendError::TooManyOutstanding`] if [`RuntimeConfig::max_pending_appends`]\n    ///   outstanding calls are already queued.\n    ///\n    /// Uses [`RuntimeConfig::append_notify_timeout`] as the deadline; use\n    /// [`Self::append_notify_with_timeout`] to override it for a single call.\n    pub async fn append_notify(&self, entry: T) -> Result<usize, AppendError<T>> {\n        self.append_notify_inner(entry, None).await\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_spawn_actor_channels",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 295,
+        "end_line": 323,
+        "kind": "code_observation",
+        "text": "pub fn spawn_actor<T, B, R>(op: OmniPaxos<T, B>, cfg: RuntimeConfig) -> OmniPaxosHandle<T>\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let (cmd_tx, cmd_rx) = async_channel::bounded(cfg.cmd_channel_capacity);\n    let (outgoing_tx, outgoing_rx) = async_channel::bounded(cfg.outgoing_capacity);\n    let (incoming_tx, incoming_rx) = async_channel::bounded(cfg.incoming_capacity);\n    let (event_tx, events_rx) = async_channel::bounded(cfg.event_capacity);\n\n    let state = ActorState::new(\n        op,\n        cmd_rx,\n        incoming_rx,\n        outgoing_tx,\n        event_tx,\n        ActorConfig::from(&cfg),\n    );\n\n    R::spawn(run::<T, B, R>(state, PhantomData::<fn() -> R>));\n\n    OmniPaxosHandle {\n        cmd_tx,\n        events_rx,\n        outgoing_rx,\n        incoming_tx,\n        decided_channel_capacity: cfg.decided_channel_capacity,\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_leader_resend",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 371,
+        "end_line": 403,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_leader(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Accept => {\n                // Resend AcceptStopSign or StopSign's decide\n                if let Some(ss) = self.internal_storage.get_stopsign() {\n                    let decided_idx = self.internal_storage.get_decided_idx();\n                    for follower in self.leader_state.get_promised_followers() {\n                        if self.internal_storage.stopsign_is_decided() {\n                            self.send_decide(follower, decided_idx, true);\n                        } else if self.leader_state.get_accepted_idx(follower)\n                            != self.internal_storage.get_accepted_idx()\n                        {\n                            self.send_accept_stopsign(follower, ss.clone(), true);\n                        }\n                    }\n                }\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Recover => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_follower_resend",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 240,
+        "end_line": 269,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_follower(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Promise\n                match &self.cached_promise_message {\n                    Some(promise) => {\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: promise.n.pid,\n                            msg: PaxosMsg::Promise(promise.clone()),\n                        }));\n                    }\n                    None => {\n                        // Shouldn't be possible to be in prepare phase without having\n                        // cached the promise sent as a response to the prepare\n                        #[cfg(feature = \"logging\")]\n                        warn!(self.logger, \"In Prepare phase without a cached promise!\");\n                        self.state = (Role::Follower, Phase::Recover);\n                        self.send_preparereq_to_all_peers();\n                    }\n                }\n            }\n            Phase::Recover => {\n                // Resend PrepareReq\n                self.send_preparereq_to_all_peers();\n            }\n            Phase::Accept => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_leader_handle_accepted",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 316,
+        "end_line": 345,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_accepted(&mut self, accepted: Accepted, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        trace!(\n            self.logger,\n            \"Got Accepted from {}, idx: {}, chosen_idx: {}, accepted: {:?}\",\n            from,\n            accepted.accepted_idx,\n            self.internal_storage.get_decided_idx(),\n            self.leader_state.accepted_indexes\n        );\n        if accepted.n == self.leader_state.n_leader && self.state == (Role::Leader, Phase::Accept) {\n            self.leader_state\n                .set_accepted_idx(from, accepted.accepted_idx);\n            if accepted.accepted_idx > self.internal_storage.get_decided_idx()\n                && self.leader_state.is_chosen(accepted.accepted_idx)\n            {\n                let decided_idx = accepted.accepted_idx;\n                self.internal_storage\n                    .set_decided_idx(decided_idx)\n                    .expect(WRITE_ERROR_MSG);\n                for pid in self.leader_state.get_promised_followers() {\n                    let latest_accdec = self.get_latest_accdec_message(pid);\n                    match latest_accdec {\n                        Some(accdec) => accdec.decided_idx = decided_idx,\n                        None => self.send_decide(pid, decided_idx, false),\n                    }\n                }\n            }\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_follower_reply_accepted",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 160,
+        "end_line": 175,
+        "kind": "code_observation",
+        "text": "    fn reply_accepted(&mut self, n: Ballot, accepted_idx: usize) {\n        let latest_accepted = self.get_latest_accepted_message(n);\n        match latest_accepted {\n            Some(acc) => acc.accepted_idx = accepted_idx,\n            None => {\n                let accepted = Accepted { n, accepted_idx };\n                let cached_idx = self.outgoing.len();\n                self.latest_accepted_meta = Some((n, cached_idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: n.pid,\n                    msg: PaxosMsg::Accepted(accepted),\n                }));\n            }\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_follower_flush_batch",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 284,
+        "end_line": 290,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn flush_batch_follower(&mut self) {\n        let accepted_idx = self.internal_storage.get_accepted_idx();\n        let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n        if new_accepted_idx > accepted_idx {\n            self.reply_accepted(self.get_promise(), new_accepted_idx);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_resend_dispatch",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 229,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "    /// Detects if a Prepare, Promise, AcceptStopSign, Decide of a Stopsign, or PrepareReq message\n    /// has been sent but not been received. If so resends them. Note: We can't detect if a\n    /// StopSign's Decide message has been received so we always resend to be safe.\n    pub(crate) fn resend_message_timeout(&mut self) {\n        match self.state.0 {\n            Role::Leader => self.resend_messages_leader(),\n            Role::Follower => self.resend_messages_follower(),\n        }\n    }\n\n    /// Flushes any batched log entries and sends their corresponding Accept or Accepted messages.\n    pub(crate) fn flush_batch_timeout(&mut self) {\n        match self.state {\n            (Role::Leader, Phase::Accept) => self.flush_batch_leader(),\n            (Role::Follower, Phase::Accept) => self.flush_batch_follower(),\n            _ => (),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "src_outgoing_trim_doc",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 52,
+        "end_line": 58,
+        "kind": "interface_statement",
+        "text": "    /// Fallback cap on how many outgoing messages the actor buffers internally\n    /// while waiting for room on the (bounded) `outgoing_messages` channel,\n    /// used only if that channel's own capacity can't be read. Past this cap,\n    /// the *oldest* buffered messages are dropped rather than growing without\n    /// bound -- safe because OmniPaxos already tolerates lost messages via its\n    /// own resend/retry mechanisms.\n    pub max_outgoing_buffered: usize,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_follower_acceptsync_reply",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 53,
+        "end_line": 79,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_follower_handle_decide",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 128,
+        "end_line": 158,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_decide(&mut self, dec: Decide) {\n        if self.check_valid_ballot(dec.n)\n            && self.state.1 == Phase::Accept\n            && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected\n        {\n            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx);\n            if let Some(idx) = new_accepted_idx {\n                self.reply_accepted(dec.n, idx);\n            }\n        }\n    }\n\n    /// To maintain decided index <= accepted index, batched entries may be flushed.\n    /// Returns `Some(new_accepted_idx)` if entries are flushed, otherwise `None`.\n    fn update_decided_idx_and_get_accepted_idx(&mut self, new_decided_idx: usize) -> Option<usize> {\n        if new_decided_idx <= self.internal_storage.get_decided_idx() {\n            return None;\n        }\n        if new_decided_idx > self.internal_storage.get_accepted_idx() {\n            let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            self.internal_storage\n                .set_decided_idx(new_decided_idx.min(new_accepted_idx))\n                .expect(WRITE_ERROR_MSG);\n            Some(new_accepted_idx)\n        } else {\n            self.internal_storage\n                .set_decided_idx(new_decided_idx)\n                .expect(WRITE_ERROR_MSG);\n            None\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_superseded_doc",
+        "file": "omnipaxos_runtime/src/event.rs",
+        "start_line": 45,
+        "end_line": 60,
+        "kind": "interface_statement",
+        "text": "    /// still just sees a `Timeout`, since surfacing the specific error cross-node would\n    /// require a new wire message.\n    Propose(ProposeErr<T>),\n    /// A leader change occurred after the entry was accepted at the given index but\n    /// before it was decided. This is a *heuristic*, not a certainty: a new leader is\n    /// required to adopt any value a majority-overlapping quorum may have already\n    /// accepted, so the entry can still end up decided at `log_entry_idx` under the\n    /// new ballot -- we just stop waiting rather than confirm it. Check\n    /// [`OmniPaxosHandle::read_decided_suffix`](super::OmniPaxosHandle::read_decided_suffix)\n    /// at that index if you need to know for sure before re-appending.\n    Superseded {\n        /// The log index the entry was assigned before the leader change.\n        log_entry_idx: usize,\n    },\n    /// The `append_notify_timeout` elapsed before the entry was decided. Retry safe.\n    Timeout,",
+        "content_digest": "c5ff151f7ee21767be3c8b53dba3aaf23deaafcf0d9188610b21ea1a6a9f9c8c"
+      },
+      {
+        "id": "src_decided_sub_push",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 296,
+        "end_line": 333,
+        "kind": "code_observation",
+        "text": "\n    /// Push newly-decided entries to every subscriber, reading the log suffix\n    /// **once** and fanning out. Each sub keeps its own cursor, so slow subs\n    /// don't block fast ones; the storage read is amortized across all subs\n    /// starting from the trailing sub's position.\n    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "151e7197fb8a4d2cb3a369cd79c6964c",
+      "result": {
+        "submission": "update.json",
+        "summary": "No new execution this turn; the audit stands on its three supported findings and I only tightened the outer boundary of the newest one. Added the adoption-path sources (leader.rs:257-285 sync_log/take_max_promise_sync, follower.rs:13-51 the prepare-phase Promise log_sync) and rewrote the identity question's scope statement: what is witnessed is a false completion for an entry that was accepted only locally (its node isolated, never replicated), and the next information that would change the judgment is whether the same Ok(idx) can be reported when the caller's entry was accepted by a write quorum — the following leader is expected to adopt such a value before syncing anyone, so the Ok arm would then be truthful, and that expectation is directly testable by replicating the entry to a quorum before cutting the leader. Current position: (1) the runtime's event egress parks the actor loop and, with enough nodes parked, the cluster stops deciding (receipts ff4511e8, 76557a28); (2) the core has no timer-driven repair for a lost Accepted reply, so a quorum-accepted entry stays undecided for at least 100 resend periods in the 2-node case (receipt 092538c6); (3) append_notify can resolve Ok(idx) for an entry that was never decided at idx, shadowing the documented Superseded heuristic (receipt 743518e2). The limits carried for each remain as recorded (bounds witnessed at capacities 64/8 rather than the 1024 default; only the 2-node configuration probed for the core gap; the identity interleaving constructed rather than sampled)."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-9527b916ba184b74865563c980642d1c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9527b916ba184b74865563c980642d1c.json"
+      },
+      "submission-e3721acc7c6a4544a22817c5c4b4b149": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-e3721acc7c6a4544a22817c5c4b4b149.json"
+      },
+      "submission-9a11299aa4344bb5b84565cbe33701ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9a11299aa4344bb5b84565cbe33701ad.json"
+      },
+      "submission-1a5428f0aa284eb1a2a3f1a083fcb052": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-1a5428f0aa284eb1a2a3f1a083fcb052.json"
+      },
+      "submission-13c0a8e06f21477689c340dad0a6962e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-13c0a8e06f21477689c340dad0a6962e.json"
+      },
+      "submission-34c476dd304f48f59580ab2799b029d3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-34c476dd304f48f59580ab2799b029d3.json"
+      },
+      "submission-9d31a7bf98034ecaa9c70e2cef669b8c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9d31a7bf98034ecaa9c70e2cef669b8c.json"
+      },
+      "submission-2b18b51118e04d8a9f0ca6001d18eb51": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-2b18b51118e04d8a9f0ca6001d18eb51.json"
+      },
+      "submission-1c6d308f0cb34825b0e959ae7035fbdf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-1c6d308f0cb34825b0e959ae7035fbdf.json"
+      },
+      "submission-dcb373d7a7c843d981030cdf4ec8d37a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-dcb373d7a7c843d981030cdf4ec8d37a.json"
+      },
+      "submission-5ae5e40c713c4c6488aa865e7a16ef53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-5ae5e40c713c4c6488aa865e7a16ef53.json"
+      },
+      "submission-77b3b52d7f4d4110a95d349465be4a30": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-77b3b52d7f4d4110a95d349465be4a30.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 2,
+        "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_subscribe_events",
+          "src_event_capacity_cfg",
+          "src_outgoing_nonblocking",
+          "src_decided_subs_nonblocking",
+          "src_append_notify_contract"
+        ],
+        "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+        "discriminator": "Two runs of the same 3-node in-process cluster that differ only in whether an unread event receiver exists: (A) nobody reads events at all (only the receiver the handle itself holds from spawn_actor); (B) a per-node consumer task reads events until a flag is set and then keeps the receiver but stops reading. The hypothesis predicts both variants park the actor after event_capacity transitions; the construction observations contradict that for (B), so the decisive next information is whether the sender in (B) actually observes a full channel - i.e. the real capacity/state of the event channel (Sender::capacity / try_send from a probe) and whether events are still being produced at that moment, rather than a further variant of the freeze symptom.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "9527b916ba184b74865563c980642d1c-question-0",
+            "version": 1,
+            "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+            "source_ids": [
+              "src_detect_events",
+              "src_run_loop",
+              "src_subscribe_events",
+              "src_event_capacity_cfg",
+              "src_outgoing_nonblocking",
+              "src_decided_subs_nonblocking",
+              "src_append_notify_contract"
+            ],
+            "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+            "discriminator": "An execution that subscribes without draining on every node of a live in-process cluster: if the actor task is parked on the event send, Command round-trips never complete and a fresh append_notify never reaches its 300ms Timeout endpoint, while the same cluster with the same event_capacity but a draining receiver keeps answering commands and decides the same entry.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "9527b916ba184b74865563c980642d1c"
+          }
+        ],
+        "operation_id": "e3721acc7c6a4544a22817c5c4b4b149"
+      },
+      {
+        "id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+        "version": 1,
+        "question": "In the core Sequence Paxos, if a follower's Accepted reply (or the leader's AcceptDecide) is lost, does any timer-driven or self-initiated mechanism restore the leader's knowledge of that acceptance, or does a quorum-accepted entry stay undecided until an unrelated new proposal arrives?",
+        "source_ids": [
+          "src_leader_resend",
+          "src_follower_resend",
+          "src_leader_handle_accepted",
+          "src_follower_reply_accepted",
+          "src_resend_dispatch"
+        ],
+        "hypothesis": "There is no repair for this direction: resend_messages_leader in Phase::Accept only resends a pending StopSign/its decide and re-Prepares peers that are not promised, and resend_messages_follower in Phase::Accept is an empty arm, so a lost Accepted is never retried by either side; the leader's decision only re-evaluates on a later handle_accepted, i.e. only when some follower accepts something new, which requires an unrelated proposal.",
+        "discriminator": "A deterministic in-process simulation (real OmniPaxos instances with a memory storage, manual message delivery and logical ticks): elect a leader, propose one entry, let the follower accept it, drop only that follower's Accepted, then keep ticking and delivering for a fair window with no new proposals, and compare the leader's decided_idx against a control run in which the same message is delivered. If the entry stays undecided in the drop case while both the leader's own acceptance and the follower's accepted_idx show a quorum, the loss is repaired by nothing in that interval; if the entry becomes decided without the message or without a new proposal, the hypothesis is refuted.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052"
+      },
+      {
+        "id": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+        "version": 2,
+        "question": "Can append_notify resolve Ok(idx) for an entry that was never decided at idx - specifically when the index the call was assigned is later occupied by a different entry - and is the documented Superseded heuristic therefore shadowed by the index-only check?",
+        "source_ids": [
+          "src_drain_notifiers_timeout",
+          "src_append_notify_contract",
+          "src_superseded_doc"
+        ],
+        "hypothesis": "drain_notifiers matches the index-based arm `Some((idx, _)) if idx <= decided` before the ballot-based Superseded arm, so a call whose assigned index becomes decided by a different entry resolves Ok(idx); the actor cannot detect the substitution because Entry is only Clone + Debug, and the Superseded heuristic therefore cannot fire once the decided index covers the assignment.",
+        "discriminator": "Witnessed so far: an entry accepted only locally (isolated node, never replicated) whose assigned index is later covered by a different entry's decision, after which the call resolves Ok(idx) while the entry at idx is not the caller's. The next information that would change the judgment is whether the same false completion is reachable when the caller's entry was actually accepted by a write quorum: the following leader adopts a quorum-accepted value through the prepare-phase Promise log_sync and take_max_promise_sync before it syncs anyone (leader.rs:257-285, follower.rs:13-51), so the expectation is that such an entry cannot be replaced at its index and the Ok arm would then be truthful; that expectation is testable by replicating the entry to a quorum before cutting the leader and letting the next leader sync from a node that accepted it.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+            "version": 1,
+            "question": "Can append_notify resolve Ok(idx) for an entry that was never decided at idx - specifically when the index the call was assigned is later occupied by a different entry - and is the documented Superseded heuristic therefore shadowed by the index-only check?",
+            "source_ids": [
+              "src_drain_notifiers_timeout",
+              "src_append_notify_contract",
+              "src_superseded_doc"
+            ],
+            "hypothesis": "drain_notifiers matches on the pending item's assignment in the order `Some((idx, _)) if idx <= decided` first and `Some((idx, ballot)) if ballot < cur_ballot` second, so once the node's decided index covers the assigned index the call resolves Ok(idx) even if leadership moved on and the entry was overwritten; the Ok contract (await its decided log index, and the documented usage 'durably decided at log idx') is then false, and the Superseded heuristic that was written for exactly this leadership-change case never fires.",
+            "discriminator": "Construction that isolates the assigned index from its entry: node A is the leader and accepts its own entry at index 1 with its outgoing and incoming traffic cut, so the entry never leaves A; nodes B and C then elect B and decide index 1 with B's own entry; A is let back in and re-syncs, truncating its log to B's and raising its decided index to 1. If A's pending call resolves Ok(1) while the entry at index 1 on A is B's entry and not A's, the index-only check is a false completion; if it resolves Superseded instead, the hypothesis is refuted.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "dcb373d7a7c843d981030cdf4ec8d37a"
+          }
+        ],
+        "operation_id": "151e7197fb8a4d2cb3a369cd79c6964c"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_detect_events",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 169,
+        "end_line": 199,
+        "kind": "code_observation",
+        "text": "    async fn detect_and_emit_events(&mut self) {\n        let cur = self.op.get_current_leader();\n        if cur != self.last_leader {\n            if let Some((pid, accepted)) = cur {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::LeaderElected { pid, accepted })\n                    .await;\n            }\n            self.last_leader = cur;\n        }\n        let d = self.op.get_decided_idx();\n        if d > self.last_decided_idx {\n            let _ = self\n                .event_tx\n                .send(OmniPaxosEvent::Decided { new_decided_idx: d })\n                .await;\n            self.last_decided_idx = d;\n        }\n        if !self.last_reconfigured {\n            if let Some(_ss) = self.op.is_reconfigured() {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::Reconfigured {\n                        stop_sign_idx: self.op.get_decided_idx(),\n                    })\n                    .await;\n                self.last_reconfigured = true;\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_run_loop",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 665,
+        "end_line": 711,
+        "kind": "code_observation",
+        "text": "pub(crate) async fn run<T, B, R>(mut state: ActorState<T, B>, _rt: PhantomData<fn() -> R>)\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let mut tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n    let mut egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n\n    // async_channel::Receiver is !Unpin; keep it in a Pin<Box<...>> so the Stream\n    // impl works under select_biased!.\n    let cmd_rx = std::mem::replace(&mut state.cmd_rx, async_channel::bounded(1).1);\n    let incoming_rx = std::mem::replace(&mut state.incoming_rx, async_channel::bounded(1).1);\n    let mut cmd_rx = Box::pin(cmd_rx);\n    let mut incoming_rx = Box::pin(incoming_rx);\n\n    loop {\n        select_biased! {\n            _ = tick_fut => {\n                state.op.tick();\n                state.detect_and_emit_events().await;\n                state.try_dispatch_undispatched();\n                state.reconcile_unconfirmed();\n                state.drain_notifiers();\n                state.push_to_all_subs();\n                tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n            }\n            _ = egress_fut => {\n                state.flush_outgoing();\n                egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n            }\n            in_msg = incoming_rx.next() => {\n                match in_msg {\n                    Some(Message::AsyncRuntime(arm)) => state.handle_runtime_msg(arm),\n                    Some(m) => state.handle_incoming_tracked(m),\n                    None => break,\n                }\n            }\n            cmd = cmd_rx.next() => {\n                match cmd {\n                    Some(c) => state.handle_command(c).await,\n                    None => break,\n                }\n            }\n        }\n    }\n}",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_outgoing_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 232,
+        "end_line": 273,
+        "kind": "code_observation",
+        "text": "    /// Non-blocking drain of `outgoing_buf` onto `outgoing_tx`. Uses `try_send`\n    /// so a merely-full channel (slow consumer) doesn't block the actor loop;\n    /// unsent messages stay in `outgoing_buf` (in order) for the next attempt.\n    /// If the buffer exceeds [`Self::outgoing_buf_cap`], oldest messages are\n    /// dropped — see [`RuntimeConfig::max_outgoing_buffered`].\n    fn drain_outgoing_buf(&mut self) {\n        let cap = self.outgoing_buf_cap();\n        trim_oldest(&mut self.outgoing_buf, cap);\n\n        let pending = std::mem::take(&mut self.outgoing_buf);\n        let mut iter = pending.into_iter();\n        for msg in iter.by_ref() {\n            match self.outgoing_tx.try_send(msg) {\n                Ok(()) => {}\n                Err(async_channel::TrySendError::Full(msg)) => {\n                    self.outgoing_buf.push(msg);\n                    break;\n                }\n                Err(async_channel::TrySendError::Closed(_)) => {\n                    // Receiver dropped — user is not draining outgoing. Discard\n                    // everything remaining; nothing left to retry against.\n                    return;\n                }\n            }\n        }\n        self.outgoing_buf.extend(iter);\n    }\n\n    /// Enqueue one outgoing message without awaiting. Appends behind any\n    /// already-buffered messages (preserves order), then tries to drain.\n    /// Used for both core protocol traffic (via [`Self::flush_outgoing`]) and\n    /// runtime control-plane messages (`TaggedProposal` / `Assigned`).\n    fn enqueue_outgoing(&mut self, msg: Message<T>) {\n        self.outgoing_buf.push(msg);\n        self.drain_outgoing_buf();\n    }\n\n    /// Pull newly-produced OmniPaxos/BLE messages into `outgoing_buf` and drain.\n    fn flush_outgoing(&mut self) {\n        self.op.take_outgoing_messages(&mut self.outgoing_buf);\n        self.drain_outgoing_buf();\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_decided_subs_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 296,
+        "end_line": 333,
+        "kind": "code_observation",
+        "text": "\n    /// Push newly-decided entries to every subscriber, reading the log suffix\n    /// **once** and fanning out. Each sub keeps its own cursor, so slow subs\n    /// don't block fast ones; the storage read is amortized across all subs\n    /// starting from the trailing sub's position.\n    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_subscribe_events",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 254,
+        "end_line": 259,
+        "kind": "code_observation",
+        "text": "    /// Subscribe to state-transition events. Each event is delivered to exactly one\n    /// receiver: if you clone the returned receiver, the clones share the queue.\n    /// For fan-out to multiple independent subscribers, wrap in a broadcasting task.\n    pub fn subscribe_events(&self) -> async_channel::Receiver<OmniPaxosEvent> {\n        self.events_rx.clone()\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_cfg",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 34,
+        "end_line": 35,
+        "kind": "code_observation",
+        "text": "    /// Bounded capacity for the event channel.\n    pub event_capacity: usize,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_default",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 61,
+        "end_line": 76,
+        "kind": "code_observation",
+        "text": "impl Default for RuntimeConfig {\n    fn default() -> Self {\n        Self {\n            tick_period: Duration::from_millis(10),\n            egress_period: Duration::from_millis(1),\n            cmd_channel_capacity: 1024,\n            outgoing_capacity: 10_000,\n            incoming_capacity: 10_000,\n            event_capacity: 1024,\n            append_notify_timeout: Duration::from_secs(5),\n            decided_channel_capacity: 1024,\n            max_pending_appends: 1024,\n            max_decided_subscribers: 128,\n            max_outgoing_buffered: 10_000,\n        }\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_incoming_awaits_caller",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 288,
+        "end_line": 291,
+        "kind": "code_observation",
+        "text": "    /// Deliver an incoming message from the network to the actor.\n    pub async fn handle_incoming(&self, m: Message<T>) {\n        let _ = self.incoming_tx.send(m).await;\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_declared_no_stall_invariant",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 1040,
+        "end_line": 1082,
+        "kind": "test_expectation",
+        "text": "/// it's closed. Since this runs on the single actor loop, that blocked\n/// tick/election/command processing for the node entirely, not just delayed\n/// egress. Uses a tiny `outgoing_capacity` and never drains it, so it fills\n/// up almost immediately (the node has configured peers and sends BLE\n/// heartbeats regardless of whether anyone's listening).\n///\n/// Notify-path (`TaggedProposal` / `Assigned`) backpressure is covered by\n/// [`notify_egress_does_not_stall_when_outgoing_full`].\n#[tokio::test]\nasync fn full_outgoing_channel_does_not_stall_actor_loop() {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        outgoing_capacity: 2,\n        ..Default::default()\n    };\n    let op = build_op(1, nodes);\n    let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TokioRuntime>(op, cfg);\n\n    // Let the outgoing channel fill up completely without ever draining it.\n    tokio::time::sleep(Duration::from_millis(100)).await;\n\n    // The actor loop must still be responsive to commands -- if\n    // flush_outgoing blocked on a full channel, this would hang.\n    let idx = timeout(Duration::from_millis(500), h.decided_idx())\n        .await\n        .expect(\"actor loop appears stalled with a full outgoing channel\");\n    assert_eq!(idx, 0);\n\n    // Draining now should still deliver messages (not silently and\n    // permanently lost) once the consumer catches up.\n    let out = h.outgoing_messages();\n    timeout(Duration::from_secs(2), out.recv())\n        .await\n        .expect(\"no message ever arrived once draining resumed\")\n        .expect(\"outgoing channel closed unexpectedly\");\n}\n\n/// Like `spawn_cluster`, but each node's outgoing drain can be paused via the\n/// returned per-pid flags. While a node's flag is `true`, its drain task stops\n/// calling `recv`, so that node's bounded `outgoing_messages` channel fills\n/// and further egress hits backpressure -- without tearing down the rest of",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "src_drain_notifiers_timeout",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 201,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_append_notify_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 114,
+        "end_line": 137,
+        "kind": "interface_statement",
+        "text": "    /// Append an entry and await its decided log index.\n    ///\n    /// Works from any node: the actor tags the entry with a unique id, routes it to\n    /// the current leader, and resolves the future when the assigned log index is\n    /// decided. If no leader is known yet, the call waits rather than failing fast --\n    /// it resolves once a leader is elected, or with `Timeout` if none is elected in\n    /// time. Fails with:\n    /// - [`AppendError::Timeout`] if the entry is not decided within\n    ///   [`RuntimeConfig::append_notify_timeout`] (including when no leader was ever\n    ///   elected in that time);\n    /// - [`AppendError::Propose`] if the underlying propose call itself failed (e.g. a\n    ///   reconfiguration is already pending) -- only when this node owns the pending\n    ///   call, otherwise it still resolves via `Timeout`;\n    /// - [`AppendError::Superseded`] if a leader change occurred before decision --\n    ///   a heuristic, not a certainty; see its doc comment for why, and check the\n    ///   returned index yourself if you need to know for sure;\n    /// - [`AppendError::TooManyOutstanding`] if [`RuntimeConfig::max_pending_appends`]\n    ///   outstanding calls are already queued.\n    ///\n    /// Uses [`RuntimeConfig::append_notify_timeout`] as the deadline; use\n    /// [`Self::append_notify_with_timeout`] to override it for a single call.\n    pub async fn append_notify(&self, entry: T) -> Result<usize, AppendError<T>> {\n        self.append_notify_inner(entry, None).await\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_spawn_actor_channels",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 295,
+        "end_line": 323,
+        "kind": "code_observation",
+        "text": "pub fn spawn_actor<T, B, R>(op: OmniPaxos<T, B>, cfg: RuntimeConfig) -> OmniPaxosHandle<T>\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let (cmd_tx, cmd_rx) = async_channel::bounded(cfg.cmd_channel_capacity);\n    let (outgoing_tx, outgoing_rx) = async_channel::bounded(cfg.outgoing_capacity);\n    let (incoming_tx, incoming_rx) = async_channel::bounded(cfg.incoming_capacity);\n    let (event_tx, events_rx) = async_channel::bounded(cfg.event_capacity);\n\n    let state = ActorState::new(\n        op,\n        cmd_rx,\n        incoming_rx,\n        outgoing_tx,\n        event_tx,\n        ActorConfig::from(&cfg),\n    );\n\n    R::spawn(run::<T, B, R>(state, PhantomData::<fn() -> R>));\n\n    OmniPaxosHandle {\n        cmd_tx,\n        events_rx,\n        outgoing_rx,\n        incoming_tx,\n        decided_channel_capacity: cfg.decided_channel_capacity,\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_leader_resend",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 371,
+        "end_line": 403,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_leader(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Accept => {\n                // Resend AcceptStopSign or StopSign's decide\n                if let Some(ss) = self.internal_storage.get_stopsign() {\n                    let decided_idx = self.internal_storage.get_decided_idx();\n                    for follower in self.leader_state.get_promised_followers() {\n                        if self.internal_storage.stopsign_is_decided() {\n                            self.send_decide(follower, decided_idx, true);\n                        } else if self.leader_state.get_accepted_idx(follower)\n                            != self.internal_storage.get_accepted_idx()\n                        {\n                            self.send_accept_stopsign(follower, ss.clone(), true);\n                        }\n                    }\n                }\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Recover => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_follower_resend",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 240,
+        "end_line": 269,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_follower(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Promise\n                match &self.cached_promise_message {\n                    Some(promise) => {\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: promise.n.pid,\n                            msg: PaxosMsg::Promise(promise.clone()),\n                        }));\n                    }\n                    None => {\n                        // Shouldn't be possible to be in prepare phase without having\n                        // cached the promise sent as a response to the prepare\n                        #[cfg(feature = \"logging\")]\n                        warn!(self.logger, \"In Prepare phase without a cached promise!\");\n                        self.state = (Role::Follower, Phase::Recover);\n                        self.send_preparereq_to_all_peers();\n                    }\n                }\n            }\n            Phase::Recover => {\n                // Resend PrepareReq\n                self.send_preparereq_to_all_peers();\n            }\n            Phase::Accept => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_leader_handle_accepted",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 316,
+        "end_line": 345,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_accepted(&mut self, accepted: Accepted, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        trace!(\n            self.logger,\n            \"Got Accepted from {}, idx: {}, chosen_idx: {}, accepted: {:?}\",\n            from,\n            accepted.accepted_idx,\n            self.internal_storage.get_decided_idx(),\n            self.leader_state.accepted_indexes\n        );\n        if accepted.n == self.leader_state.n_leader && self.state == (Role::Leader, Phase::Accept) {\n            self.leader_state\n                .set_accepted_idx(from, accepted.accepted_idx);\n            if accepted.accepted_idx > self.internal_storage.get_decided_idx()\n                && self.leader_state.is_chosen(accepted.accepted_idx)\n            {\n                let decided_idx = accepted.accepted_idx;\n                self.internal_storage\n                    .set_decided_idx(decided_idx)\n                    .expect(WRITE_ERROR_MSG);\n                for pid in self.leader_state.get_promised_followers() {\n                    let latest_accdec = self.get_latest_accdec_message(pid);\n                    match latest_accdec {\n                        Some(accdec) => accdec.decided_idx = decided_idx,\n                        None => self.send_decide(pid, decided_idx, false),\n                    }\n                }\n            }\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_follower_reply_accepted",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 160,
+        "end_line": 175,
+        "kind": "code_observation",
+        "text": "    fn reply_accepted(&mut self, n: Ballot, accepted_idx: usize) {\n        let latest_accepted = self.get_latest_accepted_message(n);\n        match latest_accepted {\n            Some(acc) => acc.accepted_idx = accepted_idx,\n            None => {\n                let accepted = Accepted { n, accepted_idx };\n                let cached_idx = self.outgoing.len();\n                self.latest_accepted_meta = Some((n, cached_idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: n.pid,\n                    msg: PaxosMsg::Accepted(accepted),\n                }));\n            }\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_follower_flush_batch",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 284,
+        "end_line": 290,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn flush_batch_follower(&mut self) {\n        let accepted_idx = self.internal_storage.get_accepted_idx();\n        let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n        if new_accepted_idx > accepted_idx {\n            self.reply_accepted(self.get_promise(), new_accepted_idx);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_resend_dispatch",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 229,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "    /// Detects if a Prepare, Promise, AcceptStopSign, Decide of a Stopsign, or PrepareReq message\n    /// has been sent but not been received. If so resends them. Note: We can't detect if a\n    /// StopSign's Decide message has been received so we always resend to be safe.\n    pub(crate) fn resend_message_timeout(&mut self) {\n        match self.state.0 {\n            Role::Leader => self.resend_messages_leader(),\n            Role::Follower => self.resend_messages_follower(),\n        }\n    }\n\n    /// Flushes any batched log entries and sends their corresponding Accept or Accepted messages.\n    pub(crate) fn flush_batch_timeout(&mut self) {\n        match self.state {\n            (Role::Leader, Phase::Accept) => self.flush_batch_leader(),\n            (Role::Follower, Phase::Accept) => self.flush_batch_follower(),\n            _ => (),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "src_outgoing_trim_doc",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 52,
+        "end_line": 58,
+        "kind": "interface_statement",
+        "text": "    /// Fallback cap on how many outgoing messages the actor buffers internally\n    /// while waiting for room on the (bounded) `outgoing_messages` channel,\n    /// used only if that channel's own capacity can't be read. Past this cap,\n    /// the *oldest* buffered messages are dropped rather than growing without\n    /// bound -- safe because OmniPaxos already tolerates lost messages via its\n    /// own resend/retry mechanisms.\n    pub max_outgoing_buffered: usize,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_follower_acceptsync_reply",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 53,
+        "end_line": 79,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_follower_handle_decide",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 128,
+        "end_line": 158,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_decide(&mut self, dec: Decide) {\n        if self.check_valid_ballot(dec.n)\n            && self.state.1 == Phase::Accept\n            && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected\n        {\n            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx);\n            if let Some(idx) = new_accepted_idx {\n                self.reply_accepted(dec.n, idx);\n            }\n        }\n    }\n\n    /// To maintain decided index <= accepted index, batched entries may be flushed.\n    /// Returns `Some(new_accepted_idx)` if entries are flushed, otherwise `None`.\n    fn update_decided_idx_and_get_accepted_idx(&mut self, new_decided_idx: usize) -> Option<usize> {\n        if new_decided_idx <= self.internal_storage.get_decided_idx() {\n            return None;\n        }\n        if new_decided_idx > self.internal_storage.get_accepted_idx() {\n            let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            self.internal_storage\n                .set_decided_idx(new_decided_idx.min(new_accepted_idx))\n                .expect(WRITE_ERROR_MSG);\n            Some(new_accepted_idx)\n        } else {\n            self.internal_storage\n                .set_decided_idx(new_decided_idx)\n                .expect(WRITE_ERROR_MSG);\n            None\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_superseded_doc",
+        "file": "omnipaxos_runtime/src/event.rs",
+        "start_line": 45,
+        "end_line": 60,
+        "kind": "interface_statement",
+        "text": "    /// still just sees a `Timeout`, since surfacing the specific error cross-node would\n    /// require a new wire message.\n    Propose(ProposeErr<T>),\n    /// A leader change occurred after the entry was accepted at the given index but\n    /// before it was decided. This is a *heuristic*, not a certainty: a new leader is\n    /// required to adopt any value a majority-overlapping quorum may have already\n    /// accepted, so the entry can still end up decided at `log_entry_idx` under the\n    /// new ballot -- we just stop waiting rather than confirm it. Check\n    /// [`OmniPaxosHandle::read_decided_suffix`](super::OmniPaxosHandle::read_decided_suffix)\n    /// at that index if you need to know for sure before re-appending.\n    Superseded {\n        /// The log index the entry was assigned before the leader change.\n        log_entry_idx: usize,\n    },\n    /// The `append_notify_timeout` elapsed before the entry was decided. Retry safe.\n    Timeout,",
+        "content_digest": "c5ff151f7ee21767be3c8b53dba3aaf23deaafcf0d9188610b21ea1a6a9f9c8c"
+      },
+      {
+        "id": "src_decided_sub_push",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 296,
+        "end_line": 333,
+        "kind": "code_observation",
+        "text": "\n    /// Push newly-decided entries to every subscriber, reading the log suffix\n    /// **once** and fanning out. Each sub keeps its own cursor, so slow subs\n    /// don't block fast ones; the storage read is amortized across all subs\n    /// starting from the trailing sub's position.\n    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_leader_sync_log",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 257,
+        "end_line": 285,
+        "kind": "code_observation",
+        "text": "    fn handle_majority_promises(&mut self) {\n        let max_promise_sync = self.leader_state.take_max_promise_sync();\n        let decided_idx = self.leader_state.get_max_decided_idx();\n        let mut new_accepted_idx = self\n            .internal_storage\n            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync)\n            .expect(WRITE_ERROR_MSG);\n        if !self.accepted_reconfiguration() {\n            if !self.buffered_proposals.is_empty() {\n                let entries = std::mem::take(&mut self.buffered_proposals);\n                new_accepted_idx = self\n                    .internal_storage\n                    .append_entries_without_batching(entries)\n                    .expect(WRITE_ERROR_MSG);\n            }\n            if let Some(ss) = self.buffered_stopsign.take() {\n                self.internal_storage\n                    .append_stopsign(ss)\n                    .expect(WRITE_ERROR_MSG);\n                new_accepted_idx = self.internal_storage.get_accepted_idx();\n            }\n        }\n        self.state = (Role::Leader, Phase::Accept);\n        self.leader_state\n            .set_accepted_idx(self.pid, new_accepted_idx);\n        for pid in self.leader_state.get_promised_followers() {\n            self.send_accsync(pid);\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_handle_prepare_logsync",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 13,
+        "end_line": 51,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_prepare(&mut self, prep: Prepare, from: NodeId) {\n        let old_promise = self.internal_storage.get_promise();\n        if old_promise < prep.n || (old_promise == prep.n && self.state.1 == Phase::Recover) {\n            // Flush any pending writes\n            // Don't have to handle flushed entries here because we will sync with followers\n            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            self.internal_storage\n                .set_promise(prep.n)\n                .expect(WRITE_ERROR_MSG);\n            self.state = (Role::Follower, Phase::Prepare);\n            self.current_seq_num = SequenceNumber::default();\n            let na = self.internal_storage.get_accepted_round();\n            let accepted_idx = self.internal_storage.get_accepted_idx();\n            let log_sync = if na > prep.n_accepted {\n                // I'm more up to date: send leader what he is missing after his decided index.\n                Some(self.create_log_sync(prep.decided_idx, prep.decided_idx))\n            } else if na == prep.n_accepted && accepted_idx > prep.accepted_idx {\n                // I'm more up to date and in same round: send leader what he is missing after his\n                // accepted index.\n                Some(self.create_log_sync(prep.accepted_idx, prep.decided_idx))\n            } else {\n                // I'm equally or less up to date\n                None\n            };\n            let promise = Promise {\n                n: prep.n,\n                n_accepted: na,\n                decided_idx: self.internal_storage.get_decided_idx(),\n                accepted_idx,\n                log_sync,\n            };\n            self.cached_promise_message = Some(promise.clone());\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Promise(promise),\n            }));\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "151e7197fb8a4d2cb3a369cd79c6964c",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_leader_sync_log"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_handle_prepare_logsync"
+        },
+        {
+          "object": "investigations",
+          "action": "update",
+          "target": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+          "changed_fields": [
+            "hypothesis",
+            "discriminator"
+          ]
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-9527b916ba184b74865563c980642d1c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9527b916ba184b74865563c980642d1c.json"
+      },
+      "submission-e3721acc7c6a4544a22817c5c4b4b149": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-e3721acc7c6a4544a22817c5c4b4b149.json"
+      },
+      "submission-9a11299aa4344bb5b84565cbe33701ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9a11299aa4344bb5b84565cbe33701ad.json"
+      },
+      "submission-1a5428f0aa284eb1a2a3f1a083fcb052": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-1a5428f0aa284eb1a2a3f1a083fcb052.json"
+      },
+      "submission-13c0a8e06f21477689c340dad0a6962e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-13c0a8e06f21477689c340dad0a6962e.json"
+      },
+      "submission-34c476dd304f48f59580ab2799b029d3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-34c476dd304f48f59580ab2799b029d3.json"
+      },
+      "submission-9d31a7bf98034ecaa9c70e2cef669b8c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9d31a7bf98034ecaa9c70e2cef669b8c.json"
+      },
+      "submission-2b18b51118e04d8a9f0ca6001d18eb51": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-2b18b51118e04d8a9f0ca6001d18eb51.json"
+      },
+      "submission-1c6d308f0cb34825b0e959ae7035fbdf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-1c6d308f0cb34825b0e959ae7035fbdf.json"
+      },
+      "submission-dcb373d7a7c843d981030cdf4ec8d37a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-dcb373d7a7c843d981030cdf4ec8d37a.json"
+      },
+      "submission-5ae5e40c713c4c6488aa865e7a16ef53": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-5ae5e40c713c4c6488aa865e7a16ef53.json"
+      },
+      "submission-77b3b52d7f4d4110a95d349465be4a30": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-77b3b52d7f4d4110a95d349465be4a30.json"
+      },
+      "submission-151e7197fb8a4d2cb3a369cd79c6964c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-151e7197fb8a4d2cb3a369cd79c6964c.json"
+      }
+    }
+  }
+}

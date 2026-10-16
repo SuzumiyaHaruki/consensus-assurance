@@ -1,0 +1,1167 @@
+{
+  "input": {
+    "rationale": "The retained execution of the fixed probe confirms the event-backpressure defect, so the question moves to an asserted defect claim; in parallel it registers the next independent sourced lead on the core's accept-phase progress (no resend of Accepted/AcceptDecide).",
+    "sources": [
+      {
+        "id": "src_leader_resend",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 371,
+        "end_line": 403,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_follower_resend",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 240,
+        "end_line": 269,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_leader_handle_accepted",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 316,
+        "end_line": 345,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_follower_reply_accepted",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 160,
+        "end_line": 175,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_follower_flush_batch",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 284,
+        "end_line": 290,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_resend_dispatch",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 229,
+        "end_line": 246,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_lost_accepted",
+        "question": "In the core Sequence Paxos, if a follower's Accepted reply (or the leader's AcceptDecide) is lost, does any timer-driven or self-initiated mechanism restore the leader's knowledge of that acceptance, or does a quorum-accepted entry stay undecided until an unrelated new proposal arrives?",
+        "source_ids": [
+          "src_leader_resend",
+          "src_follower_resend",
+          "src_leader_handle_accepted",
+          "src_follower_reply_accepted",
+          "src_resend_dispatch"
+        ],
+        "hypothesis": "There is no repair for this direction: resend_messages_leader in Phase::Accept only resends a pending StopSign/its decide and re-Prepares peers that are not promised, and resend_messages_follower in Phase::Accept is an empty arm, so a lost Accepted is never retried by either side; the leader's decision only re-evaluates on a later handle_accepted, i.e. only when some follower accepts something new, which requires an unrelated proposal.",
+        "discriminator": "A deterministic in-process simulation (real OmniPaxos instances with a memory storage, manual message delivery and logical ticks): elect a leader, propose one entry, let the follower accept it, drop only that follower's Accepted, then keep ticking and delivering for a fair window with no new proposals, and compare the leader's decided_idx against a control run in which the same message is delivered. If the entry stays undecided in the drop case while both the leader's own acceptance and the follower's accepted_idx show a quorum, the loss is repaired by nothing in that interval; if the entry becomes decided without the message or without a new proposal, the hypothesis is refuted.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_spawn_actor_channels",
+          "src_subscribe_events",
+          "src_append_notify_contract"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Current account. Source-settled mechanism: the actor publishes every observed transition with `event_tx.send(..).await` inside `detect_and_emit_events` (actor.rs:169-199), awaited from the tick arm of the single `run` select loop (actor.rs:665-711), on the channel spawn_actor builds as `async_channel::bounded(RuntimeConfig::event_capacity)` (handle.rs:295-323; knob handle.rs:34-35, default 1024 handle.rs:74). The handle owns a receiver from construction, so an application that never consumes the event stream still leaves it unread, and `subscribe_events` only hands out clones of that same channel (handle.rs:254-259). A `send` that cannot fit parks the actor task, which then cannot run `op.tick()` (election heartbeats, resends, batch flushes), cannot handle incoming messages, and cannot answer any Command - including the `append_notify` Timeout that `drain_notifiers` would have produced on that same tick path (actor.rs:201-222; endpoint documented at handle.rs:114-137). The crate's sibling egress paths avoid exactly this with `try_send` (drain_outgoing_buf; push_to_sub/push_to_all_subs) and its own regression test states the invariant for the outgoing channel. Recorded execution 011decb17a314e839b860436ad3dc164 (experiment 9a11299aa4344bb5b84565cbe33701ad-experiment, exit 0) ran the two-case harness against the clean copy and its test_selection reports both cases passed: `unconsumed_event_stream_stops_actor_loop` and `drained_event_stream_keeps_actor_loop_running` (nothing filtered out). Case 1 (event_capacity 64, paced 4ms proposals, no consumer) required and observed: all three event channels full (`len == capacity`, receiver not closed), at least one node whose actor never answered a `decided_idx` command across ten 200ms samples and still answered nothing 500ms later, and that node's `append_notify_with_timeout(.., 300ms)` unresolved after 4s although its `append_notify_timeout` is 1500ms. Case 2 (identical cluster, capacity and activity, with a task draining each event stream) required and observed the opposite: every node kept answering commands and a follower `append_notify` resolved `Ok(idx >= 1)`. Because the only difference between the cases is whether the event stream is consumed, the parking and the withheld endpoints are attributed to the unconsumed bounded event channel, not to the transport, the configuration or the harness. Scope of the defect asserted: a node whose client does not consume its event stream permanently stops participating (no ticks, no message handling, no command replies) once it has observed `event_capacity` transitions, for any finite capacity - the probe reaches that bound at 64 to stay inside a bounded window, and the source-settled mechanism is capacity-independent. Counter-limitations, kept in force: (a) the trigger is client-side usage and no snapshot source states a drain obligation, so the defect rests on the handle-method contract (every Command reply, and the documented Timeout) plus the deliberate non-blocking design of the sibling egress paths; (b) a receiver that is dropped unblocks the actor (the send error is ignored), so the stall lasts exactly as long as a live receiver exists; (c) the receipt witnesses the bound at 64 with node-local endpoints only - no observation at the 1024 default and no quorum-level measurement of the other nodes losing this participant; (d) the receipt has no parsed events (the harness asserts rather than emitting event lines), so its decisive content is the two recorded test outcomes, not parsed indices. That receipt recorded no parsed observations (event_count 0), so it cannot be cited as completed support and this account stays conditional: the defect is asserted on the source plus that recorded run, and a revised harness emitting CA_EVENT operands was submitted for a fresh execution so a later account can cite parsed indices.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Capacity-independence and practical reachability at the default 1024 are argued from source, not observed: the execution reached the bound at event_capacity=64.",
+          "Only node-local endpoints are witnessed (command round-trips and the append_notify endpoint); the consequence for the rest of the cluster (lost quorum participant, leadership churn caused by the silent node) is not measured.",
+          "The receipt carries no parsed events (event_count 0), so no zero-based indices are available for it; the decisive record is the receipt's test outcomes.",
+          "The stalled-consumer variant from earlier construction is superseded as evidence: its non-freeze was traced to proposals being decided inside a single tick gap, which coalesced transitions; the retained probe paces proposals instead."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      },
+      {
+        "investigation_id": "@q_lost_accepted",
+        "experiment_id": null,
+        "source_ids": [
+          "src_leader_resend",
+          "src_follower_resend",
+          "src_leader_handle_accepted",
+          "src_follower_reply_accepted",
+          "src_follower_flush_batch",
+          "src_resend_dispatch"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Source-only current account of the new question, no execution yet. A follower replies to each AcceptDecide/AcceptStopSign with an Accepted that carries only the receipt's ballot and the follower's accepted_idx (follower.rs:160-175), and the leader turns those receipts into a decision when `is_chosen` sees a quorum of advertised accepted indexes (leader.rs:316-345). Both roles have a periodic callback - SequencePaxos::resend_message_timeout dispatches to resend_messages_leader/resend_messages_follower every resend_message_tick_timeout logical ticks (mod.rs:229-246) - but in the accept phase the leader's version only resends a pending StopSign (or its decide) and re-Prepares peers that are not promised (leader.rs:371-403), and the follower's version is the empty `Phase::Accept => ()` arm (follower.rs:240-269); the follower's other periodic path, flush_batch_follower, replies only when the batch flush itself advanced the accepted index (follower.rs:284-290). So the direction follower->leader has no timer-driven retry, and the leader has no way to ask a follower for its accepted index; the only later trigger is a new AcceptDecide arriving for new entries, which makes the follower advertise a (possibly larger) accepted_idx. Whether that leaves a genuinely quorum-accepted entry undecided for an unbounded interval with no enabled repair under normal (no further proposal) conditions is exactly what the registered discriminator is to decide; no defect is claimed before it runs.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The claim depends on the environment being permitted to lose a single message while the transport keeps the rest in order; the probe must drop only the Accepted reply and keep delivering everything else.",
+          "A retry of the client's own proposal (in the runtime layer) can repair the earlier entry as a side effect, so any later assertion must be scoped to 'no further proposal is made', which the core API does not itself require of a caller."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+      "harness_path": "assurance_generated.rs",
+      "files": {},
+      "execution_package": "omnipaxos_runtime",
+      "test_names": null,
+      "source_ids": [
+        "src_detect_events",
+        "src_run_loop",
+        "src_spawn_actor_channels",
+        "src_subscribe_events",
+        "src_append_notify_contract"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "Bounded probe of whether an event stream the application does not consume (bounded by RuntimeConfig::event_capacity) parks the single actor loop and withholds its command/append_notify endpoints, with a drained-stream control in the same execution.",
+        "assumptions": [
+          "3 nodes, majority quorum, no message loss or reordering beyond the in-process transport, one tokio runtime in one process",
+          "event_capacity 64 so the bound is reached inside a bounded window; the source-settled mechanism (send awaits when the channel holds event_capacity events) is capacity-independent",
+          "the handle's event receiver exists from construction, so an application that never subscribes still leaves it unread"
+        ],
+        "excluded": [
+          "the 1024 default capacity",
+          "quorum-level consequence",
+          "schedule independence or any rate bound"
+        ],
+        "parameters": {
+          "event_capacity": 64,
+          "proposal_pace_ms": 4,
+          "tick_period_ms": 2,
+          "append_notify_timeout_ms": 1500,
+          "nodes": 3
+        }
+      },
+      "prefix": "Three real OmniPaxos instances (pid 1,2,3) built with OmniPaxosConfig::build over omnipaxos_storage::memory_storage::MemoryStorage, each driven by a real omnipaxos_runtime actor from spawn_actor with a harness-local tokio-backed AsyncRuntime impl; one in-process transport task per node forwards each message from that node's outgoing_messages() to msg.get_receiver()'s handle_incoming. RuntimeConfig: tick_period 2ms, egress_period 1ms, event_capacity 64, append_notify_timeout 1500ms; ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, flush_batch_tick_timeout 100. Ordinary appends are paced at 4ms so consecutive decided-index changes are observed in separate ticks; a burst would decide many entries inside one tick gap and emit a single amalgamated event. Case unconsumed_event_stream_stops_actor_loop leaves each node's event receiver unread (the handle owns one from spawn_actor even if the application never calls subscribe_events) and emits CA_EVENT unconsumed_event_bound_reached {nodes_full,nodes,event_capacity}, CA_EVENT actor_parked {node,samples_without_reply,reply_budget_ms,permanently_parked} and CA_EVENT append_notify_endpoint_withheld {node,per_call_deadline_ms,actor_timeout_ms,outer_wait_ms,resolved}. Case drained_event_stream_keeps_actor_loop_running is the control with one difference, a task per node draining the same stream, and emits CA_EVENT control_actors_responsive {nodes_answering,nodes,event_capacity} and CA_EVENT control_append_notify {origin,succeeded,idx}.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "",
+      "prerequisites": [],
+      "comparisons": [],
+      "knowledge": [],
+      "previous_id": "9a11299aa4344bb5b84565cbe33701ad-experiment",
+      "revision_reason": "Same probe, cluster/configuration and the same two cases, but the harness now prints CA_EVENT JSON lines with the observed operands (bound reached, parked node, withheld endpoint, control responsiveness, control append_notify) so the receipt carries parsed observations a conclusion can cite; the previous receipt ran both cases green but recorded no parsed events."
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 2,
+        "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_subscribe_events",
+          "src_event_capacity_cfg",
+          "src_outgoing_nonblocking",
+          "src_decided_subs_nonblocking",
+          "src_append_notify_contract"
+        ],
+        "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+        "discriminator": "Two runs of the same 3-node in-process cluster that differ only in whether an unread event receiver exists: (A) nobody reads events at all (only the receiver the handle itself holds from spawn_actor); (B) a per-node consumer task reads events until a flag is set and then keeps the receiver but stops reading. The hypothesis predicts both variants park the actor after event_capacity transitions; the construction observations contradict that for (B), so the decisive next information is whether the sender in (B) actually observes a full channel - i.e. the real capacity/state of the event channel (Sender::capacity / try_send from a probe) and whether events are still being produced at that moment, rather than a further variant of the freeze symptom.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "9527b916ba184b74865563c980642d1c-question-0",
+            "version": 1,
+            "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+            "source_ids": [
+              "src_detect_events",
+              "src_run_loop",
+              "src_subscribe_events",
+              "src_event_capacity_cfg",
+              "src_outgoing_nonblocking",
+              "src_decided_subs_nonblocking",
+              "src_append_notify_contract"
+            ],
+            "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+            "discriminator": "An execution that subscribes without draining on every node of a live in-process cluster: if the actor task is parked on the event send, Command round-trips never complete and a fresh append_notify never reaches its 300ms Timeout endpoint, while the same cluster with the same event_capacity but a draining receiver keeps answering commands and decides the same entry.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "9527b916ba184b74865563c980642d1c"
+          }
+        ],
+        "operation_id": "e3721acc7c6a4544a22817c5c4b4b149"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "9a11299aa4344bb5b84565cbe33701ad-experiment",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "rust_test",
+            "source": "//! Sourced probe: does an event stream that the application does not consume park\n//! the single omnipaxos_runtime actor task, and with it the node's whole consensus\n//! participation (ticks, incoming messages, Command replies)?\n//!\n//! The actor publishes every observed transition with `event_tx.send(..).await`\n//! (actor.rs `detect_and_emit_events`), awaited inside the tick arm of the only\n//! `run` select loop, on the channel `spawn_actor` builds as\n//! `async_channel::bounded(RuntimeConfig::event_capacity)`. The receiver always\n//! exists: the handle owns one even if the application never calls\n//! `subscribe_events()`. The other two egress paths of the same actor use\n//! `try_send` instead.\n//!\n//! Case 1 leaves that receiver unread while the cluster is kept busy, so the bound\n//! `event_capacity` is reached. Case 2 is the paired control: same cluster, same\n//! capacity, same activity, only difference is a task that drains the events.\n\nuse std::{\n    collections::HashMap,\n    future::Future,\n    sync::{\n        atomic::{AtomicBool, Ordering},\n        Arc,\n    },\n    time::Duration,\n};\n\nuse omnipaxos::{\n    storage::{Entry, Snapshot},\n    util::NodeId,\n    ClusterConfig, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_runtime::{\n    spawn_actor, AsyncRuntime, OmniPaxosEvent, OmniPaxosHandle, RuntimeConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n/// Small but non-degenerate bound: the probe only needs the bound to be reached\n/// inside a bounded window. The mechanism is the same for any finite capacity\n/// (default 1024); only the number of unconsumed transitions changes.\nconst EVENT_CAPACITY: usize = 64;\n/// Paced so that consecutive decided-index changes are observed in separate ticks,\n/// i.e. each decision produces one event instead of one amalgamated event.\nconst PROPOSAL_PACE_MS: u64 = 4;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\n/// Minimal executor: tokio (a dev-dependency of this crate) drives the actor task.\nstruct TestRuntime;\n\nimpl AsyncRuntime for TestRuntime {\n    type JoinHandle = ();\n    fn spawn<F>(future: F)\n    where\n        F: Future<Output = ()> + Send + 'static,\n    {\n        let _ = tokio::spawn(future);\n    }\n    fn sleep(duration: Duration) -> impl Future<Output = ()> + Send + 'static {\n        tokio::time::sleep(duration)\n    }\n}\n\nfn build_op(\n    pid: NodeId,\n    nodes: Vec<NodeId>,\n) -> omnipaxos::OmniPaxos<TestEntry, MemoryStorage<TestEntry>> {\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 100,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: 0,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes,\n            flexible_quorum: None,\n        },\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"config build\")\n}\n\nstruct Cluster {\n    handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>>,\n    /// Inspection handles on each node's event stream (clones of the same\n    /// per-node receiver), used to read the channel state without consuming it.\n    event_rx: HashMap<NodeId, async_channel::Receiver<OmniPaxosEvent>>,\n}\n\n/// 3-node in-process cluster: real OmniPaxos instances, real actors, in-memory\n/// transport that forwards every outgoing message to its receiver's actor.\n///\n/// `consumer` decides what the application does with each node's event stream:\n/// nothing (the handle's own receiver is simply never read) or drain it in a task.\nasync fn spawn_cluster(drain_events: bool) -> Cluster {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        event_capacity: EVENT_CAPACITY,\n        append_notify_timeout: Duration::from_millis(1500),\n        ..Default::default()\n    };\n    let mut handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>> = HashMap::new();\n    let mut event_rx = HashMap::new();\n    for pid in nodes.clone() {\n        let op = build_op(pid, nodes.clone());\n        let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TestRuntime>(op, cfg.clone());\n        let rx = h.subscribe_events();\n        if drain_events {\n            tokio::spawn(async move { while rx.recv().await.is_ok() {} });\n        }\n        event_rx.insert(pid, h.subscribe_events());\n        handles.insert(pid, h);\n    }\n    let arc = Arc::new(handles.clone());\n    for pid in nodes {\n        let out = arc[&pid].outgoing_messages();\n        let peers = arc.clone();\n        tokio::spawn(async move {\n            while let Ok(msg) = out.recv().await {\n                if let Some(peer) = peers.get(&msg.get_receiver()) {\n                    peer.handle_incoming(msg).await;\n                }\n            }\n        });\n    }\n    Cluster { handles, event_rx }\n}\n\n/// A command round-trip completes: the actor task is running its select loop.\nasync fn responds(h: &OmniPaxosHandle<TestEntry>, budget: Duration) -> bool {\n    tokio::time::timeout(budget, h.decided_idx()).await.is_ok()\n}\n\nasync fn wait_for_stable_leader(c: &Cluster) -> Option<NodeId> {\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);\n    while tokio::time::Instant::now() < deadline {\n        for h in c.handles.values() {\n            if let Ok(Some((leader, true))) =\n                tokio::time::timeout(Duration::from_millis(200), h.current_leader()).await\n            {\n                return Some(leader);\n            }\n        }\n        tokio::time::sleep(Duration::from_millis(20)).await;\n    }\n    None\n}\n\n/// Keep proposing ordinary writes on one origin, spaced out so that each decided\n/// index change is observed by the actors in a separate tick.\nfn keep_proposing(c: &Cluster, origin: NodeId, from: u64, count: u64) {\n    let h = c.handles[&origin].clone();\n    tokio::spawn(async move {\n        for v in from..from + count {\n            let origin_handle = h.clone();\n            tokio::spawn(async move {\n                let _ = origin_handle.append(TestEntry(v)).await;\n            });\n            tokio::time::sleep(Duration::from_millis(PROPOSAL_PACE_MS)).await;\n        }\n    });\n}\n\nfn channel_state(c: &Cluster) -> String {\n    let mut s = String::new();\n    for pid in [1u64, 2, 3] {\n        let rx = &c.event_rx[&pid];\n        s.push_str(&format!(\n            \" pid{pid}[len={} capacity={:?} full={} closed={}]\",\n            rx.len(),\n            rx.capacity(),\n            rx.is_full(),\n            rx.is_closed()\n        ));\n    }\n    s\n}\n\nasync fn responsive_nodes(c: &Cluster, budget: Duration) -> usize {\n    let mut n = 0;\n    for h in c.handles.values() {\n        if responds(h, budget).await {\n            n += 1;\n        }\n    }\n    n\n}\n\n/// Case 1: nothing consumes the event stream; the cluster is kept busy until the\n/// bound is reached.\n#[tokio::test]\nasync fn unconsumed_event_stream_stops_actor_loop() {\n    let c = spawn_cluster(false).await;\n\n    // The application never reads events. Get a leader going first, then keep the\n    // cluster observing transitions until the event bound is reached.\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(\n        leader.is_some(),\n        \"setup: no stable leader while the event channel still had room{}\",\n        channel_state(&c)\n    );\n    keep_proposing(&c, leader.unwrap(), 0, EVENT_CAPACITY as u64 * 3);\n\n    // Witness 1: every node reached the bound, so the actor can no longer publish\n    // the next transition it observes.\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    loop {\n        let full = [1u64, 2, 3]\n            .iter()\n            .filter(|pid| c.event_rx[pid].is_full() && !c.event_rx[pid].is_closed())\n            .count();\n        if full == 3 {\n            break;\n        }\n        assert!(\n            tokio::time::Instant::now() < deadline,\n            \"the unconsumed event channels did not reach their bound:{}\",\n            channel_state(&c)\n        );\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n\n    // Witness 2: at least one node's actor loop is parked, and it stays parked\n    // (samples over ~2s never show it serving a command again).\n    let mut parked_pid: Option<NodeId> = None;\n    let mut permanently_parked = true;\n    for _ in 0..10 {\n        let mut this_sample: Vec<NodeId> = Vec::new();\n        for (pid, h) in c.handles.iter() {\n            if !responds(h, Duration::from_millis(200)).await {\n                this_sample.push(*pid);\n            }\n        }\n        if this_sample.is_empty() {\n            permanently_parked = false;\n            break;\n        }\n        parked_pid = Some(parked_pid.map_or(this_sample[0], |p| p));\n        tokio::time::sleep(Duration::from_millis(200)).await;\n    }\n    let parked_pid = parked_pid.expect(\"no node stopped answering commands\");\n    assert!(\n        permanently_parked,\n        \"the parked actor recovered by itself; observed channel state:{}\",\n        channel_state(&c)\n    );\n    assert!(\n        !responds(&c.handles[&parked_pid], Duration::from_millis(500)).await,\n        \"node {parked_pid} answered again; channel state:{}\",\n        channel_state(&c)\n    );\n\n    // Witness 3: on that parked node the proposal endpoint is gone too - its\n    // append_notify_timeout is 1500ms, so a running actor would have answered\n    // (Timeout at the latest) well before the outer 4s.\n    let h = c.handles[&parked_pid].clone();\n    let resolved = tokio::time::timeout(\n        Duration::from_secs(4),\n        h.append_notify_with_timeout(TestEntry(999), Duration::from_millis(300)),\n    )\n    .await;\n    assert!(\n        resolved.is_err(),\n        \"append_notify on parked node {parked_pid} resolved: {resolved:?}\"\n    );\n}\n\n/// Case 2 (control): same cluster, same capacity, same activity; the only\n/// difference is that each node's event stream is drained.\n#[tokio::test]\nasync fn drained_event_stream_keeps_actor_loop_running() {\n    let c = spawn_cluster(true).await;\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(leader.is_some(), \"control: no stable leader{}\", channel_state(&c));\n    let leader = leader.unwrap();\n    keep_proposing(&c, leader, 0, EVENT_CAPACITY as u64 * 3);\n\n    let mut alive = 0;\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    while tokio::time::Instant::now() < deadline {\n        alive = responsive_nodes(&c, Duration::from_millis(200)).await;\n        if alive == c.handles.len() {\n            break;\n        }\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n    assert_eq!(\n        alive,\n        c.handles.len(),\n        \"control: some actor loop stopped with a drained event stream{}\",\n        channel_state(&c)\n    );\n\n    let follower = *c.handles.keys().find(|&&p| p != leader).unwrap();\n    let idx = match tokio::time::timeout(\n        Duration::from_secs(5),\n        c.handles[&follower].append_notify(TestEntry(7)),\n    )\n    .await\n    {\n        Ok(Ok(idx)) => idx,\n        other => panic!(\"control append_notify: expected Ok(idx), got {other:?}\"),\n    };\n    assert!(idx >= 1, \"control append_notify returned idx {idx}\");\n}\n",
+            "files": {},
+            "execution_package": "./omnipaxos_runtime",
+            "test_names": null,
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "src_detect_events",
+            "src_run_loop",
+            "src_spawn_actor_channels",
+            "src_subscribe_events",
+            "src_append_notify_contract"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Bounded probe of whether an event stream the application does not consume (bounded by RuntimeConfig::event_capacity) parks the single actor loop and withholds its command/append_notify endpoints, with a drained-stream control in the same execution.",
+            "assumptions": [
+              "3 nodes, standard majority quorum, no message loss or reordering beyond the in-process transport, all nodes run in one process on one tokio runtime",
+              "event_capacity is set to 64 so the bound is reached inside a bounded window; the source-settled mechanism (send awaits whenever the channel holds event_capacity events) does not depend on the value, only the number of unconsumed transitions does",
+              "the handle's event receiver exists from construction, so an application that never subscribes still leaves it unread"
+            ],
+            "excluded": [
+              "proving the cluster-wide outage (quorum loss) at the 1024 default capacity",
+              "schedule independence and any rate bound on how quickly the bound is reached"
+            ],
+            "parameters": {
+              "event_capacity": 64,
+              "proposal_pace_ms": 4,
+              "tick_period_ms": 2,
+              "append_notify_timeout_ms": 1500,
+              "nodes": 3
+            }
+          },
+          "prefix": "Three real OmniPaxos instances (pid 1,2,3) are built with OmniPaxosConfig::build over omnipaxos_storage::memory_storage::MemoryStorage and driven by three real omnipaxos_runtime actors spawned with spawn_actor, using a harness-local `TestRuntime` (tokio-backed AsyncRuntime impl; the crate's TokioRuntime behind the tokio_runtime feature is not required). An in-process transport task per node forwards every message from that node's `outgoing_messages()` to the receiver returned by `msg.get_receiver()`. RuntimeConfig: tick_period 2ms, egress_period 1ms, event_capacity 64, append_notify_timeout 1500ms; ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, flush_batch_tick_timeout 100. Proposals are paced at 4ms so consecutive decided-index changes are observed in separate ticks (a burst would decide many entries inside one tick gap and produce a single amalgamated event). Case `unconsumed_event_stream_stops_actor_loop` leaves each node's event receiver unread (the handle always owns one after spawn_actor; the application never calls subscribe_events or never reads it) while ordinary appends keep the cluster busy until all three event channels are full; case `drained_event_stream_keeps_actor_loop_running` is the same cluster, capacity and activity with one difference: a task per node drains the event stream. The decisive evidence of case 1 is (a) all three event channels full with a live (not closed) receiver, (b) at least one node whose actor never answers a `decided_idx` command again across ten 200ms samples, (c) that parked node's `append_notify_with_timeout(.., 300ms)` not resolving inside 4s although the actor that would produce its Timeout runs on that same tick path; the assertion messages print the observed channel state. Case 2 requires every node to keep answering and a fresh append_notify from a follower to resolve Ok(idx>=1).",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "99efa2281254411fbc4f8674b760f576",
+        "configuration": {
+          "backend": "cargo",
+          "target": {
+            "expected_module": null,
+            "variant": "omnipaxos",
+            "analysis_roots": [],
+            "execution_package": "omnipaxos",
+            "harness_path": "omnipaxos/tests/assurance_generated.rs"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+          }
+        },
+        "harness_filename": "omnipaxos_runtime/tests/assurance_generated.rs",
+        "operation_id": "9a11299aa4344bb5b84565cbe33701ad",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "9527b916ba184b74865563c980642d1c-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_subscribe_events",
+          "src_outgoing_nonblocking",
+          "src_decided_subs_nonblocking",
+          "src_append_notify_contract",
+          "src_event_capacity_cfg"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account (source-only, no receipt yet): the blocking behavior itself is settled by source - detect_and_emit_events publishes every observed transition with `event_tx.send(..).await` (omnipaxos_runtime/src/actor.rs:169-199) and is awaited in the tick arm of the only actor loop (actor.rs:665-711); the event channel is bounded (RuntimeConfig::event_capacity, handle.rs:34-35, default 1024 at handle.rs:74) and subscribe_events hands out a shared receiver clone (handle.rs:254-259). With a live-but-unread receiver the send is Pending and the actor task parks, so op.tick() (which drives leader-election heartbeats, message resends and batch flushes), handle_incoming and command handling all stop; a caller then cannot even obtain the documented append_notify failure endpoint, because the Timeout is produced by drain_notifiers on that same tick path (actor.rs:201-222, contract at handle.rs:114-137). Sibling paths of the same actor were built to avoid exactly this (try_send + buffering in drain_outgoing_buf, actor.rs:232-258; try_send + defer in push_to_all_subs, actor.rs:301-333), and the crate's own regression test asserts the invariant for the outgoing channel ('must still be responsive... if flush_outgoing blocked on a full channel, this would hang', tests/async_runtime_test.rs:1040-1082). What is NOT yet established: an actual execution showing the parked loop and its consequence. A first local construction of the probe (draft/assurance_generated.rs: 3-node in-process cluster, event_capacity=1, subscribe_events() receiver retained and never read) compiled and ran, but the harness as written did not reach the expected state - no node blocked within 500ms, and even the drained-events control cluster had not decided an entry within the probe's 300ms append_notify deadline, so the cluster had presumably not yet progressed to a second observed transition/two-state leader view. Until the probe is repaired and executed through the controller, the freeze and its consequence stay unverified. Counter-limitations to carry: (a) the trigger is client-side usage (a retained but unread receiver) - the runtime documents no drain obligation, and event_capacity only delays the parking, it does not bound it; (b) a receiver that is dropped unblocks the actor (the send error is ignored), so the stall lasts exactly as long as the receiver is held; (c) no source in the snapshot states that the actor loop must stay responsive to a full event channel, so the finding rests on the contract of the handle methods (every Command-reply method, including append_notify's Timeout) plus the deliberate non-blocking design of the sibling egress paths.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9527b916ba184b74865563c980642d1c"
+      },
+      {
+        "id": "e3721acc7c6a4544a22817c5c4b4b149-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_spawn_actor_channels",
+          "src_subscribe_events",
+          "src_append_notify_contract"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account. Settled by source: every transition the actor observes is published with an awaited send on a channel created once in spawn_actor as async_channel::bounded(RuntimeConfig::event_capacity) (handle.rs:295-323, capacity field handle.rs:34-35, default 1024 at handle.rs:74); detect_and_emit_events issues those sends (actor.rs:169-199) and is awaited from inside the tick arm of the single run select loop (actor.rs:665-711), so a Pending send there stops op.tick(), incoming handling, command handling and decided-subscriber pushes. subscribe_events hands out a clone of that same receiver (handle.rs:254-259), and append_notify's Timeout endpoint is produced by drain_notifiers on the same tick path (actor.rs:201-222, contract handle.rs:114-137), so a parked actor would also withhold that documented failure. NOT settled: whether an unread receiver actually parks the actor. Local construction (native feedback, not retained receipts; harness draft/assurance_generated.rs) produced two contradicting observations on the same cluster shape (3 nodes, in-process transport, event_capacity=1, tick_period=2ms): (A) with no consumer task at all, i.e. only the receiver the handle itself holds, no node reached a stable leader within 10s and every current_leader() poll timed out - consistent with the park; (B) with a per-node consumer task that reads events during a healthy phase (leader elected, entries decided, all commands answered) and then stops reading while keeping the receiver (instrumented: the task confirmed it had stopped reading), the cluster went on deciding all 24 further proposals and every node kept answering commands, and a later append_notify succeeded - inconsistent with the park. Because both variants leave an unread receiver on a bounded channel, (B) defeats the currently stated premise that 'unread receiver + capacity reached => sender stays Pending'. Possible explanations not yet distinguished: the tick arm's send may not be the blocking point in (B) (e.g. produces no further events, or the send resolves immediately because the channel is closed/space exists), or (A)'s no-progress has a different cause than the one claimed. Until the decisive channel-state observation is made, the freeze and its consequence stay unverified, so no defect is asserted. Counter-limitations to carry: a dropped receiver would unblock the actor (the send error is ignored), capacity only delays the parking, no snapshot source states that the actor loop must stay responsive to a full event channel (the finding would rest on the handle-method contract plus the deliberate try_send design of the sibling egress paths), and the event_capacity=1 configuration is an extreme point of a knob whose default is 1024.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Local construction observations (harness drafts run by the agent, not controller receipts) cannot support a formal conclusion; variant (B) also used an agent-defined tokio-backed AsyncRuntime implementation rather than the crate's TokioRuntime feature.",
+          "The parked-actor consequence for the rest of the cluster (lost quorum participation) has not been observed at all, only the node-local command/append_notify endpoints."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "e3721acc7c6a4544a22817c5c4b4b149"
+      },
+      {
+        "id": "9a11299aa4344bb5b84565cbe33701ad-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_spawn_actor_channels",
+          "src_subscribe_events",
+          "src_append_notify_contract"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account. Source-settled: the actor publishes each observed transition with `event_tx.send(..).await` inside `detect_and_emit_events` (actor.rs:169-199), awaited from the tick arm of the single `run` select loop (actor.rs:665-711), on the channel spawn_actor creates as async_channel::bounded(RuntimeConfig::event_capacity) (handle.rs:295-323; capacity knob handle.rs:34-35, default 1024 handle.rs:74). The handle owns a receiver from construction, so an application that ignores the event stream still leaves it unread; a Pending send there stops op.tick() (election heartbeat, resends, batch flush), incoming handling, command handling and decided-subscriber pushes, and also withholds append_notify's Timeout, which drain_notifiers would emit on the same tick path (actor.rs:201-222, contract handle.rs:114-137). Previous contradiction resolved during construction (local feedback, not receipts): the stalled-consumer variant had not frozen because the burst of proposals was decided inside a single tick gap, so only one further transition was observed and the channel never took a second send; instrumented runs showed the channel at len=1/capacity=1 with a parked actor in the no-consumer variant, and len=0 with a running actor in the burst variant. The probe is now paced (one proposal per 4ms) and reaches the bound on all three nodes at event_capacity=64, where the local runs (two consecutive, unmodified sources) show: all three channels full with live receivers, at least one actor loop parked and never answering again, its append_notify_with_timeout(300ms) unresolved after 4s, while the drained-stream control keeps all nodes answering and resolves a follower append_notify Ok(idx>=1). Defect judgment stays unresolved until the retained execution reports those comparisons; the claim under test is scoped to: a node whose client does not consume its event stream parks its actor loop once event_capacity transitions are observed, permanently losing ticks and every command reply (including the documented failure endpoints), and its participation is lost to the cluster. Counter-limitations carried forward: the trigger is client-side usage with no documented drain obligation, event_capacity only delays the parking, a dropped receiver unblocks the actor (send error ignored), no snapshot source states that a full event channel must not park the loop, and the cluster-level consequence at the default capacity (1024) is not observed by this probe.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The probe reaches the bound at event_capacity=64; it does not witness the same freeze at the default 1024, and it does not measure how many unconsumed transitions a real deployment would need.",
+          "Only the node-local consequences are asserted (command round-tripping and the append_notify endpoint); no quorum-level consequence is measured, and the parked-set is reported as `at least one node`, not as all nodes.",
+          "Local construction runs used a harness-local tokio-backed AsyncRuntime impl rather than the crate's TokioRuntime feature; the formal receipt will use the controller's clean copy."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9a11299aa4344bb5b84565cbe33701ad"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_detect_events",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 169,
+        "end_line": 199,
+        "kind": "code_observation",
+        "text": "    async fn detect_and_emit_events(&mut self) {\n        let cur = self.op.get_current_leader();\n        if cur != self.last_leader {\n            if let Some((pid, accepted)) = cur {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::LeaderElected { pid, accepted })\n                    .await;\n            }\n            self.last_leader = cur;\n        }\n        let d = self.op.get_decided_idx();\n        if d > self.last_decided_idx {\n            let _ = self\n                .event_tx\n                .send(OmniPaxosEvent::Decided { new_decided_idx: d })\n                .await;\n            self.last_decided_idx = d;\n        }\n        if !self.last_reconfigured {\n            if let Some(_ss) = self.op.is_reconfigured() {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::Reconfigured {\n                        stop_sign_idx: self.op.get_decided_idx(),\n                    })\n                    .await;\n                self.last_reconfigured = true;\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_run_loop",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 665,
+        "end_line": 711,
+        "kind": "code_observation",
+        "text": "pub(crate) async fn run<T, B, R>(mut state: ActorState<T, B>, _rt: PhantomData<fn() -> R>)\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let mut tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n    let mut egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n\n    // async_channel::Receiver is !Unpin; keep it in a Pin<Box<...>> so the Stream\n    // impl works under select_biased!.\n    let cmd_rx = std::mem::replace(&mut state.cmd_rx, async_channel::bounded(1).1);\n    let incoming_rx = std::mem::replace(&mut state.incoming_rx, async_channel::bounded(1).1);\n    let mut cmd_rx = Box::pin(cmd_rx);\n    let mut incoming_rx = Box::pin(incoming_rx);\n\n    loop {\n        select_biased! {\n            _ = tick_fut => {\n                state.op.tick();\n                state.detect_and_emit_events().await;\n                state.try_dispatch_undispatched();\n                state.reconcile_unconfirmed();\n                state.drain_notifiers();\n                state.push_to_all_subs();\n                tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n            }\n            _ = egress_fut => {\n                state.flush_outgoing();\n                egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n            }\n            in_msg = incoming_rx.next() => {\n                match in_msg {\n                    Some(Message::AsyncRuntime(arm)) => state.handle_runtime_msg(arm),\n                    Some(m) => state.handle_incoming_tracked(m),\n                    None => break,\n                }\n            }\n            cmd = cmd_rx.next() => {\n                match cmd {\n                    Some(c) => state.handle_command(c).await,\n                    None => break,\n                }\n            }\n        }\n    }\n}",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_outgoing_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 232,
+        "end_line": 273,
+        "kind": "code_observation",
+        "text": "    /// Non-blocking drain of `outgoing_buf` onto `outgoing_tx`. Uses `try_send`\n    /// so a merely-full channel (slow consumer) doesn't block the actor loop;\n    /// unsent messages stay in `outgoing_buf` (in order) for the next attempt.\n    /// If the buffer exceeds [`Self::outgoing_buf_cap`], oldest messages are\n    /// dropped — see [`RuntimeConfig::max_outgoing_buffered`].\n    fn drain_outgoing_buf(&mut self) {\n        let cap = self.outgoing_buf_cap();\n        trim_oldest(&mut self.outgoing_buf, cap);\n\n        let pending = std::mem::take(&mut self.outgoing_buf);\n        let mut iter = pending.into_iter();\n        for msg in iter.by_ref() {\n            match self.outgoing_tx.try_send(msg) {\n                Ok(()) => {}\n                Err(async_channel::TrySendError::Full(msg)) => {\n                    self.outgoing_buf.push(msg);\n                    break;\n                }\n                Err(async_channel::TrySendError::Closed(_)) => {\n                    // Receiver dropped — user is not draining outgoing. Discard\n                    // everything remaining; nothing left to retry against.\n                    return;\n                }\n            }\n        }\n        self.outgoing_buf.extend(iter);\n    }\n\n    /// Enqueue one outgoing message without awaiting. Appends behind any\n    /// already-buffered messages (preserves order), then tries to drain.\n    /// Used for both core protocol traffic (via [`Self::flush_outgoing`]) and\n    /// runtime control-plane messages (`TaggedProposal` / `Assigned`).\n    fn enqueue_outgoing(&mut self, msg: Message<T>) {\n        self.outgoing_buf.push(msg);\n        self.drain_outgoing_buf();\n    }\n\n    /// Pull newly-produced OmniPaxos/BLE messages into `outgoing_buf` and drain.\n    fn flush_outgoing(&mut self) {\n        self.op.take_outgoing_messages(&mut self.outgoing_buf);\n        self.drain_outgoing_buf();\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_decided_subs_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 296,
+        "end_line": 333,
+        "kind": "code_observation",
+        "text": "\n    /// Push newly-decided entries to every subscriber, reading the log suffix\n    /// **once** and fanning out. Each sub keeps its own cursor, so slow subs\n    /// don't block fast ones; the storage read is amortized across all subs\n    /// starting from the trailing sub's position.\n    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_subscribe_events",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 254,
+        "end_line": 259,
+        "kind": "code_observation",
+        "text": "    /// Subscribe to state-transition events. Each event is delivered to exactly one\n    /// receiver: if you clone the returned receiver, the clones share the queue.\n    /// For fan-out to multiple independent subscribers, wrap in a broadcasting task.\n    pub fn subscribe_events(&self) -> async_channel::Receiver<OmniPaxosEvent> {\n        self.events_rx.clone()\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_cfg",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 34,
+        "end_line": 35,
+        "kind": "code_observation",
+        "text": "    /// Bounded capacity for the event channel.\n    pub event_capacity: usize,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_default",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 61,
+        "end_line": 76,
+        "kind": "code_observation",
+        "text": "impl Default for RuntimeConfig {\n    fn default() -> Self {\n        Self {\n            tick_period: Duration::from_millis(10),\n            egress_period: Duration::from_millis(1),\n            cmd_channel_capacity: 1024,\n            outgoing_capacity: 10_000,\n            incoming_capacity: 10_000,\n            event_capacity: 1024,\n            append_notify_timeout: Duration::from_secs(5),\n            decided_channel_capacity: 1024,\n            max_pending_appends: 1024,\n            max_decided_subscribers: 128,\n            max_outgoing_buffered: 10_000,\n        }\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_incoming_awaits_caller",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 288,
+        "end_line": 291,
+        "kind": "code_observation",
+        "text": "    /// Deliver an incoming message from the network to the actor.\n    pub async fn handle_incoming(&self, m: Message<T>) {\n        let _ = self.incoming_tx.send(m).await;\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_declared_no_stall_invariant",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 1040,
+        "end_line": 1082,
+        "kind": "test_expectation",
+        "text": "/// it's closed. Since this runs on the single actor loop, that blocked\n/// tick/election/command processing for the node entirely, not just delayed\n/// egress. Uses a tiny `outgoing_capacity` and never drains it, so it fills\n/// up almost immediately (the node has configured peers and sends BLE\n/// heartbeats regardless of whether anyone's listening).\n///\n/// Notify-path (`TaggedProposal` / `Assigned`) backpressure is covered by\n/// [`notify_egress_does_not_stall_when_outgoing_full`].\n#[tokio::test]\nasync fn full_outgoing_channel_does_not_stall_actor_loop() {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        outgoing_capacity: 2,\n        ..Default::default()\n    };\n    let op = build_op(1, nodes);\n    let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TokioRuntime>(op, cfg);\n\n    // Let the outgoing channel fill up completely without ever draining it.\n    tokio::time::sleep(Duration::from_millis(100)).await;\n\n    // The actor loop must still be responsive to commands -- if\n    // flush_outgoing blocked on a full channel, this would hang.\n    let idx = timeout(Duration::from_millis(500), h.decided_idx())\n        .await\n        .expect(\"actor loop appears stalled with a full outgoing channel\");\n    assert_eq!(idx, 0);\n\n    // Draining now should still deliver messages (not silently and\n    // permanently lost) once the consumer catches up.\n    let out = h.outgoing_messages();\n    timeout(Duration::from_secs(2), out.recv())\n        .await\n        .expect(\"no message ever arrived once draining resumed\")\n        .expect(\"outgoing channel closed unexpectedly\");\n}\n\n/// Like `spawn_cluster`, but each node's outgoing drain can be paused via the\n/// returned per-pid flags. While a node's flag is `true`, its drain task stops\n/// calling `recv`, so that node's bounded `outgoing_messages` channel fills\n/// and further egress hits backpressure -- without tearing down the rest of",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "src_drain_notifiers_timeout",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 201,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_append_notify_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 114,
+        "end_line": 137,
+        "kind": "interface_statement",
+        "text": "    /// Append an entry and await its decided log index.\n    ///\n    /// Works from any node: the actor tags the entry with a unique id, routes it to\n    /// the current leader, and resolves the future when the assigned log index is\n    /// decided. If no leader is known yet, the call waits rather than failing fast --\n    /// it resolves once a leader is elected, or with `Timeout` if none is elected in\n    /// time. Fails with:\n    /// - [`AppendError::Timeout`] if the entry is not decided within\n    ///   [`RuntimeConfig::append_notify_timeout`] (including when no leader was ever\n    ///   elected in that time);\n    /// - [`AppendError::Propose`] if the underlying propose call itself failed (e.g. a\n    ///   reconfiguration is already pending) -- only when this node owns the pending\n    ///   call, otherwise it still resolves via `Timeout`;\n    /// - [`AppendError::Superseded`] if a leader change occurred before decision --\n    ///   a heuristic, not a certainty; see its doc comment for why, and check the\n    ///   returned index yourself if you need to know for sure;\n    /// - [`AppendError::TooManyOutstanding`] if [`RuntimeConfig::max_pending_appends`]\n    ///   outstanding calls are already queued.\n    ///\n    /// Uses [`RuntimeConfig::append_notify_timeout`] as the deadline; use\n    /// [`Self::append_notify_with_timeout`] to override it for a single call.\n    pub async fn append_notify(&self, entry: T) -> Result<usize, AppendError<T>> {\n        self.append_notify_inner(entry, None).await\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_spawn_actor_channels",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 295,
+        "end_line": 323,
+        "kind": "code_observation",
+        "text": "pub fn spawn_actor<T, B, R>(op: OmniPaxos<T, B>, cfg: RuntimeConfig) -> OmniPaxosHandle<T>\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let (cmd_tx, cmd_rx) = async_channel::bounded(cfg.cmd_channel_capacity);\n    let (outgoing_tx, outgoing_rx) = async_channel::bounded(cfg.outgoing_capacity);\n    let (incoming_tx, incoming_rx) = async_channel::bounded(cfg.incoming_capacity);\n    let (event_tx, events_rx) = async_channel::bounded(cfg.event_capacity);\n\n    let state = ActorState::new(\n        op,\n        cmd_rx,\n        incoming_rx,\n        outgoing_tx,\n        event_tx,\n        ActorConfig::from(&cfg),\n    );\n\n    R::spawn(run::<T, B, R>(state, PhantomData::<fn() -> R>));\n\n    OmniPaxosHandle {\n        cmd_tx,\n        events_rx,\n        outgoing_rx,\n        incoming_tx,\n        decided_channel_capacity: cfg.decided_channel_capacity,\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052",
+      "result": {
+        "submission": "update.json",
+        "summary": "Turned the retained run into an account and set up both the formal support and the next lead. The recorded execution (011decb17a314e839b860436ad3dc164, exit 0) reports both cases passed — the unconsumed case required all three event channels full, a permanently parked actor and its append_notify endpoint withheld, and the drained control kept all nodes answering with a follower append_notify Ok — but that receipt has no parsed events, so it cannot be cited as completed support: the answer is now a conditional account with defect_claim asserted, and a revised harness that prints CA_EVENT operands (bound reached, parked node, withheld endpoint, control responsiveness, control append_notify) was submitted as a fresh execution with previous_id/revision_reason. Also registered the next independent lead: the core has no accept-phase resend (leader's Accept branch only resends a pending StopSign and re-Prepares unpremised peers; the follower's Accept arm is empty), so a lost Accepted reply may leave a quorum-accepted entry undecided with no enabled repair until an unrelated proposal — with sources and a deterministic drop-one-message discriminator, no defect claimed before it runs."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-9527b916ba184b74865563c980642d1c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9527b916ba184b74865563c980642d1c.json"
+      },
+      "submission-e3721acc7c6a4544a22817c5c4b4b149": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-e3721acc7c6a4544a22817c5c4b4b149.json"
+      },
+      "submission-9a11299aa4344bb5b84565cbe33701ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9a11299aa4344bb5b84565cbe33701ad.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 2,
+        "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_subscribe_events",
+          "src_event_capacity_cfg",
+          "src_outgoing_nonblocking",
+          "src_decided_subs_nonblocking",
+          "src_append_notify_contract"
+        ],
+        "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+        "discriminator": "Two runs of the same 3-node in-process cluster that differ only in whether an unread event receiver exists: (A) nobody reads events at all (only the receiver the handle itself holds from spawn_actor); (B) a per-node consumer task reads events until a flag is set and then keeps the receiver but stops reading. The hypothesis predicts both variants park the actor after event_capacity transitions; the construction observations contradict that for (B), so the decisive next information is whether the sender in (B) actually observes a full channel - i.e. the real capacity/state of the event channel (Sender::capacity / try_send from a probe) and whether events are still being produced at that moment, rather than a further variant of the freeze symptom.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [
+          {
+            "id": "9527b916ba184b74865563c980642d1c-question-0",
+            "version": 1,
+            "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+            "source_ids": [
+              "src_detect_events",
+              "src_run_loop",
+              "src_subscribe_events",
+              "src_event_capacity_cfg",
+              "src_outgoing_nonblocking",
+              "src_decided_subs_nonblocking",
+              "src_append_notify_contract"
+            ],
+            "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+            "discriminator": "An execution that subscribes without draining on every node of a live in-process cluster: if the actor task is parked on the event send, Command round-trips never complete and a fresh append_notify never reaches its 300ms Timeout endpoint, while the same cluster with the same event_capacity but a draining receiver keeps answering commands and decides the same entry.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "resume_conditions": [],
+            "operation_id": "9527b916ba184b74865563c980642d1c"
+          }
+        ],
+        "operation_id": "e3721acc7c6a4544a22817c5c4b4b149"
+      },
+      {
+        "id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+        "version": 1,
+        "question": "In the core Sequence Paxos, if a follower's Accepted reply (or the leader's AcceptDecide) is lost, does any timer-driven or self-initiated mechanism restore the leader's knowledge of that acceptance, or does a quorum-accepted entry stay undecided until an unrelated new proposal arrives?",
+        "source_ids": [
+          "src_leader_resend",
+          "src_follower_resend",
+          "src_leader_handle_accepted",
+          "src_follower_reply_accepted",
+          "src_resend_dispatch"
+        ],
+        "hypothesis": "There is no repair for this direction: resend_messages_leader in Phase::Accept only resends a pending StopSign/its decide and re-Prepares peers that are not promised, and resend_messages_follower in Phase::Accept is an empty arm, so a lost Accepted is never retried by either side; the leader's decision only re-evaluates on a later handle_accepted, i.e. only when some follower accepts something new, which requires an unrelated proposal.",
+        "discriminator": "A deterministic in-process simulation (real OmniPaxos instances with a memory storage, manual message delivery and logical ticks): elect a leader, propose one entry, let the follower accept it, drop only that follower's Accepted, then keep ticking and delivering for a fair window with no new proposals, and compare the leader's decided_idx against a control run in which the same message is delivered. If the entry stays undecided in the drop case while both the leader's own acceptance and the follower's accepted_idx show a quorum, the loss is repaired by nothing in that interval; if the entry becomes decided without the message or without a new proposal, the hypothesis is refuted.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "9a11299aa4344bb5b84565cbe33701ad-experiment",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "rust_test",
+            "source": "//! Sourced probe: does an event stream that the application does not consume park\n//! the single omnipaxos_runtime actor task, and with it the node's whole consensus\n//! participation (ticks, incoming messages, Command replies)?\n//!\n//! The actor publishes every observed transition with `event_tx.send(..).await`\n//! (actor.rs `detect_and_emit_events`), awaited inside the tick arm of the only\n//! `run` select loop, on the channel `spawn_actor` builds as\n//! `async_channel::bounded(RuntimeConfig::event_capacity)`. The receiver always\n//! exists: the handle owns one even if the application never calls\n//! `subscribe_events()`. The other two egress paths of the same actor use\n//! `try_send` instead.\n//!\n//! Case 1 leaves that receiver unread while the cluster is kept busy, so the bound\n//! `event_capacity` is reached. Case 2 is the paired control: same cluster, same\n//! capacity, same activity, only difference is a task that drains the events.\n\nuse std::{\n    collections::HashMap,\n    future::Future,\n    sync::{\n        atomic::{AtomicBool, Ordering},\n        Arc,\n    },\n    time::Duration,\n};\n\nuse omnipaxos::{\n    storage::{Entry, Snapshot},\n    util::NodeId,\n    ClusterConfig, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_runtime::{\n    spawn_actor, AsyncRuntime, OmniPaxosEvent, OmniPaxosHandle, RuntimeConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n/// Small but non-degenerate bound: the probe only needs the bound to be reached\n/// inside a bounded window. The mechanism is the same for any finite capacity\n/// (default 1024); only the number of unconsumed transitions changes.\nconst EVENT_CAPACITY: usize = 64;\n/// Paced so that consecutive decided-index changes are observed in separate ticks,\n/// i.e. each decision produces one event instead of one amalgamated event.\nconst PROPOSAL_PACE_MS: u64 = 4;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\n/// Minimal executor: tokio (a dev-dependency of this crate) drives the actor task.\nstruct TestRuntime;\n\nimpl AsyncRuntime for TestRuntime {\n    type JoinHandle = ();\n    fn spawn<F>(future: F)\n    where\n        F: Future<Output = ()> + Send + 'static,\n    {\n        let _ = tokio::spawn(future);\n    }\n    fn sleep(duration: Duration) -> impl Future<Output = ()> + Send + 'static {\n        tokio::time::sleep(duration)\n    }\n}\n\nfn build_op(\n    pid: NodeId,\n    nodes: Vec<NodeId>,\n) -> omnipaxos::OmniPaxos<TestEntry, MemoryStorage<TestEntry>> {\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 100,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: 0,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes,\n            flexible_quorum: None,\n        },\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"config build\")\n}\n\nstruct Cluster {\n    handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>>,\n    /// Inspection handles on each node's event stream (clones of the same\n    /// per-node receiver), used to read the channel state without consuming it.\n    event_rx: HashMap<NodeId, async_channel::Receiver<OmniPaxosEvent>>,\n}\n\n/// 3-node in-process cluster: real OmniPaxos instances, real actors, in-memory\n/// transport that forwards every outgoing message to its receiver's actor.\n///\n/// `consumer` decides what the application does with each node's event stream:\n/// nothing (the handle's own receiver is simply never read) or drain it in a task.\nasync fn spawn_cluster(drain_events: bool) -> Cluster {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        event_capacity: EVENT_CAPACITY,\n        append_notify_timeout: Duration::from_millis(1500),\n        ..Default::default()\n    };\n    let mut handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>> = HashMap::new();\n    let mut event_rx = HashMap::new();\n    for pid in nodes.clone() {\n        let op = build_op(pid, nodes.clone());\n        let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TestRuntime>(op, cfg.clone());\n        let rx = h.subscribe_events();\n        if drain_events {\n            tokio::spawn(async move { while rx.recv().await.is_ok() {} });\n        }\n        event_rx.insert(pid, h.subscribe_events());\n        handles.insert(pid, h);\n    }\n    let arc = Arc::new(handles.clone());\n    for pid in nodes {\n        let out = arc[&pid].outgoing_messages();\n        let peers = arc.clone();\n        tokio::spawn(async move {\n            while let Ok(msg) = out.recv().await {\n                if let Some(peer) = peers.get(&msg.get_receiver()) {\n                    peer.handle_incoming(msg).await;\n                }\n            }\n        });\n    }\n    Cluster { handles, event_rx }\n}\n\n/// A command round-trip completes: the actor task is running its select loop.\nasync fn responds(h: &OmniPaxosHandle<TestEntry>, budget: Duration) -> bool {\n    tokio::time::timeout(budget, h.decided_idx()).await.is_ok()\n}\n\nasync fn wait_for_stable_leader(c: &Cluster) -> Option<NodeId> {\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);\n    while tokio::time::Instant::now() < deadline {\n        for h in c.handles.values() {\n            if let Ok(Some((leader, true))) =\n                tokio::time::timeout(Duration::from_millis(200), h.current_leader()).await\n            {\n                return Some(leader);\n            }\n        }\n        tokio::time::sleep(Duration::from_millis(20)).await;\n    }\n    None\n}\n\n/// Keep proposing ordinary writes on one origin, spaced out so that each decided\n/// index change is observed by the actors in a separate tick.\nfn keep_proposing(c: &Cluster, origin: NodeId, from: u64, count: u64) {\n    let h = c.handles[&origin].clone();\n    tokio::spawn(async move {\n        for v in from..from + count {\n            let origin_handle = h.clone();\n            tokio::spawn(async move {\n                let _ = origin_handle.append(TestEntry(v)).await;\n            });\n            tokio::time::sleep(Duration::from_millis(PROPOSAL_PACE_MS)).await;\n        }\n    });\n}\n\nfn channel_state(c: &Cluster) -> String {\n    let mut s = String::new();\n    for pid in [1u64, 2, 3] {\n        let rx = &c.event_rx[&pid];\n        s.push_str(&format!(\n            \" pid{pid}[len={} capacity={:?} full={} closed={}]\",\n            rx.len(),\n            rx.capacity(),\n            rx.is_full(),\n            rx.is_closed()\n        ));\n    }\n    s\n}\n\nasync fn responsive_nodes(c: &Cluster, budget: Duration) -> usize {\n    let mut n = 0;\n    for h in c.handles.values() {\n        if responds(h, budget).await {\n            n += 1;\n        }\n    }\n    n\n}\n\n/// Case 1: nothing consumes the event stream; the cluster is kept busy until the\n/// bound is reached.\n#[tokio::test]\nasync fn unconsumed_event_stream_stops_actor_loop() {\n    let c = spawn_cluster(false).await;\n\n    // The application never reads events. Get a leader going first, then keep the\n    // cluster observing transitions until the event bound is reached.\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(\n        leader.is_some(),\n        \"setup: no stable leader while the event channel still had room{}\",\n        channel_state(&c)\n    );\n    keep_proposing(&c, leader.unwrap(), 0, EVENT_CAPACITY as u64 * 3);\n\n    // Witness 1: every node reached the bound, so the actor can no longer publish\n    // the next transition it observes.\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    loop {\n        let full = [1u64, 2, 3]\n            .iter()\n            .filter(|pid| c.event_rx[pid].is_full() && !c.event_rx[pid].is_closed())\n            .count();\n        if full == 3 {\n            break;\n        }\n        assert!(\n            tokio::time::Instant::now() < deadline,\n            \"the unconsumed event channels did not reach their bound:{}\",\n            channel_state(&c)\n        );\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n\n    // Witness 2: at least one node's actor loop is parked, and it stays parked\n    // (samples over ~2s never show it serving a command again).\n    let mut parked_pid: Option<NodeId> = None;\n    let mut permanently_parked = true;\n    for _ in 0..10 {\n        let mut this_sample: Vec<NodeId> = Vec::new();\n        for (pid, h) in c.handles.iter() {\n            if !responds(h, Duration::from_millis(200)).await {\n                this_sample.push(*pid);\n            }\n        }\n        if this_sample.is_empty() {\n            permanently_parked = false;\n            break;\n        }\n        parked_pid = Some(parked_pid.map_or(this_sample[0], |p| p));\n        tokio::time::sleep(Duration::from_millis(200)).await;\n    }\n    let parked_pid = parked_pid.expect(\"no node stopped answering commands\");\n    assert!(\n        permanently_parked,\n        \"the parked actor recovered by itself; observed channel state:{}\",\n        channel_state(&c)\n    );\n    assert!(\n        !responds(&c.handles[&parked_pid], Duration::from_millis(500)).await,\n        \"node {parked_pid} answered again; channel state:{}\",\n        channel_state(&c)\n    );\n\n    // Witness 3: on that parked node the proposal endpoint is gone too - its\n    // append_notify_timeout is 1500ms, so a running actor would have answered\n    // (Timeout at the latest) well before the outer 4s.\n    let h = c.handles[&parked_pid].clone();\n    let resolved = tokio::time::timeout(\n        Duration::from_secs(4),\n        h.append_notify_with_timeout(TestEntry(999), Duration::from_millis(300)),\n    )\n    .await;\n    assert!(\n        resolved.is_err(),\n        \"append_notify on parked node {parked_pid} resolved: {resolved:?}\"\n    );\n}\n\n/// Case 2 (control): same cluster, same capacity, same activity; the only\n/// difference is that each node's event stream is drained.\n#[tokio::test]\nasync fn drained_event_stream_keeps_actor_loop_running() {\n    let c = spawn_cluster(true).await;\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(leader.is_some(), \"control: no stable leader{}\", channel_state(&c));\n    let leader = leader.unwrap();\n    keep_proposing(&c, leader, 0, EVENT_CAPACITY as u64 * 3);\n\n    let mut alive = 0;\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    while tokio::time::Instant::now() < deadline {\n        alive = responsive_nodes(&c, Duration::from_millis(200)).await;\n        if alive == c.handles.len() {\n            break;\n        }\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n    assert_eq!(\n        alive,\n        c.handles.len(),\n        \"control: some actor loop stopped with a drained event stream{}\",\n        channel_state(&c)\n    );\n\n    let follower = *c.handles.keys().find(|&&p| p != leader).unwrap();\n    let idx = match tokio::time::timeout(\n        Duration::from_secs(5),\n        c.handles[&follower].append_notify(TestEntry(7)),\n    )\n    .await\n    {\n        Ok(Ok(idx)) => idx,\n        other => panic!(\"control append_notify: expected Ok(idx), got {other:?}\"),\n    };\n    assert!(idx >= 1, \"control append_notify returned idx {idx}\");\n}\n",
+            "files": {},
+            "execution_package": "./omnipaxos_runtime",
+            "test_names": null,
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "src_detect_events",
+            "src_run_loop",
+            "src_spawn_actor_channels",
+            "src_subscribe_events",
+            "src_append_notify_contract"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Bounded probe of whether an event stream the application does not consume (bounded by RuntimeConfig::event_capacity) parks the single actor loop and withholds its command/append_notify endpoints, with a drained-stream control in the same execution.",
+            "assumptions": [
+              "3 nodes, standard majority quorum, no message loss or reordering beyond the in-process transport, all nodes run in one process on one tokio runtime",
+              "event_capacity is set to 64 so the bound is reached inside a bounded window; the source-settled mechanism (send awaits whenever the channel holds event_capacity events) does not depend on the value, only the number of unconsumed transitions does",
+              "the handle's event receiver exists from construction, so an application that never subscribes still leaves it unread"
+            ],
+            "excluded": [
+              "proving the cluster-wide outage (quorum loss) at the 1024 default capacity",
+              "schedule independence and any rate bound on how quickly the bound is reached"
+            ],
+            "parameters": {
+              "event_capacity": 64,
+              "proposal_pace_ms": 4,
+              "tick_period_ms": 2,
+              "append_notify_timeout_ms": 1500,
+              "nodes": 3
+            }
+          },
+          "prefix": "Three real OmniPaxos instances (pid 1,2,3) are built with OmniPaxosConfig::build over omnipaxos_storage::memory_storage::MemoryStorage and driven by three real omnipaxos_runtime actors spawned with spawn_actor, using a harness-local `TestRuntime` (tokio-backed AsyncRuntime impl; the crate's TokioRuntime behind the tokio_runtime feature is not required). An in-process transport task per node forwards every message from that node's `outgoing_messages()` to the receiver returned by `msg.get_receiver()`. RuntimeConfig: tick_period 2ms, egress_period 1ms, event_capacity 64, append_notify_timeout 1500ms; ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, flush_batch_tick_timeout 100. Proposals are paced at 4ms so consecutive decided-index changes are observed in separate ticks (a burst would decide many entries inside one tick gap and produce a single amalgamated event). Case `unconsumed_event_stream_stops_actor_loop` leaves each node's event receiver unread (the handle always owns one after spawn_actor; the application never calls subscribe_events or never reads it) while ordinary appends keep the cluster busy until all three event channels are full; case `drained_event_stream_keeps_actor_loop_running` is the same cluster, capacity and activity with one difference: a task per node drains the event stream. The decisive evidence of case 1 is (a) all three event channels full with a live (not closed) receiver, (b) at least one node whose actor never answers a `decided_idx` command again across ten 200ms samples, (c) that parked node's `append_notify_with_timeout(.., 300ms)` not resolving inside 4s although the actor that would produce its Timeout runs on that same tick path; the assertion messages print the observed channel state. Case 2 requires every node to keep answering and a fresh append_notify from a follower to resolve Ok(idx>=1).",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "99efa2281254411fbc4f8674b760f576",
+        "configuration": {
+          "backend": "cargo",
+          "target": {
+            "expected_module": null,
+            "variant": "omnipaxos",
+            "analysis_roots": [],
+            "execution_package": "omnipaxos",
+            "harness_path": "omnipaxos/tests/assurance_generated.rs"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+          }
+        },
+        "harness_filename": "omnipaxos_runtime/tests/assurance_generated.rs",
+        "operation_id": "9a11299aa4344bb5b84565cbe33701ad",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      },
+      {
+        "id": "1a5428f0aa284eb1a2a3f1a083fcb052-experiment",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "version": 2,
+        "basis": {
+          "harness": {
+            "kind": "rust_test",
+            "source": "//! Sourced probe: does an event stream that the application does not consume park\n//! the single omnipaxos_runtime actor task, and with it the node's whole consensus\n//! participation (ticks, incoming messages, Command replies)?\n//!\n//! The actor publishes every observed transition with `event_tx.send(..).await`\n//! (actor.rs `detect_and_emit_events`), awaited inside the tick arm of the only\n//! `run` select loop, on the channel `spawn_actor` builds as\n//! `async_channel::bounded(RuntimeConfig::event_capacity)`. The receiver always\n//! exists: the handle owns one even if the application never calls\n//! `subscribe_events()`. The other two egress paths of the same actor use\n//! `try_send` instead.\n//!\n//! Case 1 leaves that receiver unread while the cluster is kept busy, so the bound\n//! `event_capacity` is reached. Case 2 is the paired control: same cluster, same\n//! capacity, same activity, only difference is a task that drains the events.\n\nuse std::{\n    collections::HashMap,\n    future::Future,\n    sync::{\n        atomic::{AtomicBool, Ordering},\n        Arc,\n    },\n    time::Duration,\n};\n\nuse omnipaxos::{\n    storage::{Entry, Snapshot},\n    util::NodeId,\n    ClusterConfig, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_runtime::{\n    spawn_actor, AsyncRuntime, OmniPaxosEvent, OmniPaxosHandle, RuntimeConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n/// Small but non-degenerate bound: the probe only needs the bound to be reached\n/// inside a bounded window. The mechanism is the same for any finite capacity\n/// (default 1024); only the number of unconsumed transitions changes.\nconst EVENT_CAPACITY: usize = 64;\n/// Paced so that consecutive decided-index changes are observed in separate ticks,\n/// i.e. each decision produces one event instead of one amalgamated event.\nconst PROPOSAL_PACE_MS: u64 = 4;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\n/// Minimal executor: tokio (a dev-dependency of this crate) drives the actor task.\nstruct TestRuntime;\n\nimpl AsyncRuntime for TestRuntime {\n    type JoinHandle = ();\n    fn spawn<F>(future: F)\n    where\n        F: Future<Output = ()> + Send + 'static,\n    {\n        let _ = tokio::spawn(future);\n    }\n    fn sleep(duration: Duration) -> impl Future<Output = ()> + Send + 'static {\n        tokio::time::sleep(duration)\n    }\n}\n\nfn build_op(\n    pid: NodeId,\n    nodes: Vec<NodeId>,\n) -> omnipaxos::OmniPaxos<TestEntry, MemoryStorage<TestEntry>> {\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 100,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: 0,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes,\n            flexible_quorum: None,\n        },\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"config build\")\n}\n\nstruct Cluster {\n    handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>>,\n    /// Inspection handles on each node's event stream (clones of the same\n    /// per-node receiver), used to read the channel state without consuming it.\n    event_rx: HashMap<NodeId, async_channel::Receiver<OmniPaxosEvent>>,\n}\n\n/// 3-node in-process cluster: real OmniPaxos instances, real actors, in-memory\n/// transport that forwards every outgoing message to its receiver's actor.\n///\n/// `consumer` decides what the application does with each node's event stream:\n/// nothing (the handle's own receiver is simply never read) or drain it in a task.\nasync fn spawn_cluster(drain_events: bool) -> Cluster {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        event_capacity: EVENT_CAPACITY,\n        append_notify_timeout: Duration::from_millis(1500),\n        ..Default::default()\n    };\n    let mut handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>> = HashMap::new();\n    let mut event_rx = HashMap::new();\n    for pid in nodes.clone() {\n        let op = build_op(pid, nodes.clone());\n        let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TestRuntime>(op, cfg.clone());\n        let rx = h.subscribe_events();\n        if drain_events {\n            tokio::spawn(async move { while rx.recv().await.is_ok() {} });\n        }\n        event_rx.insert(pid, h.subscribe_events());\n        handles.insert(pid, h);\n    }\n    let arc = Arc::new(handles.clone());\n    for pid in nodes {\n        let out = arc[&pid].outgoing_messages();\n        let peers = arc.clone();\n        tokio::spawn(async move {\n            while let Ok(msg) = out.recv().await {\n                if let Some(peer) = peers.get(&msg.get_receiver()) {\n                    peer.handle_incoming(msg).await;\n                }\n            }\n        });\n    }\n    Cluster { handles, event_rx }\n}\n\n/// Emitted on stdout as a CA_EVENT JSON line so the receipt carries the observed\n/// operands, not just the test verdict.\nfn emit(line: &str) {\n    println!(\"CA_EVENT {line}\");\n}\n\n/// A command round-trip completes: the actor task is running its select loop.\nasync fn responds(h: &OmniPaxosHandle<TestEntry>, budget: Duration) -> bool {\n    tokio::time::timeout(budget, h.decided_idx()).await.is_ok()\n}\n\nasync fn wait_for_stable_leader(c: &Cluster) -> Option<NodeId> {\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);\n    while tokio::time::Instant::now() < deadline {\n        for h in c.handles.values() {\n            if let Ok(Some((leader, true))) =\n                tokio::time::timeout(Duration::from_millis(200), h.current_leader()).await\n            {\n                return Some(leader);\n            }\n        }\n        tokio::time::sleep(Duration::from_millis(20)).await;\n    }\n    None\n}\n\n/// Keep proposing ordinary writes on one origin, spaced out so that each decided\n/// index change is observed by the actors in a separate tick.\nfn keep_proposing(c: &Cluster, origin: NodeId, from: u64, count: u64) {\n    let h = c.handles[&origin].clone();\n    tokio::spawn(async move {\n        for v in from..from + count {\n            let origin_handle = h.clone();\n            tokio::spawn(async move {\n                let _ = origin_handle.append(TestEntry(v)).await;\n            });\n            tokio::time::sleep(Duration::from_millis(PROPOSAL_PACE_MS)).await;\n        }\n    });\n}\n\nfn channel_state(c: &Cluster) -> String {\n    let mut s = String::new();\n    for pid in [1u64, 2, 3] {\n        let rx = &c.event_rx[&pid];\n        s.push_str(&format!(\n            \" pid{pid}[len={} capacity={:?} full={} closed={}]\",\n            rx.len(),\n            rx.capacity(),\n            rx.is_full(),\n            rx.is_closed()\n        ));\n    }\n    s\n}\n\nasync fn responsive_nodes(c: &Cluster, budget: Duration) -> usize {\n    let mut n = 0;\n    for h in c.handles.values() {\n        if responds(h, budget).await {\n            n += 1;\n        }\n    }\n    n\n}\n\n/// Case 1: nothing consumes the event stream; the cluster is kept busy until the\n/// bound is reached.\n#[tokio::test]\nasync fn unconsumed_event_stream_stops_actor_loop() {\n    let c = spawn_cluster(false).await;\n\n    // The application never reads events. Get a leader going first, then keep the\n    // cluster observing transitions until the event bound is reached.\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(\n        leader.is_some(),\n        \"setup: no stable leader while the event channel still had room{}\",\n        channel_state(&c)\n    );\n    keep_proposing(&c, leader.unwrap(), 0, EVENT_CAPACITY as u64 * 3);\n\n    // Witness 1: every node reached the bound, so the actor can no longer publish\n    // the next transition it observes.\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    let mut nodes_full = 0;\n    loop {\n        nodes_full = [1u64, 2, 3]\n            .iter()\n            .filter(|pid| c.event_rx[pid].is_full() && !c.event_rx[pid].is_closed())\n            .count();\n        if nodes_full == 3 {\n            break;\n        }\n        assert!(\n            tokio::time::Instant::now() < deadline,\n            \"the unconsumed event channels did not reach their bound:{}\",\n            channel_state(&c)\n        );\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n\n    // Witness 2: at least one node's actor loop is parked, and it stays parked\n    // (samples over ~2s never show it serving a command again).\n    let mut parked_pid: Option<NodeId> = None;\n    let mut permanently_parked = true;\n    for _ in 0..10 {\n        let mut this_sample: Vec<NodeId> = Vec::new();\n        for (pid, h) in c.handles.iter() {\n            if !responds(h, Duration::from_millis(200)).await {\n                this_sample.push(*pid);\n            }\n        }\n        if this_sample.is_empty() {\n            permanently_parked = false;\n            break;\n        }\n        parked_pid = Some(parked_pid.map_or(this_sample[0], |p| p));\n        tokio::time::sleep(Duration::from_millis(200)).await;\n    }\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"unconsumed_event_bound_reached\\\",\\\"nodes_full\\\":{nodes_full},\\\"nodes\\\":3,\\\"event_capacity\\\":{EVENT_CAPACITY}}}\"\n    ));\n    let parked_pid = parked_pid.expect(\"no node stopped answering commands\");\n    assert!(\n        permanently_parked,\n        \"the parked actor recovered by itself; observed channel state:{}\",\n        channel_state(&c)\n    );\n    assert!(\n        !responds(&c.handles[&parked_pid], Duration::from_millis(500)).await,\n        \"node {parked_pid} answered again; channel state:{}\",\n        channel_state(&c)\n    );\n\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"actor_parked\\\",\\\"node\\\":{parked_pid},\\\"samples_without_reply\\\":10,\\\"reply_budget_ms\\\":200,\\\"permanently_parked\\\":{permanently_parked}}}\"\n    ));\n\n    // Witness 3: on that parked node the proposal endpoint is gone too - its\n    // append_notify_timeout is 1500ms, so a running actor would have answered\n    // (Timeout at the latest) well before the outer 4s.\n    let h = c.handles[&parked_pid].clone();\n    let resolved = tokio::time::timeout(\n        Duration::from_secs(4),\n        h.append_notify_with_timeout(TestEntry(999), Duration::from_millis(300)),\n    )\n    .await;\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"append_notify_endpoint_withheld\\\",\\\"node\\\":{parked_pid},\\\"per_call_deadline_ms\\\":300,\\\"actor_timeout_ms\\\":1500,\\\"outer_wait_ms\\\":4000,\\\"resolved\\\":{}}}\",\n        resolved.is_ok()\n    ));\n    assert!(\n        resolved.is_err(),\n        \"append_notify on parked node {parked_pid} resolved: {resolved:?}\"\n    );\n}\n\n/// Case 2 (control): same cluster, same capacity, same activity; the only\n/// difference is that each node's event stream is drained.\n#[tokio::test]\nasync fn drained_event_stream_keeps_actor_loop_running() {\n    let c = spawn_cluster(true).await;\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(leader.is_some(), \"control: no stable leader{}\", channel_state(&c));\n    let leader = leader.unwrap();\n    keep_proposing(&c, leader, 0, EVENT_CAPACITY as u64 * 3);\n\n    let mut alive = 0;\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    while tokio::time::Instant::now() < deadline {\n        alive = responsive_nodes(&c, Duration::from_millis(200)).await;\n        if alive == c.handles.len() {\n            break;\n        }\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"control_actors_responsive\\\",\\\"nodes_answering\\\":{alive},\\\"nodes\\\":3,\\\"event_capacity\\\":{EVENT_CAPACITY}}}\"\n    ));\n    assert_eq!(\n        alive,\n        c.handles.len(),\n        \"control: some actor loop stopped with a drained event stream{}\",\n        channel_state(&c)\n    );\n\n    let follower = *c.handles.keys().find(|&&p| p != leader).unwrap();\n    let idx = match tokio::time::timeout(\n        Duration::from_secs(5),\n        c.handles[&follower].append_notify(TestEntry(7)),\n    )\n    .await\n    {\n        Ok(Ok(idx)) => idx,\n        other => panic!(\"control append_notify: expected Ok(idx), got {other:?}\"),\n    };\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"control_append_notify\\\",\\\"origin\\\":{follower},\\\"succeeded\\\":{},\\\"idx\\\":{idx}}}\",\n        idx >= 1\n    ));\n    assert!(idx >= 1, \"control append_notify returned idx {idx}\");\n}\n",
+            "files": {},
+            "execution_package": "./omnipaxos_runtime",
+            "test_names": null,
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": []
+          },
+          "source_ids": [
+            "src_detect_events",
+            "src_run_loop",
+            "src_spawn_actor_channels",
+            "src_subscribe_events",
+            "src_append_notify_contract"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "Bounded probe of whether an event stream the application does not consume (bounded by RuntimeConfig::event_capacity) parks the single actor loop and withholds its command/append_notify endpoints, with a drained-stream control in the same execution.",
+            "assumptions": [
+              "3 nodes, majority quorum, no message loss or reordering beyond the in-process transport, one tokio runtime in one process",
+              "event_capacity 64 so the bound is reached inside a bounded window; the source-settled mechanism (send awaits when the channel holds event_capacity events) is capacity-independent",
+              "the handle's event receiver exists from construction, so an application that never subscribes still leaves it unread"
+            ],
+            "excluded": [
+              "the 1024 default capacity",
+              "quorum-level consequence",
+              "schedule independence or any rate bound"
+            ],
+            "parameters": {
+              "event_capacity": 64,
+              "proposal_pace_ms": 4,
+              "tick_period_ms": 2,
+              "append_notify_timeout_ms": 1500,
+              "nodes": 3
+            }
+          },
+          "prefix": "Three real OmniPaxos instances (pid 1,2,3) built with OmniPaxosConfig::build over omnipaxos_storage::memory_storage::MemoryStorage, each driven by a real omnipaxos_runtime actor from spawn_actor with a harness-local tokio-backed AsyncRuntime impl; one in-process transport task per node forwards each message from that node's outgoing_messages() to msg.get_receiver()'s handle_incoming. RuntimeConfig: tick_period 2ms, egress_period 1ms, event_capacity 64, append_notify_timeout 1500ms; ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, flush_batch_tick_timeout 100. Ordinary appends are paced at 4ms so consecutive decided-index changes are observed in separate ticks; a burst would decide many entries inside one tick gap and emit a single amalgamated event. Case unconsumed_event_stream_stops_actor_loop leaves each node's event receiver unread (the handle owns one from spawn_actor even if the application never calls subscribe_events) and emits CA_EVENT unconsumed_event_bound_reached {nodes_full,nodes,event_capacity}, CA_EVENT actor_parked {node,samples_without_reply,reply_budget_ms,permanently_parked} and CA_EVENT append_notify_endpoint_withheld {node,per_call_deadline_ms,actor_timeout_ms,outer_wait_ms,resolved}. Case drained_event_stream_keeps_actor_loop_running is the control with one difference, a task per node draining the same stream, and emits CA_EVENT control_actors_responsive {nodes_answering,nodes,event_capacity} and CA_EVENT control_append_notify {origin,succeeded,idx}.",
+          "requirement": null,
+          "responsibility": "",
+          "comparisons": [],
+          "knowledge": []
+        },
+        "snapshot_id": "99efa2281254411fbc4f8674b760f576",
+        "configuration": {
+          "backend": "cargo",
+          "target": {
+            "expected_module": null,
+            "variant": "omnipaxos",
+            "analysis_roots": [],
+            "execution_package": "omnipaxos",
+            "harness_path": "omnipaxos/tests/assurance_generated.rs"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+          }
+        },
+        "harness_filename": "omnipaxos_runtime/tests/assurance_generated.rs",
+        "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052",
+        "previous_id": "9a11299aa4344bb5b84565cbe33701ad-experiment",
+        "difference": {
+          "harness": {
+            "before": {
+              "kind": "rust_test",
+              "source": "//! Sourced probe: does an event stream that the application does not consume park\n//! the single omnipaxos_runtime actor task, and with it the node's whole consensus\n//! participation (ticks, incoming messages, Command replies)?\n//!\n//! The actor publishes every observed transition with `event_tx.send(..).await`\n//! (actor.rs `detect_and_emit_events`), awaited inside the tick arm of the only\n//! `run` select loop, on the channel `spawn_actor` builds as\n//! `async_channel::bounded(RuntimeConfig::event_capacity)`. The receiver always\n//! exists: the handle owns one even if the application never calls\n//! `subscribe_events()`. The other two egress paths of the same actor use\n//! `try_send` instead.\n//!\n//! Case 1 leaves that receiver unread while the cluster is kept busy, so the bound\n//! `event_capacity` is reached. Case 2 is the paired control: same cluster, same\n//! capacity, same activity, only difference is a task that drains the events.\n\nuse std::{\n    collections::HashMap,\n    future::Future,\n    sync::{\n        atomic::{AtomicBool, Ordering},\n        Arc,\n    },\n    time::Duration,\n};\n\nuse omnipaxos::{\n    storage::{Entry, Snapshot},\n    util::NodeId,\n    ClusterConfig, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_runtime::{\n    spawn_actor, AsyncRuntime, OmniPaxosEvent, OmniPaxosHandle, RuntimeConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n/// Small but non-degenerate bound: the probe only needs the bound to be reached\n/// inside a bounded window. The mechanism is the same for any finite capacity\n/// (default 1024); only the number of unconsumed transitions changes.\nconst EVENT_CAPACITY: usize = 64;\n/// Paced so that consecutive decided-index changes are observed in separate ticks,\n/// i.e. each decision produces one event instead of one amalgamated event.\nconst PROPOSAL_PACE_MS: u64 = 4;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\n/// Minimal executor: tokio (a dev-dependency of this crate) drives the actor task.\nstruct TestRuntime;\n\nimpl AsyncRuntime for TestRuntime {\n    type JoinHandle = ();\n    fn spawn<F>(future: F)\n    where\n        F: Future<Output = ()> + Send + 'static,\n    {\n        let _ = tokio::spawn(future);\n    }\n    fn sleep(duration: Duration) -> impl Future<Output = ()> + Send + 'static {\n        tokio::time::sleep(duration)\n    }\n}\n\nfn build_op(\n    pid: NodeId,\n    nodes: Vec<NodeId>,\n) -> omnipaxos::OmniPaxos<TestEntry, MemoryStorage<TestEntry>> {\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 100,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: 0,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes,\n            flexible_quorum: None,\n        },\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"config build\")\n}\n\nstruct Cluster {\n    handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>>,\n    /// Inspection handles on each node's event stream (clones of the same\n    /// per-node receiver), used to read the channel state without consuming it.\n    event_rx: HashMap<NodeId, async_channel::Receiver<OmniPaxosEvent>>,\n}\n\n/// 3-node in-process cluster: real OmniPaxos instances, real actors, in-memory\n/// transport that forwards every outgoing message to its receiver's actor.\n///\n/// `consumer` decides what the application does with each node's event stream:\n/// nothing (the handle's own receiver is simply never read) or drain it in a task.\nasync fn spawn_cluster(drain_events: bool) -> Cluster {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        event_capacity: EVENT_CAPACITY,\n        append_notify_timeout: Duration::from_millis(1500),\n        ..Default::default()\n    };\n    let mut handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>> = HashMap::new();\n    let mut event_rx = HashMap::new();\n    for pid in nodes.clone() {\n        let op = build_op(pid, nodes.clone());\n        let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TestRuntime>(op, cfg.clone());\n        let rx = h.subscribe_events();\n        if drain_events {\n            tokio::spawn(async move { while rx.recv().await.is_ok() {} });\n        }\n        event_rx.insert(pid, h.subscribe_events());\n        handles.insert(pid, h);\n    }\n    let arc = Arc::new(handles.clone());\n    for pid in nodes {\n        let out = arc[&pid].outgoing_messages();\n        let peers = arc.clone();\n        tokio::spawn(async move {\n            while let Ok(msg) = out.recv().await {\n                if let Some(peer) = peers.get(&msg.get_receiver()) {\n                    peer.handle_incoming(msg).await;\n                }\n            }\n        });\n    }\n    Cluster { handles, event_rx }\n}\n\n/// A command round-trip completes: the actor task is running its select loop.\nasync fn responds(h: &OmniPaxosHandle<TestEntry>, budget: Duration) -> bool {\n    tokio::time::timeout(budget, h.decided_idx()).await.is_ok()\n}\n\nasync fn wait_for_stable_leader(c: &Cluster) -> Option<NodeId> {\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);\n    while tokio::time::Instant::now() < deadline {\n        for h in c.handles.values() {\n            if let Ok(Some((leader, true))) =\n                tokio::time::timeout(Duration::from_millis(200), h.current_leader()).await\n            {\n                return Some(leader);\n            }\n        }\n        tokio::time::sleep(Duration::from_millis(20)).await;\n    }\n    None\n}\n\n/// Keep proposing ordinary writes on one origin, spaced out so that each decided\n/// index change is observed by the actors in a separate tick.\nfn keep_proposing(c: &Cluster, origin: NodeId, from: u64, count: u64) {\n    let h = c.handles[&origin].clone();\n    tokio::spawn(async move {\n        for v in from..from + count {\n            let origin_handle = h.clone();\n            tokio::spawn(async move {\n                let _ = origin_handle.append(TestEntry(v)).await;\n            });\n            tokio::time::sleep(Duration::from_millis(PROPOSAL_PACE_MS)).await;\n        }\n    });\n}\n\nfn channel_state(c: &Cluster) -> String {\n    let mut s = String::new();\n    for pid in [1u64, 2, 3] {\n        let rx = &c.event_rx[&pid];\n        s.push_str(&format!(\n            \" pid{pid}[len={} capacity={:?} full={} closed={}]\",\n            rx.len(),\n            rx.capacity(),\n            rx.is_full(),\n            rx.is_closed()\n        ));\n    }\n    s\n}\n\nasync fn responsive_nodes(c: &Cluster, budget: Duration) -> usize {\n    let mut n = 0;\n    for h in c.handles.values() {\n        if responds(h, budget).await {\n            n += 1;\n        }\n    }\n    n\n}\n\n/// Case 1: nothing consumes the event stream; the cluster is kept busy until the\n/// bound is reached.\n#[tokio::test]\nasync fn unconsumed_event_stream_stops_actor_loop() {\n    let c = spawn_cluster(false).await;\n\n    // The application never reads events. Get a leader going first, then keep the\n    // cluster observing transitions until the event bound is reached.\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(\n        leader.is_some(),\n        \"setup: no stable leader while the event channel still had room{}\",\n        channel_state(&c)\n    );\n    keep_proposing(&c, leader.unwrap(), 0, EVENT_CAPACITY as u64 * 3);\n\n    // Witness 1: every node reached the bound, so the actor can no longer publish\n    // the next transition it observes.\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    loop {\n        let full = [1u64, 2, 3]\n            .iter()\n            .filter(|pid| c.event_rx[pid].is_full() && !c.event_rx[pid].is_closed())\n            .count();\n        if full == 3 {\n            break;\n        }\n        assert!(\n            tokio::time::Instant::now() < deadline,\n            \"the unconsumed event channels did not reach their bound:{}\",\n            channel_state(&c)\n        );\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n\n    // Witness 2: at least one node's actor loop is parked, and it stays parked\n    // (samples over ~2s never show it serving a command again).\n    let mut parked_pid: Option<NodeId> = None;\n    let mut permanently_parked = true;\n    for _ in 0..10 {\n        let mut this_sample: Vec<NodeId> = Vec::new();\n        for (pid, h) in c.handles.iter() {\n            if !responds(h, Duration::from_millis(200)).await {\n                this_sample.push(*pid);\n            }\n        }\n        if this_sample.is_empty() {\n            permanently_parked = false;\n            break;\n        }\n        parked_pid = Some(parked_pid.map_or(this_sample[0], |p| p));\n        tokio::time::sleep(Duration::from_millis(200)).await;\n    }\n    let parked_pid = parked_pid.expect(\"no node stopped answering commands\");\n    assert!(\n        permanently_parked,\n        \"the parked actor recovered by itself; observed channel state:{}\",\n        channel_state(&c)\n    );\n    assert!(\n        !responds(&c.handles[&parked_pid], Duration::from_millis(500)).await,\n        \"node {parked_pid} answered again; channel state:{}\",\n        channel_state(&c)\n    );\n\n    // Witness 3: on that parked node the proposal endpoint is gone too - its\n    // append_notify_timeout is 1500ms, so a running actor would have answered\n    // (Timeout at the latest) well before the outer 4s.\n    let h = c.handles[&parked_pid].clone();\n    let resolved = tokio::time::timeout(\n        Duration::from_secs(4),\n        h.append_notify_with_timeout(TestEntry(999), Duration::from_millis(300)),\n    )\n    .await;\n    assert!(\n        resolved.is_err(),\n        \"append_notify on parked node {parked_pid} resolved: {resolved:?}\"\n    );\n}\n\n/// Case 2 (control): same cluster, same capacity, same activity; the only\n/// difference is that each node's event stream is drained.\n#[tokio::test]\nasync fn drained_event_stream_keeps_actor_loop_running() {\n    let c = spawn_cluster(true).await;\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(leader.is_some(), \"control: no stable leader{}\", channel_state(&c));\n    let leader = leader.unwrap();\n    keep_proposing(&c, leader, 0, EVENT_CAPACITY as u64 * 3);\n\n    let mut alive = 0;\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    while tokio::time::Instant::now() < deadline {\n        alive = responsive_nodes(&c, Duration::from_millis(200)).await;\n        if alive == c.handles.len() {\n            break;\n        }\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n    assert_eq!(\n        alive,\n        c.handles.len(),\n        \"control: some actor loop stopped with a drained event stream{}\",\n        channel_state(&c)\n    );\n\n    let follower = *c.handles.keys().find(|&&p| p != leader).unwrap();\n    let idx = match tokio::time::timeout(\n        Duration::from_secs(5),\n        c.handles[&follower].append_notify(TestEntry(7)),\n    )\n    .await\n    {\n        Ok(Ok(idx)) => idx,\n        other => panic!(\"control append_notify: expected Ok(idx), got {other:?}\"),\n    };\n    assert!(idx >= 1, \"control append_notify returned idx {idx}\");\n}\n",
+              "files": {},
+              "execution_package": "./omnipaxos_runtime",
+              "test_names": null,
+              "description": "",
+              "semantic_changes": [],
+              "prerequisites": []
+            },
+            "after": {
+              "kind": "rust_test",
+              "source": "//! Sourced probe: does an event stream that the application does not consume park\n//! the single omnipaxos_runtime actor task, and with it the node's whole consensus\n//! participation (ticks, incoming messages, Command replies)?\n//!\n//! The actor publishes every observed transition with `event_tx.send(..).await`\n//! (actor.rs `detect_and_emit_events`), awaited inside the tick arm of the only\n//! `run` select loop, on the channel `spawn_actor` builds as\n//! `async_channel::bounded(RuntimeConfig::event_capacity)`. The receiver always\n//! exists: the handle owns one even if the application never calls\n//! `subscribe_events()`. The other two egress paths of the same actor use\n//! `try_send` instead.\n//!\n//! Case 1 leaves that receiver unread while the cluster is kept busy, so the bound\n//! `event_capacity` is reached. Case 2 is the paired control: same cluster, same\n//! capacity, same activity, only difference is a task that drains the events.\n\nuse std::{\n    collections::HashMap,\n    future::Future,\n    sync::{\n        atomic::{AtomicBool, Ordering},\n        Arc,\n    },\n    time::Duration,\n};\n\nuse omnipaxos::{\n    storage::{Entry, Snapshot},\n    util::NodeId,\n    ClusterConfig, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_runtime::{\n    spawn_actor, AsyncRuntime, OmniPaxosEvent, OmniPaxosHandle, RuntimeConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n/// Small but non-degenerate bound: the probe only needs the bound to be reached\n/// inside a bounded window. The mechanism is the same for any finite capacity\n/// (default 1024); only the number of unconsumed transitions changes.\nconst EVENT_CAPACITY: usize = 64;\n/// Paced so that consecutive decided-index changes are observed in separate ticks,\n/// i.e. each decision produces one event instead of one amalgamated event.\nconst PROPOSAL_PACE_MS: u64 = 4;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\n/// Minimal executor: tokio (a dev-dependency of this crate) drives the actor task.\nstruct TestRuntime;\n\nimpl AsyncRuntime for TestRuntime {\n    type JoinHandle = ();\n    fn spawn<F>(future: F)\n    where\n        F: Future<Output = ()> + Send + 'static,\n    {\n        let _ = tokio::spawn(future);\n    }\n    fn sleep(duration: Duration) -> impl Future<Output = ()> + Send + 'static {\n        tokio::time::sleep(duration)\n    }\n}\n\nfn build_op(\n    pid: NodeId,\n    nodes: Vec<NodeId>,\n) -> omnipaxos::OmniPaxos<TestEntry, MemoryStorage<TestEntry>> {\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 100,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: 0,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: ClusterConfig {\n            configuration_id: 1,\n            nodes,\n            flexible_quorum: None,\n        },\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"config build\")\n}\n\nstruct Cluster {\n    handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>>,\n    /// Inspection handles on each node's event stream (clones of the same\n    /// per-node receiver), used to read the channel state without consuming it.\n    event_rx: HashMap<NodeId, async_channel::Receiver<OmniPaxosEvent>>,\n}\n\n/// 3-node in-process cluster: real OmniPaxos instances, real actors, in-memory\n/// transport that forwards every outgoing message to its receiver's actor.\n///\n/// `consumer` decides what the application does with each node's event stream:\n/// nothing (the handle's own receiver is simply never read) or drain it in a task.\nasync fn spawn_cluster(drain_events: bool) -> Cluster {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        event_capacity: EVENT_CAPACITY,\n        append_notify_timeout: Duration::from_millis(1500),\n        ..Default::default()\n    };\n    let mut handles: HashMap<NodeId, OmniPaxosHandle<TestEntry>> = HashMap::new();\n    let mut event_rx = HashMap::new();\n    for pid in nodes.clone() {\n        let op = build_op(pid, nodes.clone());\n        let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TestRuntime>(op, cfg.clone());\n        let rx = h.subscribe_events();\n        if drain_events {\n            tokio::spawn(async move { while rx.recv().await.is_ok() {} });\n        }\n        event_rx.insert(pid, h.subscribe_events());\n        handles.insert(pid, h);\n    }\n    let arc = Arc::new(handles.clone());\n    for pid in nodes {\n        let out = arc[&pid].outgoing_messages();\n        let peers = arc.clone();\n        tokio::spawn(async move {\n            while let Ok(msg) = out.recv().await {\n                if let Some(peer) = peers.get(&msg.get_receiver()) {\n                    peer.handle_incoming(msg).await;\n                }\n            }\n        });\n    }\n    Cluster { handles, event_rx }\n}\n\n/// Emitted on stdout as a CA_EVENT JSON line so the receipt carries the observed\n/// operands, not just the test verdict.\nfn emit(line: &str) {\n    println!(\"CA_EVENT {line}\");\n}\n\n/// A command round-trip completes: the actor task is running its select loop.\nasync fn responds(h: &OmniPaxosHandle<TestEntry>, budget: Duration) -> bool {\n    tokio::time::timeout(budget, h.decided_idx()).await.is_ok()\n}\n\nasync fn wait_for_stable_leader(c: &Cluster) -> Option<NodeId> {\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);\n    while tokio::time::Instant::now() < deadline {\n        for h in c.handles.values() {\n            if let Ok(Some((leader, true))) =\n                tokio::time::timeout(Duration::from_millis(200), h.current_leader()).await\n            {\n                return Some(leader);\n            }\n        }\n        tokio::time::sleep(Duration::from_millis(20)).await;\n    }\n    None\n}\n\n/// Keep proposing ordinary writes on one origin, spaced out so that each decided\n/// index change is observed by the actors in a separate tick.\nfn keep_proposing(c: &Cluster, origin: NodeId, from: u64, count: u64) {\n    let h = c.handles[&origin].clone();\n    tokio::spawn(async move {\n        for v in from..from + count {\n            let origin_handle = h.clone();\n            tokio::spawn(async move {\n                let _ = origin_handle.append(TestEntry(v)).await;\n            });\n            tokio::time::sleep(Duration::from_millis(PROPOSAL_PACE_MS)).await;\n        }\n    });\n}\n\nfn channel_state(c: &Cluster) -> String {\n    let mut s = String::new();\n    for pid in [1u64, 2, 3] {\n        let rx = &c.event_rx[&pid];\n        s.push_str(&format!(\n            \" pid{pid}[len={} capacity={:?} full={} closed={}]\",\n            rx.len(),\n            rx.capacity(),\n            rx.is_full(),\n            rx.is_closed()\n        ));\n    }\n    s\n}\n\nasync fn responsive_nodes(c: &Cluster, budget: Duration) -> usize {\n    let mut n = 0;\n    for h in c.handles.values() {\n        if responds(h, budget).await {\n            n += 1;\n        }\n    }\n    n\n}\n\n/// Case 1: nothing consumes the event stream; the cluster is kept busy until the\n/// bound is reached.\n#[tokio::test]\nasync fn unconsumed_event_stream_stops_actor_loop() {\n    let c = spawn_cluster(false).await;\n\n    // The application never reads events. Get a leader going first, then keep the\n    // cluster observing transitions until the event bound is reached.\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(\n        leader.is_some(),\n        \"setup: no stable leader while the event channel still had room{}\",\n        channel_state(&c)\n    );\n    keep_proposing(&c, leader.unwrap(), 0, EVENT_CAPACITY as u64 * 3);\n\n    // Witness 1: every node reached the bound, so the actor can no longer publish\n    // the next transition it observes.\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    let mut nodes_full = 0;\n    loop {\n        nodes_full = [1u64, 2, 3]\n            .iter()\n            .filter(|pid| c.event_rx[pid].is_full() && !c.event_rx[pid].is_closed())\n            .count();\n        if nodes_full == 3 {\n            break;\n        }\n        assert!(\n            tokio::time::Instant::now() < deadline,\n            \"the unconsumed event channels did not reach their bound:{}\",\n            channel_state(&c)\n        );\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n\n    // Witness 2: at least one node's actor loop is parked, and it stays parked\n    // (samples over ~2s never show it serving a command again).\n    let mut parked_pid: Option<NodeId> = None;\n    let mut permanently_parked = true;\n    for _ in 0..10 {\n        let mut this_sample: Vec<NodeId> = Vec::new();\n        for (pid, h) in c.handles.iter() {\n            if !responds(h, Duration::from_millis(200)).await {\n                this_sample.push(*pid);\n            }\n        }\n        if this_sample.is_empty() {\n            permanently_parked = false;\n            break;\n        }\n        parked_pid = Some(parked_pid.map_or(this_sample[0], |p| p));\n        tokio::time::sleep(Duration::from_millis(200)).await;\n    }\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"unconsumed_event_bound_reached\\\",\\\"nodes_full\\\":{nodes_full},\\\"nodes\\\":3,\\\"event_capacity\\\":{EVENT_CAPACITY}}}\"\n    ));\n    let parked_pid = parked_pid.expect(\"no node stopped answering commands\");\n    assert!(\n        permanently_parked,\n        \"the parked actor recovered by itself; observed channel state:{}\",\n        channel_state(&c)\n    );\n    assert!(\n        !responds(&c.handles[&parked_pid], Duration::from_millis(500)).await,\n        \"node {parked_pid} answered again; channel state:{}\",\n        channel_state(&c)\n    );\n\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"actor_parked\\\",\\\"node\\\":{parked_pid},\\\"samples_without_reply\\\":10,\\\"reply_budget_ms\\\":200,\\\"permanently_parked\\\":{permanently_parked}}}\"\n    ));\n\n    // Witness 3: on that parked node the proposal endpoint is gone too - its\n    // append_notify_timeout is 1500ms, so a running actor would have answered\n    // (Timeout at the latest) well before the outer 4s.\n    let h = c.handles[&parked_pid].clone();\n    let resolved = tokio::time::timeout(\n        Duration::from_secs(4),\n        h.append_notify_with_timeout(TestEntry(999), Duration::from_millis(300)),\n    )\n    .await;\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"append_notify_endpoint_withheld\\\",\\\"node\\\":{parked_pid},\\\"per_call_deadline_ms\\\":300,\\\"actor_timeout_ms\\\":1500,\\\"outer_wait_ms\\\":4000,\\\"resolved\\\":{}}}\",\n        resolved.is_ok()\n    ));\n    assert!(\n        resolved.is_err(),\n        \"append_notify on parked node {parked_pid} resolved: {resolved:?}\"\n    );\n}\n\n/// Case 2 (control): same cluster, same capacity, same activity; the only\n/// difference is that each node's event stream is drained.\n#[tokio::test]\nasync fn drained_event_stream_keeps_actor_loop_running() {\n    let c = spawn_cluster(true).await;\n    let leader = wait_for_stable_leader(&c).await;\n    assert!(leader.is_some(), \"control: no stable leader{}\", channel_state(&c));\n    let leader = leader.unwrap();\n    keep_proposing(&c, leader, 0, EVENT_CAPACITY as u64 * 3);\n\n    let mut alive = 0;\n    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);\n    while tokio::time::Instant::now() < deadline {\n        alive = responsive_nodes(&c, Duration::from_millis(200)).await;\n        if alive == c.handles.len() {\n            break;\n        }\n        tokio::time::sleep(Duration::from_millis(100)).await;\n    }\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"control_actors_responsive\\\",\\\"nodes_answering\\\":{alive},\\\"nodes\\\":3,\\\"event_capacity\\\":{EVENT_CAPACITY}}}\"\n    ));\n    assert_eq!(\n        alive,\n        c.handles.len(),\n        \"control: some actor loop stopped with a drained event stream{}\",\n        channel_state(&c)\n    );\n\n    let follower = *c.handles.keys().find(|&&p| p != leader).unwrap();\n    let idx = match tokio::time::timeout(\n        Duration::from_secs(5),\n        c.handles[&follower].append_notify(TestEntry(7)),\n    )\n    .await\n    {\n        Ok(Ok(idx)) => idx,\n        other => panic!(\"control append_notify: expected Ok(idx), got {other:?}\"),\n    };\n    emit(&format!(\n        \"{{\\\"event\\\":\\\"control_append_notify\\\",\\\"origin\\\":{follower},\\\"succeeded\\\":{},\\\"idx\\\":{idx}}}\",\n        idx >= 1\n    ));\n    assert!(idx >= 1, \"control append_notify returned idx {idx}\");\n}\n",
+              "files": {},
+              "execution_package": "./omnipaxos_runtime",
+              "test_names": null,
+              "description": "",
+              "semantic_changes": [],
+              "prerequisites": []
+            }
+          },
+          "scope": {
+            "before": {
+              "description": "Bounded probe of whether an event stream the application does not consume (bounded by RuntimeConfig::event_capacity) parks the single actor loop and withholds its command/append_notify endpoints, with a drained-stream control in the same execution.",
+              "assumptions": [
+                "3 nodes, standard majority quorum, no message loss or reordering beyond the in-process transport, all nodes run in one process on one tokio runtime",
+                "event_capacity is set to 64 so the bound is reached inside a bounded window; the source-settled mechanism (send awaits whenever the channel holds event_capacity events) does not depend on the value, only the number of unconsumed transitions does",
+                "the handle's event receiver exists from construction, so an application that never subscribes still leaves it unread"
+              ],
+              "excluded": [
+                "proving the cluster-wide outage (quorum loss) at the 1024 default capacity",
+                "schedule independence and any rate bound on how quickly the bound is reached"
+              ],
+              "parameters": {
+                "event_capacity": 64,
+                "proposal_pace_ms": 4,
+                "tick_period_ms": 2,
+                "append_notify_timeout_ms": 1500,
+                "nodes": 3
+              }
+            },
+            "after": {
+              "description": "Bounded probe of whether an event stream the application does not consume (bounded by RuntimeConfig::event_capacity) parks the single actor loop and withholds its command/append_notify endpoints, with a drained-stream control in the same execution.",
+              "assumptions": [
+                "3 nodes, majority quorum, no message loss or reordering beyond the in-process transport, one tokio runtime in one process",
+                "event_capacity 64 so the bound is reached inside a bounded window; the source-settled mechanism (send awaits when the channel holds event_capacity events) is capacity-independent",
+                "the handle's event receiver exists from construction, so an application that never subscribes still leaves it unread"
+              ],
+              "excluded": [
+                "the 1024 default capacity",
+                "quorum-level consequence",
+                "schedule independence or any rate bound"
+              ],
+              "parameters": {
+                "event_capacity": 64,
+                "proposal_pace_ms": 4,
+                "tick_period_ms": 2,
+                "append_notify_timeout_ms": 1500,
+                "nodes": 3
+              }
+            }
+          },
+          "prefix": {
+            "before": "Three real OmniPaxos instances (pid 1,2,3) are built with OmniPaxosConfig::build over omnipaxos_storage::memory_storage::MemoryStorage and driven by three real omnipaxos_runtime actors spawned with spawn_actor, using a harness-local `TestRuntime` (tokio-backed AsyncRuntime impl; the crate's TokioRuntime behind the tokio_runtime feature is not required). An in-process transport task per node forwards every message from that node's `outgoing_messages()` to the receiver returned by `msg.get_receiver()`. RuntimeConfig: tick_period 2ms, egress_period 1ms, event_capacity 64, append_notify_timeout 1500ms; ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, flush_batch_tick_timeout 100. Proposals are paced at 4ms so consecutive decided-index changes are observed in separate ticks (a burst would decide many entries inside one tick gap and produce a single amalgamated event). Case `unconsumed_event_stream_stops_actor_loop` leaves each node's event receiver unread (the handle always owns one after spawn_actor; the application never calls subscribe_events or never reads it) while ordinary appends keep the cluster busy until all three event channels are full; case `drained_event_stream_keeps_actor_loop_running` is the same cluster, capacity and activity with one difference: a task per node drains the event stream. The decisive evidence of case 1 is (a) all three event channels full with a live (not closed) receiver, (b) at least one node whose actor never answers a `decided_idx` command again across ten 200ms samples, (c) that parked node's `append_notify_with_timeout(.., 300ms)` not resolving inside 4s although the actor that would produce its Timeout runs on that same tick path; the assertion messages print the observed channel state. Case 2 requires every node to keep answering and a fresh append_notify from a follower to resolve Ok(idx>=1).",
+            "after": "Three real OmniPaxos instances (pid 1,2,3) built with OmniPaxosConfig::build over omnipaxos_storage::memory_storage::MemoryStorage, each driven by a real omnipaxos_runtime actor from spawn_actor with a harness-local tokio-backed AsyncRuntime impl; one in-process transport task per node forwards each message from that node's outgoing_messages() to msg.get_receiver()'s handle_incoming. RuntimeConfig: tick_period 2ms, egress_period 1ms, event_capacity 64, append_notify_timeout 1500ms; ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, flush_batch_tick_timeout 100. Ordinary appends are paced at 4ms so consecutive decided-index changes are observed in separate ticks; a burst would decide many entries inside one tick gap and emit a single amalgamated event. Case unconsumed_event_stream_stops_actor_loop leaves each node's event receiver unread (the handle owns one from spawn_actor even if the application never calls subscribe_events) and emits CA_EVENT unconsumed_event_bound_reached {nodes_full,nodes,event_capacity}, CA_EVENT actor_parked {node,samples_without_reply,reply_budget_ms,permanently_parked} and CA_EVENT append_notify_endpoint_withheld {node,per_call_deadline_ms,actor_timeout_ms,outer_wait_ms,resolved}. Case drained_event_stream_keeps_actor_loop_running is the control with one difference, a task per node draining the same stream, and emits CA_EVENT control_actors_responsive {nodes_answering,nodes,event_capacity} and CA_EVENT control_append_notify {origin,succeeded,idx}."
+          }
+        },
+        "revision_reason": "Same probe, cluster/configuration and the same two cases, but the harness now prints CA_EVENT JSON lines with the observed operands (bound reached, parked node, withheld endpoint, control responsiveness, control append_notify) so the receipt carries parsed observations a conclusion can cite; the previous receipt ran both cases green but recorded no parsed events."
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "9527b916ba184b74865563c980642d1c-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_subscribe_events",
+          "src_outgoing_nonblocking",
+          "src_decided_subs_nonblocking",
+          "src_append_notify_contract",
+          "src_event_capacity_cfg"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account (source-only, no receipt yet): the blocking behavior itself is settled by source - detect_and_emit_events publishes every observed transition with `event_tx.send(..).await` (omnipaxos_runtime/src/actor.rs:169-199) and is awaited in the tick arm of the only actor loop (actor.rs:665-711); the event channel is bounded (RuntimeConfig::event_capacity, handle.rs:34-35, default 1024 at handle.rs:74) and subscribe_events hands out a shared receiver clone (handle.rs:254-259). With a live-but-unread receiver the send is Pending and the actor task parks, so op.tick() (which drives leader-election heartbeats, message resends and batch flushes), handle_incoming and command handling all stop; a caller then cannot even obtain the documented append_notify failure endpoint, because the Timeout is produced by drain_notifiers on that same tick path (actor.rs:201-222, contract at handle.rs:114-137). Sibling paths of the same actor were built to avoid exactly this (try_send + buffering in drain_outgoing_buf, actor.rs:232-258; try_send + defer in push_to_all_subs, actor.rs:301-333), and the crate's own regression test asserts the invariant for the outgoing channel ('must still be responsive... if flush_outgoing blocked on a full channel, this would hang', tests/async_runtime_test.rs:1040-1082). What is NOT yet established: an actual execution showing the parked loop and its consequence. A first local construction of the probe (draft/assurance_generated.rs: 3-node in-process cluster, event_capacity=1, subscribe_events() receiver retained and never read) compiled and ran, but the harness as written did not reach the expected state - no node blocked within 500ms, and even the drained-events control cluster had not decided an entry within the probe's 300ms append_notify deadline, so the cluster had presumably not yet progressed to a second observed transition/two-state leader view. Until the probe is repaired and executed through the controller, the freeze and its consequence stay unverified. Counter-limitations to carry: (a) the trigger is client-side usage (a retained but unread receiver) - the runtime documents no drain obligation, and event_capacity only delays the parking, it does not bound it; (b) a receiver that is dropped unblocks the actor (the send error is ignored), so the stall lasts exactly as long as the receiver is held; (c) no source in the snapshot states that the actor loop must stay responsive to a full event channel, so the finding rests on the contract of the handle methods (every Command-reply method, including append_notify's Timeout) plus the deliberate non-blocking design of the sibling egress paths.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9527b916ba184b74865563c980642d1c"
+      },
+      {
+        "id": "e3721acc7c6a4544a22817c5c4b4b149-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_spawn_actor_channels",
+          "src_subscribe_events",
+          "src_append_notify_contract"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account. Settled by source: every transition the actor observes is published with an awaited send on a channel created once in spawn_actor as async_channel::bounded(RuntimeConfig::event_capacity) (handle.rs:295-323, capacity field handle.rs:34-35, default 1024 at handle.rs:74); detect_and_emit_events issues those sends (actor.rs:169-199) and is awaited from inside the tick arm of the single run select loop (actor.rs:665-711), so a Pending send there stops op.tick(), incoming handling, command handling and decided-subscriber pushes. subscribe_events hands out a clone of that same receiver (handle.rs:254-259), and append_notify's Timeout endpoint is produced by drain_notifiers on the same tick path (actor.rs:201-222, contract handle.rs:114-137), so a parked actor would also withhold that documented failure. NOT settled: whether an unread receiver actually parks the actor. Local construction (native feedback, not retained receipts; harness draft/assurance_generated.rs) produced two contradicting observations on the same cluster shape (3 nodes, in-process transport, event_capacity=1, tick_period=2ms): (A) with no consumer task at all, i.e. only the receiver the handle itself holds, no node reached a stable leader within 10s and every current_leader() poll timed out - consistent with the park; (B) with a per-node consumer task that reads events during a healthy phase (leader elected, entries decided, all commands answered) and then stops reading while keeping the receiver (instrumented: the task confirmed it had stopped reading), the cluster went on deciding all 24 further proposals and every node kept answering commands, and a later append_notify succeeded - inconsistent with the park. Because both variants leave an unread receiver on a bounded channel, (B) defeats the currently stated premise that 'unread receiver + capacity reached => sender stays Pending'. Possible explanations not yet distinguished: the tick arm's send may not be the blocking point in (B) (e.g. produces no further events, or the send resolves immediately because the channel is closed/space exists), or (A)'s no-progress has a different cause than the one claimed. Until the decisive channel-state observation is made, the freeze and its consequence stay unverified, so no defect is asserted. Counter-limitations to carry: a dropped receiver would unblock the actor (the send error is ignored), capacity only delays the parking, no snapshot source states that the actor loop must stay responsive to a full event channel (the finding would rest on the handle-method contract plus the deliberate try_send design of the sibling egress paths), and the event_capacity=1 configuration is an extreme point of a knob whose default is 1024.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Local construction observations (harness drafts run by the agent, not controller receipts) cannot support a formal conclusion; variant (B) also used an agent-defined tokio-backed AsyncRuntime implementation rather than the crate's TokioRuntime feature.",
+          "The parked-actor consequence for the rest of the cluster (lost quorum participation) has not been observed at all, only the node-local command/append_notify endpoints."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "e3721acc7c6a4544a22817c5c4b4b149"
+      },
+      {
+        "id": "9a11299aa4344bb5b84565cbe33701ad-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_spawn_actor_channels",
+          "src_subscribe_events",
+          "src_append_notify_contract"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account. Source-settled: the actor publishes each observed transition with `event_tx.send(..).await` inside `detect_and_emit_events` (actor.rs:169-199), awaited from the tick arm of the single `run` select loop (actor.rs:665-711), on the channel spawn_actor creates as async_channel::bounded(RuntimeConfig::event_capacity) (handle.rs:295-323; capacity knob handle.rs:34-35, default 1024 handle.rs:74). The handle owns a receiver from construction, so an application that ignores the event stream still leaves it unread; a Pending send there stops op.tick() (election heartbeat, resends, batch flush), incoming handling, command handling and decided-subscriber pushes, and also withholds append_notify's Timeout, which drain_notifiers would emit on the same tick path (actor.rs:201-222, contract handle.rs:114-137). Previous contradiction resolved during construction (local feedback, not receipts): the stalled-consumer variant had not frozen because the burst of proposals was decided inside a single tick gap, so only one further transition was observed and the channel never took a second send; instrumented runs showed the channel at len=1/capacity=1 with a parked actor in the no-consumer variant, and len=0 with a running actor in the burst variant. The probe is now paced (one proposal per 4ms) and reaches the bound on all three nodes at event_capacity=64, where the local runs (two consecutive, unmodified sources) show: all three channels full with live receivers, at least one actor loop parked and never answering again, its append_notify_with_timeout(300ms) unresolved after 4s, while the drained-stream control keeps all nodes answering and resolves a follower append_notify Ok(idx>=1). Defect judgment stays unresolved until the retained execution reports those comparisons; the claim under test is scoped to: a node whose client does not consume its event stream parks its actor loop once event_capacity transitions are observed, permanently losing ticks and every command reply (including the documented failure endpoints), and its participation is lost to the cluster. Counter-limitations carried forward: the trigger is client-side usage with no documented drain obligation, event_capacity only delays the parking, a dropped receiver unblocks the actor (send error ignored), no snapshot source states that a full event channel must not park the loop, and the cluster-level consequence at the default capacity (1024) is not observed by this probe.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The probe reaches the bound at event_capacity=64; it does not witness the same freeze at the default 1024, and it does not measure how many unconsumed transitions a real deployment would need.",
+          "Only the node-local consequences are asserted (command round-tripping and the append_notify endpoint); no quorum-level consequence is measured, and the parked-set is reported as `at least one node`, not as all nodes.",
+          "Local construction runs used a harness-local tokio-backed AsyncRuntime impl rather than the crate's TokioRuntime feature; the formal receipt will use the controller's clean copy."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9a11299aa4344bb5b84565cbe33701ad"
+      },
+      {
+        "id": "1a5428f0aa284eb1a2a3f1a083fcb052-interpretation-0",
+        "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_detect_events",
+          "src_run_loop",
+          "src_spawn_actor_channels",
+          "src_subscribe_events",
+          "src_append_notify_contract"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Current account. Source-settled mechanism: the actor publishes every observed transition with `event_tx.send(..).await` inside `detect_and_emit_events` (actor.rs:169-199), awaited from the tick arm of the single `run` select loop (actor.rs:665-711), on the channel spawn_actor builds as `async_channel::bounded(RuntimeConfig::event_capacity)` (handle.rs:295-323; knob handle.rs:34-35, default 1024 handle.rs:74). The handle owns a receiver from construction, so an application that never consumes the event stream still leaves it unread, and `subscribe_events` only hands out clones of that same channel (handle.rs:254-259). A `send` that cannot fit parks the actor task, which then cannot run `op.tick()` (election heartbeats, resends, batch flushes), cannot handle incoming messages, and cannot answer any Command - including the `append_notify` Timeout that `drain_notifiers` would have produced on that same tick path (actor.rs:201-222; endpoint documented at handle.rs:114-137). The crate's sibling egress paths avoid exactly this with `try_send` (drain_outgoing_buf; push_to_sub/push_to_all_subs) and its own regression test states the invariant for the outgoing channel. Recorded execution 011decb17a314e839b860436ad3dc164 (experiment 9a11299aa4344bb5b84565cbe33701ad-experiment, exit 0) ran the two-case harness against the clean copy and its test_selection reports both cases passed: `unconsumed_event_stream_stops_actor_loop` and `drained_event_stream_keeps_actor_loop_running` (nothing filtered out). Case 1 (event_capacity 64, paced 4ms proposals, no consumer) required and observed: all three event channels full (`len == capacity`, receiver not closed), at least one node whose actor never answered a `decided_idx` command across ten 200ms samples and still answered nothing 500ms later, and that node's `append_notify_with_timeout(.., 300ms)` unresolved after 4s although its `append_notify_timeout` is 1500ms. Case 2 (identical cluster, capacity and activity, with a task draining each event stream) required and observed the opposite: every node kept answering commands and a follower `append_notify` resolved `Ok(idx >= 1)`. Because the only difference between the cases is whether the event stream is consumed, the parking and the withheld endpoints are attributed to the unconsumed bounded event channel, not to the transport, the configuration or the harness. Scope of the defect asserted: a node whose client does not consume its event stream permanently stops participating (no ticks, no message handling, no command replies) once it has observed `event_capacity` transitions, for any finite capacity - the probe reaches that bound at 64 to stay inside a bounded window, and the source-settled mechanism is capacity-independent. Counter-limitations, kept in force: (a) the trigger is client-side usage and no snapshot source states a drain obligation, so the defect rests on the handle-method contract (every Command reply, and the documented Timeout) plus the deliberate non-blocking design of the sibling egress paths; (b) a receiver that is dropped unblocks the actor (the send error is ignored), so the stall lasts exactly as long as a live receiver exists; (c) the receipt witnesses the bound at 64 with node-local endpoints only - no observation at the 1024 default and no quorum-level measurement of the other nodes losing this participant; (d) the receipt has no parsed events (the harness asserts rather than emitting event lines), so its decisive content is the two recorded test outcomes, not parsed indices. That receipt recorded no parsed observations (event_count 0), so it cannot be cited as completed support and this account stays conditional: the defect is asserted on the source plus that recorded run, and a revised harness emitting CA_EVENT operands was submitted for a fresh execution so a later account can cite parsed indices.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Capacity-independence and practical reachability at the default 1024 are argued from source, not observed: the execution reached the bound at event_capacity=64.",
+          "Only node-local endpoints are witnessed (command round-trips and the append_notify endpoint); the consequence for the rest of the cluster (lost quorum participant, leadership churn caused by the silent node) is not measured.",
+          "The receipt carries no parsed events (event_count 0), so no zero-based indices are available for it; the decisive record is the receipt's test outcomes.",
+          "The stalled-consumer variant from earlier construction is superseded as evidence: its non-freeze was traced to proposals being decided inside a single tick gap, which coalesced transitions; the retained probe paces proposals instead."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052"
+      },
+      {
+        "id": "1a5428f0aa284eb1a2a3f1a083fcb052-interpretation-1",
+        "investigation_id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_leader_resend",
+          "src_follower_resend",
+          "src_leader_handle_accepted",
+          "src_follower_reply_accepted",
+          "src_follower_flush_batch",
+          "src_resend_dispatch"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Source-only current account of the new question, no execution yet. A follower replies to each AcceptDecide/AcceptStopSign with an Accepted that carries only the receipt's ballot and the follower's accepted_idx (follower.rs:160-175), and the leader turns those receipts into a decision when `is_chosen` sees a quorum of advertised accepted indexes (leader.rs:316-345). Both roles have a periodic callback - SequencePaxos::resend_message_timeout dispatches to resend_messages_leader/resend_messages_follower every resend_message_tick_timeout logical ticks (mod.rs:229-246) - but in the accept phase the leader's version only resends a pending StopSign (or its decide) and re-Prepares peers that are not promised (leader.rs:371-403), and the follower's version is the empty `Phase::Accept => ()` arm (follower.rs:240-269); the follower's other periodic path, flush_batch_follower, replies only when the batch flush itself advanced the accepted index (follower.rs:284-290). So the direction follower->leader has no timer-driven retry, and the leader has no way to ask a follower for its accepted index; the only later trigger is a new AcceptDecide arriving for new entries, which makes the follower advertise a (possibly larger) accepted_idx. Whether that leaves a genuinely quorum-accepted entry undecided for an unbounded interval with no enabled repair under normal (no further proposal) conditions is exactly what the registered discriminator is to decide; no defect is claimed before it runs.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The claim depends on the environment being permitted to lose a single message while the transport keeps the rest in order; the probe must drop only the Accepted reply and keep delivering everything else.",
+          "A retry of the client's own proposal (in the runtime layer) can repair the earlier entry as a side effect, so any later assertion must be scoped to 'no further proposal is made', which the core API does not itself require of a caller."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_detect_events",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 169,
+        "end_line": 199,
+        "kind": "code_observation",
+        "text": "    async fn detect_and_emit_events(&mut self) {\n        let cur = self.op.get_current_leader();\n        if cur != self.last_leader {\n            if let Some((pid, accepted)) = cur {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::LeaderElected { pid, accepted })\n                    .await;\n            }\n            self.last_leader = cur;\n        }\n        let d = self.op.get_decided_idx();\n        if d > self.last_decided_idx {\n            let _ = self\n                .event_tx\n                .send(OmniPaxosEvent::Decided { new_decided_idx: d })\n                .await;\n            self.last_decided_idx = d;\n        }\n        if !self.last_reconfigured {\n            if let Some(_ss) = self.op.is_reconfigured() {\n                let _ = self\n                    .event_tx\n                    .send(OmniPaxosEvent::Reconfigured {\n                        stop_sign_idx: self.op.get_decided_idx(),\n                    })\n                    .await;\n                self.last_reconfigured = true;\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_run_loop",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 665,
+        "end_line": 711,
+        "kind": "code_observation",
+        "text": "pub(crate) async fn run<T, B, R>(mut state: ActorState<T, B>, _rt: PhantomData<fn() -> R>)\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let mut tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n    let mut egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n\n    // async_channel::Receiver is !Unpin; keep it in a Pin<Box<...>> so the Stream\n    // impl works under select_biased!.\n    let cmd_rx = std::mem::replace(&mut state.cmd_rx, async_channel::bounded(1).1);\n    let incoming_rx = std::mem::replace(&mut state.incoming_rx, async_channel::bounded(1).1);\n    let mut cmd_rx = Box::pin(cmd_rx);\n    let mut incoming_rx = Box::pin(incoming_rx);\n\n    loop {\n        select_biased! {\n            _ = tick_fut => {\n                state.op.tick();\n                state.detect_and_emit_events().await;\n                state.try_dispatch_undispatched();\n                state.reconcile_unconfirmed();\n                state.drain_notifiers();\n                state.push_to_all_subs();\n                tick_fut = Box::pin(R::sleep(state.config.tick_period)).fuse();\n            }\n            _ = egress_fut => {\n                state.flush_outgoing();\n                egress_fut = Box::pin(R::sleep(state.config.egress_period)).fuse();\n            }\n            in_msg = incoming_rx.next() => {\n                match in_msg {\n                    Some(Message::AsyncRuntime(arm)) => state.handle_runtime_msg(arm),\n                    Some(m) => state.handle_incoming_tracked(m),\n                    None => break,\n                }\n            }\n            cmd = cmd_rx.next() => {\n                match cmd {\n                    Some(c) => state.handle_command(c).await,\n                    None => break,\n                }\n            }\n        }\n    }\n}",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_outgoing_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 232,
+        "end_line": 273,
+        "kind": "code_observation",
+        "text": "    /// Non-blocking drain of `outgoing_buf` onto `outgoing_tx`. Uses `try_send`\n    /// so a merely-full channel (slow consumer) doesn't block the actor loop;\n    /// unsent messages stay in `outgoing_buf` (in order) for the next attempt.\n    /// If the buffer exceeds [`Self::outgoing_buf_cap`], oldest messages are\n    /// dropped — see [`RuntimeConfig::max_outgoing_buffered`].\n    fn drain_outgoing_buf(&mut self) {\n        let cap = self.outgoing_buf_cap();\n        trim_oldest(&mut self.outgoing_buf, cap);\n\n        let pending = std::mem::take(&mut self.outgoing_buf);\n        let mut iter = pending.into_iter();\n        for msg in iter.by_ref() {\n            match self.outgoing_tx.try_send(msg) {\n                Ok(()) => {}\n                Err(async_channel::TrySendError::Full(msg)) => {\n                    self.outgoing_buf.push(msg);\n                    break;\n                }\n                Err(async_channel::TrySendError::Closed(_)) => {\n                    // Receiver dropped — user is not draining outgoing. Discard\n                    // everything remaining; nothing left to retry against.\n                    return;\n                }\n            }\n        }\n        self.outgoing_buf.extend(iter);\n    }\n\n    /// Enqueue one outgoing message without awaiting. Appends behind any\n    /// already-buffered messages (preserves order), then tries to drain.\n    /// Used for both core protocol traffic (via [`Self::flush_outgoing`]) and\n    /// runtime control-plane messages (`TaggedProposal` / `Assigned`).\n    fn enqueue_outgoing(&mut self, msg: Message<T>) {\n        self.outgoing_buf.push(msg);\n        self.drain_outgoing_buf();\n    }\n\n    /// Pull newly-produced OmniPaxos/BLE messages into `outgoing_buf` and drain.\n    fn flush_outgoing(&mut self) {\n        self.op.take_outgoing_messages(&mut self.outgoing_buf);\n        self.drain_outgoing_buf();\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_decided_subs_nonblocking",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 296,
+        "end_line": 333,
+        "kind": "code_observation",
+        "text": "\n    /// Push newly-decided entries to every subscriber, reading the log suffix\n    /// **once** and fanning out. Each sub keeps its own cursor, so slow subs\n    /// don't block fast ones; the storage read is amortized across all subs\n    /// starting from the trailing sub's position.\n    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_subscribe_events",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 254,
+        "end_line": 259,
+        "kind": "code_observation",
+        "text": "    /// Subscribe to state-transition events. Each event is delivered to exactly one\n    /// receiver: if you clone the returned receiver, the clones share the queue.\n    /// For fan-out to multiple independent subscribers, wrap in a broadcasting task.\n    pub fn subscribe_events(&self) -> async_channel::Receiver<OmniPaxosEvent> {\n        self.events_rx.clone()\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_cfg",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 34,
+        "end_line": 35,
+        "kind": "code_observation",
+        "text": "    /// Bounded capacity for the event channel.\n    pub event_capacity: usize,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_event_capacity_default",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 61,
+        "end_line": 76,
+        "kind": "code_observation",
+        "text": "impl Default for RuntimeConfig {\n    fn default() -> Self {\n        Self {\n            tick_period: Duration::from_millis(10),\n            egress_period: Duration::from_millis(1),\n            cmd_channel_capacity: 1024,\n            outgoing_capacity: 10_000,\n            incoming_capacity: 10_000,\n            event_capacity: 1024,\n            append_notify_timeout: Duration::from_secs(5),\n            decided_channel_capacity: 1024,\n            max_pending_appends: 1024,\n            max_decided_subscribers: 128,\n            max_outgoing_buffered: 10_000,\n        }\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_incoming_awaits_caller",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 288,
+        "end_line": 291,
+        "kind": "code_observation",
+        "text": "    /// Deliver an incoming message from the network to the actor.\n    pub async fn handle_incoming(&self, m: Message<T>) {\n        let _ = self.incoming_tx.send(m).await;\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_declared_no_stall_invariant",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 1040,
+        "end_line": 1082,
+        "kind": "test_expectation",
+        "text": "/// it's closed. Since this runs on the single actor loop, that blocked\n/// tick/election/command processing for the node entirely, not just delayed\n/// egress. Uses a tiny `outgoing_capacity` and never drains it, so it fills\n/// up almost immediately (the node has configured peers and sends BLE\n/// heartbeats regardless of whether anyone's listening).\n///\n/// Notify-path (`TaggedProposal` / `Assigned`) backpressure is covered by\n/// [`notify_egress_does_not_stall_when_outgoing_full`].\n#[tokio::test]\nasync fn full_outgoing_channel_does_not_stall_actor_loop() {\n    let nodes: Vec<NodeId> = vec![1, 2, 3];\n    let cfg = RuntimeConfig {\n        tick_period: Duration::from_millis(2),\n        egress_period: Duration::from_millis(1),\n        outgoing_capacity: 2,\n        ..Default::default()\n    };\n    let op = build_op(1, nodes);\n    let h = spawn_actor::<TestEntry, MemoryStorage<TestEntry>, TokioRuntime>(op, cfg);\n\n    // Let the outgoing channel fill up completely without ever draining it.\n    tokio::time::sleep(Duration::from_millis(100)).await;\n\n    // The actor loop must still be responsive to commands -- if\n    // flush_outgoing blocked on a full channel, this would hang.\n    let idx = timeout(Duration::from_millis(500), h.decided_idx())\n        .await\n        .expect(\"actor loop appears stalled with a full outgoing channel\");\n    assert_eq!(idx, 0);\n\n    // Draining now should still deliver messages (not silently and\n    // permanently lost) once the consumer catches up.\n    let out = h.outgoing_messages();\n    timeout(Duration::from_secs(2), out.recv())\n        .await\n        .expect(\"no message ever arrived once draining resumed\")\n        .expect(\"outgoing channel closed unexpectedly\");\n}\n\n/// Like `spawn_cluster`, but each node's outgoing drain can be paused via the\n/// returned per-pid flags. While a node's flag is `true`, its drain task stops\n/// calling `recv`, so that node's bounded `outgoing_messages` channel fills\n/// and further egress hits backpressure -- without tearing down the rest of",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "src_drain_notifiers_timeout",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 201,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "src_append_notify_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 114,
+        "end_line": 137,
+        "kind": "interface_statement",
+        "text": "    /// Append an entry and await its decided log index.\n    ///\n    /// Works from any node: the actor tags the entry with a unique id, routes it to\n    /// the current leader, and resolves the future when the assigned log index is\n    /// decided. If no leader is known yet, the call waits rather than failing fast --\n    /// it resolves once a leader is elected, or with `Timeout` if none is elected in\n    /// time. Fails with:\n    /// - [`AppendError::Timeout`] if the entry is not decided within\n    ///   [`RuntimeConfig::append_notify_timeout`] (including when no leader was ever\n    ///   elected in that time);\n    /// - [`AppendError::Propose`] if the underlying propose call itself failed (e.g. a\n    ///   reconfiguration is already pending) -- only when this node owns the pending\n    ///   call, otherwise it still resolves via `Timeout`;\n    /// - [`AppendError::Superseded`] if a leader change occurred before decision --\n    ///   a heuristic, not a certainty; see its doc comment for why, and check the\n    ///   returned index yourself if you need to know for sure;\n    /// - [`AppendError::TooManyOutstanding`] if [`RuntimeConfig::max_pending_appends`]\n    ///   outstanding calls are already queued.\n    ///\n    /// Uses [`RuntimeConfig::append_notify_timeout`] as the deadline; use\n    /// [`Self::append_notify_with_timeout`] to override it for a single call.\n    pub async fn append_notify(&self, entry: T) -> Result<usize, AppendError<T>> {\n        self.append_notify_inner(entry, None).await\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_spawn_actor_channels",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 295,
+        "end_line": 323,
+        "kind": "code_observation",
+        "text": "pub fn spawn_actor<T, B, R>(op: OmniPaxos<T, B>, cfg: RuntimeConfig) -> OmniPaxosHandle<T>\nwhere\n    T: ActorEntry,\n    B: Storage<T> + Send + 'static,\n    R: AsyncRuntime,\n{\n    let (cmd_tx, cmd_rx) = async_channel::bounded(cfg.cmd_channel_capacity);\n    let (outgoing_tx, outgoing_rx) = async_channel::bounded(cfg.outgoing_capacity);\n    let (incoming_tx, incoming_rx) = async_channel::bounded(cfg.incoming_capacity);\n    let (event_tx, events_rx) = async_channel::bounded(cfg.event_capacity);\n\n    let state = ActorState::new(\n        op,\n        cmd_rx,\n        incoming_rx,\n        outgoing_tx,\n        event_tx,\n        ActorConfig::from(&cfg),\n    );\n\n    R::spawn(run::<T, B, R>(state, PhantomData::<fn() -> R>));\n\n    OmniPaxosHandle {\n        cmd_tx,\n        events_rx,\n        outgoing_rx,\n        incoming_tx,\n        decided_channel_capacity: cfg.decided_channel_capacity,\n    }",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "src_leader_resend",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 371,
+        "end_line": 403,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_leader(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Accept => {\n                // Resend AcceptStopSign or StopSign's decide\n                if let Some(ss) = self.internal_storage.get_stopsign() {\n                    let decided_idx = self.internal_storage.get_decided_idx();\n                    for follower in self.leader_state.get_promised_followers() {\n                        if self.internal_storage.stopsign_is_decided() {\n                            self.send_decide(follower, decided_idx, true);\n                        } else if self.leader_state.get_accepted_idx(follower)\n                            != self.internal_storage.get_accepted_idx()\n                        {\n                            self.send_accept_stopsign(follower, ss.clone(), true);\n                        }\n                    }\n                }\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Recover => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_follower_resend",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 240,
+        "end_line": 269,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_follower(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Promise\n                match &self.cached_promise_message {\n                    Some(promise) => {\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: promise.n.pid,\n                            msg: PaxosMsg::Promise(promise.clone()),\n                        }));\n                    }\n                    None => {\n                        // Shouldn't be possible to be in prepare phase without having\n                        // cached the promise sent as a response to the prepare\n                        #[cfg(feature = \"logging\")]\n                        warn!(self.logger, \"In Prepare phase without a cached promise!\");\n                        self.state = (Role::Follower, Phase::Recover);\n                        self.send_preparereq_to_all_peers();\n                    }\n                }\n            }\n            Phase::Recover => {\n                // Resend PrepareReq\n                self.send_preparereq_to_all_peers();\n            }\n            Phase::Accept => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_leader_handle_accepted",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 316,
+        "end_line": 345,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_accepted(&mut self, accepted: Accepted, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        trace!(\n            self.logger,\n            \"Got Accepted from {}, idx: {}, chosen_idx: {}, accepted: {:?}\",\n            from,\n            accepted.accepted_idx,\n            self.internal_storage.get_decided_idx(),\n            self.leader_state.accepted_indexes\n        );\n        if accepted.n == self.leader_state.n_leader && self.state == (Role::Leader, Phase::Accept) {\n            self.leader_state\n                .set_accepted_idx(from, accepted.accepted_idx);\n            if accepted.accepted_idx > self.internal_storage.get_decided_idx()\n                && self.leader_state.is_chosen(accepted.accepted_idx)\n            {\n                let decided_idx = accepted.accepted_idx;\n                self.internal_storage\n                    .set_decided_idx(decided_idx)\n                    .expect(WRITE_ERROR_MSG);\n                for pid in self.leader_state.get_promised_followers() {\n                    let latest_accdec = self.get_latest_accdec_message(pid);\n                    match latest_accdec {\n                        Some(accdec) => accdec.decided_idx = decided_idx,\n                        None => self.send_decide(pid, decided_idx, false),\n                    }\n                }\n            }\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src_follower_reply_accepted",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 160,
+        "end_line": 175,
+        "kind": "code_observation",
+        "text": "    fn reply_accepted(&mut self, n: Ballot, accepted_idx: usize) {\n        let latest_accepted = self.get_latest_accepted_message(n);\n        match latest_accepted {\n            Some(acc) => acc.accepted_idx = accepted_idx,\n            None => {\n                let accepted = Accepted { n, accepted_idx };\n                let cached_idx = self.outgoing.len();\n                self.latest_accepted_meta = Some((n, cached_idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: n.pid,\n                    msg: PaxosMsg::Accepted(accepted),\n                }));\n            }\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_follower_flush_batch",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 284,
+        "end_line": 290,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn flush_batch_follower(&mut self) {\n        let accepted_idx = self.internal_storage.get_accepted_idx();\n        let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n        if new_accepted_idx > accepted_idx {\n            self.reply_accepted(self.get_promise(), new_accepted_idx);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src_resend_dispatch",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 229,
+        "end_line": 246,
+        "kind": "code_observation",
+        "text": "    /// Detects if a Prepare, Promise, AcceptStopSign, Decide of a Stopsign, or PrepareReq message\n    /// has been sent but not been received. If so resends them. Note: We can't detect if a\n    /// StopSign's Decide message has been received so we always resend to be safe.\n    pub(crate) fn resend_message_timeout(&mut self) {\n        match self.state.0 {\n            Role::Leader => self.resend_messages_leader(),\n            Role::Follower => self.resend_messages_follower(),\n        }\n    }\n\n    /// Flushes any batched log entries and sends their corresponding Accept or Accepted messages.\n    pub(crate) fn flush_batch_timeout(&mut self) {\n        match self.state {\n            (Role::Leader, Phase::Accept) => self.flush_batch_leader(),\n            (Role::Follower, Phase::Accept) => self.flush_batch_follower(),\n            _ => (),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "1a5428f0aa284eb1a2a3f1a083fcb052",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@q_lost_accepted": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_leader_resend"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_follower_resend"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_leader_handle_accepted"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_follower_reply_accepted"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_follower_flush_batch"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_resend_dispatch"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@q_lost_accepted"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+          "changed_fields": [
+            "conclusion",
+            "defect_claim",
+            "rationale",
+            "limitations"
+          ]
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[1]",
+          "investigation_id": "@q_lost_accepted"
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "1a5428f0aa284eb1a2a3f1a083fcb052-experiment"
+    },
+    "applied_operations": {
+      "submission-9527b916ba184b74865563c980642d1c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9527b916ba184b74865563c980642d1c.json"
+      },
+      "submission-e3721acc7c6a4544a22817c5c4b4b149": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-e3721acc7c6a4544a22817c5c4b4b149.json"
+      },
+      "submission-9a11299aa4344bb5b84565cbe33701ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-9a11299aa4344bb5b84565cbe33701ad.json"
+      },
+      "submission-1a5428f0aa284eb1a2a3f1a083fcb052": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-16_13-51-31-omnipaxos-real-run/semantic-commits/submission-1a5428f0aa284eb1a2a3f1a083fcb052.json"
+      }
+    }
+  }
+}

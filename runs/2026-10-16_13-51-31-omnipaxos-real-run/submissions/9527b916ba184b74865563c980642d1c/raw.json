@@ -1,0 +1,144 @@
+{
+  "rationale": "Orient in the captured omnipaxos snapshot (crate omnipaxos 0.2.3 + the async actor layer crate omnipaxos_runtime) and register the first sourced relationship on the decision-formation/progress axis: the runtime's event egress is the single path that blocks the actor loop when its channel is full.",
+  "sources": [
+    {
+      "id": "src_detect_events",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 169,
+      "end_line": 199,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_run_loop",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 665,
+      "end_line": 711,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_outgoing_nonblocking",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 232,
+      "end_line": 273,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_decided_subs_nonblocking",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 296,
+      "end_line": 333,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_subscribe_events",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 254,
+      "end_line": 259,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_event_capacity_cfg",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 34,
+      "end_line": 35,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_event_capacity_default",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 61,
+      "end_line": 76,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_incoming_awaits_caller",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 288,
+      "end_line": 291,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_declared_no_stall_invariant",
+      "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+      "start_line": 1040,
+      "end_line": 1082,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "src_drain_notifiers_timeout",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 201,
+      "end_line": 222,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_append_notify_contract",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 114,
+      "end_line": 137,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_event_backpressure",
+      "question": "Can a full, undrained RuntimeConfig event channel (a subscribed but unread subscribe_events() receiver) stop the single actor task, and with it the node's whole consensus participation - ticks, message handling and every Command reply?",
+      "source_ids": [
+        "src_detect_events",
+        "src_run_loop",
+        "src_subscribe_events",
+        "src_event_capacity_cfg",
+        "src_outgoing_nonblocking",
+        "src_decided_subs_nonblocking",
+        "src_append_notify_contract"
+      ],
+      "hypothesis": "detect_and_emit_events awaits event_tx.send for every observed transition and is awaited inside the run loop's tick arm, so once the bounded event channel is full the actor task parks inside the tick arm: no further tick() (leader election heartbeat, resend and flush timers), no incoming-message handling, and no Command reply (not even the documented append_notify Timeout, which drain_notifiers would have produced).",
+      "discriminator": "An execution that subscribes without draining on every node of a live in-process cluster: if the actor task is parked on the event send, Command round-trips never complete and a fresh append_notify never reaches its 300ms Timeout endpoint, while the same cluster with the same event_capacity but a draining receiver keeps answering commands and decides the same entry.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_event_send_blocks_actor",
+      "kind": "behavior",
+      "statement": "Every state transition the actor observes is published with an awaited send on the bounded event channel: detect_and_emit_events runs `self.event_tx.send(...).await` for OmniPaxosEvent::LeaderElected, ::Decided and ::Reconfigured, and it is invoked (and awaited) from inside the tick arm of the single `run` select loop. When the event channel holds RuntimeConfig::event_capacity unread events and the receiver is still alive, the send is Pending, so the whole actor task - not just egress - stops: op.tick() (election, resend and batch-flush timers), incoming-message handling, command handling and push_to_all_subs all stop until either the application reads an event or drops its receiver (a dropped receiver makes the send fail, which the code ignores).",
+      "conditions": "omnipaxos_runtime actor built by spawn_actor with RuntimeConfig.event_capacity >= 1; the application called subscribe_events() and holds a receiver it does not drain, or drains slower than transitions occur; no other task drops that receiver.",
+      "source_ids": [
+        "src_detect_events",
+        "src_run_loop",
+        "src_subscribe_events",
+        "src_event_capacity_cfg",
+        "src_event_capacity_default"
+      ]
+    },
+    {
+      "ref": "@k_other_egress_nonblocking",
+      "kind": "behavior",
+      "statement": "The other two egress paths of the same actor are deliberately non-blocking: protocol/control-plane messages go through enqueue_outgoing -> drain_outgoing_buf, which uses try_send and keeps unsent messages buffered (trimming oldest past the cap), and decided-log subscribers are fed with try_send in push_to_sub/push_to_all_subs, deferring the push when a subscriber is full. Incoming delivery awaits on the caller side (OmniPaxosHandle::handle_incoming), not on the actor side. The event channel is therefore the only egress whose backpressure can park the actor loop.",
+      "conditions": "Same actor; RuntimeConfig::outgoing_capacity / decided_channel_capacity reached while the receiver stays alive.",
+      "source_ids": [
+        "src_outgoing_nonblocking",
+        "src_decided_subs_nonblocking",
+        "src_incoming_awaits_caller",
+        "src_declared_no_stall_invariant"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_event_backpressure",
+      "source_ids": [
+        "src_detect_events",
+        "src_run_loop",
+        "src_subscribe_events",
+        "src_outgoing_nonblocking",
+        "src_decided_subs_nonblocking",
+        "src_append_notify_contract",
+        "src_event_capacity_cfg"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Current account (source-only, no receipt yet): the blocking behavior itself is settled by source - detect_and_emit_events publishes every observed transition with `event_tx.send(..).await` (omnipaxos_runtime/src/actor.rs:169-199) and is awaited in the tick arm of the only actor loop (actor.rs:665-711); the event channel is bounded (RuntimeConfig::event_capacity, handle.rs:34-35, default 1024 at handle.rs:74) and subscribe_events hands out a shared receiver clone (handle.rs:254-259). With a live-but-unread receiver the send is Pending and the actor task parks, so op.tick() (which drives leader-election heartbeats, message resends and batch flushes), handle_incoming and command handling all stop; a caller then cannot even obtain the documented append_notify failure endpoint, because the Timeout is produced by drain_notifiers on that same tick path (actor.rs:201-222, contract at handle.rs:114-137). Sibling paths of the same actor were built to avoid exactly this (try_send + buffering in drain_outgoing_buf, actor.rs:232-258; try_send + defer in push_to_all_subs, actor.rs:301-333), and the crate's own regression test asserts the invariant for the outgoing channel ('must still be responsive... if flush_outgoing blocked on a full channel, this would hang', tests/async_runtime_test.rs:1040-1082). What is NOT yet established: an actual execution showing the parked loop and its consequence. A first local construction of the probe (draft/assurance_generated.rs: 3-node in-process cluster, event_capacity=1, subscribe_events() receiver retained and never read) compiled and ran, but the harness as written did not reach the expected state - no node blocked within 500ms, and even the drained-events control cluster had not decided an entry within the probe's 300ms append_notify deadline, so the cluster had presumably not yet progressed to a second observed transition/two-state leader view. Until the probe is repaired and executed through the controller, the freeze and its consequence stay unverified. Counter-limitations to carry: (a) the trigger is client-side usage (a retained but unread receiver) - the runtime documents no drain obligation, and event_capacity only delays the parking, it does not bound it; (b) a receiver that is dropped unblocks the actor (the send error is ignored), so the stall lasts exactly as long as the receiver is held; (c) no source in the snapshot states that the actor loop must stay responsive to a full event channel, so the finding rests on the contract of the handle methods (every Command-reply method, including append_notify's Timeout) plus the deliberate non-blocking design of the sibling egress paths."
+    }
+  ]
+}

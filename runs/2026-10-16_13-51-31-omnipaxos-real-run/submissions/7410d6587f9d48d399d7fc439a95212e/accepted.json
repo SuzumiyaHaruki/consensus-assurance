@@ -1,0 +1,71 @@
+{
+  "rationale": "Extends the compaction finding with its second-stage, source-settled consequence and the layer-side error-attribution aspect: a storage write error makes the core panic inside the actor task, and the layer's only observable for a dead actor is Shutdown, indistinguishable from an orderly shutdown.",
+  "sources": [
+    {
+      "id": "src_write_error_panics",
+      "file": "omnipaxos/src/sequence_paxos/leader.rs",
+      "start_line": 111,
+      "end_line": 133,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_write_error_msg",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 354,
+      "end_line": 357,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_runtime_shutdown_only",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 160,
+      "end_line": 180,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_storage_error_contract",
+      "file": "omnipaxos/src/storage/mod.rs",
+      "start_line": 128,
+      "end_line": 136,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "d1c8f1d91ec1493eb2f50155d4b8815b-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "src_core_compaction_api",
+        "src_runtime_command_enum",
+        "src_spawn_actor_channels",
+        "src_runtime_public_api",
+        "src_compaction_doc",
+        "src_write_error_panics",
+        "src_write_error_msg",
+        "src_runtime_shutdown_only",
+        "src_storage_error_contract"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Source-only current account; no execution. Stage one, the duty and the unreachable path: the repository's own documentation states that the log grows without bound unless users compact it and shows the call on the instance - 'As time passes, the replicated log in OmniPaxos will grow large. To avoid letting the log growing infinitely large, we support two ways of compaction that can be initiated by users', with the example `omni_paxos.trim(trim_idx)` (docs/omnipaxos/compaction.md:1-11) - backed by `OmniPaxos::trim`/`snapshot` (omni_paxos.rs:242-262); the layer removes the path, because spawn_actor consumes the instance by value (handle.rs:295), the handle keeps only channels and a capacity with no accessor back and no compaction method, the client protocol has no compaction request (event.rs:90-128), and the actor never calls op.trim()/op.snapshot() (its only 'trim' is trim_oldest over its own outgoing buffer, actor.rs:239, 715-720). Stage two, what the growing log leads to: the core treats a storage write error as fatal wherever it writes - `accept_entry_leader`/`accept_entries_leader` call `append_entry_with_batching(..).expect(WRITE_ERROR_MSG)` (leader.rs:113-115, 124-127), the follower's batch-flush and decision paths do the same (follower.rs:59, 100), and the message is 'Error writing to storage.' (util.rs:357) - while the Storage trait defines a write error as an allowed outcome whose operations are rolled back (storage/mod.rs:130-136). Stage three, what the layer shows: that panic happens inside the task spawned by spawn_actor (handle.rs:295-323), whose join handle is not kept, and the layer's public failure contract has no storage-error variant - the only value for an actor that is not there is `AppendError::Shutdown` / `RuntimeProposeErr::Shutdown` (handle.rs:164-165, 174-177, 237-240) - so every pending and subsequent call resolves as Shutdown, indistinguishable from an orderly shutdown, and the core's message never reaches the caller. The comparison therefore holds in two parts: an omitted duty of the layer that owns the instance (a runtime-only user cannot bound the log's growth) and an error-attribution gap in the same layer (an actor death caused by a target-internal fatal storage error is reported to callers as the same value as a clean shutdown). Counter-limitations kept in force: (a) the layer nowhere claims feature parity with the core, so part one rests on the documented duty plus the absence of any path (handle methods, Command variants, actor calls into the core - all three inspected); (b) stage two is not exercised: no backend in the snapshot was driven to refuse a write, and the storage backend's real behaviour on exhaustion is unexamined, so the chain is source-settled rather than observed; (c) the panic itself is the core's documented fatal-error design, so the layer-side gap is the attribution of the death, not the panic; (d) no source states that compaction is deliberately out of scope for the layer, and the layer does expose other core-facing operations (append, append_notify, reconfigure, read_decided_suffix, current_leader, decided_idx, try_become_leader, reconnected, subscribe_decided).",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [],
+      "limitations": [
+        "Source-only account: neither the missing path nor the panic-to-Shutdown chain was executed; the absence of a path is established by inspecting the handle's methods, the Command enum and the actor's calls into the core.",
+        "Stage two's premise - a storage backend actually refusing a write - is not exercised, and the backends' behaviour when exhausted is not examined.",
+        "The panic on a storage write error is the core's documented fatal-error design; the layer-side gap recorded here is that the resulting death is reported as an ordinary Shutdown.",
+        "No source states that compaction is deliberately out of scope for the layer; the account treats it as an omitted operation against the duty the repo's own documentation states."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,123 @@
+{
+  "rationale": "Recorded the executed control receipt in the question account: the same crash pattern with the recovery driven by the replica that holds the value preserves it (comparisons hold), so the loss is tied to a coordinator that lacks the command. The question's own discrimination is answered, so its disposition is set to explained, and an independent sourced question is opened on the recovery ballot/authority path that the same code gates on IsLeader.",
+  "sources": [
+    {
+      "id": "s-nack-accept",
+      "file": "epaxos/epaxos.go",
+      "start_line": 1008,
+      "end_line": 1035,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s-isleader-default",
+      "file": "epaxos/epaxos.go",
+      "start_line": 149,
+      "end_line": 165,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s-betheleader",
+      "file": "epaxos/epaxos.go",
+      "start_line": 1121,
+      "end_line": 1125,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "aa497fcd14934325ba2eabe45fefecd1-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    },
+    {
+      "id": null,
+      "ref": "@rec-recovery-ballot",
+      "question": "Can a recovering replica that is not the master-designated leader recover an instance whose accepted value sits at a ballot above its own recovery ballot, or does the periodic retry repeat the same rejected prepare with no enabled repair?",
+      "source_ids": [
+        "s-makeballot",
+        "s-exec-recovery-trigger",
+        "s-decl-prepare-reply",
+        "s-nack-accept",
+        "s-isleader-default",
+        "s-betheleader"
+      ],
+      "hypothesis": "makeBallot gives a fixed ballot per replica (r.Id for the instance owner, r.Id+N otherwise) and climbs above maxRecvBallot only while r.IsLeader is true; epaxos.New hardcodes IsLeader false and only the master's BeTheLeader RPC sets it, so for every other replica a prepare at its fixed ballot is rejected by any acceptor whose stored bal is higher, and the three nack repairs (handlePreAcceptReply, handleAcceptReply, handlePrepareReply) are all gated on r.IsLeader. executeCommands re-enqueues the same instance every COMMIT_GRACE_PERIOD, so the same rejected prepare is repeated without a ballot advance, and instances that depend on the stuck instance cannot execute.",
+      "discriminator": "Whether two consecutive startRecoveryForInstance calls on a non-designated replica emit the identical Prepare ballot while the acceptors' replies all report a higher stored ballot, with no higher-ballot Prepare emitted and the instance uncommitted; and whether the same call on a replica with IsLeader true emits a ballot above maxRecvBallot.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "aa497fcd14934325ba2eabe45fefecd1-question-0",
+      "experiment_id": "fc825b4d2a9c488e8c03dff32b05cab7-experiment",
+      "source_ids": [
+        "s-decl-recovery",
+        "s-decl-prepare-reply",
+        "s-recovery-init",
+        "s-prepare-reply-adopt",
+        "s-subcase-dispatch",
+        "s-makeballot",
+        "s-handle-prepare",
+        "s-exec-recovery-trigger"
+      ],
+      "executions": {
+        "143e14592eea4c42b3c81044e3860348": [
+          7,
+          8,
+          9,
+          11,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current account: in the executed scenario the captured EPaxos package loses an accepted value during recovery of the instance by a replica that does not itself hold the command, and decides a different value for that instance. Witnesses from receipt 143e14592eea4c42b3c81044e3860348 (fixed experiment fc825b4d2a9c488e8c03dff32b05cab7-experiment, test TestAssuranceEPaxosRecoveryValueAdoption, 24 parsed events, no parsing errors): event 5 shows leader 0 in status ACCEPTED with cmd_op 1 after the non-equal pre-accept phase; event 6 shows the Accept broadcast to replicas 2 and 3 at ballot 0; event 7 shows replica 2 carrying the PUT (cmd_op 1) at vbal 0 after the Accept, event 8 shows replica 3 holding the same coordinates with no command (has_cmds false, status NONE) and vbal 0, and event 9 shows leader 0 still ACCEPTED with cmd_op 1 immediately before it fails. The instance (0,0) value was therefore accepted at ballot 0 by replicas 0, 2 and 3, i.e. by a quorum of the five replicas, and no replica had committed it when leader 0 failed after the Accept broadcast. Event 11 records the recovery start by replica 3: tried_ballot 8 and its own self reply carrying self_vballot 8 with self_status NONE and self_has_command false, while startRecoveryForInstance had set lb.ballot to the pre-recovery local vbal (epaxos/epaxos.go:1145) and had overwritten inst.vbal with the freshly tried ballot (epaxos/epaxos.go:1150-1153, anchor s-decl-recovery). Events 12 and 13 show the Prepare broadcast at ballot 8; event 14 shows replica 2's PrepareReply carrying the PUT at vballot 0 (status PREACCEPTED_EQ) with Ballot 8 after joining, and event 15 the reply of replica 4 with no command; event 16 states the decisive operands: self_vballot 8, max_remote_vballot_with_command 0, so the self ballot is above every remote value ballot, and quorum_reply_command_op 1. Comparison 0 is violated with complete witness 17: the PreAccept the recovery emitted (ballot 8, cmd_len 1) carries cmd_op 0, i.e. state.NOOP(), while quorum_reply_command_op is 1 - the adoption loop at epaxos/epaxos.go:1239-1246 (anchor s-decl-prepare-reply) keeps lb.cmds nil and lb.status NONE because the self reply is evaluated first with the fabricated vbal 8 and the genuine reply at vbal 0 fails the >= test, so sub-case 6 (epaxos/epaxos.go:1278-1279) calls startPhase1 with the NOOP (epaxos/epaxos.go:1307-1313). Events 18-21 show the consequence: the recovered NOOP became the instance's value at replicas 2, 3 and 4 (status 4 COMMITTED, cmd_op 0), the quiescent run completed, and comparison 1 is violated with complete witness 20: replica 2, which held the accepted PUT after the Accept phase (event 7), ended holding the NOOP (cmd_op 0), i.e. the recovery overwrote the only live copy of the accepted command. Events 22 and 23 record the failed replicas' retained state: replica 1 still PREACCEPTED with cmd_op 1 and leader 0 still ACCEPTED with cmd_op 1, so the recovered decision (NOOP at ballot 8) is a different value for instance (0,0) than the value those replicas accepted at ballot 0. This establishes the scoped defect: after a permitted leader failure in the accept window, a recovery driven by a replica that knows the instance without its command proposes and commits a NOOP instead of the value the prepare replies carry, discarding a quorum-accepted value rather than completing it.",
+      "answers": {
+        "aa497fcd14934325ba2eabe45fefecd1-gap-0": {
+          "explanation": "Resolved by the executed scenario: with replica 1 failing after replying to the PreAccept but before the Accept broadcast, the target's own handleAccept left replica 3 with instance (0,0) known to its executor (crtInstance[0] advanced) while holding no command - event 8 (has_cmds false, status NONE, bal and vbal 0) and event 10 - and replica 3's startRecoveryForInstance then let the fabricated self reply (event 11: self_vballot 8, status NONE, no command) decide the adopted value, producing the NOOP proposal of event 17 and the committed NOOP of events 19-21. The accept-broadcast peer set differing from the pre-accept peer set is thus sufficient and was realised under the harness's crash model (reply delivered, then the peer marked failed before the broadcast).",
+          "resolved": true
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The defect is bounded to coordinators that lack the command, and this bound is now executed, not merely sourced: the control experiment 242eaa8afa384a87b0952fbcd4b074b4-experiment (receipt 9d07449105684a498113db891da025d9, exit 0) replayed the identical crash pattern with the recovery driven by replica 2, which holds X at value ballot 0; its declared preservation comparisons both hold, evaluating parsed index 17 (the recovered PreAccept carries cmd_op 1 although no remote reply carries a command) and indices 19-20 (replica 2 remains at cmd_op 1 through quiescence). The value-adoption receipt 143e14592eea4c42b3c81044e3860348 is the same harness with only the recoverer changed to replica 3, which holds no command, so the loss is tied to the coordinator's missing value rather than to the crash pattern.",
+        "Event 16 also shows the comparison is a ballot ordering, not a general discard: a reply whose value ballot exceeded the coordinator's own recovery ballot would still be adopted, so a higher-id replica's later recovery at a higher ballot is not excluded by this mechanism.",
+        "The countervailing ballot-climb path in makeBallot (epaxos/epaxos.go:439-451) is gated on IsLeader, which is false in this execution and in epaxos.New; the designated leader's climbing behaviour (epaxos/epaxos.go:1121-1125, master-driven) was excluded from the scope, so nothing here claims that a designated leader could not recover.",
+        "The executed value X was accepted by a quorum but never COMMITTED at any replica before the leader failed (no Commit message appears in the event stream); the witness therefore contradicts a quorum-accepted (chosen) value, not a value whose commit notification had been delivered."
+      ],
+      "limitations": [
+        "One configuration and one instance: N=5, F=2, instance (0,0), a single PUT command (key 1) and the NOOP generated by the recovery; the harness's event stream is the target's own messages and handler state, but no other command shape, key or instance index was exercised.",
+        "The harness schedules delivery explicitly instead of waiting for timers: the startRecoveryForInstance(0,0) call is the function the executor invokes from instancesToRecover after COMMIT_GRACE_PERIOD (epaxos/epaxos.go:404-417), but the call itself was made by the harness, and no run() loop or executeCommands goroutine was active; the same holds for the control receipt 9d07449105684a498113db891da025d9.",
+        "The premise that the accept broadcast reaches a replica that never pre-accepted was produced by setting the failed peer's Alive flag false between the pre-accept and accept broadcasts (the peer's reply was delivered, then it was marked failed), matching the target's own Alive mechanism for choosing recipients; a real connection loss was not exercised.",
+        "Incidental observation not used by the claim: the committed recovered instance ends with Seq -1 at replicas 2, 3 and 4 (events 19-21) although startPhase1 computed seq 0 (event 18); this ordering field is recorded here as a separate lead, not as support for the adoption claim."
+      ],
+      "joint_history": "Producer events 12-15 (Prepare/PrepareReply traffic between replicas 3, 2 and 4) and result events 17-21 all belong to receipt 143e14592eea4c42b3c81044e3860348 for fixed experiment fc825b4d2a9c488e8c03dff32b05cab7-experiment; events 7-9 are the same run's pre-recovery state of the same instance (0,0).",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

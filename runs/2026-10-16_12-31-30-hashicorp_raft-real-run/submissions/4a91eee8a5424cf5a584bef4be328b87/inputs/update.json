@@ -1,0 +1,95 @@
+{
+ "rationale": "Recorded the current account for receipt a1c98fc2bafd4775aa05275dd25f2767, which answers the registered repair gap with a live cluster: the restarted follower held no configuration at all (comparison 0 violated, valid witness at parsed index 26) although its leader stayed in Leader state and the follower's log already matched (last log index 113, last applied 110), so ordinary replication did not re-derive it; a later configuration entry appended by the same leader did repair it (comparison 2 holds at parsed index 27, new entry index 114 and three voters), and both flag-disabled controls hold (indices 29 and 30). The gap is therefore resolved, the live-cluster durability of the wrong context is recorded as a fact, and the discriminator moves to the voting consequence of an empty reconstruction.",
+ "investigations": [
+  {
+   "id": "2708fe4120de4b7b945ec449b641cfed-question-0",
+   "discriminator": "Whether an empty reconstruction also disables the membership and voter gates on the vote path, so that a restarted node grants support to a peer that is not a voter in the committed configuration while it knows no leader, which the correct configuration rejects."
+  }
+ ],
+ "knowledge": [
+  {
+   "id": "2708fe4120de4b7b945ec449b641cfed-knowledge-3",
+   "kind": "behavior",
+   "statement": "appendEntries processes configuration entries only for the entries it newly appends; entries already present at the same index and term are skipped, so ordinary replication from a healthy leader does not re-derive the configuration of a follower whose log already matches.",
+   "conditions": "Follower handling a normal AppendEntries whose entries are duplicates of its own log; entries that are in the leader's compacted prefix instead arrive as an InstallSnapshot, which rewrites both configurations from the snapshot metadata.",
+   "source_ids": [
+    "append_new",
+    "install_snapshot_cfg"
+   ],
+   "executions": {
+    "a1c98fc2bafd4775aa05275dd25f2767": [
+     25,
+     26,
+     27
+    ]
+   }
+  },
+  {
+   "ref": "@live_cluster_no_repair",
+   "kind": "fact",
+   "statement": "In the retained live-cluster execution a restarted follower no longer held any configuration and ordinary replication did not repair it: after 400 ms of a leader that stayed in Leader state, the follower's reconstructed configuration was empty (latest_config_index 0, no servers) while its own log's configuration entry at index 103 has two voters and its log already matched the leader's (last log index 113, last applied 110, snapshot_count 0). When that leader afterwards appended a new configuration entry at index 114, the follower's configuration became that entry (latest_config_index 114, three voters), so the repair came from the later configuration change rather than from replication; the flag-disabled control over the same shape held latest_config_index 103 with two voters at observation time and was repaired by the same entry.",
+   "conditions": "Three-member cluster whose leader committed a RemoveServer before the restart and kept leading; only the remaining follower was restarted, over its own stores and with no snapshot of its own, reconnected to the live leader in both directions; the observation and repair windows are 400 ms each.",
+   "source_ids": [
+    "scan_start",
+    "append_new",
+    "cfg_entry",
+    "follower_gate"
+   ],
+   "executions": {
+    "a1c98fc2bafd4775aa05275dd25f2767": [
+     25,
+     26,
+     27,
+     29,
+     30
+    ]
+   }
+  }
+ ],
+ "interpretations": [
+  {
+   "investigation_id": "2708fe4120de4b7b945ec449b641cfed-question-0",
+   "experiment_id": "07164ab92e0941569fb6137ae84eee50-experiment",
+   "source_ids": [
+    "scan_start",
+    "restore_lastapplied",
+    "snapshot_cfg",
+    "cfg_entry",
+    "append_new",
+    "follower_gate",
+    "install_snapshot_cfg",
+    "restore_doc",
+    "existing_test"
+   ],
+   "executions": {
+    "a1c98fc2bafd4775aa05275dd25f2767": [
+     25,
+     26,
+     27,
+     29,
+     30
+    ]
+   },
+   "conclusion": "violated",
+   "defect_claim": "asserted",
+   "rationale": "Receipt a1c98fc2bafd4775aa05275dd25f2767 (completed, exit 0, TestAssuranceRestoreCommittedLogsContext passed, 31 parsed events) answers the repair gap with a live cluster and extends the divergence to the follower role. Reconstruction under a live leader: comparison 0 is violated with a valid witness at parsed index 26, where the restarted follower's latest configuration held no servers at all while its own log's configuration entry at index 103 has two voters, its leader stayed in Leader state and the follower's own log already matched (follower_last_log_index 113, follower_last_applied 110, snapshot_count 0 in the inputs event at parsed index 25); comparison 1 holds at parsed index 29, where the same shape with the flag disabled held latest_config_index 103 with two voters. Repair: comparison 2 holds at parsed index 27, where the configuration entry the leader appended afterwards (new entry index 114) became the follower's configuration with three voters, and comparison 3 holds at parsed index 30 for the same repair in the control. The account is therefore that the wrong configuration is not transient noise under a healthy leader: it is what the node keeps using until a configuration entry is appended or a snapshot is installed, and ordinary AppendEntries neither rewrites nor repairs it [append_new, cfg_entry]. This joins the previously recorded results, which remain as independent support under their own receipts: reconstruction in both directions and across ladders with an identified snapshot origin (receipts 63d4401225884bdd9c75fbe580336c63 and faa52ef8ac8a422aa26e12582959eda1), leadership acquired with no election request and a commit completed while the other committed voter was stopped, and a client-acknowledged commit resting on one of three committed voters (receipt c7938884cd87410eb02432e32dc092ce). Remaining uncertainty is now narrow: the vote path of a node whose reconstruction is empty has not been exercised, and whether it still enforces the membership and voter gates is the current discriminator; disk-backed stores and crash semantics remain outside the exercised scope.",
+   "answers": {
+    "2708fe4120de4b7b945ec449b641cfed-gap-0": {
+     "explanation": "No enabled path repairs the reconstruction without a later membership change when the follower's log already matches the leader's. Executed: the empty reconstruction persisted through 400 ms of a live Leader-state leader replicating to an up-to-date follower (parsed indices 25 and 26), because a follower re-derives its configuration only from entries an AppendEntries newly appends [append_new]; the configuration entry the leader appended afterwards did repair it (parsed index 27, new entry index 114 with three voters). Source-only boundary: an installed snapshot also rewrites both configurations, but it is only sent when the leader cannot serve the follower's previous log entry, which is not this shape [install_snapshot_cfg].",
+     "resolved": true
+    }
+   },
+   "counterevidence": [
+    "The feature's documented purpose is replaying known-committed logs into the FSM; nothing in the sources makes skipping committed configuration entries a required behaviour, and the existing TestRaft_RestoreCommittedLogs asserts only applied index, tracked commit index and log indices, so it neither exercises nor contradicts the configuration reconstruction.",
+    "Competing explanation that the flag's committed-log replay itself, rather than the skipped configuration entry, produces the divergence: excluded by the within-flag case whose configuration entry lies above the replayed prefix and by the flag-disabled controls in every receipt, which hold the published configuration and refuse the same decisions.",
+    "The live-cluster observation window is 400 ms and single-shot; the mechanism has no time dependence (duplicate entries are skipped without limit), but a longer or repeated observation is not exercised."
+   ],
+   "limitations": [
+    "Single process with in-memory stores; the follower shape uses one restarted follower and a leader that keeps leading, and no crash or network fault is injected.",
+    "The vote path of an empty reconstruction, the durability failure under disk-backed stores, and multi-member committed configurations with several restarted followers are still not exercised.",
+    "The repair observed here is one configuration entry appended immediately after the observation; no claim follows about how long the wrong context can persist in other shapes.",
+    "The bounded observations remain single-shot windows (400 ms here, 3000 ms for leadership and 1000-1500 ms for commits elsewhere) and are not liveness or durability proofs."
+   ]
+  }
+ ]
+}

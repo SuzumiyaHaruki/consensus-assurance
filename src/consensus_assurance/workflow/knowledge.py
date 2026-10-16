@@ -188,8 +188,24 @@ def validate_receipt_references(state, knowledge, interpretations, aliases):
             target_receipt(state, id, owner_id=owner.id, experiment_id=change.experiment_id,
                            joint_history=change.joint_history, path=f'/interpretations/{number}/executions')
         if change.experiment_id:
-            if artifact(state, change.experiment_id).investigation_id != owner.id:
-                raise ValueError('Interpretation must identify its investigation and fixed experiment')
+            fixed = artifact(state, change.experiment_id)
+            if fixed.investigation_id != owner.id:
+                raise DiagnosticError([Diagnostic(code='interpretation_experiment', category='association',
+                    object_ids=[owner.id, fixed.id, fixed.investigation_id],
+                    paths=[f'/interpretations/{number}/investigation_id', f'/interpretations/{number}/experiment_id'],
+                    details={'submitted_investigation_id':change.investigation_id, 'investigation_id':owner.id,
+                        'experiment_id':fixed.id, 'experiment_investigation_id':fixed.investigation_id,
+                        'conclusion':change.conclusion,
+                        'experiment_record':{'path':'state.json', 'collection':'experiments', 'id':fixed.id},
+                        'owner_record':{'path':'state.json', 'collection':'investigations', 'id':fixed.investigation_id},
+                        'navigation':'research.json'},
+                    message=f'/interpretations/{number}/experiment_id: fixed experiment {fixed.id!r} belongs to '
+                        f'investigation {fixed.investigation_id!r}, but this Interpretation identifies {owner.id!r}. '
+                        'An experiment-bound Interpretation must identify that owning investigation and cite the '
+                        "experiment's actual receipt. To retain this question while reusing receipts, omit experiment_id "
+                        'and use conclusion explained, conditional, or unresolved, retaining actual execution citations '
+                        'and applicable joint_history reasoning. joint_history does not change experiment ownership; '
+                        'defect_claim remains an independent scoped judgment. Inspect state.json or research.json.')])
             if not any(c.experiment_id == change.experiment_id and c.id in change.executions for c in state.checks):
                 raise ValueError('When experiment_id is set, cite an actual execution of that fixed experiment; '
                     'omit it for a question-level explained/conditional/unresolved account reusing applicable receipts')

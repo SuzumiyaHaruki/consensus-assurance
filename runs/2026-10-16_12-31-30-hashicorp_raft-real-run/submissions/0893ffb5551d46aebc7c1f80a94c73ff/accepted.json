@@ -1,0 +1,124 @@
+{
+  "rationale": "Recorded the account for receipt 2996ef7e45d946e3bbd6ad696be91ed3, which observes what a healed partition leaves behind: comparison 0 holds at parsed index 49 because the cluster converged on a single leader, but comparison 1 is violated at the same index because both divergent committed entries were still present, each on its own side, while the flag-disabled control holds at parsed index 52 with a single entry. The duplicate-skip behaviour now cites the receipt as the case where entries at the same index and term with different content are both retained, a fact was added for the observation, and the limitation that a healed partition was unexercised is withdrawn.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "2708fe4120de4b7b945ec449b641cfed-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "Every consequence in this account is exercised, including what a healed partition leaves behind, and the strongest one has been reproduced. What remains outside is the surrounding fault and storage model: a disk-backed commit-tracking store, crash and restart timing, and further repetitions or longer runs. Those are recorded as limitations rather than as open questions.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": "2708fe4120de4b7b945ec449b641cfed-knowledge-3",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "appendEntries processes configuration entries only for the entries it newly appends; entries already present at the same index and term are skipped, so ordinary replication from a healthy leader does not re-derive the configuration of a follower whose log already matches.",
+      "conditions": "Follower handling a normal AppendEntries whose entries are duplicates of its own log; entries that are in the leader's compacted prefix instead arrive as an InstallSnapshot, which rewrites both configurations from the snapshot metadata. The same index-and-term comparison decides log conflicts: receipt 2996ef7e45d946e3bbd6ad696be91ed3 shows two entries at the same index and term with different content both surviving, because neither side treats the other's entry as a conflict.",
+      "source_ids": [
+        "append_new",
+        "install_snapshot_cfg"
+      ],
+      "executions": {
+        "a1c98fc2bafd4775aa05275dd25f2767": [
+          25,
+          26,
+          27
+        ],
+        "2996ef7e45d946e3bbd6ad696be91ed3": [
+          48,
+          49
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@divergent_entries_survive_healing",
+      "kind": "fact",
+      "statement": "In the retained healed-partition execution the cluster converged on leadership but not on content: after the connections were restored it held exactly one leader (leaders_after_heal 1, the restarted side a follower at term 4, parsed index 49), yet both divergent committed entries were still present, the restarted side's own entry in its store and the other side's entry in theirs (first_entry_survives true, second_entry_survives true, entries_surviving 2), while the flag-disabled control ended with the single entry that had been committed there (entries_surviving 1 at parsed index 52). The two entries had been written at the same index while both sides held the same term, so each side's AppendEntries treats the other's entry as a duplicate rather than a conflict.",
+      "conditions": "The two sides of the partition case had each led and committed one uniquely named entry, as recorded by the split_result event at parsed index 48 of the same run; healing reconnects the restarted side and the two peers in both directions with the transport's Connect, waits twice the 800 ms election window and then searches each store for the two payload strings. The observation covers log-store contents only; the state machines of the two sides were not compared.",
+      "source_ids": [
+        "append_new",
+        "cfg_entry",
+        "candidate_quorum",
+        "quorum_size",
+        "leader_commitment"
+      ],
+      "executions": {
+        "2996ef7e45d946e3bbd6ad696be91ed3": [
+          47,
+          48,
+          49,
+          50,
+          51,
+          52
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "2708fe4120de4b7b945ec449b641cfed-question-0",
+      "experiment_id": "871eaf86d20146fa946e6317c14309cd-experiment",
+      "source_ids": [
+        "scan_start",
+        "restore_lastapplied",
+        "cfg_entry",
+        "append_new",
+        "follower_gate",
+        "candidate_quorum",
+        "quorum_size",
+        "leader_commitment",
+        "commitment_impl",
+        "inmem_ct",
+        "test_opts"
+      ],
+      "executions": {
+        "2996ef7e45d946e3bbd6ad696be91ed3": [
+          47,
+          48,
+          49,
+          50,
+          51,
+          52
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Receipt 2996ef7e45d946e3bbd6ad696be91ed3 (completed, exit 0, TestAssuranceRestoreCommittedLogsContext passed, 53 parsed events) adds the end state of the split. Its split_result events reproduce the partition outcome of the two earlier receipts (both sides leading in the same term with no cross-side entry at parsed index 48), and its split_healed event at parsed index 49 shows the cluster converging on one leader — comparison 0 holds there — while both divergent committed entries remain in the cluster, the restarted side's entry in its own store and the other side's in theirs, so comparison 1 is violated (entries_surviving 2); comparison 2 holds at parsed index 52 for the control, where only the single entry committed there exists. The source explains why convergence of leadership does not reconcile content: AppendEntries matches stored entries at the same index by term only, and the two leaders wrote different content at the same index while both held the same term, so each side treats the other's entry as a duplicate and never truncates it [append_new]. The account is therefore complete for the exercised scope, each consequence under its own receipts: the startup reconstruction diverges from the node's own log because the configuration scan starts above max(lastSnapshotIndex, lastApplied) after restoreFromCommittedLogs advanced lastApplied to the tracked commit index [scan_start, restore_lastapplied, cfg_entry]; that context persists under a live healthy leader until a configuration entry is appended; and it produces bounded non-progress, leadership and commits resting on a minority of the committed configuration, a client-acknowledged commit that rests on one copy or is discarded entirely, votes and leadership granted without entitlement, a client membership change that replaces the committed configuration with support that is not its majority, two leaders in the same term under a partition, and — after that partition is healed — a single leader with two divergent committed histories still in place. What the healing receipt does not establish is what the two state machines hold or how an application would detect the divergence; only log-store contents were observed.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The feature's documented purpose is replaying known-committed logs into the FSM; nothing in the sources makes skipping committed configuration entries a required behaviour, and the existing TestRaft_RestoreCommittedLogs asserts only applied index, tracked commit index and log indices, so it neither exercises nor contradicts the configuration reconstruction.",
+        "Competing explanation that the flag's committed-log replay itself, rather than the skipped configuration entry, produces these effects: excluded wherever tested, by the within-flag case whose configuration entry lies above the replayed prefix and by the flag-disabled controls in every receipt, which hold the published configuration and refuse the same requests, decisions, changes and leadership.",
+        "Each consequence needs its stated conditions, and the healed observation is a consequence of the conditions being met earlier: the partition must have produced two leaders in one term, which in turn needs the two sides physically separated and the restarted side able to reach a quorum of its own reconstruction.",
+        "The healed observation window is 1600 ms and covers log stores only; a later snapshot transfer, a further election or an application-level reconciliation could change the end state, and no such path was exercised."
+      ],
+      "limitations": [
+        "Single process with in-memory transports and in-memory commit-tracking stores, no crash injection, no disk-backed store and no network fault model beyond the transport's own Disconnect and Connect.",
+        "Single-shot windows (200-1600 ms depending on the case, 3000 ms for leadership, 1000-1500 ms for commits) and one or two restarted instances per case; the partition outcome is reproduced twice, but no rate, longer-run or long-stability claim follows.",
+        "The healed state is described by log-store contents and leadership only; the two state machines, any subsequent snapshot or further election, and detection or repair by an application are unexercised.",
+        "The reconstruction shapes beyond the five exercised ladders, other stores and other configuration flags were not varied; the LogCache entries record a separate startup-plumbing gap rather than a consensus consequence."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

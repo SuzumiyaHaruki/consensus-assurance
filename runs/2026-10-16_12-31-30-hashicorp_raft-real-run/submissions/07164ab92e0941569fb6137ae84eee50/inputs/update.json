@@ -1,0 +1,156 @@
+{
+ "rationale": "Registered the successor execution that tests the registered repair gap with a live cluster: the harness adds a follower_in_live_cluster case in which one follower of a three-voter cluster is removed-from-configuration ladder is not needed — instead the leader removes one peer, keeps leading and replicating, and only the other follower is restarted. The restarted follower is observed after 400 ms of ordinary replication from the still-leading leader, and then the leader appends a new configuration entry so the same follower can be observed again. Construction-time local feedback: with the flag enabled the follower was up to date (last log index 113) yet held no configuration at all (latest_config_index 0, no servers) while its own log's configuration entry at index 103 has two voters, and the later configuration entry at index 114 repaired it; with the flag disabled the same follower reconstructed the two-voter configuration and was also repaired by that entry.",
+ "experiment": {
+  "investigation_id": "2708fe4120de4b7b945ec449b641cfed-question-0",
+  "previous_id": "4029778b95df48e48d3c0e5d2944996a-experiment",
+  "revision_reason": "Adds the follower_in_live_cluster case with its flag-disabled control: with a live leading leader and a leader-side RemoveServer committed beforehand, only the remaining follower is restarted, observed after ordinary replication, and then observed again after the leader appends a new configuration entry. Replaces the comparison set with this case's reconstruction and repair predicates.",
+  "harness_path": "assurance_generated_test.go",
+  "execution_package": ".",
+  "test_names": [
+   "TestAssuranceRestoreCommittedLogsContext"
+  ],
+  "source_ids": [
+   "scan_start",
+   "restore_lastapplied",
+   "snapshot_cfg",
+   "cfg_entry",
+   "append_new",
+   "follower_gate",
+   "install_snapshot_cfg",
+   "restore_doc",
+   "ct_contract",
+   "inmem_ct",
+   "test_opts"
+  ],
+  "scope": {
+   "description": "Whether ordinary replication from a healthy leader repairs a restarted follower's reconstructed configuration, and whether a later configuration entry does. Eleven in-process cases: the nine previously exercised restart shapes plus a follower_in_live_cluster case run with RestoreCommittedLogs enabled and disabled. In that case a three-peer cluster removes one peer while keeping three entries of history, the remaining follower is stopped and restarted while the leader keeps leading and replicating, the follower is observed after 400 ms, and the leader then re-adds the removed peer as a new configuration entry and the follower is observed again.",
+   "assumptions": [
+    "Real raft instances in one process over the in-memory transport and the in-memory commit-tracking log store from the captured package; the restarted follower is reconnected to the live leader in both directions.",
+    "The restarted follower has no snapshot of its own (snapshot_count 0) and its log already matches the leader's for every entry the leader holds, so no snapshot is shipped and no configuration entry is newly appended before the observation.",
+    "The leader stays live and healthy throughout, is in Leader state when the follower is observed, and the new configuration entry is appended by that same leader afterwards.",
+    "The observation and repair windows are 400 ms each; the follower's last log index and last applied index are emitted as operands."
+   ],
+   "excluded": [
+    "Disk-backed stores, real networks, restarts of more than one member, membership changes between the two observation points other than the single re-add, and any claim about the follower's behaviour while no leader is reachable."
+   ],
+   "parameters": {
+    "wait_millis": 400,
+    "applied_commands": 100,
+    "post_remove_applies": 10,
+    "peers": 3
+   }
+  },
+  "prefix": "The new case builds a three-peer cluster with MakeClusterCustom(MakeClusterOpts{Peers: 3, Bootstrap: true, CommitTrackingLogs: true, Conf: inmemConfig with TrailingLogs 10 and RestoreCommittedLogs set per case}), applies 100 commands, calls leader.RemoveServer on one peer, applies ten more entries, and reads the remaining follower's own log configuration entry and tracked commit index plus its snapshot list before stopping only that follower. It emits a follower_inputs CA_EVENT, rebuilds the follower over its own stores on the same address with a fresh in-memory transport reconnected to the live leader in both directions, waits 400 ms, and emits a follower_observation CA_EVENT with the follower's reconstructed configuration index, voter count and server set, its last log and applied indexes, its own log's configuration entry, the leader's state and the leader's configuration. It then calls leader.AddVoter for the removed peer, reads the leader's new configuration index, waits 400 ms and emits a follower_repair CA_EVENT with the new entry index, the follower's reconstructed configuration and the derived repaired flag whose operands are the two indexes and the voter count.",
+  "responsibility": "NewRaft owns the reconstruction of a node's own configuration from its durable stores, and on a follower that configuration is only rewritten by processing a newly appended configuration entry (or an installed snapshot); the leader's ordinary AppendEntries replication is not responsible for re-deriving it.",
+  "prerequisites": [
+   {
+    "alias": "state",
+    "event": "follower_inputs",
+    "conditions": [
+     {
+      "field": "snapshot_count",
+      "value": 0
+     },
+     {
+      "field": "leader_was_running",
+      "value": true
+     }
+    ]
+   }
+  ],
+  "comparisons": [
+   {
+    "event": "follower_observation",
+    "identity_fields": [
+     "scenario",
+     "restore_committed_logs"
+    ],
+    "admission_alias": "state",
+    "assertion": {
+     "field": "latest_config_voters",
+     "reference": "state.log_config_voters"
+    },
+    "applicability_conditions": [
+     {
+      "field": "scenario",
+      "value": "follower_in_live_cluster"
+     },
+     {
+      "field": "restore_committed_logs",
+      "value": true
+     }
+    ],
+    "description": "Live-cluster case with the flag enabled: after 400 ms of replication from a leading leader, the follower's reconstructed voter count is compared with the voter count of the configuration entry in its own log."
+   },
+   {
+    "event": "follower_observation",
+    "identity_fields": [
+     "scenario",
+     "restore_committed_logs"
+    ],
+    "admission_alias": "state",
+    "assertion": {
+     "field": "latest_config_voters",
+     "reference": "state.log_config_voters"
+    },
+    "applicability_conditions": [
+     {
+      "field": "scenario",
+      "value": "follower_in_live_cluster"
+     },
+     {
+      "field": "restore_committed_logs",
+      "value": false
+     }
+    ],
+    "description": "Control: with the flag disabled the same restarted follower holds the configuration entry's own voter count under the same live leader."
+   },
+   {
+    "event": "follower_repair",
+    "identity_fields": [
+     "scenario",
+     "restore_committed_logs"
+    ],
+    "admission_alias": "state",
+    "assertion": {
+     "field": "repaired",
+     "value": true
+    },
+    "applicability_conditions": [
+     {
+      "field": "scenario",
+      "value": "follower_in_live_cluster"
+     },
+     {
+      "field": "restore_committed_logs",
+      "value": true
+     }
+    ],
+    "description": "Live-cluster case with the flag enabled: the configuration entry appended afterwards is expected to rewrite the follower's configuration to the new entry index and voter count."
+   },
+   {
+    "event": "follower_repair",
+    "identity_fields": [
+     "scenario",
+     "restore_committed_logs"
+    ],
+    "admission_alias": "state",
+    "assertion": {
+     "field": "repaired",
+     "value": true
+    },
+    "applicability_conditions": [
+     {
+      "field": "scenario",
+      "value": "follower_in_live_cluster"
+     },
+     {
+      "field": "restore_committed_logs",
+      "value": false
+     }
+    ],
+    "description": "Control: the same appended configuration entry leaves the flag-disabled follower on the new entry index and voter count as well."
+   }
+  ]
+ }
+}

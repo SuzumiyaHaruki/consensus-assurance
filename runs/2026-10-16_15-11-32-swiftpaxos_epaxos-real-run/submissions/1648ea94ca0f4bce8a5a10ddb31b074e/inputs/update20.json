@@ -1,0 +1,339 @@
+{
+  "rationale": "Interpreted the non-owner boundary receipt and corrected the alias ambiguity that left its control comparison unknown; a successor execution with round-pinned aliases is requested. The recovery-authority account now states the measured boundary (fixed ballot below the stored ballot is rejected inertly, above it advances), and both supporting behaviors cite the boundary receipt.",
+  "knowledge": [
+    {
+      "id": "a92a355fb0ca4aa7a0b62580ea79f7fa-knowledge-0",
+      "kind": "behavior",
+      "statement": "In handlePrepareReply a reply whose Ballot differs from lb.lastTriedBallot increments lb.nacks and returns before the reply is appended to lb.prepareReplies, and the sub-case dispatch is guarded by len(lb.prepareReplies) >= SlowQuorumSize(); the only repair on the nack path (makeBallot plus a fresh bcastPrepare) is executed only while r.IsLeader is true. When every answering peer reports a stored ballot above the tried ballot, the appended count stays at the recovering replica's own self reply, so no sub-case is selected and no PreAccept, Accept or Commit is emitted for that attempt.",
+      "conditions": "Recovery where the replicas that answer the Prepare have a stored bal above the recovering replica's fixed tried ballot, so every answer is a rejection rather than a matching-ballot reply (epaxos/epaxos.go:1204-1235, with epaxos/epaxos.go:439-451 and 1216-1235).",
+      "source_ids": [
+        "s-decl-prepare-reply",
+        "s-makeballot",
+        "s-isleader-default",
+        "s-betheleader"
+      ],
+      "executions": {
+        "911d45335b3047178a6fd739f24b2cfb": [
+          17,
+          18,
+          19,
+          20,
+          23,
+          24,
+          25,
+          28,
+          29,
+          30,
+          31
+        ],
+        "c68b6de1442e45ffa00ddaf4df9b32e6": [
+          12,
+          17
+        ]
+      }
+    },
+    {
+      "id": "a92a355fb0ca4aa7a0b62580ea79f7fa-knowledge-1",
+      "kind": "behavior",
+      "statement": "makeBallot assigns the instance owner the ballot equal to its own replica id and any other recovering replica id+N, and advances it in steps of N only while r.IsLeader is true and the candidate is below maxRecvBallot; epaxos.New hardcodes IsLeader false and only the exported BeTheLeader RPC sets it, which the master invokes for the replica it designates. Repeating startRecoveryForInstance without that flag therefore reuses the identical ballot, whereas after the flag is set the same call emits a ballot above maxRecvBallot. For a non-owner, the boundary is the comparison between its fixed id+N ballot and the ballot the accepting peers have stored: id+N below that value is rejected exactly as the owner's ballot is, while id+N above it is joined by the peers and the attempt advances.",
+      "conditions": "Any startRecoveryForInstance call in the captured snapshot, including repeat calls from executeCommands after COMMIT_GRACE_PERIOD (epaxos/epaxos.go:439-451, 1127-1150, 149-165, 1121-1125).",
+      "source_ids": [
+        "s-makeballot",
+        "s-decl-recovery",
+        "s-isleader-default",
+        "s-betheleader",
+        "s-decl-prepare-reply"
+      ],
+      "executions": {
+        "911d45335b3047178a6fd739f24b2cfb": [
+          16,
+          20,
+          21,
+          25,
+          26,
+          27,
+          31
+        ],
+        "c68b6de1442e45ffa00ddaf4df9b32e6": [
+          8,
+          12,
+          14,
+          17
+        ]
+      }
+    }
+  ],
+  "experiment": {
+    "investigation_id": "f47677cc0dd94647aa374fc84b1e6b8e-question-1",
+    "harness_path": "epaxos/assurance_generated_test.go",
+    "execution_package": "./epaxos",
+    "test_names": [
+      "TestAssuranceEPaxosRecoveryBallotNonOwnerBoundary"
+    ],
+    "anchors": [
+      {
+        "material_id": "s-decl-recovery",
+        "symbol": "startRecoveryForInstance",
+        "start_line": 1127,
+        "end_line": 1141
+      },
+      {
+        "material_id": "s-decl-prepare-reply",
+        "symbol": "handlePrepareReply",
+        "start_line": 1204,
+        "end_line": 1235
+      }
+    ],
+    "source_ids": [
+      "s-makeballot",
+      "s-decl-recovery",
+      "s-decl-prepare-reply",
+      "s-isleader-default",
+      "s-betheleader",
+      "s-exec-recovery-trigger"
+    ],
+    "scope": {
+      "description": "Same 5-replica harness as the recovery-ballot experiment. Owner replica 0 proposes X on instance (0,0) and enters the Accept phase at ballot 0 towards replicas 2 and 3 (replica 1's non-equal reply is delivered first and replica 1 then fails); replica 0's AcceptReplies are left in flight; replica 2 then recovers the instance at its own ballot 7, so the accepting peers store bal 7, and replica 2 fails after broadcasting that Prepare. Two further recovery attempts are then made at replica 1 and replica 3, whose fixed ballots for a non-owned instance are 6 and 8 respectively, and each attempt's Prepare/PrepareReply traffic and follow-up messages are recorded.",
+      "assumptions": [
+        "Same construction, transport boundary and crash model as the value-adoption and recovery-ballot experiments; in-process replicas, marshaled RPC structs decoded per delivery, FIFO per link, no delivery to crashed replicas.",
+        "The two recoverers hold the instance (replica 1 pre-accepted X and answered the owner's Prepare; replica 3 received the owner's Accept), which is what lets their executors act on it.",
+        "No production logic is modified; IsLeader stays false for both recoverers."
+      ],
+      "excluded": [
+        "No client path, no state-machine execution, no run() loop or recovery timer loop in the harness."
+      ],
+      "parameters": {
+        "n": 5,
+        "f": 2,
+        "owner": 0,
+        "first_recoverer": 2,
+        "below_recoverer": 1,
+        "above_recoverer": 3,
+        "stored_ballot": 7,
+        "non_owner_ballots": [
+          6,
+          8
+        ]
+      }
+    },
+    "prefix": "The harness drives the owner's proposal and accept phase through the target's own path, delivers replica 2's higher-ballot Prepare so the peers store bal 7 and then fails replica 2, and finally calls startRecoveryForInstance(0,0) first at replica 1 and then at replica 3, delivering each attempt's Prepare/PrepareReply traffic through handlePrepare/handlePrepareReply and recording tried, matching and follow-up messages.",
+    "requirement": "Recovery must be attainable by any replica that holds the instance: a recovering replica whose fixed ballot is below the ballot the accepting peers have stored must still be able to advance the instance, either by a prepared quorum and a sub-case dispatch or by a later attempt using a ballot above the stored one.",
+    "responsibility": "The target's own ballot policy (epaxos/epaxos.go:439-451 makeBallot) and its rejection handling (epaxos/epaxos.go:1204-1235 handlePrepareReply): the peers answer honestly with the ballot they stored and the recoverers are ordinary replicas.",
+    "prerequisites": [
+      {
+        "alias": "owner-accepted",
+        "event": "instance_state",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 0
+          },
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_preaccept_replies"
+          },
+          {
+            "field": "status",
+            "op": "eq",
+            "value": 3
+          },
+          {
+            "field": "cmd_op",
+            "op": "eq",
+            "value": 1
+          }
+        ]
+      },
+      {
+        "alias": "peers-store-high-ballot",
+        "event": "instance_state",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 3
+          },
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_high_ballot_prepare"
+          },
+          {
+            "field": "bal",
+            "op": "eq",
+            "value": 7
+          }
+        ]
+      },
+      {
+        "alias": "round-start-below",
+        "event": "round_start",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "stored_bal_before_attempt",
+            "op": "eq",
+            "value": 7
+          }
+        ]
+      },
+      {
+        "alias": "round-start-above",
+        "event": "round_start",
+        "conditions": [
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 3
+          },
+          {
+            "field": "round",
+            "op": "eq",
+            "value": 2
+          },
+          {
+            "field": "stored_bal_before_attempt",
+            "op": "eq",
+            "value": 7
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "recovery_attempt",
+        "identity_fields": [
+          "replica",
+          "instance_row",
+          "instance_index",
+          "round"
+        ],
+        "admission_alias": "round-start-below",
+        "assertion": {
+          "field": "recovery_advanced",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "stored_bal_before_attempt",
+            "op": "eq",
+            "value": 7
+          },
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "A non-owner recoverer whose fixed ballot (6) is below the peers' stored ballot (7) still advances the instance: no matching reply and no follow-up message means the attempt is inert; violated in this configuration."
+      },
+      {
+        "event": "recovery_attempt",
+        "identity_fields": [
+          "replica",
+          "instance_row",
+          "instance_index",
+          "round"
+        ],
+        "admission_alias": "round-start-above",
+        "assertion": {
+          "field": "recovery_advanced",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "stored_bal_before_attempt",
+            "op": "eq",
+            "value": 7
+          },
+          {
+            "field": "replica",
+            "op": "eq",
+            "value": 3
+          }
+        ],
+        "description": "Control: a non-owner recoverer whose fixed ballot (8) is above the peers' stored ballot (7) produces matching replies and dispatches its phase-1 proposal; expected to hold, locating the boundary at the comparison between the recoverer's fixed ballot and the stored ballot."
+      }
+    ],
+    "previous_id": "43b9bbefd939404e9ad77b1e71564e2d-experiment",
+    "revision_reason": "Pinned each round-start prerequisite to its round: both aliases previously carried only the stored-ballot condition, so both round_start events satisfied both aliases and the completion/dispatch correlations were ambiguous. The harness, scenario and the compared fields are unchanged."
+  },
+  "interpretations": [
+    {
+      "investigation_id": "f47677cc0dd94647aa374fc84b1e6b8e-question-1",
+      "experiment_id": "adfa9c6d31ca481896e5ca1277f6cdf4-experiment",
+      "source_ids": [
+        "s-makeballot",
+        "s-decl-recovery",
+        "s-decl-prepare-reply",
+        "s-isleader-default",
+        "s-betheleader",
+        "s-exec-recovery-trigger"
+      ],
+      "executions": {
+        "911d45335b3047178a6fd739f24b2cfb": [
+          0,
+          2,
+          3,
+          4,
+          5,
+          6,
+          10,
+          11,
+          15,
+          16,
+          17,
+          20,
+          21,
+          23,
+          25,
+          26,
+          27,
+          28,
+          31,
+          32,
+          33,
+          34,
+          35
+        ],
+        "c68b6de1442e45ffa00ddaf4df9b32e6": [
+          8,
+          12,
+          14,
+          17,
+          19,
+          20
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current account: recovery authority in the captured EPaxos package is bounded by the recovering replica's fixed ballot, and the boundary is now measured for both the instance owner and a non-owner. Owner case (receipt 911d45335b3047178a6fd739f24b2cfb, fixed experiment adfa9c6d31ca481896e5ca1277f6cdf4-experiment): two attempts at ballot 0 against peers storing 7 append only the self reply, dispatch nothing and emit no follow-up (comparisons 0 and 1 violated, witnesses 20 and 25), while the same call after the target's own BeTheLeader uses ballot 10, matches the peers and completes the instance (control comparisons 2 and 3 hold, evaluated 31 and 32). Non-owner boundary (receipt c68b6de1442e45ffa00ddaf4df9b32e6, fixed experiment 43b9bbefd939404e9ad77b1e71564e2d-experiment, 23 parsed events): with the same premise (peers storing bal 7), the attempt by replica 1 whose fixed ballot is 6 produces no matching reply, dispatches nothing and emits no follow-up (comparison 0 violated, witness 12), whereas the attempt by replica 3 whose fixed ballot is 8 is joined by the peers, matches two replies and dispatches its phase-1 proposal (follow_up [preaccept, preaccept]) - so the gate bites exactly when the recoverer's fixed ballot is below the stored one, and not otherwise. That receipt's control comparison came back unknown because both round-start prerequisite aliases carried only the stored-ballot condition and therefore matched both rounds' round_start events; the events themselves are consistent, and a successor execution with the aliases pinned to their rounds is requested in this update. No repair exists inside the snapshot for the blocked case: makeBallot's climb is gated on IsLeader, and the nack path's makeBallot-plus-prepare repair is likewise gated on it.",
+      "counterevidence": [
+        "The gate is a boundary, not a blanket inability: the control in the owner receipt and the above-ballot round in the boundary receipt both show the same instance advancing when the recoverer's ballot exceeds the stored one, so replicas whose fixed ballot is above the stored ballot (id+N > stored) are unaffected.",
+        "The peers' answers are legitimate protocol behaviour: each reports the ballot it stored, and the rejected tries were genuinely below it, so the rejections do not themselves violate a peer duty.",
+        "The blocked state requires a stored ballot above the recoverer's fixed ballot; in both receipts it came from a recovery attempt that failed after broadcasting its Prepare, which is a permitted failure but a specific one.",
+        "The recoverers that hold the instance without its command cannot substitute another path: their only entry point is startRecoveryForInstance, whose prepare uses makeBallot's fixed ballot."
+      ],
+      "limitations": [
+        "One configuration (N=5, F=2, instance (0,0)) with the stored ballot fixed at 7; the boundary was exercised at fixed ballots 0, 6 and 8, so an intermediate stored ballot and higher ballot rounds (id+2N and beyond) were not exercised.",
+        "The harness invoked startRecoveryForInstance directly instead of waiting for the executor's COMMIT_GRACE_PERIOD retry (epaxos/epaxos.go:404-417) and scheduled all deliveries explicitly, so the retry cadence and transport timing are modelled.",
+        "The boundary receipt's control comparison is pending the corrected-alias successor; until it lands, the above-ballot round's advance rests on its parsed events (matching replies and follow_up messages) rather than on a declared comparison outcome.",
+        "The premise that the accepting peers store the higher ballot was produced by failing replica 2 after its Prepare broadcast; a real deployment could reach it through the same permitted failure or through a slower/lost reply path, which was not exercised."
+      ],
+      "joint_history": "Indices 0-6, 10, 11, 15-17, 20, 21, 23-28 and 31-35 belong to receipt 911d45335b3047178a6fd739f24b2cfb (owner-recoverer run, instance (0,0)); indices 8, 12, 14, 17, 19 and 20 belong to receipt c68b6de1442e45ffa00ddaf4df9b32e6 (non-owner boundary run, same instance (0,0) and same scenario). Each statement names its receipt; no measurement is combined across executions."
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "rationale": "The identity probe executed and its parsed observation shows the completion endpoint reporting Ok(idx) for an index occupied by another entry, so the new question gets its first account; a revision of the same probe is requested so a receipt without parse loss can carry the formal support.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+      "experiment_id": "dcb373d7a7c843d981030cdf4ec8d37a-experiment",
+      "source_ids": [
+        "src_drain_notifiers_timeout",
+        "src_append_notify_contract",
+        "src_superseded_doc",
+        "src_subscribe_events",
+        "src_append_notify_contract"
+      ],
+      "executions": {
+        "bd165f9c43d94a7c9b57791a1979c00b": [
+          1
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Current account. Source: drain_notifiers resolves a pending call by matching the recorded assignment in the order `Some((idx, _)) if idx <= decided` first and `Some((idx, ballot)) if ballot < cur_ballot` second (actor.rs:201-222), i.e. as soon as the node's decided index covers the index the call was assigned, the call resolves Ok(idx) without checking that the entry at that index is the one the call submitted; the Superseded arm exists for the leadership-change case and its own documentation admits the entry may still be lost (event.rs:45-60), while the Ok contract is to await the entry's decided log index (handle.rs:114-137). Execution bd165f9c43d94a7c9b57791a1979c00b (experiment dcb373d7a7c843d981030cdf4ec8d37a-experiment, exit 0, its single test passed) ran the construction and parsed event 1 `overwritten_index_resolution`: {a_decided_idx: 1, a_entry_at_index_1_is_own: false, b_decided_idx: 1, b_idx: 1, resolution: \"Ok(1)\"}. Read operand-by-operand: node 1's call for its own entry resolved Ok(1) (resolution \"Ok(1)\"), node 1's decided index was 1 (a_decided_idx 1), the entry at index 1 on node 1 was NOT the entry that call submitted (a_entry_at_index_1_is_own false), and the entry that actually occupies index 1 is node 2's, which node 2's own call got assigned the same index for (b_idx 1, b_decided_idx 1). So the declared comparison holds: the completion endpoint reported success at an index whose decided entry is a different entry, and the Superseded heuristic written for that leadership change never fired because the index-based arm is matched first. The remaining premise the construction supplies rather than assumes: node 1 really held its own entry at index 1 before being re-synchronized (the harness reads it back as Undecided at that point) and node 2's log was empty when it took over (node 1 was isolated in both directions so its entry could not be adopted); both are harness-side preconditions of the interleaving, not target behaviors. Formal support is withheld for one reason: this receipt has parsing_error_count 1 - the companion `after_b_takeover` line rendered Rust's `{:?}` of Option<(u64,bool)>, which is not JSON, and was recorded as invalid_observation at event index 0 - so the account is 'explained' rather than a citation-backed 'holds' until the revised emission is executed; event 0 is deliberately not cited. Counter-limitations kept in force: (a) the interleaving is constructed, not sampled, and its frequency in a deployment is not measured; (b) the call is only wrong if the caller treats Ok(idx) as 'my entry is decided at idx', which is what the handle documentation and the crate's own usage example state ('durably decided at log idx'); the actor cannot verify identity here because Entry is only Clone + Debug, so the fix would have to keep the index-based success arm honest by another means (e.g. reporting Superseded whenever the assignment's ballot is no longer current) rather than by comparing values; (c) the case needs the assigned index to be overwritten while the call is still pending, which requires the caller's entry not to be replicated and a leader change before the deadline.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [],
+      "limitations": [
+        "The receipt records a parse loss (event 0, the companion state line, was emitted with Rust's `{:?}` and is not cited); the formal support citation is limited to event index 1.",
+        "The overwritten-index interleaving is constructed deliberately; nothing is claimed about how likely it is in a deployment.",
+        "Whether Ok(idx) must mean 'the submitted entry is decided at idx' is a contract reading: the handle documentation and the example say so ('durably decided at log idx'), but the actor cannot compare entry values (Entry is only Clone + Debug)."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "dcb373d7a7c843d981030cdf4ec8d37a-question-0",
+    "harness_path": "identity_probe.rs",
+    "files": {},
+    "execution_package": "omnipaxos_runtime",
+    "test_names": null,
+    "source_ids": [
+      "src_drain_notifiers_timeout",
+      "src_append_notify_contract",
+      "src_superseded_doc",
+      "src_detect_events",
+      "src_run_loop"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Focused construction of one completion-endpoint identity case: an assigned index that is decided while the entry originally assigned to it was overwritten.",
+      "assumptions": [
+        "3 nodes, majority quorum, in-process delivery under harness control",
+        "node 1 isolated in both directions while node 2 takes over, so its entry cannot be adopted",
+        "node 1 re-admitted through the normal Promise + AcceptSync re-synchronization path"
+      ],
+      "excluded": [
+        "the default event capacity (unrelated)",
+        "how often this interleaving occurs in a deployment"
+      ],
+      "parameters": {
+        "nodes": 3,
+        "tick_period_ms": 2000,
+        "append_notify_timeout_ms": 5000
+      }
+    },
+    "prefix": "Unchanged from the previous version: three real OmniPaxos instances (pid 1,2,3) over MemoryStorage, each driven by a real omnipaxos_runtime actor from spawn_actor with a harness-local tokio-backed AsyncRuntime impl; explicit transport (pump task per node into a shared queue, one delivery task popping and calling handle_incoming, dropping messages whose sender or receiver is isolated). Node 1 has leader_priority 10 and becomes leader after the initial heartbeats; node 1 is then isolated in both directions and `node1.append_notify(TestEntry(42))` is accepted locally at index 1 (read back as Undecided); `node2.try_become_leader()` makes node 2 the leader with node 3's promise and its own empty log, and `node2.append_notify(TestEntry(99))` is decided at index 1; node 1 is un-isolated and asked to reconnect, which makes it promise node 2 and receive an AcceptSync that truncates its log to node 2's and raises its decided index to 1. Emits CA_EVENT after_b_takeover {b_leader,c_leader,a_leader,b_decided,c_decided} (now JSON-safe strings) and CA_EVENT overwritten_index_resolution {a_decided_idx,a_entry_at_index_1_is_own,b_decided_idx,b_idx,resolution}, and asserts that the resolved call reports Ok(idx) while the entry at that index on node 1 is not the entry that call submitted. RuntimeConfig: tick_period 2000ms, egress_period 1ms, append_notify_timeout 5s.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": "dcb373d7a7c843d981030cdf4ec8d37a-experiment",
+    "revision_reason": "Same construction and assertions; only the emission changed. The `after_b_takeover` line rendered Rust's `{:?}` of Option<(u64,bool)>, which is not JSON, so the receipt recorded it as invalid_observation (parsing_error_count 1) and that event cannot be cited; it is now rendered as strings (\"2:true\" etc.). The decisive event `overwritten_index_resolution` is unchanged."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

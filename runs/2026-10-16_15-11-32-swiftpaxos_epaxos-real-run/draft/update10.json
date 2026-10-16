@@ -1,0 +1,111 @@
+{
+  "rationale": "Interpreted the completed committed-value receipt: the recovery still proposes a NOOP against a value a live replica has committed (violated comparison 0, witness 19), and the recovering replica ends undecided once it adopts the reply's COMMITTED status (violated comparison 1, witness 21). The value-adoption account now cites both executed witnesses, and the status-guard mechanism has its own conditional account with the committed-contradiction outcome recorded as a source-derived prediction.",
+  "knowledge": [
+    {
+      "id": "cbbf11dd38d843f1b6acf52fd5b6e82e-knowledge-0",
+      "kind": "behavior",
+      "statement": "In handlePreAcceptReply the block at epaxos/epaxos.go:876-881 overwrites lb.ballot, lb.cmds, lb.status, lb.seq and lb.deps whenever a reply's VBallot is >= the running lb.ballot, so a reply whose Status is COMMITTED replaces lb.status with COMMITTED; the guard immediately before it (epaxos/epaxos.go:870) returns for any reply while lb.status is neither PREACCEPTED nor PREACCEPTED_EQ, so every later reply to the same PreAccept is discarded and lb.preAcceptOKs stops increasing, leaving the leader's proposal in the pre-accept state.",
+      "conditions": "A phase-1 proposal whose acceptor set includes a replica that already has the instance COMMITTED (or a recoverer that adopted such a status), as happens when a recovery is restarted from sub-case 6 by a replica that lacks the value while another replica has it committed (epaxos/epaxos.go:847-895, 1236-1313).",
+      "source_ids": [
+        "s-preaccept-reply",
+        "s-decl-prepare-reply",
+        "s-subcase-dispatch"
+      ],
+      "executions": {
+        "9b8471479d484a12bdaf961653bbbe54": [
+          16,
+          19,
+          20,
+          21,
+          23
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "aa497fcd14934325ba2eabe45fefecd1-question-0",
+      "experiment_id": "fc825b4d2a9c488e8c03dff32b05cab7-experiment",
+      "source_ids": [
+        "s-decl-recovery",
+        "s-decl-prepare-reply",
+        "s-recovery-init",
+        "s-prepare-reply-adopt",
+        "s-subcase-dispatch",
+        "s-makeballot",
+        "s-handle-prepare",
+        "s-exec-recovery-trigger",
+        "s-preaccept-reply"
+      ],
+      "executions": {
+        "143e14592eea4c42b3c81044e3860348": [
+          7,
+          8,
+          9,
+          11,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current account: a recovery driven by a replica that does not itself hold the command replaces the value carried by its prepare replies with a NOOP, both when the quorum reports the value as pre-accepted and when a live replica reports it as COMMITTED. Primary witnesses are unchanged (receipt 143e14592eea4c42b3c81044e3860348 for fixed experiment fc825b4d2a9c488e8c03dff32b05cab7-experiment): the accepted value X at ballot 0 is replaced, the self reply's fabricated VBallot 8 shadows the genuine reply at value ballot 0, sub-case 6 selects startPhase1 with state.NOOP(), and the holder loses X (index 20). A second executed witness from the same harness family sharpens the consequence: receipt 9b8471479d484a12bdaf961653bbbe54 (fixed experiment cbbf11dd38d843f1b6acf52fd5b6e82e-experiment, test TestAssuranceEPaxosRecoveryContradictsCommittedValue) first has the owner commit X (index 6, status COMMITTED, cmd_op 1), delivers that Commit to one live peer only (index 10) so that replica 2 also holds X COMMITTED (index 11), fails the owner, and then recovers the instance at replica 3, which holds no command. The recovery still emits a NOOP although replica 2's prepare reply carries X with Status COMMITTED at value ballot 0 (index 16; comparison 0 violated, witness 19), so the recovery proposes a value that contradicts a value another live replica has already decided. In the same run the recovering replica did not reach a decided state (comparison 1 violated, witness 21: replica 3 final status PREACCEPTED), because adopting the reply's COMMITTED status into lb.status makes the guard at epaxos/epaxos.go:870 discard the remaining replies, so the restarted phase-1 proposal never reaches its fast quorum; that stall is recorded under the separate status-guard question. Together the two receipts establish the scoped defect: a recovery that lacks the command can replace an accepted value and can even proceed against a value that a live replica has committed, instead of adopting the value the quorum reports.",
+      "counterevidence": [
+        "The defect is bounded to coordinators that lack the command, and this bound is executed, not merely sourced: control experiment 242eaa8afa384a87b0952fbcd4b074b4-experiment (receipt 9d07449105684a498113db891da025d9) replayed the value-adoption crash pattern with the recovery driven by replica 2, which holds X; its preservation comparisons hold, evaluating indices 17 and 19-20.",
+        "Event 16 of the first receipt shows the adoption is a ballot ordering, not a general discard: a reply whose value ballot exceeded the coordinator's own recovery ballot would still be adopted.",
+        "The second receipt's live holder is protected at the state level: replica 2 ignores the recovered PreAccept and the recovered Commit because its instance is already COMMITTED (epaxos/epaxos.go:1082, and the Cmds-nil branch of epaxos/epaxos.go:807), so no completed contradiction of a committed value was observed - the observed contradiction is between the recovery's chosen value and replica 2's committed value, and the divergence completes only if the recovery runs again.",
+        "The countervailing ballot-climb path in makeBallot (epaxos/epaxos.go:439-451) is gated on IsLeader, which is false in both executions and in epaxos.New; the master-designated leader's behaviour was excluded from these scopes."
+      ],
+      "limitations": [
+        "One configuration and one instance in both receipts: N=5, F=2, instance (0,0), one PUT command (key 1) and the NOOP the recovery generates.",
+        "The harness schedules delivery explicitly: the startRecoveryForInstance calls are the functions the executor invokes after COMMIT_GRACE_PERIOD (epaxos/epaxos.go:404-417), but no run() loop or executeCommands goroutine was active, and the crash points (owner failing after the first Commit of its broadcast, peer failing after its pre-accept reply) were chosen by the harness within the target's permitted failure model.",
+        "The premise that an accept broadcast reaches a replica that never pre-accepted uses the target's Alive mechanism between the pre-accept and accept broadcasts; a real connection loss was not exercised.",
+        "In the second receipt the recovering replica's own instance is left undecided once the COMMITTED status is adopted, so the completed committed contradiction is a prediction from the same source path rather than an observation: epaxos/epaxos.go:1278-1305 would dispatch sub-case 3 on a later attempt and commit the NOOP while replica 2 keeps X.",
+        "Incidental observation not used by the claim: the recovered committed instance in the first receipt carries Seq -1 at replicas 2, 3 and 4 (indices 19-21) although startPhase1 computed seq 0 (index 18)."
+      ],
+      "joint_history": "All cited indices belong to one of the two receipts named in the rationale: indices 7-9, 11-14, 16-23 of receipt 143e14592eea4c42b3c81044e3860348 (instance (0,0) of the value-adoption run) and indices 6, 10, 11, 16, 19, 21 of receipt 9b8471479d484a12bdaf961653bbbe54 (instance (0,0) of the committed-value run); the second receipt's indices are cited in the rationale text rather than in the executions map because that receipt belongs to another fixed experiment."
+    },
+    {
+      "investigation_id": "cbbf11dd38d843f1b6acf52fd5b6e82e-question-0",
+      "source_ids": [
+        "s-preaccept-reply",
+        "s-decl-prepare-reply",
+        "s-subcase-dispatch",
+        "s-decl-recovery"
+      ],
+      "executions": {
+        "9b8471479d484a12bdaf961653bbbe54": [
+          11,
+          16,
+          19,
+          20,
+          21,
+          23
+        ]
+      },
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Current account: the executed run supports the status-guard mechanism and shows the stall, and the same source path predicts that a later attempt completes a NOOP commit that contradicts the live committed value. Evidence from receipt 9b8471479d484a12bdaf961653bbbe54 (test TestAssuranceEPaxosRecoveryContradictsCommittedValue): index 11 shows replica 2 holding instance (0,0) COMMITTED with cmd_op 1; index 16 shows its prepare reply to the recovering replica 3 carrying vballot 0 with Status COMMITTED and a command; index 19 shows the recovery nevertheless emitting a PreAccept with cmd_op 0 (the NOOP), and index 21 shows replica 3 ending in status PREACCEPTED, i.e. undecided after the run - comparison 1 of that experiment is violated with witness 21. The mechanism is sourced: the adoption block epaxos/epaxos.go:876-881 replaces lb.status with the reply's COMMITTED status on the restarted phase-1 path, and the guard at epaxos/epaxos.go:870 then returns for every later reply that carries a matching ballot, so lb.preAcceptOKs stops at one and neither the fast nor the slow commit branch is entered; the second acceptor in this run did handle the PreAccept and reply (index 23 shows replica 4 holding the NOOP as PREACCEPTED_EQ), so the missing quorum is not a missing reply. Because the recovering replica has no command of its own, the proposal it stalls on is the NOOP it fabricated, and the peer that already committed X is exactly the peer whose reply the guard discards. Prediction from the same path: on a later startRecoveryForInstance(0,0) the local vbal token equals the tried ballot, so the COMMITTED reply is no longer adopted and the reply is counted, giving sub-case 3 (epaxos/epaxos.go:1269-1272) and an accept phase that commits the NOOP at the recovering replica while replica 2 keeps X - a completed contradiction of a committed value.",
+      "counterevidence": [
+        "The stall is not universal: replica 4 accepted and pre-accepted the recovered proposal, and the peer holding X is protected in its own state (epaxos/epaxos.go:1082), so the mechanism damages progress at the recovering replica rather than silently rewriting a committed value at its holder.",
+        "The stall was observed only for a restarted phase-1 proposal whose value is the NOOP that the same recovery fabricated; the run does not show a leader with a genuine client value stalling this way.",
+        "The peer's COMMITTED status is the target's own honest answer; the defect lies in the recovering side's handling of that answer, not in the peer's reply."
+      ],
+      "limitations": [
+        "One run, one instance (0,0) with N=5, F=2 and one command; the guard's interaction was not exercised for a leader that holds its own command, nor for a lower ballot on the COMMITTED reply.",
+        "The harness delivered the replies and did not run the executor's timer: the repeated attempt that would complete the contradiction is predicted from source, not measured.",
+        "The recovering replica's instance is left PREACCEPTED, which also means the dependents of (0,0) at the recovering replica would not progress; that consequence was not measured because no execution path ran."
+      ],
+      "joint_history": "Producer and result indices all belong to receipt 9b8471479d484a12bdaf961653bbbe54 for fixed experiment cbbf11dd38d843f1b6acf52fd5b6e82e-experiment and describe instance (0,0): index 11 is the live holder's committed state before the recovery, index 16 the prepare reply that reports it, index 19 the recovered proposal, and indices 21 and 23 the two recovering-side states after the quiescence attempt."
+    }
+  ]
+}

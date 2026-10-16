@@ -1,0 +1,157 @@
+{
+  "rationale": "Registered the successor execution for the lost-decision discriminator: the harness adds a lost_acknowledged_commit case on a three-voter committed configuration. The leader first demotes both peers (committed single-voter configuration), applies 100 commands, snapshots that configuration, then promotes both peers back to voters (committed three-voter configuration). Every instance is stopped, the former leader is restarted, and if it is running it acknowledges one commit with a unique payload; the holder is then stopped, the other two voters are restarted with the flag disabled, and the payload is looked for on every store, including after the holder rejoins. Construction-time local feedback: with the flag enabled the restarted instance held one voter against its log's three, elected itself alone and acknowledged the commit, which afterwards existed on exactly one copy with the other two voters never having received it; with the flag disabled it reconstructed the three-voter configuration, elected nobody and acknowledged nothing (\"node is not the leader\").",
+  "experiment": {
+    "investigation_id": "2708fe4120de4b7b945ec449b641cfed-question-0",
+    "previous_id": "2f3fb202ac14432ea8d60324f40fa275-experiment",
+    "revision_reason": "Adds the three-voter lost_acknowledged_commit case with its flag-disabled control: demote both peers, snapshot the single-voter configuration, promote both peers again, restart the former leader, acknowledge one uniquely named commit on it, then bring the other two voters back and scan every store for that payload. Replaces the comparison set with this case's reconstruction and durability predicates.",
+    "harness_path": "assurance_generated_test.go",
+    "execution_package": ".",
+    "test_names": [
+      "TestAssuranceRestoreCommittedLogsContext"
+    ],
+    "source_ids": [
+      "scan_start",
+      "restore_lastapplied",
+      "snapshot_cfg",
+      "cfg_entry",
+      "append_new",
+      "follower_gate",
+      "candidate_quorum",
+      "quorum_size",
+      "leader_commitment",
+      "commitment_impl",
+      "restore_doc",
+      "ct_contract",
+      "inmem_ct",
+      "test_opts"
+    ],
+    "scope": {
+      "description": "Whether an acknowledged commit taken on a reconstructed smaller configuration is durable on a majority of the committed configuration. Nine in-process cases: the seven previously exercised restart shapes plus a lost_acknowledged_commit case run with RestoreCommittedLogs enabled and disabled. In that case a three-voter cluster is left with a single voter, snapshotted, then made three voters again; after every instance is stopped the former leader is restarted, the instance acknowledges one uniquely named commit, the holder is stopped, the other two voters are restarted with the flag disabled, and every store is scanned for that payload before and after the holder rejoins.",
+      "assumptions": [
+        "Real raft instances in one process over the in-memory transport and the in-memory commit-tracking log store from the captured package; the same durable stores are reused across restarts.",
+        "The committed configuration of the lost_acknowledged_commit case has three voters while the node's own snapshot metadata carries the demoted configuration with one voter.",
+        "The two voters brought back after the acknowledged commit are restarted with RestoreCommittedLogs disabled on purpose, so their own configuration comes from their logs and the second leadership is formed by a majority that never held the payload.",
+        "The acknowledged commit is attempted with a 1500 ms timeout, leadership waits use the 3000 ms window, and the payload is searched for across first-index to last-index of each store."
+      ],
+      "excluded": [
+        "Disk-backed stores, real networks, crashes during the restart, membership changes after the acknowledged commit, and any comparison of payload contents beyond the exact unique byte string."
+      ],
+      "parameters": {
+        "wait_millis": 3000,
+        "apply_timeout_ms": 1500,
+        "settle_millis": 800,
+        "applied_commands": 100,
+        "post_promote_applies": 5,
+        "peers": 3
+      }
+    },
+    "prefix": "The new case runs after the earlier cases in the same test. It builds a three-peer cluster with MakeClusterCustom(MakeClusterOpts{Peers: 3, Bootstrap: true, CommitTrackingLogs: true, Conf: inmemConfig with TrailingLogs 10 and RestoreCommittedLogs set per case}), calls leader.DemoteVoter on both non-leader peers, applies 100 commands, takes leader.Snapshot(), then calls leader.AddVoter for both peers with their addresses and applies five more entries. It emits a lost_inputs CA_EVENT with the last configuration entry (index, decoded server list, voter count), the snapshot metadata's ConfigurationIndex and voter count, and the tracked commit index; it then stops every instance and rebuilds the former leader over its own stores with a fresh in-memory transport. After a bounded leadership wait it applies one uniquely named payload, records whether the future completed and the index it returned, and stops that instance. It rebuilds the other two peers with RestoreCommittedLogs disabled over their own stores, connects the rebuilt instances in both directions, waits for one of them to become leader, and scans both stores for the payload; it then rebuilds the original holder the same way, waits, and scans again. It emits an entry_survival CA_EVENT carrying the reconstructed voter count, the acknowledgement outcome, the payload index, whether the payload remains on the holder after the rejoin, how many of the other voters hold it, the derived durable_on_majority with the copy count, and both terms.",
+    "responsibility": "NewRaft owns the reconstruction of a node's own configuration from its durable stores, and the reconstructed configurations.latest is the only input to the node's own election gating, quorumSize and leader commitment; the committed configuration recorded in the node's own log is the basis on which a client acknowledgement is supposed to be durable.",
+    "prerequisites": [
+      {
+        "alias": "state",
+        "event": "lost_inputs",
+        "conditions": [
+          {
+            "field": "log_config_count",
+            "value": 2
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "entry_survival",
+        "identity_fields": [
+          "scenario",
+          "restore_committed_logs"
+        ],
+        "admission_alias": "state",
+        "assertion": {
+          "field": "reconstructed_config_voters",
+          "reference": "state.log_config_voters"
+        },
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "lost_acknowledged_commit"
+          },
+          {
+            "field": "restore_committed_logs",
+            "value": true
+          }
+        ],
+        "description": "Three-voter case with the flag enabled: the reconstructed voter count is compared with the number of voters in the configuration entry persisted in the node's own log."
+      },
+      {
+        "event": "entry_survival",
+        "identity_fields": [
+          "scenario",
+          "restore_committed_logs"
+        ],
+        "admission_alias": "state",
+        "assertion": {
+          "field": "reconstructed_config_voters",
+          "reference": "state.log_config_voters"
+        },
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "lost_acknowledged_commit"
+          },
+          {
+            "field": "restore_committed_logs",
+            "value": false
+          }
+        ],
+        "description": "Control for the three-voter case: with the flag disabled the reconstructed voter count matches the committed configuration entry."
+      },
+      {
+        "event": "entry_survival",
+        "identity_fields": [
+          "scenario",
+          "restore_committed_logs"
+        ],
+        "admission_alias": "state",
+        "assertion": {
+          "field": "durable_on_majority",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "lost_acknowledged_commit"
+          },
+          {
+            "field": "restore_committed_logs",
+            "value": true
+          }
+        ],
+        "description": "Three-voter case with the flag enabled: an acknowledged commit is expected to be durable on a majority of the committed configuration rather than on a single copy."
+      },
+      {
+        "event": "entry_survival",
+        "identity_fields": [
+          "scenario",
+          "restore_committed_logs"
+        ],
+        "admission_alias": "state",
+        "assertion": {
+          "field": "acknowledged",
+          "value": false
+        },
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "lost_acknowledged_commit"
+          },
+          {
+            "field": "restore_committed_logs",
+            "value": false
+          }
+        ],
+        "description": "Control for the three-voter case: with the flag disabled the single running member of a three-voter committed configuration cannot acknowledge a commit at all."
+      }
+    ]
+  }
+}

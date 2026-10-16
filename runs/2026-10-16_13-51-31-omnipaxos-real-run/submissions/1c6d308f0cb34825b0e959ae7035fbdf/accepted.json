@@ -1,0 +1,48 @@
+{
+  "rationale": "The third case now witnesses the cluster-level consequence that was previously only a limitation of the event-backpressure finding, so that question's account is updated to the measured consequence; the identity probe under construction is not submitted yet.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+      "experiment_id": "2b18b51118e04d8a9f0ca6001d18eb51-experiment",
+      "source_ids": [
+        "src_detect_events",
+        "src_run_loop",
+        "src_spawn_actor_channels",
+        "src_subscribe_events",
+        "src_append_notify_contract",
+        "src_outgoing_nonblocking",
+        "src_decided_subs_nonblocking"
+      ],
+      "executions": {
+        "76557a280cf8429d8ce3102d7565decb": [
+          2,
+          0,
+          1,
+          3,
+          4
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "Current account. Source-settled mechanism: the actor publishes every observed transition with `event_tx.send(..).await` inside `detect_and_emit_events` (actor.rs:169-199), awaited from the tick arm of the single `run` select loop (actor.rs:665-711), on the channel spawn_actor builds as `async_channel::bounded(RuntimeConfig::event_capacity)` (handle.rs:295-323; knob handle.rs:34-35, default 1024 handle.rs:74). The handle owns a receiver from construction, so an application that never consumes the event stream still leaves it unread, and `subscribe_events` only hands out clones of that same channel (handle.rs:254-259). A send that cannot fit parks the actor task, which then cannot run op.tick() (election heartbeats, resends, batch flushes), cannot handle incoming messages, and cannot answer any Command - including the append_notify Timeout that drain_notifiers would have produced on that same tick path (actor.rs:201-222; endpoint documented at handle.rs:114-137). The crate's sibling egress paths avoid this with try_send (drain_outgoing_buf; push_to_sub/push_to_all_subs), and its own regression test states the invariant for the outgoing channel. Node-local support - the same execution also carries it: events 3,4 `unconsumed_event_bound_reached` {nodes_full:3, nodes:3, event_capacity:64}, `actor_parked` {node:1, samples_without_reply:10, reply_budget_ms:200, permanently_parked:true} and `append_notify_endpoint_withheld` {node:1, per_call_deadline_ms:300, actor_timeout_ms:1500, outer_wait_ms:4000, resolved:false}, against control events 0,1 `control_actors_responsive` {nodes_answering:3} and `control_append_notify` {origin:1, succeeded:true, idx:2}. Cluster-level consequence - execution 76557a280cf8429d8ce3102d7565decb (experiment 2b18b51118e04d8a9f0ca6001d18eb51-experiment, exit 0, all three tests passed): in a 3-node cluster where only node 1 consumes its event stream (event_capacity 8), event 2 `parked_majority_cluster` records nodes_parked:2, healthy_node_responsive:true, append_notify_timeout_reached:true, decided_before:7, decided_after:7, i.e. two of three nodes parked on unconsumed event streams and the healthy third node could not complete a write - it reached the documented Timeout endpoint for a 300ms per-call deadline and its decided index did not move across the attempt - while events 0,1 in the same run (`control_actors_responsive` {nodes_answering:3}, `control_append_notify` {origin:1, succeeded:true, idx:2}) and events 3,4 (`unconsumed_event_bound_reached`, `actor_parked` {node:2, permanently_parked:true}) show the control and the node-local freeze respectively. The comparison therefore holds at both scopes: with unconsumed bounded event streams the actor loops park, the parked node loses every command endpoint (even the documented failure), and when enough nodes park the cluster stops deciding while every node process is still alive; with the same capacity and activity and a draining consumer nothing freezes. Scope of the defect asserted: a node whose client does not consume its event stream stops participating (no ticks, no message handling, no command replies) once it has observed event_capacity transitions, for any finite capacity; the probe reaches the bound at 64 (node-local cases) and 8 (cluster case) to stay inside bounded windows, and the mechanism is capacity-independent because the send awaits whenever the channel holds capacity events. Counter-limitations kept in force: (a) the trigger is client-side usage and no snapshot source states a drain obligation, so the finding rests on the handle-method contract (every Command reply, and the documented Timeout) plus the deliberate non-blocking design of the sibling egress paths; (b) a dropped receiver unblocks the actor (the send error is ignored), so the stall lasts exactly as long as a live receiver exists; (c) the bounds witnessed are 64 and 8, not the default 1024, and no rate claim is made about how fast a deployment reaches them; (d) the cluster case parks two of three nodes in one schedule - it does not establish how many nodes a given schedule parks, only that the healthy remainder cannot decide.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [],
+      "limitations": [
+        "The bounds witnessed are event_capacity 64 (node-local cases) and 8 (cluster case); capacity-independence and reachability at the default 1024 are argued from source, not observed.",
+        "The trigger is client-side (a live receiver the application does not read) and no snapshot source states a drain obligation; the defect rests on the Command/append_notify contract plus the sibling paths' non-blocking design.",
+        "A dropped receiver unblocks the actor, so the stall is bounded by how long a live, unread receiver is held.",
+        "The cluster case witnesses one schedule in which two of three nodes parked; it does not bound how many nodes park in other schedules."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

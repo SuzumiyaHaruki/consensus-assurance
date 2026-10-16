@@ -1,0 +1,108 @@
+{
+  "rationale": "The core run executed and refuted the narrow claim, so the question's account is corrected and the probe is re-requested with a cadence fix and post-drop tracing instead of an outcome prediction.",
+  "sources": [
+    {
+      "id": "src_follower_acceptsync_reply",
+      "file": "omnipaxos/src/sequence_paxos/follower.rs",
+      "start_line": 53,
+      "end_line": 79,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_follower_handle_decide",
+      "file": "omnipaxos/src/sequence_paxos/follower.rs",
+      "start_line": 128,
+      "end_line": 158,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "src_leader_resend",
+        "src_follower_resend",
+        "src_leader_handle_accepted",
+        "src_follower_reply_accepted",
+        "src_follower_flush_batch",
+        "src_resend_dispatch",
+        "src_follower_acceptsync_reply",
+        "src_follower_handle_decide"
+      ],
+      "executions": {
+        "9a8b2864badf41a183a56bcfe91e49a2": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current account, corrected by the executed run. The suspicion was that a lost follower Accepted reply is never repaired by any timer-driven or self-initiated action, so a quorum-accepted entry stays undecided until an unrelated new proposal arrives (source reading: resend_messages_leader's Accept arm only re-Prepares unpremised peers and resends a pending StopSign; resend_messages_follower's Accept arm is empty; flush_batch_follower replies only when the flush itself advanced the accepted index). Execution 9a8b2864badf41a183a56bcfe91e49a2 (experiment 34c476dd304f48f59580ab2799b029d3-experiment, exit 101) ran the probe and defeats that suspicion in the probed configuration: parsed event 1 `lost_accepted_window` records dropped=Accepted:1, follower_accepted_idx=1, accept_decide_total=1 (so no new client proposal was made in the whole 500-step window) and yet leader_decided_idx=1 with follower_decided_idx=1 - the entry did become decided. The same event names the wire traffic that did it: produced = BLE:676,Prepare:4,Promise:6,AcceptSync:6,AcceptDecide:1,Accepted:3,PrepareReq:2,Decide:1. Three Accepted replies were produced although only one AcceptDecide exists, which matches the accept-sync path in the follower: handle_acceptsync pushes a fresh Accepted carrying the follower's current accepted index (follower.rs:53-79) and it runs whenever the follower is back in Phase::Prepare, i.e. after a new Prepare/Promise cycle (Prepare:4, Promise:6, AcceptSync:6). So the acceptance is re-advertised through ballot-change and re-sync paths rather than through the empty Accept-phase resend arms; the source reading of the empty arms is unchanged, but it does not imply non-repair. Counter-limitation and necessary gap that the correction does not remove: the churn in this run may be an artifact of the previous harness's cadence (it ticked both nodes before draining and delivering anything, which can put a heartbeat reply into a later BLE round than the request that asked for it), so this receipt does not establish whether a lost Accepted is repaired when no ballot change occurs; the revised experiment measures the same window again with per-node tick-and-deliver cadence and with after_drop tracing, which will either show the entry undecided (suspicion survives in the faithful configuration) or name the repairing message. A second, independent defect in the previous harness also shows in parsed event 0 `delivered_accepted_decides` (steps_until_decided=6, leader_decided_idx=1, follower_decided_idx=0): the control read the follower's decided index before its Decide had been delivered, so that failure is attributed to the probe, not to the target. No defect is claimed for this question.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [],
+      "limitations": [
+        "The refuting witness is a run whose protocol-level churn may have been provoked by the harness's own cadence; whether a lost Accepted is repaired without any ballot change is a necessary open gap.",
+        "The receipt is a failing run (exit 101); the decisive content is the parsed CA_EVENT operands emitted before the assertions, and the control's failure in that same run is a probe bug (Decide still in flight when the follower's decided index was read).",
+        "The window is 500 logical steps (100 configured resend periods) with an error-free memory storage and in-order delivery of everything except the one deliberately dropped message.",
+        "Only a 2-node configuration is probed, where one dropped receipt is exactly what the write quorum needs; nothing is concluded about wider clusters."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+    "harness_path": "core_lost_accepted.rs",
+    "files": {},
+    "execution_package": "omnipaxos",
+    "test_names": null,
+    "source_ids": [
+      "src_leader_resend",
+      "src_follower_resend",
+      "src_leader_handle_accepted",
+      "src_follower_reply_accepted",
+      "src_follower_flush_batch",
+      "src_resend_dispatch",
+      "src_follower_acceptsync_reply",
+      "src_outgoing_trim_doc"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Bounded, deterministic measurement of whether a deliberately dropped follower Accepted reply is repaired within 100 resend periods while no client proposal is made, and which protocol messages carry the repair if it happens.",
+      "assumptions": [
+        "2-node cluster so the write quorum is the leader's own acceptance plus exactly one follower receipt",
+        "error-free memory storage; everything except the one Accepted is delivered, in order, with no crash",
+        "one logical step per node equals one tick(); the 500-step window covers 100 configured resend periods"
+      ],
+      "excluded": [
+        "socket or kompact transport",
+        "concurrent node execution",
+        "any inference from real time",
+        "claims about which repair path is reachable in a deployment"
+      ],
+      "parameters": {
+        "nodes": 2,
+        "election_tick_timeout": 3,
+        "resend_message_tick_timeout": 5,
+        "steps": 500,
+        "resend_periods": 100
+      }
+    },
+    "prefix": "Deterministic in-process simulation of the core crate: two real OmniPaxos instances (pid 1,2; configuration_id 1; MemoryStorage; error-free storage) built by OmniPaxosConfig::build, never run concurrently and never in real time. One logical step = tick(pid1), take_outgoing_messages(pid1), deliver them, then the same for pid2, so BLE replies are delivered within the round that requested them. Node 1 has leader_priority 1 so the election is deterministic; election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1. Case lost_accepted_leaves_entry_undecided: elect (both nodes in the accept phase), append one entry at the leader, deliberately discard exactly one PaxosMsg::Accepted (the follower's receipt) while delivering everything else, then run 500 steps = 100 configured resend periods with no further client proposal. It emits CA_EVENT lost_accepted_window {steps,resend_periods,produced,dropped,after_drop,accept_decide_total,leader_decided_idx,follower_decided_idx,follower_accepted_idx,follower_holds_undecided_entry,leader_still_stable} and asserts only that the trigger happened (exactly one Accepted dropped), that the follower really holds the entry as Undecided with accepted_idx 1, and that exactly one AcceptDecide exists in the whole run; whether the leader decided inside the window is the measured operand. It then appends a second entry on the same state and emits CA_EVENT later_proposal_repairs {steps_until_decided,leader_decided_idx,follower_decided_idx}. Case delivered_accepted_decides is the control: identical, the receipt is delivered, and it is read only after 20 extra steps so the Decide can reach the follower (CA_EVENT delivered_accepted_decides).",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": "34c476dd304f48f59580ab2799b029d3-experiment",
+    "revision_reason": "Same cluster and window, two corrections. (1) Cadence fidelity: the previous harness ticked both nodes and only then drained and delivered, which can leave a heartbeat reply arriving in a later BLE round than the request that asked for it and can provoke leadership churn; the fixed cadence ticks one node, drains and delivers it, then does the same for the other, so replies land in the round that asked. (2) The probe no longer predicts the outcome: it asserts the environment (exactly one AcceptDecide in the whole run, i.e. no new client proposal) and traces what the protocol itself puts on the wire after the deliberate drop (after_drop), so the receipt names the repair path if one exists. The control now runs 20 further steps after the leader decides before reading the follower's decided index (the previous attempt read it while the Decide was still in flight, which made the control fail for a harness reason)."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

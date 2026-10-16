@@ -1,0 +1,116 @@
+{
+  "rationale": "Closed the delivery-order discriminator with the three-order receipt and refined the mechanism: the adopted command is fixed by the last reply adopted before the slow-quorum trigger, so the same reply set yields different decided commands under different arrival orders. The account now withdraws both the earlier 'order variant unmeasured' limitation and the interim claim that the first two runs refuted order dependence, and the supporting behavior entry gained the new receipt.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "2b0dd5bd3ea84bdeba83de7f4c680c00-knowledge-0",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "A nil command slice does not stay nil across the wire: PrepareReply.Unmarshal (and the other RPC decoders) allocate the received slice with make([]state.Command, alen1), so a sender that carries no command yields a non-nil empty slice at the receiver. In handlePrepareReply's adoption loop that empty slice is copied into lb.cmds, and the sub-case 5/6 fallback tests only `inst.lb.cmds != nil`, so it passes the empty slice to startPhase1 instead of substituting state.NOOP(); the resulting instance holds an empty (non-nil) command list, which executeCommands accepts because its guard is also a nil test, and handleCommit's re-offer path does not recognise it because that path requires exactly one command with operation NONE. Which command is adopted is decided by the replies present when the slow-quorum trigger fires, so the same reply set can yield different decided commands under different arrival orders.",
+      "conditions": "Recovery whose replies include one from a replica that holds the instance with no command, when that reply's VBallot is at least the running candidate ballot (epaxos/defs.go:228-235, epaxos/epaxos.go:1239-1246, 1291-1296, 1307-1311 and 1090-1099).",
+      "source_ids": [
+        "s-prepare-reply-unmarshal",
+        "s-prepare-reply-adopt",
+        "s-subcase-dispatch",
+        "s-decl-prepare-reply",
+        "s-commit-repropose",
+        "s-exec-reply"
+      ],
+      "executions": {
+        "81a44ff62122417db3cc5697fc5303f6": [
+          3,
+          4,
+          5,
+          9,
+          10,
+          11
+        ],
+        "098ab4425325464192aa558be557f0ce": [
+          3,
+          4
+        ],
+        "e89ecb076e8d4a78b174f848562ed77f": [
+          6,
+          13,
+          20
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "0757162a4aa64ef4a58a90002641eb27-question-0",
+      "experiment_id": "e8fb81e1cb0742118ce33f60e08a0de1-experiment",
+      "source_ids": [
+        "s-decl-recovery",
+        "s-decl-prepare-reply",
+        "s-prepare-reply-adopt",
+        "s-subcase-dispatch",
+        "s-preaccept-guard",
+        "s-prepare-reply-unmarshal",
+        "s-commit-repropose"
+      ],
+      "executions": {
+        "81a44ff62122417db3cc5697fc5303f6": [
+          0,
+          2,
+          3,
+          4,
+          5,
+          9,
+          10,
+          11
+        ],
+        "098ab4425325464192aa558be557f0ce": [
+          0,
+          2,
+          3,
+          4
+        ],
+        "e89ecb076e8d4a78b174f848562ed77f": [
+          6,
+          13,
+          20
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current account: the anomaly is resolved and it is a defect distinct from the fabricated-self-ballot one. Receipt 81a44ff62122417db3cc5697fc5303f6 (fixed experiment 0757162a4aa64ef4a58a90002641eb27-experiment) shows the owner holding its command X at status ACCEPTED before its own recovery (index 0), the empty acceptor at status NONE after the Accept (index 3), and, after the owner recovered its own instance and the three PrepareReplies were delivered, an instance left at status PREACCEPTED with an empty command list plus bookkeeping whose candidate command is an empty slice (index 4: inst_cmds_len 0, inst_status 1, lb_cmds_len 0, lb_status 1, lb_appended 1, lb_nacks 0), with no command proposed afterwards (index 5) and the same values in the second run (indices 9-11); comparison 0 and comparison 1 are both violated with witnesses 5 and 11. The mechanism is now sourced: a reply from a replica that holds no command carries a nil command slice, the decoder allocates it with make([]state.Command, alen1) so the receiver sees a non-nil empty slice (epaxos/defs.go:228-235), the adoption loop copies that empty slice into lb.cmds because its VBallot equals the running candidate ballot (epaxos/epaxos.go:1239-1246), and the sub-case 5/6 fallback substitutes state.NOOP() only when lb.cmds is nil (epaxos/epaxos.go:1307-1311), which an empty slice is not - so startPhase1 is called with an empty command batch and the instance becomes PREACCEPTED with Cmds of length zero (epaxos/epaxos.go:1291-1296, 751-779). That also explains why the probe recorded no PreAccept command (proposed_cmd_op -1 was the empty batch, not an absent proposal) and why the probe's two runs coincided: the empty slice wins in both delivery orders because the loop adopts ties with >= and the empty reply is adopted whatever its position, the last delivery being irrelevant. Consequences for the captured package: the instance is proposed and can be decided with no command at all, replacing the command the owner itself held; executeCommands accepts an empty non-nil batch because its guard is a nil test, so the instance executes as a no-op rather than stalling; and the client re-offer path that protects the fabricated-NOOP case does not fire here, because handleCommit tests for exactly one command with operation NONE (epaxos/epaxos.go:1090-1099), which an empty batch never satisfies. A second receipt measures the client-side consequence of exactly that decision: receipt 098ab4425325464192aa558be557f0ce (fixed experiment 49b316fdc67c459fb374500fb7f26514-experiment) attaches a real client proposal (command id 91) to the owner's own instance, that instance's own recovery decides the empty batch, and both declared comparisons are violated with complete witness 4 - the decided instance holds a command list of length zero while the owner held command X before (index 0: status 3, cmd_op 1) and the owner's pending request is never re-offered (requeued 0 with pending_proposals 1 and reply_bytes 0), while the single-NOOP decision of the same family (receipt 893f6180a4514a8d9e20a1d5e6698542) re-queued its request and later completed it. The contrast is the re-offer guard's own condition: handleCommit requires exactly one command with operation NONE (epaxos/epaxos.go:1090-1099), which an empty batch never satisfies, so the empty-command decision drops the client's request with neither a reply nor a re-offer. The delivery-order question is now measured with three runs of the same reply set (receipt e89ecb076e8d4a78b174f848562ed77f, fixed experiment e8fb81e1cb0742118ce33f60e08a0de1-experiment): with the replies delivered as 2,4,3 the instance ends with no command (comparison 0 violated, witness 6); as 3,4,2 the same outcome (comparison 1 violated, witness 13); and as 3,2,4 - where the command-carrying reply is the second delivered - the instance keeps the owner's command (comparison 2 holds, evaluated 20). The mechanism is therefore not a simple last-reply-wins rule over the whole set but the timing of the quorum trigger: handlePrepareReply dispatches as soon as len(lb.prepareReplies) reaches SlowQuorumSize, which for one self reply and a five-replica configuration is two peer replies, and the candidate command is whatever the last adopted reply in that prefix carries. In this reply set two peers carry no command and one carries X, so two of the three delivery orders put an empty reply in the adopted position and lose the command, while the third order puts X there and keeps it. The adopted value therefore depends on arrival order among equally admissible replies rather than on their content, and the empty-slice handling is what makes the losing orders lose the command outright instead of substituting state.NOOP(). The earlier statement that the order variant was unmeasured is withdrawn; the state/command invariant entry is qualified rather than wrong: it holds for the command-carrying writers, while this path reaches the same status-without-command combination through an empty non-nil slice, which that entry's nil test does not cover.",
+      "answers": {
+        "c60acf998d394127b5cef04b47bcee00-gap-3": {
+          "explanation": "Resolved: the path is sub-case 5/6 of handlePrepareReply together with the sub-case fallback. The owner's bookkeeping ended with an empty candidate command and a single appended reply because the dispatch replaced inst.lb with the fresh bookkeeping that startPhase1 creates (hence ballot -1, status PREACCEPTED and the empty slice it was handed) and one further reply was appended to that new bookkeeping, while the instance fields were overwritten with lb.cmds/lb.status before the dispatch (epaxos/epaxos.go:1291-1296) - which is how the instance reached PREACCEPTED with an empty command list.",
+          "resolved": true
+        },
+        "e12170eb561b4cdd9d5760b259ca8838-gap-4": {
+          "explanation": "Resolved in favour of the target path: the recorded state came from the package's own handling of an empty (nil-on-the-wire) command slice, not from a startPhase1 call with an empty batch issued by the probe. The probe called startPhase1 once, with the command X, and never with an empty slice; the empty slice appeared only when a reply from a replica holding no command was decoded (epaxos/defs.go:228-235) and adopted into lb.cmds.",
+          "resolved": true
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "The replacement needs a reply that carries no command at a value ballot at least as high as the recovering replica's candidate ballot; in this run that reply came from an acceptor that never pre-accepted, which required the accept broadcast to skip a failed peer, so the same reachability limit as the value-adoption finding applies.",
+        "The owner's command is not re-offered by the captured package in this scenario, and that is now measured rather than derived: receipt 098ab4425325464192aa558be557f0ce shows the decided instance holding an empty command list, the pending proposal count at 1 and nothing on the owner's propose channel, so the client-visible completion depends on the client's own retry rather than on the re-offer path that covers the single-NOOP case.",
+        "The outcome is order-dependent rather than inevitable: the third recorded order (3,2,4) kept the owner's command with the same reply set, so the empty-command loss is contingent on which reply is adopted last before the quorum trigger, not a property of the replies' content alone.",
+        "Both runs came from one execution and one configuration; no independent receipt shows the same replacement.",
+        "The measurement is bounded to the owner-as-recoverer case with one pending proposal; it does not show what a client library would do next, since no client process ran and the reply writer stayed empty.",
+        "The earlier claim that the two first runs refuted order dependence is withdrawn: those runs did not apply an order at all, and the three-order receipt shows the opposite - the same message set yields two different decided commands depending only on arrival order."
+      ],
+      "limitations": [
+        "One configuration and instance (N=5, F=2, instance (0,0), one command, owner as recoverer); the scenario was not repeated with a non-owner recoverer or with several commands in a batch.",
+        "Delivery order was exercised in three specific orders among the six permutations of the three peer replies; the two orders that lost the command and the one that kept it are recorded, but the full permutation space was not enumerated, and the trigger position (second peer reply) follows from the configuration rather than from an independent manipulation.",
+        "The empty-command decision's execution-side effects (execution as a no-op because the batch is non-nil but empty, ordering of dependents) remain derived from source; no executor ran. The client-side effect is now measured for this scenario, including the absence of a re-offer and the empty reply writer.",
+        "The decoding behaviour is stated for the PrepareReply decoder that this path uses; the claim that all RPC decoders allocate the slice the same way rests on the generated Marshal/Unmarshal pattern rather than on a run."
+      ],
+      "joint_history": "All cited indices belong to receipt 81a44ff62122417db3cc5697fc5303f6 for fixed experiment 0757162a4aa64ef4a58a90002641eb27-experiment: index 0 the owner's pre-recovery state, index 3 the empty acceptor, index 4 the owner's bookkeeping after the recovery replies, index 5 the outcome of the first run, and indices 9-11 the same for the second run.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

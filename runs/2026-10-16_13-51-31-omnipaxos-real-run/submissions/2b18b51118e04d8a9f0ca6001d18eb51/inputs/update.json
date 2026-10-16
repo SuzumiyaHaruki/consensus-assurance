@@ -1,0 +1,90 @@
+{
+  "rationale": "The cadence-fixed core probe executed and confirms the accept-phase repair gap, so that question closes as a supported defect; the same update extends the runtime probe with the cluster-level consequence of the event-backpressure defect (its previously stated limitation).",
+  "experiment": {
+    "investigation_id": "9527b916ba184b74865563c980642d1c-question-0",
+    "harness_path": "assurance_generated.rs",
+    "execution_package": "omnipaxos_runtime",
+    "previous_id": "1a5428f0aa284eb1a2a3f1a083fcb052-experiment",
+    "revision_reason": "Adds a third case to the same harness (existing two cases and their assertions unchanged except that case 1 now waits for at least one parked node and asserts the full-and-live channel on the parked nodes, plus 25s windows and 6x paced proposals so it is not sensitive to how many nodes reach the bound first). New case `parked_majority_stops_the_cluster_deciding`: a 3-node cluster where only node 1 drains its event stream (event_capacity 8), nodes 2 and 3 park, and the healthy node 1 must then be unable to complete a write - it reports the documented Timeout for an append_notify with a 300ms deadline, and its decided index is unchanged across the attempt.",
+    "source_ids": [
+      "src_detect_events",
+      "src_run_loop",
+      "src_spawn_actor_channels",
+      "src_subscribe_events",
+      "src_append_notify_contract",
+      "src_outgoing_nonblocking",
+      "src_decided_subs_nonblocking"
+    ],
+    "prefix": "Three real OmniPaxos instances (pid 1,2,3) over MemoryStorage, each driven by a real omnipaxos_runtime actor from spawn_actor with a harness-local tokio-backed AsyncRuntime impl; one in-process transport task per node forwards outgoing messages to the receiver's handle_incoming. RuntimeConfig: tick_period 2ms, egress_period 1ms, append_notify_timeout 1500ms; case 1/2 use event_capacity 64, case 3 uses 8. ServerConfig: election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1. Case 3 subscribes and drains events only on pid 1; pids 2 and 3 leave the receiver the handle owns unread, so after enough observed transitions their event channels fill and their actors park. It keeps paced ordinary writes coming from the elected leader, waits until two of the three nodes stop answering commands, then requires: node 1 still answers; node 1's `append_notify_with_timeout(_, 300ms)` resolves with Timeout (its own actor runs, so that endpoint is reachable) rather than Ok; node 1's decided index is unchanged one second later. It emits CA_EVENT parked_majority_cluster {nodes_parked,healthy_node_responsive,append_notify_timeout_reached,decided_before,decided_after}.",
+    "scope": {
+      "description": "Consequence probe: what the rest of the cluster loses when a majority of nodes' actors are parked by unconsumed event streams.",
+      "assumptions": [
+        "3 nodes, majority quorum 2; only node 1 consumes its event stream",
+        "same in-process transport and error-free memory storage as the other cases",
+        "event_capacity 8 on all nodes so the bound is reached quickly"
+      ],
+      "excluded": [
+        "the 1024 default capacity",
+        "any claim that a deployment reaches the bound in a given time"
+      ],
+      "parameters": {
+        "nodes": 3,
+        "event_capacity": 8,
+        "append_notify_timeout_ms": 300,
+        "paced_proposals": 60
+      }
+    }
+  },
+  "knowledge": [
+    {
+      "kind": "behavior",
+      "statement": "In the accept phase the core has no self-initiated refresh of the leader's knowledge of a follower's acceptance: resend_messages_leader's Accept arm only re-Prepares peers that are not promised and resends a pending StopSign (or its decide), and resend_messages_follower's Accept arm is empty, so a dropped Accepted reply is never retried by either role. Over 500 logical steps (100 configured resend periods) with nothing else proposed, the only traffic after the drop is BLE heartbeats, the leader remains the stable leader, the follower holds the entry as Undecided with accepted_idx 1, and both nodes stay at decided index 0. The acceptance is only re-advertised later, either by a new client proposal (which makes the follower advertise a larger accepted index and decides both entries) or by a new Prepare/Promise cycle, where handle_acceptsync pushes a fresh Accepted carrying the follower's current accepted index.",
+      "conditions": "Two-node Sequence Paxos configuration (write quorum = the leader's own acceptance plus exactly one follower receipt) driven only through tick() and message passing; the follower's single Accepted reply is dropped while every other message is delivered in order; the storage is error-free; no further client proposal and no ballot change during the window.",
+      "source_ids": [
+        "src_leader_resend",
+        "src_follower_resend",
+        "src_follower_flush_batch",
+        "src_follower_acceptsync_reply",
+        "src_leader_handle_accepted"
+      ],
+      "executions": {
+        "092538c6a04e456e8c0277f748a174d9": [
+          1,
+          0
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "1a5428f0aa284eb1a2a3f1a083fcb052-question-0",
+      "experiment_id": "9d31a7bf98034ecaa9c70e2cef669b8c-experiment",
+      "source_ids": [
+        "src_leader_resend",
+        "src_follower_resend",
+        "src_leader_handle_accepted",
+        "src_follower_reply_accepted",
+        "src_follower_flush_batch",
+        "src_resend_dispatch",
+        "src_follower_acceptsync_reply",
+        "src_outgoing_trim_doc"
+      ],
+      "executions": {
+        "092538c6a04e456e8c0277f748a174d9": [
+          1,
+          0,
+          2
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "Current account. With the harness cadence corrected (one node ticked, drained and delivered at a time, so heartbeat replies land in the round that asked for them), the suspicion holds and the earlier apparent refutation is explained as an artifact of the old cadence. Execution 092538c6a04e456e8c0277f748a174d9 (experiment 9d31a7bf98034ecaa9c70e2cef669b8c-experiment, exit 0, both selected tests passed) parsed three events. Event 1 `lost_accepted_window`: steps 500, resend_periods 100, dropped Accepted:1, produced BLE:675,Prepare:1,Promise:1,AcceptSync:1,Accepted:2,AcceptDecide:1, after_drop BLE:667, accept_decide_total 1, leader_decided_idx 0, follower_decided_idx 0, follower_accepted_idx 1, follower_holds_undecided_entry true, leader_still_stable true - i.e. exactly one client proposal, no ballot change, no protocol message at all after the deliberate drop beyond heartbeats, and the entry still undecided after 100 resend periods even though the follower holds it and the leader is stable. Event 0 `delivered_accepted_decides` is the control: the same setup with the receipt delivered decides in 1 step (leader and follower both at 1), so the non-decision is attributable to the lost receipt, not to the window or to the configuration. Event 2 `later_proposal_repairs`: a second proposal decides both entries within 1 step (leader_decided_idx 2), which names the only enabled repair in that interval; the follower's decided index reads 0 there because the loop stopped as soon as the leader decided and the Decide had not been delivered yet (a probe-side reading, not a target behavior). Source support for the responsibility: the library exposes resend_message_tick_timeout, documented as 'the number of calls to tick() before a message is considered dropped and thus resent', and this snapshot's own runtime layer deliberately discards outgoing messages when its buffer exceeds the cap, documenting that as safe 'because OmniPaxos already tolerates lost messages via its own resend/retry mechanisms' (omnipaxos_runtime/src/handle.rs:52-58). In the accept phase that premise does not hold: the follower->leader direction has no retry at all, so the leader's quorum count stays one short of quorum until unrelated traffic or a ballot change repairs it. Scope asserted: in a two-node configuration where the single dropped Accepted is exactly what the write quorum still needs, the quorum-accepted entry stays undecided for at least 100 resend periods with no repair enabled by the protocol itself, and progress requires a new proposal or a leadership change. Counter-limitations kept in force: (a) the core API documents no bounded decision time and its resend knob is a recommendation, so the finding rests on the library's own loss-tolerance claim plus this snapshot's intentional message dropping; (b) a client retry (the runtime's documented 'retry safe' Timeout) effectively repairs the earlier entry as a side effect, so the lost duty is bounded by client retry behaviour rather than by the protocol; (c) only a 2-node configuration is probed, where one drop is quorum-critical - in wider clusters the same drop is masked whenever another follower's receipt still completes the quorum, and dropping all needed receipts is a stronger fault assumption; (d) the window is 500 logical steps with an error-free, in-order transport.",
+      "limitations": [
+        "Only the 2-node configuration is probed: the gap bites when the dropped receipt(s) are exactly those the write quorum still needs.",
+        "The earlier run's apparent repair (churn plus accept-sync re-advertisement) is real but requires a new Prepare/Promise cycle; this probe does not measure how often a deployment would incur one while no client traffic flows.",
+        "Client-side retry can repair the earlier entry as a side effect, so the practical impact depends on the caller's retry policy; the probe deliberately makes no further proposal.",
+        "The receipt's event 2 follower reading (decided 0) is a probe-side in-flight artifact, not a target behaviour."
+      ]
+    }
+  ]
+}
