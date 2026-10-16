@@ -31,7 +31,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 baseline 保持仓库级入口 `python -m baseline`，CA 提供可安装的 `consensus-assurance` 命令。两者共享工具和配置读取，不合并研究流程。使用 `pip install -e '.[test,baseline]'` 安装开发依赖；所有测试位于 `tests/`，`pytest -m 'not real'` 选择普通离线测试，`real` 标记的外部工具检查按环境单独运行。
 
-历史 `runs/`、`baseline/runs/`、`baseline/acceptance/` 和开发用 `AGENTS.md` 保留在本地但不进入发布文件；已有 Git 历史不改写。
+历史 `runs/`、`baseline/runs/` 和开发用 `AGENTS.md` 保留在本地但不进入发布文件；旧 `baseline/acceptance/` 产物已清理，可从已有 Git 历史查阅。
 
 ## 文档与记录
 

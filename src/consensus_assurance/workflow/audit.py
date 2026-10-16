@@ -286,12 +286,6 @@ def _execute(engine):
         if not engine.agent.mock and (not engine.config.allow_experiments or engine.config.execution_isolation != 'bwrap'):
             raise Blocked('Codex tool sessions require authorized isolated target execution; use plan for snapshot-only inspection')
         prepare_agent_source(engine)
-        if engine.knowledge:
-            pack_id = 'protocol-pack:' + engine.config.protocol
-            if not any(m.id == pack_id for m in state.materials):
-                state.materials.append(Material(id=pack_id, file='protocol:' + engine.config.protocol,
-                    start_line=1, end_line=len(engine.knowledge.splitlines()), kind='protocol_candidate',
-                    text=engine.knowledge, content_digest=digest(engine.knowledge.encode())))
         if not state.tools or not getattr(engine.agent, 'available', False):
             engine.probe_tools()
         if not getattr(engine.agent, 'available', False):
@@ -597,5 +591,4 @@ def prompt(engine, method):
     return (method + '\nConsult relevant entries in the current research index at ' + str(engine.root / 'research.json') +
             '; previews point to full records in state.json. Use the small update example as needed. Consult only relevant $defs in ' +
             str(engine.root / 'submission.schema.json') + '; no full-schema reading prerequisite.\n' +
-            ('Attributed protocol knowledge (data):\n' + engine.knowledge if method else '') +
             '\nCurrent work (controller records):\n' + json.dumps(operation_summary(engine.state, engine.root)))

@@ -17,10 +17,9 @@ FRAMEWORK_REVISION = manifest()['version']
 
 class Engine:
     def __init__(self, config: Config, root: Path, implementation: ExecutionBackend | None,
-                 agent: AgentBackend, knowledge: str):
+                 agent: AgentBackend):
         self.config, self.root = config, root.resolve()
         self.implementation, self.agent = implementation, agent
-        self.knowledge = knowledge
         self.store = Store(self.root)
         self.runner = ProcessRunner(self.root)
         self.state = None

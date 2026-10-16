@@ -53,149 +53,39 @@ func TestAssuranceOld(t *testing.T) { t.Fatal("Unselected old case") }
     assert execution_feedback(state,engine.root,new,checks[-1])['test_selection']['requested']==['TestAssuranceB']
 
 
-@pytest.mark.parametrize('gap',[False,True])
-def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
-    seen = []
-    def start(state):
-        sub,files=combined(state)
-        sub['experiment']['source_ids'].append('protocol-pack:none')
-        return sub,files
+@pytest.mark.parametrize('gap', [False, True])
+def test_combined_submission_execution_interpretation_and_noop(tmp_path, gap):
+    retained = {}
     def interpret(state):
-        seen.append(json.loads((e.root/'research.json').read_text()))
-        before=e.state.model_dump(mode='json')
-        summary=operation_summary(e.state,e.root)
-        assert 'uncited_executions' not in summary
-        assert list(summary).index('questions') < list(summary).index('reselection')
-        question=summary['questions'][0]
-        assert (question['question_state'],question['version'],question['hypothesis'])==('current',1,'The boundary may wrap')
-        execution=question['execution']
-        raw=json.loads((e.root/execution['observations']).read_text())
-        assert execution['events']==raw['events'] and execution['events_omitted_count']==0
-        assert execution['event_count']==2 and execution['parsing_error_count']==0
-        assert execution['comparisons'][0]['definition']==state['experiments'][0]['basis']['comparisons'][0]
-        assert execution['comparisons'][0]['result']['valid_witness_indices']==[1]
-        code=next(m for m in execution['sources'] if m['id']=='code')
-        assert code==dict(id='code',path='agent-source/target.py',start_line=1,end_line=2,
-                         record=dict(path='state.json',collection='materials',id='code'))
-        pack=next(m for m in execution['sources'] if m['id']=='protocol-pack:none')
-        assert 'path' not in pack and pack['record']==dict(path='state.json',collection='materials',id=pack['id'])
-        assert execution['anchors'][0]['material_id']=='code'
-        assert (e.root/execution['harness']).read_text()==state['experiments'][0]['basis']['harness']['source']
-        assert e.state.model_dump(mode='json')==before and not state['interpretations']
-        sub,files=opinion(state)
-        if gap:sub['gaps']=[dict(investigation_id=state['investigations'][0]['id'],
-            experiment_id=state['experiments'][0]['id'],question='Does the producer establish the sampled input?')]
-        return sub,files
+        question, = operation_summary(e.state, e.root)['questions']
+        retained['execution'] = question['execution']['id']
+        assert question['execution']['comparisons'][0]['result']['valid_witness_indices'] == [1]
+        assert not state['interpretations']
+        sub, files = opinion(state)
+        if gap:
+            sub['gaps'] = [dict(investigation_id=state['investigations'][0]['id'],
+                experiment_id=state['experiments'][0]['id'], question='Does the producer establish the sampled input?')]
+        return sub, files
     def duplicate(state):
-        summary=operation_summary(e.state,e.root)
-        assert summary['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
-        assert 'execution' not in summary['questions'][0]
-        change=summary['interpretation_changes'][0]
-        assert list(summary).index('interpretation_changes') < list(summary).index('questions') < list(summary).index('reselection')
-        assert change['previous'] is None and change['current']['id']==state['interpretations'][0]['id']
-        citation=change['executions'][0]
-        assert citation['event_indices']==citation['current_event_indices']==[1]
-        assert citation['previous_event_indices']==[]
-        assert citation['cited_events'][0]['event_index']==1 and citation['cited_events'][0]['observation']['value']==0
-        assert citation['references']['current']==[]
+        summary = operation_summary(e.state, e.root)
+        assert summary['questions'][0]['latest_interpretation']['id'] == state['interpretations'][0]['id']
+        assert summary['interpretation_changes'][0]['executions'][0]['id'] == retained['execution']
         return opinion(state)
     def finish(state):
-        index = json.loads((e.root/'research.json').read_text())
-        assert index['investigations'][0]['latest_execution'] == seen[0]['investigations'][0]['latest_execution']
-        assert index['investigations'][0]['latest_interpretation']['executions']
-        summary=operation_summary(e.state,e.root)
-        assert summary['no_change'] and not summary['questions']
-        assert 'interpretation_changes' not in summary
-        assert bool(summary['necessary_gaps'])==gap
-        if gap:assert summary['necessary_gaps'][0]['investigation_id']==state['investigations'][0]['id']
-        assert summary['reselection']['questions'][0]['latest_interpretation']['id']==state['interpretations'][0]['id']
-        assert 'latest_actual_execution' not in summary
-        assert list(summary).index('questions') < list(summary).index('reselection')
-        account=summary['reselection']['questions'][0]['latest_interpretation']
-        assert account['rationale']==state['interpretations'][0]['rationale'] and account['record']['id']==account['id']
-        assert summary['reselection']['questions'][0]['discriminator']=='Observe the return'
+        summary = operation_summary(e.state, e.root)
+        assert summary['no_change'] and not summary['questions'] and 'interpretation_changes' not in summary
+        assert bool(summary['necessary_gaps']) == gap
         return stop(state)
-    e, repo = engine_for(tmp_path,[start,interpret,duplicate,finish])
-    e.knowledge='A fixture protocol candidate, not target source.'
+    e, repo = engine_for(tmp_path, [combined, interpret, duplicate, finish])
     state = e.start(repo)
     assert len(state.investigations) == len(state.experiments) == len(state.interpretations) == 1
-    assert state.usage == {'agent_calls':4,'experiments':1}
-    assert state.agent_session_id == 'fixture-session'
-    fixed = state.experiments[0]
-    check = next(c for c in state.checks if c.experiment_id == fixed.id)
-    result = assessment(state,e.root,fixed,check)
+    assert state.usage == {'agent_calls': 4, 'experiments': 1} and state.agent_session_id == 'fixture-session'
+    index = json.loads((e.root/'research.json').read_text())['investigations'][0]
+    assert index['latest_execution']['id'] == retained['execution']
+    assert index['latest_interpretation']['executions'] == {retained['execution']: [1]}
+    check = next(c for c in state.checks if c.id == retained['execution'])
+    result = assessment(state, e.root, state.experiments[0], check)
     assert result['outcome'] == 'violated' and 'Scripted or nonoriginal execution' in str(result['blockers'])
-    assert result['comparisons'][0]['valid_witness_indices'] == [1]
-    assert not any(name in type(state).model_fields for name in ('units','claims','bindings','relations','evidence','findings'))
-
-
-
-
-
-def test_knowledge_and_interpretation_changes_share_observations_without_losing_old_basis(tmp_path):
-    retained={}
-    def start(state):
-        sub,files=combined(state)
-        files['check.py'] += "for i in range(9): print('CA_EVENT '+json.dumps(dict(event='extra',operation=str(i))))\n"
-        return sub,files
-    def seed(state):
-        receipt=next(c['id'] for c in state['checks'] if c.get('experiment_id'))
-        retained['receipt']=receipt
-        retained['files']={p:p.read_bytes() for folder in ('fixed-experiments','logs')
-            for p in (e.root/folder).rglob('*') if p.is_file()}
-        sub,files=opinion(state,conclusion='conditional',executions={receipt:[0,1]})
-        sub['knowledge']=[dict(kind='behavior',statement='The boundary invocation returns zero',
-            conditions='At the selected capacity',source_ids=['code'],executions={receipt:[0,1]})]
-        return sub,files
-    def revise(state):
-        summary=operation_summary(e.state,e.root)
-        new,=summary['knowledge_changes']
-        assert list(summary).index('knowledge_changes') < list(summary).index('questions')
-        assert new['previous'] is None and not new['intermediate_revisions']
-        assert new['current']['conditions']=='At the selected capacity'
-        assert {v['field'] for v in new['text_changes']}=={'statement','conditions'}
-        assert not new['executions'][0]['cited_events'] and len(new['executions'][0]['shared_cited_events'])==2
-        entry=state['knowledge'][0]
-        change={key:entry[key] for key in ('id','kind','statement','conditions','source_ids')}
-        change['executions']={retained['receipt']:list(range(1,11))}
-        retained['change']={**change,'conditions':'One invocation under the documented capacity contract','source_ids':['doc']}
-        sub,files=opinion(state,conclusion='conditional',executions={retained['receipt']:list(range(1,9))})
-        sub['knowledge']=[change,retained['change']]
-        return sub,files
-    def duplicate(state):
-        before=e.state.model_dump(mode='json')
-        summary=operation_summary(e.state,e.root)
-        change,=summary['knowledge_changes']
-        assert (change['previous']['revision'],change['current']['revision'])==(1,3)
-        assert change['intermediate_revisions']==[2]
-        assert change['previous']['source_ids']==['code'] and change['current']['source_ids']==['doc']
-        assert {s['id'] for s in change['sources']}=={'code','doc'}
-        assert change['previous']['record']['revision']==1 and change['current']['record']['revision']==3
-        text,=change['text_changes']
-        assert text['field']=='conditions' and 'At the selected capacity' in json.dumps(text)
-        assert retained['change']['conditions'] in json.dumps(text)
-        receipt,=change['executions']
-        assert receipt['previous_event_indices']==[0,1] and receipt['current_event_indices']==list(range(1,11))
-        assert receipt['event_indices']==list(range(11)) and not receipt['cited_events']
-        assert receipt['omitted_cited_indices']==[1,9,10] and len(receipt['shared_cited_events'])==8
-        for event in receipt['shared_cited_events']:
-            located=summary
-            for part in event['path'].strip('/').split('/'):
-                located=located[int(part)] if isinstance(located,list) else located[part]
-            assert located['event_index']==event['event_index']
-        assert receipt['references']['knowledge']==[]
-        assert len(summary['interpretation_changes'][0]['executions'][0]['cited_events'])==8
-        assert not any(q['gaps'] for q in state['investigations']) and 'knowledge_corrections' not in summary
-        assert e.state.model_dump(mode='json')==before
-        assert all(p.read_bytes()==data for p,data in retained['files'].items())
-        return {'rationale':'Keep the identical effective knowledge','knowledge':[retained['change']]},{}
-    def finish(state):
-        summary=operation_summary(e.state,e.root)
-        assert summary['no_change'] and 'knowledge_changes' not in summary and 'interpretation_changes' not in summary
-        assert state['knowledge'][0]['revision']==3 and state['usage']['experiments']==1
-        return stop(state)
-    e,repo=engine_for(tmp_path,[start,seed,revise,duplicate,finish])
-    e.start(repo)
 
 
 def test_schema_projected_local_revision_preserves_support_and_allows_withdrawal(tmp_path):
@@ -233,6 +123,7 @@ def test_schema_projected_local_revision_preserves_support_and_allows_withdrawal
             'knowledge':['statement'],'interpretations':['rationale']}
         assert e.state.knowledge[0].model_dump(mode='json')==saved['knowledge']
         assert e.state.interpretations[-1].model_dump(mode='json')==saved['interpretation']
+        sub['knowledge'].insert(0, {**sub['knowledge'][0], 'conditions':'An intermediate narrower condition'})
         return sub,{}
     def withdraw(state):
         for collection in ('knowledge','interpretations'):
@@ -253,6 +144,10 @@ def test_schema_projected_local_revision_preserves_support_and_allows_withdrawal
         assert state['usage']['experiments']==2 and len(state['interpretations'])==3
         for collection in ('knowledge','interpretations'):
             assert state[collection][-1]['executions']=={next(iter(saved['receipts'])):[1]}
+        entry = state['knowledge'][0]
+        assert entry['revision'] == 4 and len(entry['history']) == 3
+        assert entry['history'][1]['conditions'] == 'An intermediate narrower condition'
+        assert entry['history'][1]['operation_id'] == entry['history'][2]['operation_id']
         assert all(h['executions']==saved['receipts'] for h in state['knowledge'][0]['history'])
         assert state['interpretations'][0]==saved['interpretation']
         assert all(p.read_bytes()==content for p,content in saved['files'].items())

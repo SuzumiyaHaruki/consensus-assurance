@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 
 import pytest
@@ -28,6 +28,36 @@ pytestmark = pytest.mark.real
 toolchains = pytest.mark.parametrize('environment', ['go_module', 'cargo'], indirect=True, scope='module')
 
 
+@pytest.fixture(scope='module')
+def native_model():
+    if not shutil.which('codex'):
+        pytest.skip('Codex is required')
+    catalog = json.loads(subprocess.check_output(['codex', 'debug', 'models', '--bundled']))
+    return next(m['slug'] for m in catalog['models'] if 'high' in {v['effort'] for v in m['supported_reasoning_levels']})
+
+
+@contextmanager
+def prepared_client(config, root, timeout=900):
+    """Prepare one isolated baseline workspace and always close its client."""
+    for name in ("source", "inputs", "turns"):
+        (root / name).mkdir(parents=True)
+    runner.capture_source(config.repo_path, root / "source", time.monotonic() + 30)
+    shutil.copytree(root / "source", root / "work")
+    runner.git(root / "work", "-c", "init.templateDir=", "init")
+    (root / "inputs/task.md").write_bytes(runner.TASK.read_bytes())
+    runner.write_json(root / "inputs/implementation.json", runner.implementation_identity(root))
+    # Adversarial repository instructions must not be automatically injected.
+    (root / "work/AGENTS.md").write_text("METHOD_AND_ANSWER_CANARY_7301")
+    client = codex.Codex(config, root, load_target(config), time.monotonic() + timeout)
+    try:
+        actual = client.prepare()
+        assert actual['tool_evidence']['local_registration_and_tcp'] == 'not_checked_in_ordinary_run'
+        assert not (root/'inputs/local-exec-probe.json').exists()
+        yield client
+    finally:
+        client.close()
+
+
 @pytest.fixture(scope="module")
 def environments():
     with ExitStack() as cleanup:
@@ -42,6 +72,7 @@ def environment(request, environments):
         return clients[backend]
     retained = os.environ.get("BASELINE_ACCEPTANCE_DIR")
     # The main Agent deliberately hides host /tmp; real run directories live outside it.
+    (runner.TASK.parent / "runs").mkdir(exist_ok=True)
     tmp_path = Path(retained).resolve() / backend if retained else Path(cleanup.enter_context(
         tempfile.TemporaryDirectory(prefix=".capability-", dir=runner.TASK.parent / "runs")))
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -63,21 +94,8 @@ def environment(request, environments):
     (tmp_path / "private-canary").write_text("private")
     if backend == "cargo":
         (cache / "credentials.toml").write_text("private")
-    root = tmp_path / "run"
-    for name in ("source", "inputs", "turns"):
-        (root / name).mkdir(parents=True)
-    runner.capture_source(config.repo_path, root / "source", time.monotonic() + 30)
-    shutil.copytree(root / "source", root / "work")
-    runner.git(root / "work", "-c", "init.templateDir=", "init")
-    (root / "inputs/task.md").write_bytes(runner.TASK.read_bytes())
-    runner.write_json(root / "inputs/implementation.json", runner.implementation_identity(root))
-    # Adversarial repository instructions must not be automatically injected.
-    (root / "work/AGENTS.md").write_text("METHOD_AND_ANSWER_CANARY_7301")
-    client = codex.Codex(config, root, load_target(config), time.monotonic() + 900)
-    cleanup.callback(client.close)
-    actual = client.prepare()
-    assert actual['tool_evidence']['local_registration_and_tcp'] == 'not_checked_in_ordinary_run'
-    assert not (root/'inputs/local-exec-probe.json').exists()
+    client = cleanup.enter_context(prepared_client(config, tmp_path / 'run'))
+    root = client.root
     client.prompt_probe()
     assert (root / 'inputs/models.json').read_bytes() == Path(config.codex_provider.model_catalog_path).read_bytes()
     prompt = (root / 'inputs/prompt-input/stdout.jsonl').read_text()
@@ -247,7 +265,8 @@ def test_real_exec_resume_request_tools_and_result_consumption(environment, monk
         assert results[0]['session_id'] == results[1]['session_id']
         initial = capture.requests[0]['tools']
         assert any(t.get('type') == 'tool_search' for t in initial)
-        assert all('METHOD_AND_ANSWER_CANARY_7301' not in json.dumps(body) and 'Available skills' not in json.dumps(body['input']) for body in capture.requests)
+        assert all('METHOD_AND_ANSWER_CANARY_7301' not in json.dumps(body)
+            and '\\n### Available skills\\n' not in json.dumps(body['input']) for body in capture.requests)
         runner.write_json(folder/'observations.json', {'evidence': 'scripted_local_fixture_not_model_inference',
             'cli': client.version, 'supports_search_tool': True, 'tool_mode': selected['models'][0].get('tool_mode'),
             'endpoint_override': capture.url, 'credential': 'synthetic-local-fixture',
@@ -264,25 +283,18 @@ def test_real_exec_resume_request_tools_and_result_consumption(environment, monk
         assert not any(json.loads(line).get('type') == 'turn.completed' for line in text.splitlines() if line.startswith('{'))
 
 
-def test_native_openai_connection_and_key_boundary(tmp_path, monkeypatch):
+def test_native_openai_connection_and_key_boundary(tmp_path, monkeypatch, native_model):
     if not all(shutil.which(name) for name in ("codex", "bwrap", "go")):
         pytest.skip("Codex, Bubblewrap and Go are required")
     config = configuration(tmp_path)
     config.codex_provider = None
-    config.agent_model = "gpt-5.4"
+    config.agent_model = native_model
     config.api_key_env = "BASELINE_NATIVE_TEST_KEY"
     root = tmp_path / "native"
-    for name in ("inputs", "source", "turns"):
-        (root / name).mkdir(parents=True)
-    runner.capture_source(config.repo_path, root / "source", time.monotonic() + 30)
-    shutil.copytree(root / "source", root / "work")
-    (root / "inputs/task.md").write_bytes(runner.TASK.read_bytes())
     connection = {'HTTPS_PROXY':'http://proxy.example.invalid:7890', 'https_proxy':'http://proxy.example.invalid:7890',
                   'NO_PROXY':'localhost,127.0.0.1', 'SSL_CERT_DIR':'/etc/ssl/certs'}
     for key,value in {**connection,'UNRELATED_SECRET':'not-for-client'}.items():monkeypatch.setenv(key,value)
-    client = codex.Codex(config, root, load_target(config), time.monotonic() + 60)
-    try:
-        client.prepare()
+    with prepared_client(config, root, timeout=60) as client:
         assert all(client.environment[key]==value for key,value in connection.items())
         assert 'UNRELATED_SECRET' not in client.environment
         assert not connection.keys() & client.execution_control['environment'].keys()
@@ -299,8 +311,6 @@ def test_native_openai_connection_and_key_boundary(tmp_path, monkeypatch):
         assert client.environment["CODEX_API_KEY"] == "native-test-canary"
         assert config.api_key_env not in client.environment
         assert "native-test-canary" not in json.dumps(client.settings)
-    finally:
-        client.close()
 
 
 def test_check_env_runs_no_model_and_retains_real_probes(tmp_path):
@@ -565,7 +575,7 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
     assert heartbeat.read_text()==before, 'Detached descendant survived the service lifecycle'
 
 
-def test_native_full_profile_prepares_without_custom_provider(environment, monkeypatch):
+def test_native_full_profile_prepares_without_custom_provider(environment, monkeypatch, native_model):
     from consensus_assurance.adapters.agents.backend import CodexAgent
     from consensus_assurance.adapters.runners.process import ProcessRunner
     client=environment
@@ -575,7 +585,7 @@ def test_native_full_profile_prepares_without_custom_provider(environment, monke
     home=client.home/'native-profile-home';home.mkdir()
     monkeypatch.setenv('CODEX_HOME',str(home))
     process_runner=ProcessRunner(root)
-    agent=CodexAgent('high','gpt-5.4',profile='single_agent')
+    agent=CodexAgent('high',native_model,profile='single_agent')
     assert agent.probe(process_runner)['available']
     agent.bind_inputs(root, root/'agent-source')
     assert agent.prepare(process_runner,root/'draft','s')[0]

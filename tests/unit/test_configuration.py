@@ -51,3 +51,11 @@ def test_both_entry_points_reject_duplicate_yaml_keys(tmp_path, loader):
     path.write_text('agent_model: first\nagent_model: second\n')
     with pytest.raises(ValueError, match='Duplicate configuration key'):
         loader(path)
+
+
+@pytest.mark.parametrize('selection', [{'execution_backend': 'unknown'}, {'agent_backend': 'unknown'}])
+def test_unknown_backend_has_an_explicit_configuration_error(selection):
+    from consensus_assurance.core.config import Config
+    from consensus_assurance.registry import assemble
+    with pytest.raises(ValueError, match='Unknown configured backend'):
+        assemble(Config(**selection))

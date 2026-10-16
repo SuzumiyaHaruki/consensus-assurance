@@ -129,7 +129,7 @@ def main(argv=None):
                     "限制说明":"上限不自动扩容或兑换；单项额度耗尽不自动终止有预算的源码调查。缺失 token 用量保持未知，不预测发现数。"},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)
-        implementation, agent, knowledge = assemble(config)
+        implementation, agent = assemble(config)
         if args.command == "doctor":
             runner = ProcessRunner(root)
             results = {"agent": agent.probe(runner)}
@@ -145,7 +145,7 @@ def main(argv=None):
             snapshot = capture(repo, analysis_roots=config.target.analysis_roots, expected_module=config.target.expected_module)
             write_json(root / "snapshot.json", snapshot)
             print(f"目标快照已保存：{root / 'snapshot.json'}"); return 0
-        engine = Engine(config, root, implementation, agent, knowledge)
+        engine = Engine(config, root, implementation, agent)
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:

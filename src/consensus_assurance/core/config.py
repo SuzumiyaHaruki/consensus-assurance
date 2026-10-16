@@ -65,7 +65,6 @@ class CodexProvider(Record):
 
 class Config(Record):
     '''Main configuration for the system.'''
-    protocol: str = "none"
     execution_backend: str = "none"
     target: TargetConfig = TargetConfig()
     repo_path: str | None = None

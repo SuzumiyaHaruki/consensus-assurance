@@ -3,11 +3,8 @@ from consensus_assurance.adapters.runners.go_module import GoModuleBackend
 from consensus_assurance.adapters.runners.python import PythonBackend
 from consensus_assurance.adapters.runners.cargo import CargoBackend
 from consensus_assurance.adapters.runners.maven import MavenBackend
-from consensus_assurance.plugins.protocols.raft.pack import knowledge as raft_knowledge
-from consensus_assurance.plugins.protocols.toy.pack import knowledge as toy_knowledge
 
 EXECUTION_BACKENDS = {"go_module": GoModuleBackend, "cargo": CargoBackend, "maven": MavenBackend, "python": PythonBackend, "none": lambda target, timeout: None}
-KNOWLEDGE = {"raft": raft_knowledge, "toy": toy_knowledge, "none": lambda: ""}
 AGENTS = {"codex": lambda cfg: CodexAgent(cfg.agent_reasoning_effort, cfg.agent_model, cfg.codex_provider, cfg.codex_profile), "mock": lambda cfg: MockAgent(cfg.fixture)}
 
 
@@ -19,6 +16,6 @@ def execution_backend(config):
 
 def assemble(config):
     try:
-        return execution_backend(config), AGENTS[config.agent_backend](config), KNOWLEDGE[config.protocol]()
+        return execution_backend(config), AGENTS[config.agent_backend](config)
     except KeyError as exc:
         raise ValueError("Unknown configured backend: " + str(exc)) from exc

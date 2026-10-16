@@ -1,5 +1,5 @@
-from consensus_assurance.core.submissions import SourceRange
 """Codex transport protocol, local permission preflight and source boundaries."""
+from consensus_assurance.core.submissions import SourceRange
 import json
 from pathlib import Path
 import pytest
@@ -62,90 +62,117 @@ def test_transport_diagnostic_keeps_mixed_restrictions_and_completed_reconnects(
     else:assert result is None and check.status==ExecutionStatus.TIMEOUT
 
 
-@pytest.mark.parametrize('boundary',[
-    'turn','turn_no_final','turn_stdout','turn_crash','total','action','unlabelled','cancelled','no_session',
-    'refusal','permission','permission_recheck','session_lost','empty_error','calls','time'])
-@pytest.mark.parametrize('completed',[False,True])
-def test_turn_deadline_continues_only_saved_session_with_capacity(tmp_path,boundary,completed):
-    from support.audit import ScriptedAgent,engine_for,first,combined
-    continuation=combined if boundary=='turn_crash' else first
-    engine,repo=engine_for(tmp_path,[first,continuation])
-    resumed=boundary in {'turn','turn_no_final','turn_stdout','turn_crash'}
-    if boundary=='calls':engine.config.budget.agent_calls=1
-    class InterruptedAgent(ScriptedAgent):
-        def investigate(self,runner,prompt,directory,snapshot_id,timeout,session_id=None):
-            if self.cursor:
-                assert resumed and session_id=='saved'
-                assert not engine.state.investigations and not engine.state.materials
-                assert engine.state.usage['agent_calls']==2
-                assert 'interrupted_turn' in prompt and self.check.id in prompt and self.check.stdout in prompt
-                assert json.loads(Path(self.check.stdout).with_name('check.json').read_text())['status']=='timeout'
-                check,_,result=super().investigate(runner,prompt,directory,snapshot_id,timeout,session_id)
-                return check,session_id,result
-            self.cursor+=1
-            assert session_id is None
-            draft,_=first(engine.state.model_dump(mode='json'))
-            draft['investigations'][0]['question']='Incomplete draft must not be accepted'
-            (directory/'unfinished.json').write_text(json.dumps(draft))
-            response=runner.root/'actions'/runner.active_action_id/'agent-response.json'
-            final=json.dumps({'submission':'unfinished.json','summary':'Valid-looking interrupted output'})
-            if boundary not in {'turn_no_final','turn_stdout'}:response.write_text(final)
-            events=[] if boundary=='no_session' else [{'type':'thread.started','thread_id':'saved'}]
-            events.append({'type':'item.completed','item':{'id':'tool','type':'command_execution',
-                'aggregated_output':'Fixture case: permission denied; thread not found'}})
-            errors={'refusal':'This content was flagged for possible cybersecurity risk.',
-                'permission':'Permission denied; request timed out','session_lost':'thread not found','empty_error':''}
-            if boundary in errors:events.append({'type':'turn.failed','error':{'message':errors[boundary]}})
-            if boundary=='turn_stdout':
-                events.append({'type':'item.completed','item':{'type':'agent_message','text':final}})
-            if completed:events.append({'type':'turn.completed'})
-            self.check=CheckRun(action='agent_turn',cwd=str(directory),snapshot_id=snapshot_id,
-                pending_action_id=runner.active_action_id,exit_code=-9,
-                status=ExecutionStatus.CANCELLED if boundary=='cancelled' else ExecutionStatus.TIMEOUT,
-                reason='Fixture interrupted at '+boundary,
-                parameters={} if boundary=='unlabelled' else {'timeout_limit':
-                    {'total':'total_seconds','action':'action_timeout'}.get(boundary,'agent_turn_timeout')})
-            log=runner.root/'logs'/self.check.id/'stdout.log';log.parent.mkdir(parents=True)
-            self.raw='\n'.join(map(json.dumps,events));log.write_text(self.raw)
-            self.check.stdout=str(log)
-            if boundary=='time':engine.budget.previous=engine.config.budget.total_seconds
-            if boundary=='permission_recheck':self.prepare=lambda *args:(False,[])
-            return CodexAgent().decode(self.check,response,session_id)
-    engine.agent=InterruptedAgent([first,continuation])
-    if boundary=='turn_crash':
-        checkpoint=engine.checkpoint
+def interrupted_receipt(folder, snapshot_id, boundary='turn', completed=False):
+    """A durable timeout with optional stream completion; never a successful process."""
+    folder.mkdir(parents=True, exist_ok=True)
+    final = json.dumps({'submission': 'unfinished.json', 'summary': 'Interrupted draft'})
+    response = folder / 'agent-response.json'
+    if boundary not in {'turn_no_final', 'turn_stdout'}:
+        response.write_text(final)
+    events = [] if boundary == 'no_session' else [{'type': 'thread.started', 'thread_id': 'saved'}]
+    events.append({'type': 'item.completed', 'item': {'id': 'tool', 'type': 'command_execution',
+        'aggregated_output': 'Fixture case: permission denied; thread not found'}})
+    errors = {'refusal': 'This content was flagged for possible cybersecurity risk.',
+        'permission': 'Permission denied; request timed out', 'session_lost': 'thread not found', 'empty_error': ''}
+    if boundary in errors:
+        events.append({'type': 'turn.failed', 'error': {'message': errors[boundary]}})
+    if boundary == 'turn_stdout':
+        events.append({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': final}})
+    if completed:
+        events.append({'type': 'turn.completed'})
+    log = folder / 'stdout.log'
+    log.write_text('\n'.join(map(json.dumps, events)))
+    check = CheckRun(action='agent_turn', cwd=str(folder), snapshot_id=snapshot_id, stdout=str(log), exit_code=-9,
+        status=ExecutionStatus.CANCELLED if boundary == 'cancelled' else ExecutionStatus.TIMEOUT,
+        reason='Fixture interrupted at ' + boundary, parameters={} if boundary == 'unlabelled' else {
+            'timeout_limit': {'total': 'total_seconds', 'action': 'action_timeout'}.get(boundary, 'agent_turn_timeout')})
+    return CodexAgent().decode(check, response)
+
+
+@pytest.mark.parametrize('boundary', [
+    'turn', 'turn_no_final', 'turn_stdout', 'total', 'action', 'unlabelled', 'cancelled',
+    'no_session', 'refusal', 'permission', 'session_lost', 'empty_error'])
+@pytest.mark.parametrize('completed', [False, True])
+def test_timeout_receipt_continuation_boundary(tmp_path, boundary, completed):
+    from types import SimpleNamespace
+    from support.evidence import research_state
+    from consensus_assurance.workflow.audit import accept_received
+    state = research_state(tmp_path)
+    check, session, result = interrupted_receipt(tmp_path / 'receipt', state.snapshot.id, boundary, completed)
+    state.checks.append(check)
+    state.agent_session_id = session
+    state.current_submission = dict(operation_id=check.id, phase='received', result=result,
+        status=check.status.value, reason=check.reason)
+    before = state.model_dump(mode='json')
+    raw = Path(check.stdout).read_bytes()
+    advanced = []
+    engine = SimpleNamespace(state=state, root=tmp_path, advance=advanced.append)
+    assert accept_received(engine) is False and result is None
+    assert advanced == (['agent_turn_timeout:' + check.id] if boundary.startswith('turn') else [])
+    assert bool(state.current_submission) == (not advanced)
+    assert state.investigations == type(state).model_validate(before).investigations
+    assert check.status == (ExecutionStatus.ERROR if completed and boundary == 'no_session'
+        else ExecutionStatus.CANCELLED if boundary == 'cancelled' else ExecutionStatus.TIMEOUT)
+    assert check.parameters['agent_turn_completed'] == completed and Path(check.stdout).read_bytes() == raw
+    assert not (tmp_path / 'submissions').exists()
+
+
+@pytest.mark.parametrize('boundary', ['continue', 'crash', 'calls', 'time', 'permission_recheck'])
+def test_turn_timeout_resume_budget_and_recovery(tmp_path, monkeypatch, boundary):
+    from support.audit import engine_for, first, combined
+    engine, repo = engine_for(tmp_path, [combined])
+    engine.config.budget.agent_calls = 1 if boundary == 'calls' else 2
+    investigate = engine.agent.investigate
+    calls = []
+    retained = {}
+
+    def interrupted(runner, prompt, directory, snapshot_id, timeout, session_id=None):
+        calls.append(session_id)
+        if len(calls) > 1:
+            assert session_id == 'saved' and not engine.state.investigations
+            assert engine.state.usage['agent_calls'] == 2 and 'interrupted_turn' in prompt
+            assert retained['id'] in prompt and retained['stdout'] in prompt
+            check, _, result = investigate(runner, prompt, directory, snapshot_id, timeout, session_id)
+            return check, session_id, result
+        (directory/'unfinished.json').write_text(json.dumps(first({})[0]))
+        payload = interrupted_receipt(runner.root/'logs/timeout', snapshot_id, completed=True)
+        retained.update(id=payload[0].id, stdout=payload[0].stdout)
+        if boundary == 'time':
+            engine.budget.previous = engine.config.budget.total_seconds
+        if boundary == 'permission_recheck':
+            engine.agent.prepare = lambda *args: (False, [])
+        return payload
+
+    monkeypatch.setattr(engine.agent, 'investigate', interrupted)
+    if boundary == 'crash':
+        checkpoint = engine.checkpoint
         def interrupt_after_result(event):
             checkpoint(event)
-            if event=='action_result_saved' and engine.state.usage['agent_calls']==2:
-                raise KeyboardInterrupt('Interrupt before receiving the completed continuation')
-        engine.checkpoint=interrupt_after_result
-        with pytest.raises(KeyboardInterrupt):engine.start(repo)
-        assert not engine.state.investigations and len(engine.state.agent_turns)==1
-        engine.checkpoint=checkpoint
-        state=engine.resume()
-    else:state=engine.start(repo)
-    assert engine.agent.cursor==state.usage['agent_calls']==(2 if resumed else 1)
-    assert len(state.agent_turns)==(2 if resumed else 1)
-    assert len(state.investigations)==int(resumed)
-    assert len(state.experiments)==state.usage.get('experiments',0)==int(boundary=='turn_crash')
-    if boundary=='turn_crash':
-        executions=[check.id for check in state.checks if check.experiment_id]
-        state=engine.resume()
-        assert len(executions)==1 and [check.id for check in state.checks if check.experiment_id]==executions
-        assert state.usage['agent_calls']==2 and state.usage['experiments']==1
-    assert Path(engine.agent.check.stdout).read_text()==engine.agent.raw
-    assert engine.agent.check.status==(ExecutionStatus.ERROR if completed and boundary=='no_session'
-        else ExecutionStatus.CANCELLED if boundary=='cancelled' else ExecutionStatus.TIMEOUT)
-    assert engine.agent.check.parameters['agent_turn_completed']==completed
-    assert not (engine.root/'submissions'/engine.agent.check.id).exists()
+            if event == 'action_result_saved' and engine.state.usage['agent_calls'] == 2:
+                raise KeyboardInterrupt('After durable continuation result')
+        monkeypatch.setattr(engine, 'checkpoint', interrupt_after_result)
+        with pytest.raises(KeyboardInterrupt):
+            engine.start(repo)
+        assert not engine.state.investigations and len(engine.state.agent_turns) == 1
+        monkeypatch.setattr(engine, 'checkpoint', checkpoint)
+        engine.resume()
+    else:
+        engine.start(repo)
+    resumed = boundary in {'continue', 'crash'}
+    state = engine.state
+    assert calls == ([None, 'saved'] if resumed else [None])
+    assert state.usage['agent_calls'] == len(state.agent_turns) == len(calls)
+    assert len(state.investigations) == len(state.experiments) == state.usage.get('experiments', 0) == int(resumed)
+    assert not (engine.root/'submissions'/retained['id']).exists()
     assert (engine.root/'draft/unfinished.json').is_file()
     if resumed:
-        assert state.agent_session_id=='saved' and 'agent_calls budget exhausted' in state.stop_reason
-        actions=[json.loads(p.read_text()) for p in (engine.root/'actions').glob('*/input.json')]
-        actions=[action for action in actions if 'turn' in action]
-        assert sorted(a['turn'] for a in actions)==[0,1]
-        assert next(a for a in actions if a['turn']==1)['session_id']=='saved'
-        assert state.investigations[0].question=='Does the actual local return remain bounded?'
+        receipts = [c.id for c in state.checks if c.experiment_id]
+        actions = [json.loads(p.read_text()) for p in (engine.root/'actions').glob('*/input.json')]
+        assert sorted(a['turn'] for a in actions if 'turn' in a) == [0, 1]
+        assert next(a for a in actions if a.get('turn') == 1)['session_id'] == 'saved'
+        engine.resume()
+        assert calls == [None, 'saved'] and engine.state.usage['experiments'] == 1
+        assert [c.id for c in engine.state.checks if c.experiment_id] == receipts
 
 
 def test_completed_stream_event_does_not_complete_a_timed_out_process(tmp_path,monkeypatch):

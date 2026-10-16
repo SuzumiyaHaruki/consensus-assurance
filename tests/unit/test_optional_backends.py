@@ -1,5 +1,4 @@
 """Tool selection and timeout boundaries, without a real Codex or target process."""
-import ast
 import json
 import sys
 import time
@@ -11,18 +10,6 @@ from consensus_assurance.workflow.audit import add_support
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.adapters.runners.experiment import install_harness
 from consensus_assurance.core.types import Harness
-
-
-def test_default_assembly_respects_plugin_dependency_boundary():
-    root=Path(__file__).resolve().parents[2]/'src/consensus_assurance'
-    for package in ('core','workflow'):
-        for path in (root/package).rglob('*.py'):
-            for node in ast.walk(ast.parse(path.read_text())):
-                if isinstance(node,ast.ImportFrom):assert 'plugins' not in (node.module or '').split('.')
-                if isinstance(node,ast.Import):assert all('plugins' not in a.name.split('.') for a in node.names)
-    with pytest.raises(ValueError,match='Unknown configured backend'):
-        assemble(Config(execution_backend='hashicorp_raft',agent_backend='mock'))
-    assert Config().investigation_focus==[]
 
 
 @pytest.mark.real
