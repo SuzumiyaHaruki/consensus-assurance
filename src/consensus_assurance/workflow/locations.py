@@ -109,6 +109,31 @@ def declarations(material, include_calls=True):
                 'end':offset+node.end_point.row+1 if not node.has_error else None,
                 'known_end':material.end_line,'closed':not node.has_error,
                 'kind':'interface_member' if node.type=='function_signature_item' else 'declaration'})
+    elif material.file.endswith('.java'):
+        from tree_sitter import Language, Parser
+        import tree_sitter_java
+        nodes=[Parser(Language(tree_sitter_java.language())).parse(text.encode()).root_node]
+        types={'class_declaration','interface_declaration','enum_declaration','record_declaration','annotation_type_declaration'}
+        while nodes:
+            node=nodes.pop()
+            nodes.extend(reversed(node.named_children))
+            if node.type not in types | {'method_declaration','constructor_declaration','annotation_type_element_declaration'}:continue
+            name=node.child_by_field_name('name');body=node.child_by_field_name('body')
+            if name is None or name.is_missing or any(c.has_error for c in node.named_children if c!=body):continue
+            owners=[];parent=node.parent
+            while parent:
+                if parent.type in types:
+                    owner=parent.child_by_field_name('name')
+                    if owner and not owner.has_error:owners.insert(0,owner.text.decode())
+                # Anonymous classes do not acquire their enclosing named type's identity.
+                if parent.type=='object_creation_expression':owners=[];break
+                parent=parent.parent
+            result.append({'owner':'.'.join(owners) or None,'symbol':name.text.decode(),
+                'start':offset+node.start_point.row+1,
+                'signature_end':offset+(body.start_point.row if body else node.end_point.row)+1,
+                'end':offset+node.end_point.row+1 if not node.has_error else None,
+                'known_end':material.end_line,'closed':not node.has_error,
+                'kind':'interface_member' if node.type=='method_declaration' and body is None else 'declaration'})
     return result
 
 

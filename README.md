@@ -8,9 +8,9 @@
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 export PATH="$HOME/.local/bin:$PATH"
-.venv/bin/consensus-assurance doctor --config configs/targets/etcd_raft.yaml
+.venv/bin/consensus-assurance doctor --config configs/targets/deepseek.example.yaml
 .venv/bin/consensus-assurance inspect \
-  --config configs/targets/etcd_raft.yaml --repo /实际路径/etcd-raft
+  --config configs/targets/deepseek.example.yaml --repo /实际路径/Go模块仓库
 ```
 
 真实运行需要现有认证、材料发送及隔离执行授权；具体运行命令、工具路径和开发测试见环境文档。工具不会自动下载目标或提高预算。
@@ -21,11 +21,11 @@ export PATH="$HOME/.local/bin:$PATH"
 
 问题的局部暂停保留未决工作并继续 Codex 会话；开放运行持续推进到控制器时间／调用边界或真实中断；没有下一项完整检查不能结束整轮。用户预先指定的有限定向任务处置完毕后可结束。`research.json` 给出当前问题、实际结果位置、必要缺口、知识修订及剩余能力。只保留总时间、模型调用和目标执行等实际资源限制；增加总时长不会自动增加调用或执行次数。
 
-新运行支持源码调查、条件探索和真实实现的直接检查／受控调度；内置 TLA/TLC 产品、搜索及校准链已退出，不再要求 Java 或 JAR。直接测试不等价于模型空间穷举。当前方法版本和加载路径以[权威清单](src/consensus_assurance/resources/task-skills.json)为准。旧运行及原始报告保持只读；恢复旧方法必须使用其原 Git 版本。含已退役产品配额的本地配置需从当前模板重新生成。
+新运行支持源码调查、条件探索和真实实现的直接检查／受控调度；执行后端支持 Go、Rust/Cargo、Java/Maven 和 Python。直接测试不等价于模型空间穷举。当前方法版本和加载路径以[权威清单](src/consensus_assurance/resources/task-skills.json)为准。旧运行及原始报告保持只读；恢复旧方法必须使用其原 Git 版本。含已退役产品配额的本地配置需从当前模板重新生成。
 
 ## 目标配置
 
-configs/targets 保留 etcd Raft、HashiCorp Raft、Dragonboat、OmniPaxos、SwiftPaxos 中 EPaxos 的五份目标模板，以及一份 DeepSeek 接入示例。目标模板默认关闭材料发送和执行授权；获权后使用本地 `*.run.yaml`，不提交。同一目标、模型及预算复用已有配置，不按实验轮次或方法版本复制；新配置以目标、模型和预算命名。实际方法版本由运行时记录，每次运行独立保存所用配置。目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。tests/fixtures/toy_protocol 仅用于隔离回归，不是实验目标或默认选题答案。
+configs/targets 保留 DeepSeek 接入示例和本地 DeepSeek 运行配置；公开的 HashiCorp 配对配置位于 baseline/configs。示例默认关闭材料发送和执行授权；获权后使用本地 `*.run.yaml`，不提交。同一目标、模型及预算复用已有配置，不按实验轮次或方法版本复制；新配置以目标、模型和预算命名。实际方法版本由运行时记录，每次运行独立保存所用配置。目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。tests/fixtures/toy_protocol 仅用于隔离回归，不是实验目标或默认选题答案。
 
 ## 文档与记录
 

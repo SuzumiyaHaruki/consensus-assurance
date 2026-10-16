@@ -20,6 +20,27 @@ def test_declaration_outside_read_material_requires_reading():
     assert not locate(binding(prefix),{prefix.id:prefix})[0]['boundary_complete']
 
 
+def test_java_declarations_resolve_actual_owner_and_overload_range():
+    from consensus_assurance.workflow.locations import declarations
+    m=material('''class First {
+    @Deprecated public int take(int n) {
+        return n;
+    }
+    public int take() { return 0; }
+    static class Nested { void act() {} }
+}
+interface Second { int take(); }
+// class Invented { void ignored() {} }
+''', file='Sample.java')
+    assert locate(binding(m,'First.take',3,3),{m.id:m})[0]['start_line']==2
+    assert locate(binding(m,'First.take',5,5),{m.id:m})[0]['start_line']==5
+    assert locate(binding(m,'Second.take',3,3),{m.id:m})[0] is None
+    assert any(d['owner']=='First.Nested' and d['symbol']=='act' for d in declarations(m))
+    assert not any(d['symbol']=='ignored' for d in declarations(m))
+    partial=material('    public int take(int n) {\n        return n;\n',2,file='Sample.java')
+    assert locate(binding(partial,'First.take',3,3),{partial.id:partial})[0] is None
+
+
 def test_qualified_interface_member_requires_actual_owner_and_anchor():
     from consensus_assurance.workflow.locations import location_context
     m=material('type First interface {\n Response() int\n}\ntype Second interface {\n Response() int\n}\n')

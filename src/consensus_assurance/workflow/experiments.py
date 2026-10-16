@@ -127,7 +127,7 @@ def execute(engine, fixed, operation_id):
         check.tool_version = engine.state.tools.get('implementation', 'unknown')
         check.parameters.update(execution_package=harness.execution_package, harness_filename=fixed.harness_filename,
                                 action_started_at=started, action_seconds=time.monotonic() - clock)
-        if harness.kind in {'go_test', 'rust_test'}:
+        if harness.kind in {'go_test', 'rust_test', 'java_test'}:
             check.parameters.setdefault('test_selection', {'requested':harness.test_names,
                 'observed':[], 'unobserved':harness.test_names or []})
         check.artifacts.extend(paths)

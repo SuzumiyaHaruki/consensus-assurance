@@ -147,26 +147,40 @@ def test_costs_keep_missing_data_and_do_not_double_count_children(tmp_path):
         assert execution_cost(c.model_copy(update={'parameters':{'action_seconds':invalid},'started_at':'invalid'}))=={'process_seconds':None,'action_seconds':None}
 
 
-@pytest.mark.parametrize('outcome',['unknown','holds'])
-def test_report_distinguishes_unchecked_and_opposing_mechanical_results(tmp_path,outcome):
+@pytest.mark.parametrize('outcome,conclusion',[
+    ('unknown','violated'), ('unknown','holds'), ('holds','violated'), ('violated','holds')])
+def test_report_distinguishes_unchecked_and_opposing_mechanical_results(tmp_path,outcome,conclusion):
     def start(state):
         value,files=combined(state)
         if outcome=='unknown':
             value['experiment'].update(requirement=None,comparisons=[])
-        else:
+        elif outcome=='holds':
             value['experiment']['comparisons'][0]['assertion']={'field':'value','value':0}
         return value,files
-    e,repo=engine_for(tmp_path,[start,lambda s:opinion(s,defect_claim='asserted'),stop])
+    e,repo=engine_for(tmp_path,[start,lambda s:opinion(s,conclusion=conclusion,defect_claim='asserted'),stop])
     state=e.start(repo)
     assert len(state.interpretations)==1
+    check=next(c for c in state.checks if c.experiment_id)
+    assert assessment(state,e.root,state.experiments[0],check)['outcome']==outcome
+    before=state.model_dump(mode='json')
     text=render_report(state,e.root).read_text()
-    assert ('Interpretation differs from the mechanical result' in text)==(outcome=='holds')
+    assert state.model_dump(mode='json')==before
+    current=text.split(f'### {state.investigations[0].question}',1)[1].split('Fixed experiment `',1)[0]
+    assert f'Current model interpretation `{state.interpretations[0].id}` · `{conclusion}`' in current
+    assert 'declared predicate' not in current
+    assert ('Interpretation differs from the mechanical result' in text)==(outcome!='unknown')
     assert ('mechanical comparison is undetermined, not an opposing conclusion' in text)==(outcome=='unknown')
+    assert ('No fixed comparisons declared' in text)==(outcome=='unknown')
+    labels={'unknown':'comparison undetermined','holds':'declared predicate holds','violated':'declared predicate does not hold'}
+    assert text.count(f'Mechanical comparison: {labels[outcome]} (`{outcome}`).')==(1 if outcome=='unknown' else 2)
     assert 'Current model defect claim: defect asserted' in text and 'confirmed' not in text
     assert 'Mechanical results evaluate declared predicates' in text
     assert 'not provider request count' in text and 'excludes Agent local exploratory checks' in text
     assert f'### {state.investigations[0].question}' in text
     assert state.interpretations[0].rationale in text
+    view=json.loads((e.root/'research.json').read_text())
+    assert view['investigations'][0]['latest_interpretation']['conclusion']==conclusion
+    assert view['reselection']['questions'][0]['latest_interpretation']['conclusion']==conclusion
 
 
 @pytest.mark.parametrize('claim,label',[

@@ -56,7 +56,7 @@ class CodexProvider(Record):
             raise ValueError('Provider base_url must be HTTPS without credentials, query, fragment or whitespace')
         _ = url.port
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',self.env_key) or self.env_key.upper() in {
-                'PATH','HOME','CODEX_HOME','TMPDIR','LANG','LC_ALL','JAVA_HOME','RUSTC','RUSTDOC','CARGO_HOME',
+                'PATH','HOME','CODEX_HOME','TMPDIR','LANG','LC_ALL','JAVA_HOME','JAVA_TOOL_OPTIONS','MAVEN_ARGS','MAVEN_OPTS','RUSTC','RUSTDOC','CARGO_HOME',
                 'GOCACHE','GOMODCACHE','GOPROXY','GOSUMDB','GOTOOLCHAIN','GOFLAGS','SSL_CERT_FILE','SSL_CERT_DIR',
                 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY'}:
             raise ValueError('Provider env_key must name a dedicated credential variable, not a runtime setting')
@@ -76,6 +76,7 @@ class Config(Record):
     codex_profile: Literal['single_agent'] | None = None
     runs_dir: str = "runs"
     cargo_seed_cache_dir: str | None = None
+    maven_dependency_cache_dir: str | None = None
     budget: Budget = Budget()
     investigation_focus: list[str] = []
     directed_question: str | None = None
@@ -84,7 +85,7 @@ class Config(Record):
     allow_experiments: bool = True
     allow_agent_materials: bool = True
 
-    @field_validator('cargo_seed_cache_dir')
+    @field_validator('cargo_seed_cache_dir', 'maven_dependency_cache_dir')
     @classmethod
     def seed_cache_path(cls, value):
         return str(Path(value).expanduser().absolute()) if value and value.strip() else value

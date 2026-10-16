@@ -18,7 +18,7 @@ def load_config(path=None, overrides=None):
     data = yaml.safe_load(Path(path).read_text()) or {} if path else {}
     if not isinstance(data, dict):
         raise ValueError("Configuration must be an object")
-    for name in ("repo_path", "runs_dir", "fixture", "cargo_seed_cache_dir"):
+    for name in ("repo_path", "runs_dir", "fixture", "cargo_seed_cache_dir", "maven_dependency_cache_dir"):
         if data.get(name):
             p = Path(data[name]).expanduser()
             if not p.is_absolute():

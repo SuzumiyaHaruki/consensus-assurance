@@ -14,7 +14,7 @@ from pathlib import Path
 
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.storage.snapshot import (
-    EXCLUDED_DIRS, KEY_NAME, SOURCE_SUFFIXES, SENSITIVE_CONTENT, SENSITIVE_NAME,
+    EXCLUDED_DIRS, sensitive_file,
 )
 
 from .codex import Codex
@@ -38,12 +38,11 @@ def implementation_identity(root):
         and getattr(module, '__file__', None) and not Path(module.__file__).resolve().is_relative_to(project)})
     retained = {}
     for name, path in sources.items():
-        if (path.is_symlink() or set(Path(name).parts) & EXCLUDED or SENSITIVE_NAME.search(path.name)
-                or KEY_NAME.search(path.name) and path.suffix.lower() not in SOURCE_SUFFIXES):
+        if (path.is_symlink() or set(Path(name).parts) & EXCLUDED or sensitive_file(path)):
             retained[name] = {'source': str(path), 'record': None, 'reason': 'private or excluded file'}
             continue
         data = path.read_bytes()
-        if SENSITIVE_CONTENT.search(data):
+        if sensitive_file(path,data):
             retained[name] = {'source': str(path), 'record': None, 'reason': 'credential-like content excluded'}
             continue
         destination = root/'inputs/implementation-source'/name
@@ -107,7 +106,7 @@ def capture_source(repo, destination, deadline):
         if path.is_absolute() or ".." in path.parts:
             raise ValueError("Unsafe Git tree path")
         if (set(path.parts) & EXCLUDED or path.name in {"AGENTS.md", "SKILL.md"}
-                or SENSITIVE_NAME.search(path.name) or (KEY_NAME.search(path.name) and path.suffix.lower() not in SOURCE_SUFFIXES)
+                or sensitive_file(path)
                 or mode not in {"100644", "100755"} or kind != "blob"):
             excluded[name] = "instruction, private, excluded directory, link, or submodule"
         else:
@@ -126,7 +125,7 @@ def capture_source(repo, destination, deadline):
         size = int(header[2])
         data = payload[end + 1:end + 1 + size]
         offset = end + size + 2
-        if SENSITIVE_CONTENT.search(data):
+        if sensitive_file(name,data):
             excluded[name] = "credential-like content"
             continue
         path = destination / name
@@ -155,12 +154,12 @@ def file_inventory(root, *, exclude=WORK_EXCLUDED):
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 excluded[rel] = "symlink, hardlink, or nonregular file"
                 continue
-            if (SENSITIVE_NAME.search(name) or (KEY_NAME.search(name) and path.suffix.lower() not in SOURCE_SUFFIXES)
+            if (sensitive_file(path)
                     or name.endswith(".lock.tmp")):
                 excluded[rel] = "private or transient file"
                 continue
             data = path.read_bytes()
-            if SENSITIVE_CONTENT.search(data):
+            if sensitive_file(path,data):
                 excluded[rel] = "credential-like content"
                 continue
             files[rel] = {"digest": digest(data), "mode": stat.S_IMODE(info.st_mode), "size": len(data)}
@@ -212,7 +211,7 @@ def brief(root, source, target, deadline, timeout, calls_left):
         "source_identity": source.get("commit") or source.get("kind"), "scope": target,
         "report_path": str(root / "work/report.md"), "retained_logs": str(root / "turns"),
         "permissions": "Source/logs read only; work writable; ordinary shell has no network. isolated_exec supports private local TCP; no host or external network.",
-        "tool_environment": "Offline Go/Cargo. work/.runtime is disposable, excluded from retained artifacts and removed at cleanup. Keep reproduction source, scripts, notes and outputs needed for review elsewhere under work.",
+        "tool_environment": f"Offline {target['execution_backend']}. work/.runtime is disposable, excluded from retained artifacts and removed at cleanup. Keep reproduction source, scripts, notes and outputs needed for review elsewhere under work.",
         "remaining_total_seconds": remaining, "turn_timeout_seconds": timeout, "remaining_agent_calls": calls_left,
         "generated_at": now(), "estimated_turn_deadline_utc": (datetime.now(timezone.utc) + timedelta(seconds=timeout)).isoformat(),
         "deadline_basis": "Host monotonic clock; preparation, tool work and model waiting all consume total time."}, indent=2)
@@ -258,6 +257,8 @@ def loop(config, root, source, target, client, deadline, record):
                                 "tool_events": result.get("tool_events", 0), "path": str(folder.relative_to(root))})
         session = result.get("session_id")
         write_json(root / "run.json", record)
+        if result.get("continuable_timeout") and result["timeout_limit"] == "agent_turn_timeout":
+            continue
         if result["status"] != "completed":
             record["stop"] = ("total_deadline" if result["status"] == "timeout" and result["timeout_limit"] == "total_seconds"
                               else "turn_timeout" if result["status"] == "timeout" else result["status"])

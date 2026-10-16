@@ -12,7 +12,8 @@ DEFECT_LABELS = {'asserted':'defect asserted (subject to independent verificatio
 
 
 def comparison_summary(result):
-    return f"Mechanical comparison: {COMPARISON_LABELS[result['outcome']]} (`{result['outcome']}`)."
+    prefix = 'No fixed comparisons declared. ' if result.get('comparisons') == [] else ''
+    return prefix + f"Mechanical comparison: {COMPARISON_LABELS[result['outcome']]} (`{result['outcome']}`)."
 
 
 def execution_summary(check):
@@ -20,8 +21,8 @@ def execution_summary(check):
     return execution_cost(check)
 
 
-def interpretation_rows(value, conclusions):
-    heading = f'Current interpretation `{value.id}` · {conclusions[value.conclusion]}'
+def interpretation_rows(value):
+    heading = f'Current model interpretation `{value.id}` · `{value.conclusion}`'
     sources = ', '.join(f'[{id}](state.json)' for id in value.source_ids)
     executions = '; '.join(f'[{id}](logs/{id}/check.json) ([observations](logs/{id}/observations.json), event indices {indices})'
         for id,indices in value.executions.items()) or 'No execution receipt explicitly cited by this interpretation'
@@ -47,7 +48,6 @@ def interpretation_rows(value, conclusions):
 def render_report(state, root):
     root = Path(root)
     labels = {'active':'active','paused':'paused','explained':'local question answered','closed':'local question disposed'}
-    conclusions = {**COMPARISON_LABELS, 'explained':'source explanation','conditional':'conditional interpretation','unresolved':'unresolved'}
     latest = {i.investigation_id:i for i in state.interpretations}
     claimed = {id for id,i in latest.items() if i.defect_claim == 'asserted'}
     rows = ['# Consensus audit research report', '',
@@ -69,7 +69,7 @@ def render_report(state, root):
                      f'Question `{q.id}` v{q.version}; sources: {", ".join(q.source_ids)} ([full references](state.json)).'])
         rows.append('Current model defect claim: ' + DEFECT_LABELS[opinions[-1].defect_claim if opinions else None] + '.')
         if opinions:
-            rows.extend(interpretation_rows(opinions[-1], conclusions))
+            rows.extend(interpretation_rows(opinions[-1]))
         if q.parent_id:
             rows.append(f'Parent question: `{q.parent_id}`; this result does not automatically close its parent.')
         if q.hypothesis:

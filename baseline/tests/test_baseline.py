@@ -66,7 +66,7 @@ def events(folder, *, final="Partial handoff.", identity=SESSION, error=None, co
 
 def test_configuration_paths_and_neutral_target(tmp_path):
     c = load_config(PROJECT / "baseline/configs/deepseek.example.yaml")
-    assert Path(c.target_config) == PROJECT / "configs/targets/hashicorp_raft.yaml"
+    assert Path(c.target_config) == PROJECT / "baseline/configs/hashicorp.deepseek-pair.full.yaml"
     assert Path(c.codex_provider.model_catalog_path).read_bytes() == (PROJECT / "configs/providers/deepseek-flash.models.json").read_bytes()
     local = configuration(tmp_path)
     target = validate_selection(local)
@@ -182,6 +182,23 @@ def test_native_refusal_still_stops_a_completed_turn(tmp_path, event):
     assert codex.decode(tmp_path, result)['status'] == 'external_blocker_needs_review'
 
 
+@pytest.mark.parametrize('identity,previous,completed,event,allowed', [
+    (SESSION, None, False, None, True), (SESSION, SESSION, True, None, True),
+    ('changed', SESSION, False, None, False), ('', None, False, None, False),
+    (SESSION, SESSION, False, {'type':'thread.started','thread_id':'changed'}, False),
+    (SESSION, SESSION, False, {'type':'turn.failed','error':{'message':'service error'}}, False),
+    (SESSION, SESSION, True, {'type':'refusal'}, False),
+    (SESSION, SESSION, False, {'type':'error','message':'permission denied'}, False),
+])
+def test_timeout_continuation_checks_identity_and_failures(tmp_path, identity, previous, completed, event, allowed):
+    result = events(tmp_path, identity=identity, completed=completed, final=None, tool_failure=True)
+    if event:
+        with (tmp_path/'stdout.jsonl').open('a') as stream:stream.write(json.dumps(event)+'\n')
+    result.update(status='timeout', exit_code=-9)
+    decoded = codex.decode(tmp_path, result, previous)
+    assert decoded['status'] == 'timeout' and decoded['continuable_timeout'] is allowed
+
+
 @pytest.mark.parametrize('shape', ['absent','empty','nonempty','file','symlink','dangling','fifo','denied'])
 def test_reserved_paths_remove_only_real_empty_directories(tmp_path, monkeypatch, shape):
     client = object.__new__(codex.Codex)
@@ -267,7 +284,7 @@ class ScriptedClient:
 
 @pytest.mark.parametrize("statuses,stop,turns,report", [
     (["completed"] * 3, "agent_call_limit", 3, "report 3"),
-    (["completed", "timeout"], "turn_timeout", 2, "report 1"),
+    (["completed", "timeout", "completed"], "agent_call_limit", 3, "report 3"),
     (["completed", "cancelled"], "cancelled", 2, "report 1"),
     (["external_error"], "external_error", 1, None)])
 def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop, turns, report):
@@ -319,7 +336,7 @@ def test_unchanged_report_reuses_completed_delta_before_later_timeout(tmp_path):
     result = runner.run(config, load_target(config), client_factory=Client)
     root = Path(result['run_dir'])
     record = json.loads((root/'run.json').read_text())
-    assert result['stop'] == 'turn_timeout'
+    assert result['stop'] == 'agent_call_limit'
     assert record['last_completed_report'] == 'turns/0001/changes/files/report.md'
     assert (root/record['last_completed_report']).read_text() == 'report 1'
     assert not (root/'turns/0002/changes/files/report.md').exists()

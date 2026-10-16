@@ -159,7 +159,7 @@ def test_shared_dependencies_are_read_only_and_not_copied(environment):
         private = cache.parent / "private-canary"
     else:
         cache = Path(client.config.cargo_dependency_cache_dir)
-        visible = [client.work / ".runtime/cargo" / name for name in ("registry", "git")]
+        visible = [client.work / ".runtime/cargo-home" / name for name in ("registry", "git")]
         assert all(path.is_symlink() and path.resolve() == cache / path.name for path in visible)
         private = cache / "credentials.toml"
     script = """import errno, pathlib
@@ -586,13 +586,8 @@ def test_pairing_uses_configured_assembly_and_actual_exec_resume(environment, mo
     from consensus_assurance.adapters.runners.experiment import run_experiment
     from consensus_assurance.adapters.runners.process import output
     client = environment
-    import yaml
-    from consensus_assurance.core.config import Budget
     config_path='baseline/configs/hashicorp.deepseek-pair.full.yaml'
-    with pytest.raises(ValueError,match='v60'):load_config(config_path)
-    # Keep the historical pairing template untouched; select current real resource fields locally.
-    raw=yaml.safe_load(Path(config_path).read_text())
-    config = load_config(config_path, overrides={'budget':{k:v for k,v in raw['budget'].items() if k in Budget.model_fields}})
+    config = load_config(config_path)
     assert (config.agent_model, config.agent_reasoning_effort) == (client.config.agent_model, client.config.agent_reasoning_effort)
     config.target.expected_module = None  # Only synthetic code is used for boundary acceptance.
     root = client.root.parent/'paired-full'; root.mkdir()
@@ -637,7 +632,8 @@ def test_pairing_uses_configured_assembly_and_actual_exec_resume(environment, mo
         for body in capture.requests:
             assert body['model'] == config.agent_model and body['reasoning']['effort'] == config.agent_reasoning_effort
             text = json.dumps(body['input'])
-            assert all(token not in text for token in ('UNTRUSTED_HOME_INSTRUCTIONS', 'UNTRUSTED_PAIRING_INSTRUCTIONS', 'Available skills'))
+            assert all(token not in text for token in ('UNTRUSTED_HOME_INSTRUCTIONS', 'UNTRUSTED_PAIRING_INSTRUCTIONS', '\\n### Available skills\\n'))
+            assert all(entry['path'] not in text for entry in agent.profile_settings['skills.config'])
             assert not any(tool.get('type') in {'mcp', 'web_search', 'web_search_preview'} for tool in body['tools'])
     protected = [str(root/'agent-source/fixture.txt'), str(root/'logs/host-record')]
     (root/'logs/host-record').write_text('evidence')

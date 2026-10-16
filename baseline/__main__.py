@@ -35,6 +35,7 @@ class Config(BaseModel):
     allow_experiments: bool = False
     go_mod_cache_dir: str | None = None
     cargo_dependency_cache_dir: str | None = None
+    maven_dependency_cache_dir: str | None = None
     budget: Budget = Field(default_factory=Budget)
 
     @model_validator(mode="after")
@@ -83,7 +84,7 @@ def load_config(path):
     path = Path(path).expanduser().resolve()
     raw = read_yaml(path)
     config = Config.model_validate(raw)
-    for name in ("target_config", "repo_path", "runs_dir", "go_mod_cache_dir", "cargo_dependency_cache_dir"):
+    for name in ("target_config", "repo_path", "runs_dir", "go_mod_cache_dir", "cargo_dependency_cache_dir", "maven_dependency_cache_dir"):
         value = getattr(config, name)
         if value is not None:
             p = Path(value).expanduser()
@@ -96,8 +97,8 @@ def load_config(path):
 
 def load_target(config):
     raw = read_yaml(config.target_config)
-    if raw.get("execution_backend") not in {"go_module", "cargo"}:
-        raise ValueError("Only go_module and cargo targets are supported")
+    if raw.get("execution_backend") not in {"go_module", "cargo", "maven"}:
+        raise ValueError("Only go_module, cargo and maven targets are supported")
     fields = {k: v for k, v in raw.get("target", {}).items()
               if k in {"variant", "expected_module", "execution_package", "analysis_roots"}}
     target = TargetConfig.model_validate(fields)

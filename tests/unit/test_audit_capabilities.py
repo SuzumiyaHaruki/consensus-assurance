@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 import json
 import pytest
@@ -17,7 +16,8 @@ def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path):
     (repo/'README.md').write_text('Repository orientation')
     (repo/variant/'secret.txt').write_text('Private file')
     (repo/variant/'binary').write_bytes(b'\0')
-    cfg=Path(__file__).resolve().parents[2]/f'configs/targets/swiftpaxos_{variant}.yaml'
+    cfg=tmp_path/'target.yaml'
+    cfg.write_text(json.dumps({'execution_backend':'go_module','target':{'analysis_roots':[variant,'replica','go.mod','README.md']}}))
     config=load_config(str(cfg));snapshot=capture(repo,analysis_roots=config.target.analysis_roots)
     assert all(f'{f}/node.go' in snapshot.files for f in families)
     assert {f'{variant}/node.go','replica/node.go','go.mod','README.md'}==set(snapshot.readable_files)

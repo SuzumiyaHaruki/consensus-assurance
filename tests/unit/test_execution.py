@@ -403,3 +403,23 @@ def test_cargo_completed_receipt_recovers_after_deadline_without_reexecution(tmp
     lock.write_bytes(lock.read_bytes() + b'\n# changed after execution\n')
     with pytest.raises(ValueError, match='build inputs or tools changed'):
         engine.validate_builds(state.pending_action)
+
+
+@pytest.mark.parametrize('name,body,excluded', [
+    ('src/main/java/SecretReader.java','public class SecretReader { String read() { return System.getProperty("service.auth.password"); } }',False),
+    ('src/main/java/Config.java','public class Config { static final String PASSWORD = "service.auth.password"; String read() { return System.getProperty(PASSWORD); } }',False),
+    ('src/main/java/Config.java','public class Config { static final String PASSWORD = "service.auth.password"; }',True),
+    ('src/test/java/ConfigTest.java','public class ConfigTest { String PASSWORD = "testpassword"; }',False),
+    ('src/test/java/ConfigTest.java','public class ConfigTest { String PASSWORD = "Q9x_actual_credential_73"; }',True),
+    ('src/test/java/ConfigTest.java','public class ConfigTest { String value = "ghp_' + 'x'*24 + '"; }',True),
+    ('src/main/java/Secrets.java','opaque-private-data',True),
+    ('src/main/java/Secrets.java','public class Secrets { String TOKEN = "Q9x_actual_credential_73"; }',True),
+])
+def test_java_source_screening_keeps_types_and_dummy_inputs_not_credentials(tmp_path,name,body,excluded):
+    from consensus_assurance.adapters.storage.snapshot import capture
+    from baseline.runner import file_inventory
+    repo=tmp_path/'repo';path=repo/name;path.parent.mkdir(parents=True);path.write_text(body)
+    snapshot=capture(repo)
+    inventory,_=file_inventory(repo)
+    assert (name not in snapshot.files)==excluded
+    assert (name not in inventory)==excluded

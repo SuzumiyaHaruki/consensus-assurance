@@ -452,6 +452,7 @@ def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path
         check=next(c for c in e.state.checks if c.experiment_id)
         saved['assessment']=assessment(e.state,e.root,fixed,check)
         saved['fixed'],saved['check']=fixed.model_dump(mode='json'),check.model_dump(mode='json')
+        saved['interpretations']=[i.model_dump(mode='json') for i in e.state.interpretations]
         paths=[f'fixed-experiments/{fixed.id}/basis.json',f'fixed-experiments/{fixed.id}/{fixed.harness_filename}',
                *[f'logs/{check.id}/{name}' for name in ('check.json','observations.json','stdout.log','stderr.log')]]
         saved['files']={path:(e.root/path).read_bytes() for path in paths}
@@ -484,15 +485,23 @@ def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path
     assert 'Retained observations still support sourced interpretation' in limitation
     assert 'no successor or rerun is required' in limitation
     assert [i.defect_claim for i in state.interpretations]==['asserted','refuted']
+    assert [i.model_dump(mode='json') for i in state.interpretations[:-1]]==saved['interpretations']
+    assert json.loads((e.root/'state.json').read_text())['interpretations']==[
+        i.model_dump(mode='json') for i in state.interpretations]
     assert all(i.executions=={checks[0].id:[1]} for i in state.interpretations)
     view=json.loads((e.root/'research.json').read_text())
     assert view['investigations'][0]['latest_interpretation']['defect_claim']=='refuted'
+    assert view['investigations'][0]['latest_interpretation']['conclusion']=='explained'
     assert view['reselection']['questions'][0]['latest_interpretation']['defect_claim']=='refuted'
+    assert view['reselection']['questions'][0]['latest_interpretation']['conclusion']=='explained'
     assert view['experiments'][0]['results'][0]['blockers']==[limitation]
     report=render_report(state,e.root).read_text()
     claims,_,other=report.split('## Explicit model defect claims (subject to independent verification)',1)[1].partition('## Other research results')
     assert state.investigations[0].question not in claims and state.investigations[0].question in other
     assert 'Current model defect claim: defect claim refuted within the stated scope' in other and report.count('### ')==1
+    current=other.split('Fixed experiment `',1)[0]
+    assert f'Current model interpretation `{state.interpretations[-1].id}` · `explained`' in current
+    assert 'source explanation' not in current
     assert 'historical interpretation; the question has a later account' in other
     assert limitation in other
     assert state.interpretations[-1].rationale in report and state.interpretations[0].rationale not in report

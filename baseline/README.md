@@ -15,7 +15,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 [DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 和 [HashiCorp 配对草案](PAIRING.md) 默认关闭授权。填写 `repo_path`、实际模型和连接；相对路径以 YAML 所在目录为准。`run` 要求 `allow_agent_materials`、`allow_experiments` 同时为 `true`，凭据只放环境变量。目标必须是干净 Git 提交，输出与源仓库分离；不会替用户清理工作树。
 
-`check-env` 是独立的本地检查：捕获源码、验证权限、提示隔离、功能设置、工具版本、离线依赖，以及标准 MCP STDIO 工具清单和固定 TCP 收发。它不调用模型、不执行目标测试、不创建 app-server 会话，也不使用真实认证。Go 依赖检查为 `go list -m all`，Rust 为离线 `cargo metadata`。`environment_checked` 只证明这些本地项目通过。
+`check-env` 是独立的本地检查：捕获源码、验证权限、提示隔离、功能设置、工具版本、离线依赖，以及标准 MCP STDIO 工具清单和固定 TCP 收发。它不调用模型、不执行目标测试、不创建 app-server 会话，也不使用真实认证。Go 依赖检查为 `go list -m all`，Rust 为离线 `cargo metadata`，Maven 为所选模块及上游的离线 `test-compile -DskipTests`；不执行测试。`environment_checked` 只证明这些本地项目通过。
 
 普通 `run` 每次验证新运行的权限、捕获实际目录和工具版本，完成必要的 skills 初始化后直接进入审计。它不执行合成修复、不读取兼容性证书、不强制模型调用 MCP，也不重复执行 `check-env` 的服务和提示诊断。`tool_evidence` 分别记录服务探测、模型请求工具面和真实模型使用的证据范围；未检查的项目不会标成已验证。
 
@@ -47,11 +47,11 @@ Codex 客户端继承启动终端中显式配置的 HTTP／HTTPS／ALL／NO_PROX
 
 baseline 的唯一 MCP 是 `baseline_local.isolated_exec`，设置 `required=true`，参数只有普通 `argv`、工作副本内相对 `cwd` 和可选 `timeout_seconds`。普通 shell 禁止网络；该工具每次创建独立网络、PID、IPC 和文件视图，提供固定的 IPv4／IPv6 localhost 映射，允许同次调用内的本地 TCP，不开放宿主网络或任意挂载。源码和依赖只读，输出由宿主服务保留；命令退出、取消、断开及父进程退出均清理后代进程。完整组继续使用自己原有的固定执行器。
 
-可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；`cargo_dependency_cache_dir` 仅只读提供 Cargo home 的 `registry/`、`git/`，不开放认证配置。没有共享依赖时使用空离线缓存。每 run 的构建和临时目录位于 `work/.runtime/`，构建耗时计入预算；该临时目录不留存并在收尾删除；复现源码、脚本、笔记和必要输出须由 Agent 放在 `work` 下其他普通目录，沿用安全文件差异留存。已有实验被清理的复现文件不因此恢复。不复制或全量扫描宿主缓存。完整组 Rust 编译种子与普通组依赖复用存在差异，成本须分别说明。
+可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；`cargo_dependency_cache_dir` 仅只读提供 Cargo home 的 `registry/`、`git/`，不开放认证配置。Cargo 默认读取用户 Cargo home 的依赖树；Maven 通过可选 `maven_dependency_cache_dir` 指定只读仓库，默认 `~/.m2/repository`。Rust 与 Maven 的工具定位、离线环境和依赖权限与 CA 共用。每 run 的构建和临时目录位于 `work/.runtime/`，构建耗时计入预算；该临时目录不留存并在收尾删除；复现源码、脚本、笔记和必要输出须由 Agent 放在 `work` 下其他普通目录，沿用安全文件差异留存。已有实验被清理的复现文件不因此恢复。不复制或全量扫描宿主缓存。当前 Rust 配对关闭 CA 跨运行编译种子；运行内缓存继续各自复用，见 [配对条件](PAIRING.md)。
 
 ## 预算与记录
 
-总时间从源码捕获前起算，包含准备、工具和模型等待；每回合取单回合限制与总剩余的较小值，正常完成且有预算时精确续接同一 session。工具串行执行，请求上限、动作上限、回合剩余和总剩余共同约束。单回合超时会结束整个 run，配置时长是上限；局部准备超时不冒充总预算耗尽。到时只保留已有材料，不追加总结。
+总时间从源码捕获前起算，包含准备、工具和模型等待；每回合取单回合限制与总剩余的较小值，正常完成且有预算时精确续接同一 session。工具串行执行，请求上限、动作上限、回合剩余和总剩余共同约束。单回合超时在会话身份一致、无明确失败／拒绝且总预算有余时续接，部分输出仍标记超时；取消、服务错误、身份变化及总期限仍结束运行。配置时长是上限；局部准备超时不冒充总预算耗尽。到时只保留已有材料，不追加总结。
 
 每次启动创建新目录、新 session；baseline 没有跨进程 resume 入口。`run.json` 保存阶段时点、实际停止原因和回合索引；`index.md` 链接最近完成报告与原始输出。usage 保留逐事件值，不未经核对求和。停止依据采用原生失败／拒绝事件、真实退出状态、控制器边界及明确的 `RUN_BLOCKED:`；报告中的拒绝引文或单条非 JSON 诊断不推翻有效完成。session 按非空字符串原样续接，不要求 UUID 格式。
 
@@ -71,4 +71,4 @@ runs/<run-id>/
 
 报告也在工作区变更中保留，`last_completed_report` 指向实际保留的版本；报告未变时复用该路径，后续超时修改不覆盖它。不再复制 `turns/N/report.md`；历史归档及旧链接不改写。回合末文件不冒充每条命令开始时的快照，模型自行 tee 的内容不冒充宿主原始输出。
 
-结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。当前追踪 HashiCorp、etcd、Dragonboat、OmniPaxos、EPaxos 各一次 baseline：`gpt-6-astra` / `low`，预设各 40 分钟；目录与实际停止状态见[保留运行](../runs/README.md)。保留未完成回合、工作报告、测试和原始输出。历史运行可从 Git 历史查看，能力证据保留在 `acceptance/`；它们不进入新审计的上下文。
+结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。保留未完成回合、工作报告、测试和原始输出；历史运行不进入新审计上下文。实际所选运行及停止状态见 [保留运行](runs/)。

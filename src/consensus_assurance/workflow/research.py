@@ -538,10 +538,10 @@ def operation_summary(state, root):
         question['execution'] = execution_feedback(state, root, fixed, check)
     summary['necessary_gaps'] = necessary_gaps
     summary['reselection'] = reselection_view(state)
-    action = ('For a newly inferred consequence, wider scope or excluded path, check the added premise and link: '
-        'do actual operations and same-object observations before and after them establish it, or fit a concrete '
-        'alternative? Use saved evidence or inspect the decisive source or sampling where needed. Correct unsupported '
-        'extensions and their identified uses, preserving independent findings; no separate review submission is needed. '
+    action = ('For a disputed or strengthened inference, use fixed code and saved observations to inspect the decisive '
+        'intervention, observation-producing path, relevant exposure or contradicted passage, whichever could change '
+        'that judgment. Use a focused experiment where needed to distinguish remaining explanations. Replace affected current '
+        'explanations and correct identified uses, preserving independent findings; no separate review submission is needed. '
         if executed or changes or knowledge_changes or corrections else '')
     summary['next'] = (
         'The unchanged submission is already retained; this call still consumed time and a model turn. '

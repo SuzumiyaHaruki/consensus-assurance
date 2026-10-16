@@ -16,6 +16,7 @@ from consensus_assurance.adapters.agents.backend import (
     classify_failure, codex_diagnostic, common_settings, DISABLED_FEATURES, codex_options as options,
 )
 from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+from consensus_assurance.adapters.runners.toolchains import cargo_tool, cargo_environment, maven_tools, maven_environment
 from consensus_assurance.adapters.storage.files import write_json, digest
 from . import local_exec
 
@@ -89,6 +90,14 @@ def decode(folder, result, session_id=None):
     result.update(session_id=identity, native_completed=bool(completed), diagnostic=diagnostic,
                   usage=[e.get("usage") for e in completed], usage_semantics="unverified_do_not_sum",
                   tool_events=len(tools), invalid_jsonl_lines=invalid, final_present=bool(final))
+    same_session = (isinstance(identity, str) and bool(identity.strip())
+                    and all(x == identity for x in identities)
+                    and (session_id is None or identity == session_id))
+    refusal = any(e.get("type") == "refusal" or e.get("item", {}).get("type") == "refusal"
+                  for e in events if isinstance(e.get("item", {}), dict))
+    result["continuable_timeout"] = bool(result["status"] == "timeout" and same_session
+        and not diagnostic["message"] and not refusal and not final.lstrip().startswith("RUN_BLOCKED:")
+        and not any(e.get("type") in {"turn.failed", "error"} for e in events))
     if result["status"] != "completed":
         return result
     # Match src: native retries can emit error notifications before successful completion.
@@ -107,8 +116,7 @@ def decode(folder, result, session_id=None):
         result.update(status="external_blocker_needs_review", reason="Incomplete or unrecognized native completion")
     elif final.lstrip().startswith("RUN_BLOCKED:"):
         result.update(status="run_blocked", reason=final)
-    elif any(e.get("type") == "refusal" or e.get("item", {}).get("type") == "refusal"
-             for e in events if isinstance(e.get("item", {}), dict)):
+    elif refusal:
         result.update(status="external_blocker_needs_review", reason="Native refusal event; inspect retained output")
     return result
 
@@ -138,14 +146,9 @@ class Codex:
             "SSL_CERT_FILE", "SSL_CERT_DIR") if key in os.environ})
         self.secrets = []
         self.read_roots = [str(Path(self.executable).parent), str(self.client_home / "tmp" / "arg0"), str(self.helpers)]
-        self.tool_environment = {**GoModuleBackend().environment(self.work),
-                                 "PATH": "/usr/bin:/bin", "HOME": str(self.work / ".runtime/home"),
-                                 "TMPDIR": str(self.work / ".runtime/tmp"), "LANG": "C.UTF-8",
-                                 "GOCACHE": str(self.work / ".runtime/go-build"),
-                                 "GOMODCACHE": str(self.work / ".runtime/go-mod"),
-                                 "CARGO_HOME": str(self.work / ".runtime/cargo"), "CARGO_NET_OFFLINE": "true",
-                                 "CARGO_TARGET_DIR": str(self.work / ".runtime/cargo-target")}
-        for name in ("home", "tmp", "go-build", "go-mod", "cargo", "cargo-target"):
+        self.tool_environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.work / ".runtime/home"),
+                                 "TMPDIR": str(self.work / ".runtime/tmp"), "LANG": "C.UTF-8"}
+        for name in ("home", "tmp"):
             (self.work / ".runtime" / name).mkdir(parents=True, exist_ok=True)
         self.settings = {}
 
@@ -206,37 +209,47 @@ class Codex:
         if result['status'] != 'completed' or result['exit_code'] or 'codex' not in text:
             raise ValueError('Codex CLI version unavailable')
         self.version = text.strip()
-        tool = "go" if self.target["execution_backend"] == "go_module" else "rustc"
-        command = [tool, "env", "GOROOT"] if tool == "go" else [tool, "--print", "sysroot"]
-        discovered = subprocess.run(command, capture_output=True, text=True, timeout=self.limit(), check=True)
-        tool_root = Path(discovered.stdout.strip()).resolve()
-        self.read_roots.append(str(tool_root))
-        if tool == "go":
-            if self.config.go_mod_cache_dir:
-                cache = Path(self.config.go_mod_cache_dir)
-                if not cache.is_dir() or cache.is_symlink() or self.root.is_relative_to(cache) or cache.is_relative_to(self.root):
-                    raise ValueError("go_mod_cache_dir must be a separate existing module cache directory")
-                self.tool_environment["GOMODCACHE"] = str(cache)
-                self.read_roots.append(str(cache))
-        elif self.config.cargo_dependency_cache_dir:
-            cache = Path(self.config.cargo_dependency_cache_dir)
+        backend = self.target["execution_backend"]
+        scratch = self.work / '.runtime'
+        if backend == 'go_module':
+            discovered = subprocess.run(['go', 'env', 'GOROOT'], capture_output=True, text=True,
+                                        timeout=self.limit(), check=True)
+            tool_roots = [Path(discovered.stdout.strip()).resolve()]
+            cache = Path(self.config.go_mod_cache_dir) if self.config.go_mod_cache_dir else scratch / 'go-mod'
+            self.tool_environment.update(GoModuleBackend().environment(self.work))
+            self.tool_environment.update(GOCACHE=str(scratch/'go-build'), GOMODCACHE=str(cache))
+            for name in ('go-build', 'go-mod'):(scratch/name).mkdir(exist_ok=True)
+            commands = {'go': ['go', 'version'], 'go_environment':
+                ['go', 'env', 'GOOS', 'GOARCH', 'GOVERSION', 'GOROOT', 'GOMODCACHE', 'GOCACHE', 'GOFLAGS', 'GOWORK']}
+            dependencies = [cache] if self.config.go_mod_cache_dir else []
+        elif backend == 'cargo':
+            cargo = cargo_tool()
+            tool_roots = [cargo.parent.parent]
+            cache = Path(self.config.cargo_dependency_cache_dir or Path.home()/'.cargo')
+            if not any((cache/name).is_dir() for name in ('registry', 'git')):
+                raise ValueError('cargo_dependency_cache_dir needs registry/ or git/; a compiled seed directory is not a dependency cache')
+            self.tool_environment.update(cargo_environment(scratch, cargo, cache))
+            dependencies = [cache/name for name in ('registry', 'git') if (cache/name).is_dir()]
+            commands = {'cargo': ['cargo', '--version', '--verbose'], 'rustc': ['rustc', '--version', '--verbose']}
+        elif backend == 'maven':
+            maven, java_home = maven_tools()
+            tool_roots = [java_home, maven.parent.parent]
+            cache = Path(self.config.maven_dependency_cache_dir or Path.home()/'.m2/repository')
+            self.tool_environment.update(maven_environment(scratch, maven, java_home, cache))
+            dependencies = [cache]
+            commands = {'maven': ['mvn', '--version'], 'java': ['java', '-version']}
+        else:
+            raise ValueError('Unsupported toolchain: ' + backend)
+        for cache in dependencies:
             if not cache.is_dir() or cache.is_symlink() or self.root.is_relative_to(cache) or cache.is_relative_to(self.root):
-                raise ValueError("cargo_dependency_cache_dir must be a separate existing Cargo home")
-            if not any((cache / name).is_dir() for name in ("registry", "git")):
-                raise ValueError("cargo_dependency_cache_dir needs registry/ or git/; a compiled seed directory is not a dependency cache")
-            # Match CargoBackend: expose only dependency trees through the private Cargo home.
-            for name in ("registry", "git"):
-                dependency = cache / name
-                if dependency.is_dir():
-                    if dependency.is_symlink():
-                        raise ValueError("Cargo dependency roots must not be symlinks")
-                    (self.work / ".runtime/cargo" / name).symlink_to(dependency, target_is_directory=True)
-                    self.read_roots.append(str(dependency))
-        self.tool_environment["PATH"] = str(tool_root / "bin") + ":" + str(self.helpers) + ":/usr/bin:/bin"
+                raise ValueError('Dependency cache must be a separate existing directory')
+        self.read_roots.extend(str(path) for path in [*tool_roots, *dependencies])
+        tool_path = ':'.join(str(path/'bin') for path in tool_roots)
+        self.tool_environment["PATH"] = tool_path + ':' + str(self.helpers) + ':/usr/bin:/bin'
         self.execution_control = {'work': str(self.work), 'records': str(self.root/'executions'),
-            'tool_roots': [str(tool_root)], 'read_only_roots': [str(self.root/'source'),
-                *[p for p in self.read_roots if p not in {str(tool_root), str(Path(self.executable).parent), str(self.client_home/'tmp/arg0'), str(self.helpers)}]],
-            'environment': {**self.tool_environment, 'PATH': str(tool_root/'bin')+':/usr/bin:/bin'},
+            'tool_roots': list(map(str, tool_roots)),
+            'read_only_roots': [str(self.root/'source'), *map(str, dependencies)],
+            'environment': {**self.tool_environment, 'PATH': tool_path + ':/usr/bin:/bin'},
             'action_timeout': self.config.budget.action_timeout, 'run_deadline': self.deadline,
             'turn_deadline': min(self.deadline, time.monotonic()+30), 'turn': 'environment-check',
             'allow_experiments': True}
@@ -306,17 +319,15 @@ class Codex:
         self.settings["skills.config"] = [{"path": str(path), "enabled": False}
                                           for path in sorted(self.client_home.glob("skills/**/SKILL.md"))]
         versions = {}
-        commands = {"platform": ["uname", "-sm"], "go": ["go", "version"],
-                    "go_environment": ["go", "env", "GOOS", "GOARCH", "GOVERSION", "GOROOT", "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOWORK"]} if tool == "go" else {
-                    "platform": ["uname", "-sm"], "cargo": ["cargo", "--version", "--verbose"], "rustc": ["rustc", "--version", "--verbose"]}
+        commands['platform'] = ['uname', '-sm']
         for name, command in commands.items():
             result, text = self.local(["sandbox", "--include-managed-config", "-P", "codex_plain", *options(self.settings),
                                       "-C", str(self.work), *command], "tool-" + name)
             if result["status"] != "completed" or result["exit_code"]:
                 raise ValueError("Cannot record the actual sandbox tool version: " + name)
-            versions[name] = text.strip()
+            versions[name] = text.strip() or (self.root / 'inputs' / ('tool-' + name) / 'stderr.log').read_text(errors='replace').strip()
         write_json(self.root / "inputs/cli-settings.json", self.settings)
-        return {"cli": self.version, "tool_root": str(tool_root), "tool_environment": self.tool_environment, "versions": versions,
+        return {"cli": self.version, "tool_roots": list(map(str, tool_roots)), "tool_environment": self.tool_environment, "versions": versions,
                 "network": "ordinary shell: disabled; isolated_exec: private loopback; model client: selected provider",
                 "subagents": False, "cache_policy": "private cold builds; optional read-only shared dependencies",
                 "native_retries": {"request_max_retries": 4, "stream_max_retries": 5} if provider else
@@ -398,8 +409,9 @@ print('PERMISSIONS_VERIFIED')
             raise ValueError("Required disabled capability could not be verified")
 
     def dependency_probe(self):
-        command = ["go", "list", "-m", "all"] if self.target["execution_backend"] == "go_module" else [
-            "cargo", "metadata", "--offline", "--format-version", "1"]
+        command = {'go_module': ['go', 'list', '-m', 'all'],
+                   'cargo': ['cargo', 'metadata', '--offline', '--format-version', '1'],
+                   'maven': ['mvn', '-o', '-B', '-ntp', '-pl', self.target['execution_package'], '-am', '-DskipTests', 'test-compile']}[self.target['execution_backend']]
         result, _ = self.local(["sandbox", "--include-managed-config", "-P", "codex_plain", *options(self.settings),
                                 "-C", str(self.work), *command], "dependency-probe", maximum=60)
         if result["status"] != "completed" or result["exit_code"]:

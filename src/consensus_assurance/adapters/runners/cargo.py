@@ -1,8 +1,6 @@
 """Cargo integration tests through the existing fixed-input and isolated runner path."""
 import os
 import re
-import shutil
-import subprocess
 from pathlib import Path
 try:
     import tomllib
@@ -10,6 +8,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.adapters.runners.experiment import local_package
+from consensus_assurance.adapters.runners.toolchains import cargo_tool, cargo_environment
 
 
 class CargoBackend:
@@ -23,12 +22,7 @@ class CargoBackend:
         self.package = local_package(target.execution_package if target else ".")
         self.harness_filename = (target.harness_path if target else None) or str(Path(self.package)/"tests/assurance_generated.rs")
         self.destination(self.package,self.harness_filename)
-        executable = shutil.which("cargo")
-        if not executable:raise ValueError("Cargo is required; add the Rust toolchain bin directory to PATH")
-        if executable and Path(executable).resolve().name == "rustup":
-            executable = subprocess.check_output(
-                [str(Path(executable).resolve()),"which","cargo"],text=True,timeout=10).strip()
-        self.cargo = Path(executable).resolve()
+        self.cargo = cargo_tool()
         self.cache = Path(os.environ.get("CARGO_HOME",Path.home()/".cargo")).expanduser().resolve()
 
     @staticmethod
@@ -58,20 +52,10 @@ class CargoBackend:
         return [self.cargo.parent.parent,*[self.cache/name for name in ('registry','git')]]
 
     def environment(self,workspace):
-        home=workspace/'.execution/cargo-home'
-        if any(p.is_symlink() for p in [home,*home.parents] if p.is_relative_to(workspace)):
+        scratch=workspace/'.execution'
+        if any(p.is_symlink() for p in [scratch,*scratch.parents] if p.is_relative_to(workspace)):
             raise ValueError("Cargo scratch directory traverses a symlink")
-        home.mkdir(parents=True,exist_ok=True)
-        for name in ('registry','git'):
-            source=self.cache/name;dest=home/name
-            if not source.is_dir():continue
-            if dest.is_symlink() and dest.resolve()==source.resolve():continue
-            if dest.exists() or dest.is_symlink():raise ValueError("Cargo scratch cache differs from the configured read-only dependency cache")
-            dest.symlink_to(source,target_is_directory=True)
-        # Preserve PATH: Codex injects its sandbox helper directory at launch.
-        return {'CARGO_HOME':str(home),'CARGO_TARGET_DIR':str(workspace/'.execution/cargo-target'),
-            'CARGO_NET_OFFLINE':'true','CARGO_TERM_COLOR':'never','CARGO_BUILD_JOBS':'2',
-            'RUSTC':str(self.cargo.parent/'rustc'),'RUSTDOC':str(self.cargo.parent/'rustdoc')}
+        return cargo_environment(scratch,self.cargo,self.cache)
 
     @staticmethod
     def test_filters(test_names):
