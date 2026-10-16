@@ -137,7 +137,7 @@ def resolved_uses(uses, aliases):
 
 
 def target_receipts(state, root, executions, *, owner_id=None, experiment_id=None, joint_history='', failure=None, support=True,
-                    path='/executions'):
+                    path='/executions', reuse_failure=False):
     from .experiments import artifact, observed, validate_failure, fixed_files
     from consensus_assurance.core.types import ExecutionStatus
     for id, indices in executions.items():
@@ -166,23 +166,51 @@ def target_receipts(state, root, executions, *, owner_id=None, experiment_id=Non
                     f'Inspect {observations}. Cite each selected parsed event index once, not raw output line numbers.')])
         if not support:
             continue
-        fixed_files(root, a)
-        if c.status != ExecutionStatus.COMPLETED or not indices or measured['parsing_errors']:
-            raise ValueError('Supporting observations require completed execution and intact parsed events')
-        if c.parameters.get('changed_target_files') or c.parameters.get('lock_unchanged') is False:
-            raise ValueError('Referenced execution changed protected inputs')
-        if a.basis.harness.prerequisites and measured['prerequisites'] and measured['prerequisites']['status'] != 'matched':
-            raise ValueError('Referenced execution has unmatched prerequisites')
-        if c.exit_code != 0 or c.outcome == 'not_applicable':
-            if failure is None:
-                raise ValueError('Referenced test failed or did not complete a selected test')
-            validate_failure(state, root, a, c, measured, failure)
+        attribution = failure
+        if reuse_failure:
+            current = next((i for i in reversed(state.interpretations) if i.investigation_id == a.investigation_id), None)
+            if (current and current.experiment_id == a.id and id in current.executions and
+                    current.conclusion in {'violated', 'holds'}):
+                attribution = current.failure_attribution
+        try:
+            fixed_files(root, a)
+            if c.status != ExecutionStatus.COMPLETED or not indices or measured['parsing_errors']:
+                raise ValueError('Supporting observations require completed execution and intact parsed events')
+            if c.parameters.get('changed_target_files') or c.parameters.get('lock_unchanged') is False:
+                raise ValueError('Referenced execution changed protected inputs')
+            if a.basis.harness.prerequisites and measured['prerequisites'] and measured['prerequisites']['status'] != 'matched':
+                raise ValueError('Referenced execution has unmatched prerequisites')
+            if c.exit_code != 0 or c.outcome == 'not_applicable':
+                if attribution is None:
+                    raise ValueError('Referenced test failed or did not complete a selected test')
+                witnesses = validate_failure(state, root, a, c, measured, attribution)
+                if reuse_failure:
+                    allowed = {i for comparison, values in witnesses.items() for witness in values
+                        for i in [witness, *measured['comparisons'][comparison]['correlations'][str(witness)]['alias_indices'].values()]}
+                    if not set(indices) <= allowed:
+                        raise ValueError('Knowledge citations exceed the attributed witnesses and their actual prerequisites; '
+                            f'allowed event indices: {sorted(allowed)}')
+        except ValueError as exc:
+            field = path + '/' + id.replace('~', '~0').replace('/', '~1')
+            hint = ('Knowledge can reuse a current Interpretation with valid failure_attribution for this exact receipt '
+                '(including in the same update), limited to its witnesses and actual prerequisites. '
+                if reuse_failure else 'For an independently explained test failure, supply failure_attribution on this Interpretation. ')
+            raise DiagnosticError([Diagnostic(code='execution_support', category='association', object_ids=[id], paths=[field],
+                details={'status':c.status.value, 'outcome':c.outcome, 'exit_code':c.exit_code,
+                    'observations':f'logs/{id}/observations.json', 'stdout':c.stdout, 'stderr':c.stderr},
+                message=f'{field}: {exc}. {hint}Otherwise retain the observations in a question-level '
+                    'explained/conditional/unresolved Interpretation; failure, timeout or missing data cannot become completed support.')]) from exc
+
+
+def validate_knowledge_receipts(state, root, changes):
+    """Validate after same-update interpretations, before the surrounding transaction commits."""
+    for number, change in enumerate(changes):
+        target_receipts(state, root, change.executions, path=f'/knowledge/{number}/executions', reuse_failure=True)
 
 
 def update_knowledge(state, root, changes, operation, aliases):
     for number, change in enumerate(changes):
         require_sources(state, change.source_ids)
-        target_receipts(state, root, change.executions, path=f'/knowledge/{number}/executions')
         old = next((k for k in state.knowledge if k.id == change.id), None)
         if change.id and old is None:
             raise ValueError('Unknown knowledge entry')

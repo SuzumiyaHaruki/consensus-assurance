@@ -1,0 +1,298 @@
+{
+  "rationale": "Read the impact receipt (execution a38d65ea01ee4e2ea53193c166144cdd, exit 0, both cases passed). It confirms the replay effect and it corrects the impact I had reported from local construction feedback: the client write issued at the moment of the duplicate was rejected with 'node is not the leader', whereas the earlier local run had shown a successful write. The receipt also records one leaderless sample out of 140 taken at 10 ms intervals, so the demotion window exists but is short. Because a single write cannot say how long client work is refused, the duplicate case now attempts a write on every sampling step and records the count of rejections, the first and last rejection offsets and the rejection window; local runs of that extension show one rejection out of 137 attempts, at the very first step, and no later rejection. This update records the corrected account and requests the quantified impact receipt.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "2c066843eb7a4e9d85db8bbbd0ccf363-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "src_timeout_now",
+        "src_timeout_now_msg",
+        "src_request_vote"
+      ],
+      "executions": {
+        "a38d65ea01ee4e2ea53193c166144cdd": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "cfeb8d63a1134a859021ca15bc7f098b": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Present conclusion: the leadership-transfer control message is not idempotent and carries no context with which a receiver could reject a duplicate or stale copy, so the same payload honoured twice forces a second election, and a client operation issued in the resulting window is refused. Decided evidence: the first receipt (execution cfeb8d63a1134a859021ca15bc7f098b; duplicate setup index 0, probe index 1, control setup index 2, probe index 3) resolved all four comparisons as complete holds - the first payload moved leadership to the target (term 2 -> 3), the identical payload raised the term to 4 with the same node still Leader, and the control's plain campaign with an equal log claim was refused, left the term at 2 and changed no leadership. The impact receipt (execution a38d65ea01ee4e2ea53193c166144cdd, same indices) then measured the aftermath: duplicate_caused_election true (term 3 -> 4), one leaderless sample out of 140 samples taken every 10 ms, and the client write issued at the moment of the duplicate rejected with 'node is not the leader' (client_write_ok false) - which corrects the earlier local-run claim that such a write still succeeded; the retained receipt is the authority and local feedback is superseded. Source basis: TimeoutNowRequest embeds only RPCHeader with no term and no sender role (src_timeout_now_msg, commands.go 205-208), timeoutNow clears the known leader, moves the node to Candidate and sets the candidate-from-transfer flag without validating anything (src_timeout_now, raft.go 2232-2239), and that flag is what lets voters skip the known-leader rejection in requestVote (src_request_vote, raft.go 1626-1758). Scope of the harm: one extra election, a brief interval in which the node that was leader no longer accepts client work, and no change of leader identity in this configuration because the re-elected node had the most up-to-date log; safety is unaffected since the vote's log-completeness test still applies to the replay. Limits: three voters, in-process transport, no partition and one duplicate; the receipt shows one rejection and one leaderless sample, so the duration of the refusal window is bounded by the 10 ms sampling step rather than measured exactly, and the quantified extension is requested with this update; delayed rather than duplicated delivery, partitions during the replay, larger clusters and interaction with in-flight writes are unmeasured.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The first delivery is the documented transfer path; only the identical second delivery is the defect subject, and that delivery is supplied by the harness rather than produced by the library's own transport.",
+        "The retained impact receipt contradicts my earlier local-run observation that a concurrent write succeeds: the write issued at the duplicate was rejected with 'node is not the leader', so the client-visible effect is real, though short.",
+        "Raft tolerates spurious elections for safety and the vote's log-completeness test still applies to the replay, so no unsafe leadership outcome was observed."
+      ],
+      "limitations": [
+        "The refusal window is only bounded (one leaderless sample and the first attempted write) because sampling is 10 ms; the quantified extension is requested with this update.",
+        "One cluster size and one delivery path; delayed delivery, partitions during replay, larger clusters and in-flight write interactions are unmeasured."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "2c066843eb7a4e9d85db8bbbd0ccf363-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "test_names": [
+      "TestAssurance_StaleTimeoutNowDuplicate",
+      "TestAssurance_Control_PlainVoteRejected"
+    ],
+    "source_ids": [
+      "src_timeout_now",
+      "src_timeout_now_msg",
+      "src_request_vote"
+    ],
+    "anchors": [
+      {
+        "material_id": "src_timeout_now",
+        "symbol": "timeoutNow",
+        "start_line": 2232,
+        "end_line": 2239,
+        "anchor": {
+          "source_ids": [
+            "src_timeout_now"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_timeout_now",
+          "start_line": 2232,
+          "end_line": 2232,
+          "symbol": "timeoutNow"
+        }
+      },
+      {
+        "material_id": "src_request_vote",
+        "symbol": "requestVote",
+        "start_line": 1626,
+        "end_line": 1758,
+        "anchor": {
+          "source_ids": [
+            "src_request_vote",
+            "src_vote_log_check"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_request_vote",
+          "start_line": 1626,
+          "end_line": 1626,
+          "symbol": "requestVote"
+        }
+      }
+    ],
+    "scope": {
+      "description": "The same two cases as before (three-voter cluster with ten committed entries; one TimeoutNow payload delivered twice versus a plain follower campaign as control), extended so the duplicate case attempts a client write on every 10 ms sampling step for 1.5 s after the duplicate and records the write attempts, the number of rejections, the first and last rejection offsets, the rejection window and the leaderless sample count alongside the term and state.",
+      "assumptions": [
+        "Fault model unchanged: no message loss inside the injected transport; the induced event is one duplicated control message, or one plain campaign in the control case.",
+        "Writes are issued on the node that was leader before the duplicate, with the ordinary 200 ms enqueue timeout, so a rejection reflects the node's state rather than a retry policy; the client is expected to retry such a rejection in practice.",
+        "Sampling and writes advance together at 10 ms, so a zero rejection window means the refusal lasted less than one step, not that it was absent; the counts are what the run observed.",
+        "Reused facilities: MakeCluster with inmemConfig timings and InmemTransport."
+      ],
+      "excluded": [
+        "No production logic was modified; the harness only adds test code.",
+        "No partition is induced, so the case isolates message handling rather than concurrency."
+      ],
+      "parameters": {
+        "peers": 3,
+        "entries": 10,
+        "sample_step_ms": 10,
+        "window_ms": 1500
+      }
+    },
+    "prefix": "As before: elect a leader in a three-voter cluster, commit ten entries, record the leader, term and log claims, then in the duplicate case deliver one TimeoutNow built from the current leader's header to a follower, wait for a stable single leader, deliver the identical payload again to that new leader, and for 1.5 s afterwards alternate sampling the leadership set and attempting one client write on that node, recording attempts, rejections, the first and last rejection offsets, the leaderless sample count, the term and the state; in the control case deliver a plain RequestVote from the follower's own identity and log claim and record the response and whether the leadership changed.",
+    "semantic_changes": [
+      "Affected services: client writes during the duplicate window, refusals are observable and can be replayed through real prefixes.",
+      "Checks: any_write_rejected is a new comparison subject, and the probe records write attempts, rejection count, first and last rejection offsets and the rejection window per case."
+    ],
+    "requirement": "A control message that changes leadership must either carry enough context for its receiver to reject a duplicate or stale copy, or must not change leadership when honoured again, and any resulting interval in which the node refuses client work must be bounded.",
+    "responsibility": "target",
+    "prerequisites": [
+      {
+        "alias": "duplicate_transfer_setup",
+        "event": "ca_auth_setup",
+        "conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "plain_vote_setup",
+        "event": "ca_auth_setup",
+        "conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "plain-vote-control",
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "duplicate_transfer_setup",
+        "assertion": {
+          "field": "leadership_moved_on_first",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now",
+            "reference": null
+          },
+          {
+            "field": "first_delivered",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Sanity: the first delivery performs the requested transfer, so the second delivery is a duplicate rather than the initial transfer."
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "duplicate_transfer_setup",
+        "assertion": {
+          "field": "duplicate_caused_election",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now",
+            "reference": null
+          },
+          {
+            "field": "duplicate_delivered",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "The identical payload honoured a second time raises the term again, i.e. the duplicate forces another election in a cluster that needed no transfer."
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "duplicate_transfer_setup",
+        "assertion": {
+          "field": "any_write_rejected",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now",
+            "reference": null
+          },
+          {
+            "field": "duplicate_delivered",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Client-visible cost: at least one client write issued while the node was campaigning was refused, rather than served by the cluster."
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "plain_vote_setup",
+        "assertion": {
+          "field": "vote_granted",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "plain-vote-control",
+            "reference": null
+          },
+          {
+            "field": "delivered",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Control: the same log claim carried by a plain campaign is refused because a leader is known, so the difference is the transfer path rather than the request's log content."
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "plain_vote_setup",
+        "assertion": {
+          "field": "leadership_changed",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "plain-vote-control",
+            "reference": null
+          }
+        ],
+        "description": "Control: no election follows a plain campaign, so the duplicate case's second election is not an artifact of the probe schedule."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": "658bcfd607c7416b8dcce619f66aeb14-experiment",
+    "revision_reason": "The impact receipt showed a client write refused at the moment of the duplicate, but a single write cannot bound the refusal interval, so the duplicate case now attempts a write on every sampling step and emits the attempts, rejection count, first and last rejection offsets and the window, together with one new comparison for a refused client write. Scenario, cases, anchors and the control are unchanged."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

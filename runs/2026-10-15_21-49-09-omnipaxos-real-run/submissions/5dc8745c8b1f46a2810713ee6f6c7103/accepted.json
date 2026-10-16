@@ -1,0 +1,147 @@
+{
+  "rationale": "Dispatches the corrected placeholder-accounting probe, which locally reproduced the suspicion with a tick period large enough that no `drain_notifiers` pass can fall between the origin's flush and the truncation. The local run gives `resolved` = ok with `assigned_idx` 4 while entry 33 sits at index 2 and index 4 holds entry 35, i.e. the fresh caller is told an index that does not contain its entry - a shift of two, consistent with the two placeholders for the entries the truncation discarded being popped against the fresh batch's index advances. The previous local run of the same scenario with an 80 ms tick gave the correct index 2, so the construction difference that matters is the tick period relative to the flush-to-truncation gap. The harness now also emits an admission event, which is why the comparison can carry a prerequisite alias. Two details of this run are recorded rather than smoothed over: the new leader's `append_notify(22)` did not resolve `Ok(1)` within its timeout and the origin's decided index was still 0 at the re-synchronisation sample, so the internal ordering is inferred from the endpoints (the decided values 22,33,34,35 and the reported indices) rather than observed step by step.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "Pending: the submitted probe's receipt. The arm-order account is settled separately; this probe targets a second mechanism inside the same completion bookkeeping (`reconcile_unconfirmed` mapping one placeholder per index advance). It would change the judgment if the fresh caller's returned index equals the true position of its entry, if its entry is absent from the decided log, or if the value at the returned index is the caller's entry.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+    "harness_path": "omnipaxos_runtime/tests/assurance_shift.rs",
+    "files": {},
+    "execution_package": "./omnipaxos_runtime",
+    "test_names": [
+      "case_h_placeholder_shift_after_truncation"
+    ],
+    "source_ids": [
+      "actor_record_assignment",
+      "actor_pending_assigned_field",
+      "actor_append_tracked",
+      "actor_drain_notifiers",
+      "handle_append_notify_contract"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One run of a three-node actor cluster with batch_size 3 and a 1000 ms tick period, so a tick cannot fall between the origin's batch flush and the truncation that follows it. Node 1 is the leader; two `append_notify` calls buffer entries 11 and 12 in its batch; node 1's links to both followers are cut so they elect node 3, which decides entry 22 at index 1; the links are restored so node 1 flushes its batch and is then truncated back to the new leader's single-entry log; node 1 is re-elected and a fresh `append_notify` for entry 33 fills the batch together with two plain appends 34 and 35. The run reports the fresh call's resolution, the index it returns, the true position of entry 33 in the decided log, whether they agree, and the entry at the returned index.",
+      "assumptions": [
+        "Message loss and the following re-synchronisation are permitted faults; nothing in the harness modifies target logic.",
+        "Batching (batch_size 3) is what defers the two writes into `unconfirmed_local`, and the batch is only flushed when its size is reached or on a `Prepare`, which is what makes the discarded entries' placeholders exist at all.",
+        "A tick period of 1000 ms against a flush-to-truncation gap of a few milliseconds is what keeps a `drain_notifiers` pass out of that window; the same scenario at 80 ms ticks gave the caller the correct index.",
+        "Node 1 carries leader_priority 1 so the first election is deterministic and the re-election is explicit via `try_become_leader`."
+      ],
+      "excluded": [
+        "Any claim about other batch sizes or tick periods; only this configuration was run.",
+        "Any claim about a follower origin, or about the concurrent arm-order defect that this run's resolution is not testing.",
+        "Any claim about the internal placeholder queue: it is not observable through the public API, so the shift is reported through the returned index and the log contents."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "batch_size": 3,
+        "tick_ms": 1000,
+        "election_tick_timeout": 2,
+        "resend_message_tick_timeout": 2,
+        "buffered_entries": "11,12",
+        "new_leader_entry": 22,
+        "fresh_entry": 33,
+        "filler_appends": "34,35",
+        "re_election": "explicit try_become_leader on the origin"
+      }
+    },
+    "prefix": "Build three actors with batch_size 3 and a 1000 ms tick period, node 1 carrying leader_priority 1. Call `try_become_leader()` on node 1 until nodes 1, 2 and 3 all report it as the accepted leader and emit the admission event. Issue `append_notify(TestEntry(11))` and then `append_notify(TestEntry(12))` on node 1 from spawned tasks so both are deferred into its batch, and sample its decided index. Block node 1's links to nodes 2 and 3 in both directions, wait until nodes 2 and 3 report a leader other than 1, and call `append_notify(TestEntry(22))` on that leader. Unblock the links and sleep long enough (several ticks) for node 1 to process the `Prepare` that flushes its batch and the following `AcceptSync` that truncates it back, sampling its decided index afterwards. Then call `try_become_leader()` on node 1 until it reports itself as the accepted leader, spawn `append_notify(TestEntry(33))` on it, follow with two plain appends (34, 35) that fill the batch, sleep several ticks, and await the fresh call. Finally read node 1's decided suffix from index 0, find the 1-based position of entry 33 in it, read the entry at the index the call returned, and emit one `shift_outcome` event with the resolution, the returned index, the true position of 33, whether the two agree, and the entry at the returned index.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "The decisive inputs come from the target: batching defers the two writes into `unconfirmed_local`, the re-synchronisation truncates the entries they refer to, and `reconcile_unconfirmed` maps one queued placeholder per index advance to compute the index it later reports to the caller. The harness only chooses the schedule and reads the endpoints.",
+    "prerequisites": [
+      {
+        "alias": "shift_admission",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "H",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 33,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "shift_outcome",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "shift_admission",
+        "assertion": {
+          "field": "assigned_idx_matches_true_index",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "resolved",
+          "op": "eq",
+          "value": "ok",
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "If the fresh call resolves Ok, the index it returns must be the position of the caller's entry. The placeholder-accounting suspicion predicts violation."
+      },
+      {
+        "event": "shift_outcome",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "shift_admission",
+        "assertion": {
+          "field": "entry_at_assigned_idx",
+          "op": "eq",
+          "value": "decided:33",
+          "reference": null
+        },
+        "antecedent": {
+          "field": "resolved",
+          "op": "eq",
+          "value": "ok",
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "The entry at the returned index must be the caller's entry."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

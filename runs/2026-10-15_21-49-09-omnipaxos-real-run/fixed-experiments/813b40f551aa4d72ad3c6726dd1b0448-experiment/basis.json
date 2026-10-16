@@ -1,0 +1,193 @@
+{
+  "id": "813b40f551aa4d72ad3c6726dd1b0448-experiment",
+  "investigation_id": "813b40f551aa4d72ad3c6726dd1b0448-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "rust_test",
+      "source": "//! Focused probe for the core crate's recovery path under out-of-order delivery.\n//!\n//! This file lives in the `omnipaxos_runtime` test target because that dependency graph\n//! builds offline here; it drives three real `OmniPaxos` instances directly through the\n//! public API and never touches the actor layer.\n//!\n//! Question: when one follower misses an `AcceptDecide` and then receives a *later*\n//! `AcceptDecide` first (a sequence break, which triggers the Recover path), and the\n//! held-back older message is delivered afterwards, does that follower end up with the\n//! same decided values as the leader and keep making progress?\n\nuse std::collections::BTreeMap;\n\nuse omnipaxos::{\n    messages::{sequence_paxos::PaxosMsg, Message},\n    storage::{Entry, Snapshot},\n    util::LogEntry,\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\ntype Op = OmniPaxos<TestEntry, MemoryStorage<TestEntry>>;\n\nfn build(pid: u64, nodes: Vec<u64>) -> Op {\n    let cluster_config = ClusterConfig {\n        configuration_id: 1,\n        nodes,\n        flexible_quorum: None,\n    };\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 1024,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: if pid == 1 { 1 } else { 0 },\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config,\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .unwrap()\n}\n\n/// Advance every instance and deliver all pending messages in-process. When `capture` is\n/// `Some(pid)`, the first `AcceptDecide` addressed to `pid` is removed from the flow and\n/// stored in `held` instead of being delivered, so it can be delivered later.\nfn pump(\n    ops: &mut BTreeMap<u64, Op>,\n    capture: Option<u64>,\n    held: &mut Option<Message<TestEntry>>,\n) {\n    for _ in 0..30 {\n        let pids: Vec<u64> = ops.keys().copied().collect();\n        for pid in &pids {\n            ops.get_mut(pid).unwrap().tick();\n        }\n        for pid in &pids {\n            let mut buf = Vec::new();\n            ops.get_mut(pid).unwrap().take_outgoing_messages(&mut buf);\n            for m in buf {\n                let to = m.get_receiver();\n                if to == *pid {\n                    continue;\n                }\n                if Some(to) == capture && held.is_none() {\n                    if let Message::SequencePaxos(p) = &m {\n                        if matches!(&p.msg, PaxosMsg::AcceptDecide(_)) {\n                            *held = Some(m);\n                            continue;\n                        }\n                    }\n                }\n                if let Some(dst) = ops.get_mut(&to) {\n                    dst.handle_incoming(m);\n                }\n            }\n        }\n    }\n}\n\nfn emit(event: &str, fields: &[(&str, String)]) {\n    let mut line = format!(\"{{\\\"event\\\":\\\"{}\\\"\", event);\n    for (k, v) in fields {\n        line.push_str(&format!(\",\\\"{}\\\":{}\", k, v));\n    }\n    line.push('}');\n    println!(\"CA_EVENT {}\", line);\n}\n\nfn q(v: &str) -> String {\n    format!(\"\\\"{}\\\"\", v)\n}\n\nfn n(v: usize) -> String {\n    v.to_string()\n}\n\nfn decided_values(op: &Op) -> (usize, Vec<u64>) {\n    let decided_idx = op.get_decided_idx();\n    let values = op\n        .read_decided_suffix(0)\n        .map(|entries| {\n            entries\n                .into_iter()\n                .filter_map(|e| match e {\n                    LogEntry::Decided(TestEntry(v)) => Some(v),\n                    _ => None,\n                })\n                .collect::<Vec<u64>>()\n        })\n        .unwrap_or_default();\n    (decided_idx, values)\n}\n\nfn join(values: &[u64]) -> String {\n    values\n        .iter()\n        .map(|v| v.to_string())\n        .collect::<Vec<_>>()\n        .join(\",\")\n}\n\nfn elect_node_1(ops: &mut BTreeMap<u64, Op>, held: &mut Option<Message<TestEntry>>) -> bool {\n    for _ in 0..200 {\n        ops.get_mut(&1).unwrap().try_become_leader();\n        pump(ops, None, held);\n        if let Some((pid, true)) = ops.get(&2).unwrap().get_current_leader() {\n            if pid == 1 {\n                return true;\n            }\n        }\n    }\n    false\n}\n\n/// Both cases append entries 1..=6 on node 1 with node 2 as the follower under\n/// observation. Case A delivers everything in order; case B holds back the\n/// `AcceptDecide` for entry 4, lets the one for entry 5 arrive first, and then delivers\n/// the held message.\n#[test]\nfn case_a_in_order_delivery() {\n    run_case(\"A\", false);\n}\n\n#[test]\nfn case_b_reordered_delivery() {\n    run_case(\"B\", true);\n}\n\nfn run_case(mode: &str, reorder: bool) {\n    let nodes = vec![1u64, 2, 3];\n    let mut ops: BTreeMap<u64, Op> = nodes\n        .iter()\n        .map(|pid| (*pid, build(*pid, nodes.clone())))\n        .collect();\n    let mut held: Option<Message<TestEntry>> = None;\n\n    let elected = elect_node_1(&mut ops, &mut held);\n    emit(\n        \"admission\",\n        &[\n            (\"mode\", q(mode)),\n            (\"nodes\", q(\"1,2,3\")),\n            (\"follower\", n(2)),\n            (\"leader_elected\", if elected { \"true\".to_string() } else { \"false\".to_string() }),\n        ],\n    );\n    if !elected {\n        emit(\n            &format!(\"reorder_outcome_{}\", mode.to_lowercase()),\n            &[\n                (\"mode\", q(mode)),\n                (\"stage\", q(\"no_leader\")),\n            ],\n        );\n        return;\n    }\n\n    // Baseline: entries 1..=3 decided everywhere.\n    for v in 1..=3u64 {\n        ops.get_mut(&1).unwrap().append(TestEntry(v)).unwrap();\n    }\n    let mut baseline_ok = false;\n    for _ in 0..40 {\n        pump(&mut ops, None, &mut held);\n        if ops.values().all(|op| op.get_decided_idx() >= 3) {\n            baseline_ok = true;\n            break;\n        }\n    }\n\n    // Entry 4, then entry 5. In the reorder case the AcceptDecide carrying entry 4 is\n    // captured, so node 2 sees the one for entry 5 as a sequence break.\n    ops.get_mut(&1).unwrap().append(TestEntry(4)).unwrap();\n    if reorder {\n        pump(&mut ops, Some(2), &mut held);\n    } else {\n        pump(&mut ops, None, &mut held);\n    }\n    let captured = held.is_some();\n    ops.get_mut(&1).unwrap().append(TestEntry(5)).unwrap();\n    pump(&mut ops, None, &mut held);\n\n    // Deliver the held-back older message (reorder case only).\n    let delivered_late = if let Some(m) = held.take() {\n        ops.get_mut(&2).unwrap().handle_incoming(m);\n        true\n    } else {\n        false\n    };\n    pump(&mut ops, None, &mut held);\n\n    // Entry 6 and enough pumping for the Recover path and any resends to settle.\n    ops.get_mut(&1).unwrap().append(TestEntry(6)).unwrap();\n    for _ in 0..10 {\n        pump(&mut ops, None, &mut held);\n    }\n\n    let (leader_decided, leader_values) = decided_values(ops.get(&1).unwrap());\n    let (follower_decided, follower_values) = decided_values(ops.get(&2).unwrap());\n    let (third_decided, third_values) = decided_values(ops.get(&3).unwrap());\n    let same_values = follower_values == leader_values;\n    let all_six = leader_values.len() >= 6 && follower_values.len() >= 6;\n\n    emit(\n        &format!(\"reorder_outcome_{}\", mode.to_lowercase()),\n        &[\n            (\"mode\", q(mode)),\n            (\"nodes\", q(\"1,2,3\")),\n            (\"follower\", n(2)),\n            (\"reorder\", if reorder { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"baseline_three_decided_everywhere\", if baseline_ok { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"acceptdecide_captured\", if captured { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"held_message_delivered_late\", if delivered_late { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"leader_decided_idx\", n(leader_decided)),\n            (\"follower_decided_idx\", n(follower_decided)),\n            (\"third_node_decided_idx\", n(third_decided)),\n            (\"leader_decided_values\", q(&join(&leader_values))),\n            (\"follower_decided_values\", q(&join(&follower_values))),\n            (\"third_node_decided_values\", q(&join(&third_values))),\n            (\"follower_values_equal_leader\", if same_values { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"all_six_entries_decided_on_both\", if all_six { \"true\".to_string() } else { \"false\".to_string() }),\n        ],\n    );\n}\n",
+      "files": {},
+      "execution_package": "./omnipaxos_runtime",
+      "test_names": null,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admission_a",
+          "event": "admission",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "A",
+              "reference": null
+            },
+            {
+              "field": "nodes",
+              "op": "eq",
+              "value": "1,2,3",
+              "reference": null
+            },
+            {
+              "field": "follower",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admission_b",
+          "event": "admission",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "B",
+              "reference": null
+            },
+            {
+              "field": "nodes",
+              "op": "eq",
+              "value": "1,2,3",
+              "reference": null
+            },
+            {
+              "field": "follower",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "core_check_valid_ballot",
+      "core_decided_advance_gates"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two runs of one cluster shape with three real `OmniPaxos` instances driven directly through the public API in a single process (lossless in-process delivery, node 1 the elected leader, node 2 the follower under observation, node 3 as the third acceptor). Both runs decide entries 1..=3 as a baseline, then append entries 4, 5 and 6. Case A delivers every message in order. Case B captures the `AcceptDecide` carrying entry 4 before it reaches node 2, delivers the one carrying entry 5 (so node 2 sees a sequence break), and then delivers the held message late.",
+      "assumptions": [
+        "Out-of-order delivery of replication messages is a permitted fault for this protocol: the core carries sequence numbers and a Recover path for exactly this case, and nothing in the docs claims ordered delivery as a caller duty beyond the sequence-number contract.",
+        "The capture happens in the transport only: the leader's message is held in the harness and delivered later, so no target logic is modified and the leader is unaware of the interception.",
+        "The instances run with batch_size 1, majority quorum and no snapshots, so a decided entry is observable immediately in `read_decided_suffix`.",
+        "Logical ticks are driven by the harness, so the resend and election timeouts are exercised deterministically rather than by wall-clock timing."
+      ],
+      "excluded": [
+        "Any claim about message duplication, corruption, or storage faults.",
+        "Any claim about the actor layer: this probe drives the core crate directly.",
+        "Any claim about which intermediate phase the follower passed through; the probe observes the endpoints, not the follower's internal phase."
+      ],
+      "parameters": {
+        "nodes": "1,2,3",
+        "leader": 1,
+        "follower_under_observation": 2,
+        "baseline_entries": "1..=3",
+        "then_appended": "4,5,6",
+        "captured_message": "AcceptDecide addressed to node 2 (case B only)",
+        "ticks_per_pump": 30
+      }
+    },
+    "prefix": "For each case: build one `OmniPaxos<TestEntry, MemoryStorage<TestEntry>>` per node id (configuration_id 1, election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, node 1 leader_priority 1), elect node 1 by calling `try_become_leader()` and pumping until node 2 reports it as the accepted leader, emit the admission event, append entries 1..=3 on node 1 and pump until every node has decided at least 3, then append entry 4. In case B the pump captures the first `AcceptDecide` addressed to node 2 instead of delivering it; in case A it delivers everything. Append entry 5 and pump, then in case B deliver the captured message to node 2 and pump again. Append entry 6 and pump ten more times, then read each node's decided suffix and emit, under the mode-specific event name, both the decided values per node and whether the follower's decided values equal the leader's and whether at least six entries are decided on both.",
+    "requirement": null,
+    "responsibility": "The decisive inputs are produced by the target: the follower's sequence-number check classifies the later message as a break and drives the recovery exchange, while `check_valid_ballot` gates every message that could advance its decided index; the harness only chooses the delivery order and never inspects or repairs protocol state.",
+    "comparisons": [
+      {
+        "event": "reorder_outcome_a",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "follower_values_equal_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: with in-order delivery the follower's decided values match the leader's."
+      },
+      {
+        "event": "reorder_outcome_a",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "all_six_entries_decided_on_both",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: both endpoints decide entries 1..=6."
+      },
+      {
+        "event": "reorder_outcome_b",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "follower_values_equal_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Reorder case: after the captured message is delivered late, the follower's decided values still match the leader's. Expected holds."
+      },
+      {
+        "event": "reorder_outcome_b",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "all_six_entries_decided_on_both",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Reorder case: the follower keeps progressing and decides entries 1..=6. Expected holds."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "f2313b6a761845ca82e89ebd95e29cf8",
+  "configuration": {
+    "backend": "cargo",
+    "target": {
+      "expected_module": null,
+      "variant": "omnipaxos",
+      "analysis_roots": [],
+      "execution_package": "omnipaxos",
+      "harness_path": "omnipaxos/tests/assurance_generated.rs"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+    }
+  },
+  "harness_filename": "omnipaxos_runtime/tests/assurance_generated.rs",
+  "operation_id": "813b40f551aa4d72ad3c6726dd1b0448",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

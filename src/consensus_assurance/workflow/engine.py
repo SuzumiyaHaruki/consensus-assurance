@@ -24,10 +24,14 @@ class Engine:
         self.store = Store(self.root)
         self.runner = ProcessRunner(self.root)
         self.state = None
+        self.phase = 'initialization'
+        self.last_checkpoint = None
 
     def checkpoint(self, event):
+        self.phase = 'checkpoint:' + event
         self.budget.sync()
         self.store.save(self.state, event)
+        self.last_checkpoint = event
         from .research import current_view
         write_json(self.root/'research.json',current_view(self.state,self.root,self.implementation))
 
@@ -63,6 +67,7 @@ class Engine:
         if raw.get("framework_revision") != FRAMEWORK_REVISION:
             raise ValueError("Historical run uses an incompatible method; use its original Git revision or start a fresh run")
         self.state = self.store.load()
+        self.last_checkpoint = 'loaded state.json'
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()
         self.validate_agent_inputs()
@@ -97,8 +102,7 @@ class Engine:
             self.checkpoint("resume_tools_changed")
             return self.state
         try:
-            if hasattr(self.implementation,'validate_builds'):
-                self.implementation.validate_builds(self.root,self.state.snapshot.id,self.runner.deadline)
+            self.validate_builds(self.state.pending_action)
         except ValueError as exc:
             self.state.invalidate(str(exc));self.state.stop_reason=str(exc)
             self.checkpoint('resume_build_inputs_changed');return self.state
@@ -121,8 +125,8 @@ class Engine:
             self.state.run_stop = {}
             self.state.stop_reason = 'Not started'
             self.advance('explicit_transport_resume:' + failed.id)
-        # Running actions with a completed raw receipt resume their existing operation.
-        # Unknown outcomes receive a new identity only when action() schedules a retry.
+        # Completed raw receipts resume their operation; unknown target outcomes
+        # are retained for an explicit decision, never automatically replayed.
         self.checkpoint("resumed")
         from .audit import execute
         return execute(self)
@@ -165,23 +169,48 @@ class Engine:
         if version and self.state.tools.get('agent',version)!=version:
             raise ValueError('Codex CLI version changed; start a new run')
 
+    def validate_builds(self, pending=None):
+        if not hasattr(self.implementation, 'validate_builds'):
+            return
+        deadline = self.runner.deadline
+        if pending and pending.kind == 'experiment_execute':
+            complete = (self.root / 'actions' / pending.id / 'result.json').is_file() or any(
+                c.pending_action_id == pending.id and c.action == 'experiment' and c.ended_at
+                for c in (CheckRun.model_validate_json(path.read_text())
+                          for path in (self.root / 'logs').glob('*/check.json')))
+            if complete:
+                # Tool verification retains its own finite timeout. A saved result
+                # needs input validation and postprocessing, not a target time grant.
+                deadline = None
+        self.implementation.validate_builds(self.root, self.state.snapshot.id, deadline)
+
     def action(self, kind, resource, callback, inputs=None):
         from .action_identity import stable_input
         if kind=='agent_turn':self.validate_agent_inputs()
-        if kind in {'experiment_execute'} and hasattr(self.implementation,'validate_builds'):
-            self.implementation.validate_builds(self.root,self.state.snapshot.id,self.runner.deadline)
         logical = stable_input(inputs or {})
         pending = self.state.pending_action
         same = pending and pending.kind == kind and pending.logical_input == logical
+        if kind == 'experiment_execute':
+            self.validate_builds(pending if same else None)
         if same and (self.root / "actions" / pending.id / "result.json").exists():
             return json.loads((self.root / "actions" / pending.id / "result.json").read_text())
         receipts = [CheckRun.model_validate_json(p.read_text()) for p in (self.root / "logs").glob("*/check.json")]
         recoverable = same and any(c.pending_action_id == pending.id and c.ended_at for c in receipts)
+        if same and kind == 'experiment_execute':
+            targets = [c for c in receipts if c.pending_action_id == pending.id and c.action == 'experiment']
+            if any(not c.ended_at for c in targets):
+                from .errors import Blocked
+                pending.status = 'outcome_unknown'
+                raise Blocked('Target execution outcome is unknown; preserve its receipt. '
+                              'Recovery cannot replay it; a new attempt requires an explicit submission.')
+            # No target receipt means execution has not started. Restore preparation
+            # under the original reservation, including interrupted seed copies.
+            recoverable = True
         if not recoverable:
             if pending:
                 if pending.status == "running":
                     pending.status = "outcome_unknown"
-                    self.state.gaps.append("Interrupted operation has no completed receipt; retry in a fresh workspace")
+                    self.state.gaps.append("Interrupted operation has no completed receipt; outcome remains unknown")
                 self.state.action_history.append(pending.model_copy(deep=True))
             self.budget.take(resource)
             pending = PendingAction(kind=kind, logical_input=logical)
@@ -193,6 +222,7 @@ class Engine:
         self.runner.active_action_id = pending.id
         try:
             self.checkpoint("action_started")
+            self.phase = kind + ':execute'
             value = callback()
         finally:
             self.runner.active_action_id = None
@@ -202,6 +232,7 @@ class Engine:
             if isinstance(item, dict): return {k:pack(v) for k,v in item.items()}
             return item
         value = pack(value)
+        self.phase = kind + ':save_result'
         write_json(directory / "result.json", value)
         pending.status = "completed"
         self.checkpoint("action_result_saved")

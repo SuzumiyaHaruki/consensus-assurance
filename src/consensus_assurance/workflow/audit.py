@@ -2,6 +2,7 @@
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 from pydantic import ValidationError
 from consensus_assurance.adapters.storage.files import digest, write_json
@@ -205,6 +206,7 @@ def prepare_agent_source(engine):
 
 
 def receive(engine, payload):
+    engine.phase = 'agent_turn:retain_receipt'
     check = CheckRun.model_validate(payload[0])
     session, result = payload[1:]
     if check.status == ExecutionStatus.COMPLETED and result:
@@ -223,6 +225,25 @@ def receive(engine, payload):
 
 
 def execute(engine):
+    try:
+        return _execute(engine)
+    except OSError as exc:
+        # Do not turn controller storage failures into rejected model submissions,
+        # or let a second failed checkpoint replace the first error.
+        from .research import stop_record
+        reason = f'Controller I/O failure during {engine.phase}: {exc}'
+        previous = engine.last_checkpoint or 'none'
+        engine.state.stop_reason = reason
+        stop_record(engine, 'tool_gap')
+        try:
+            engine.checkpoint('audit_io_error')
+        except OSError:
+            pass
+        print(f'{reason}; last reliable checkpoint before failure: {previous}', file=sys.stderr)
+        return engine.state
+
+
+def _execute(engine):
     from .research import global_stop
     engine.validate_agent_inputs()
     state = engine.state
@@ -252,7 +273,7 @@ def execute(engine):
             payload = engine.action('agent_turn', 'agent_calls',
                 lambda:engine.agent.decode(check, response, state.agent_session_id), pending.logical_input)
             receive(engine, payload)
-    stop_cause='resource_limit'
+    stop_cause='tool_gap'
     try:
         if state.current_submission.get('phase') == 'received':
             accept_received(engine)
@@ -317,16 +338,18 @@ def execute(engine):
         stop_cause='user_stop'
         raise
     finally:
-        if state.stop_reason == 'Not started':
-            state.stop_reason = 'Audit investigation reached the authorized total time budget'
-        if not global_stop(state.current_submission):
-            from .research import stop_record
-            last = state.checks[-1] if state.checks else None
-            reason = ('resource_limit' if engine.budget.remaining() <= 0
-                else 'user_stop' if last and last.status == ExecutionStatus.CANCELLED
-                else 'tool_gap' if state.current_submission.get('phase') == 'failed' else stop_cause)
-            stop_record(engine, reason)
-        engine.checkpoint('audit_stopped')
+        if not isinstance(sys.exc_info()[1], OSError):
+            if state.stop_reason == 'Not started':
+                state.stop_reason = ('Audit investigation reached the authorized total time budget'
+                    if engine.budget.remaining() <= 0 else 'Audit investigation stopped with retained work')
+            if not global_stop(state.current_submission):
+                from .research import stop_record
+                last = state.checks[-1] if state.checks else None
+                reason = ('resource_limit' if engine.budget.remaining() <= 0
+                    else 'user_stop' if last and last.status == ExecutionStatus.CANCELLED
+                    else 'tool_gap' if state.current_submission.get('phase') == 'failed' else stop_cause)
+                stop_record(engine, reason)
+            engine.checkpoint('audit_stopped')
     return state
 
 
@@ -384,7 +407,7 @@ def submission_effects(before, state, submission, operation_id):
 
 
 def prepare_submission(engine, submission, inputs, operation_id):
-    from .knowledge import (update_knowledge, update_questions, add_gap, interpret,
+    from .knowledge import (update_knowledge, validate_knowledge_receipts, update_questions, add_gap, interpret,
                             resolve, investigation, resolved_uses, open_gaps)
     from .experiments import validate_basis, artifact, fixed_files
     from consensus_assurance.core.types import ExperimentBasis, Harness, FixedExperiment
@@ -402,13 +425,14 @@ def prepare_submission(engine, submission, inputs, operation_id):
     for gap in submission.gaps:
         add_gap(state, resolve(gap.investigation_id, aliases), gap.question, operation_id, gap.experiment_id)
     interpret(state, engine.root, submission.interpretations, operation_id, aliases)
+    validate_knowledge_receipts(state, engine.root, submission.knowledge)
     fixed = None
     request = submission.experiment
     if request:
         owner = investigation(state, resolve(request.investigation_id, aliases))
         harness = Harness(kind=engine.implementation.harness_kind, source=inputs.read(request.harness_path),
             files={name: inputs.read(path) for name, path in request.files.items()},
-            execution_package=request.execution_package, prerequisites=request.prerequisites,
+            execution_package=request.execution_package, test_names=request.test_names, prerequisites=request.prerequisites,
             semantic_changes=request.semantic_changes)
         basis = ExperimentBasis(harness=harness, source_ids=request.source_ids, anchors=request.anchors,
             scope=request.scope, prefix=request.prefix, requirement=request.requirement,
@@ -502,11 +526,13 @@ def accept_received(engine):
         else:
             product = AuditSubmission.model_validate_json((archive / 'raw.json').read_text())
             inputs = Inputs(archive / 'inputs')
+            engine.phase = 'submission:commit_update'
             commit_update(engine, 'submission-' + operation_id, product.model_dump(mode='json'),
                           lambda proxy: prepare_submission(proxy, product, inputs, operation_id)())
+            engine.phase = 'submission:save_acceptance'
             write_json(archive / 'accepted.json', product)
             return True
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         errors = submission_errors(submission_diagnostics(exc), archive, result)
         write_json(archive / 'diagnostics.json', errors)
     engine.state.current_submission = {'phase':'rejected', 'operation_id':operation_id, 'rejected':errors}
@@ -517,18 +543,31 @@ def accept_received(engine):
 def execute_accepted(engine):
     from .experiments import artifact, execute, observed
     current = engine.state.current_submission
+    check = None
     if current.get('experiment_id'):
         fixed = artifact(engine.state, current['experiment_id'])
         try:
             check = execute(engine, fixed, current['operation_id'])
+            engine.phase = 'experiment_execute:save_observations'
             write_json(engine.root / 'logs' / check.id / 'observations.json', observed(fixed, check))
-        except (OSError, ValueError, Blocked, BudgetExhausted) as exc:
+        except (ValueError, Blocked, BudgetExhausted) as exc:
+            check = None
             current['execution_gap'] = str(exc)
             if isinstance(exc, BudgetExhausted) and engine.budget.remaining() <= 0:
                 engine.checkpoint('execution_deferred_at_deadline')
                 return
     current['phase'] = 'executed'
     engine.checkpoint('audit_execution_completed')
+    if (check and (check.ended_at or check.parameters.get('preparation_failure'))
+            and check.parameters.get('changed_target_files') is not None
+            and hasattr(engine.implementation, 'cleanup')):
+        engine.phase = 'experiment_execute:cleanup'
+        try:
+            engine.implementation.cleanup(Path(check.cwd))
+        except (OSError, ValueError) as exc:
+            message = f'Private build cleanup incomplete for {check.id}: {exc}; saved execution is unchanged'
+            engine.state.gaps.append(message)
+            print(message, file=sys.stderr)
 
 
 def validate_submission(state, root, name, implementation):

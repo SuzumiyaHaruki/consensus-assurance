@@ -118,7 +118,7 @@ def execute(engine, fixed, operation_id):
         # A completed raw receipt must reach runner recovery even after the deadline.
         # New actions still require budget.take; the runner cannot start with zero time.
         check = run_experiment(engine.runner,
-            engine.implementation.experiment_command(harness.execution_package, fixed.harness_filename),
+            engine.implementation.experiment_command(harness.execution_package, fixed.harness_filename, harness.test_names),
             workspace, fixed.snapshot_id, min(engine.config.budget.action_timeout, engine.budget.remaining()), engine.config.execution_isolation,
             'experiment', adapter=engine.implementation)
         check.experiment_id = fixed.id
@@ -126,6 +126,9 @@ def execute(engine, fixed, operation_id):
         check.tool_version = engine.state.tools.get('implementation', 'unknown')
         check.parameters.update(execution_package=harness.execution_package, harness_filename=fixed.harness_filename,
                                 action_started_at=started, action_seconds=time.monotonic() - clock)
+        if harness.kind in {'go_test', 'rust_test'}:
+            check.parameters.setdefault('test_selection', {'requested':harness.test_names,
+                'observed':[], 'unobserved':harness.test_names or []})
         check.artifacts.extend(paths)
         if 'changed_target_files' not in check.parameters:
             after = capture(workspace, excluded_dirs={'.execution'}).files
@@ -150,7 +153,7 @@ def observed(fixed, check, root=None):
 
 
 def validate_failure(state, root, fixed, check, measurement, value):
-    """Only a completed, intact violating witness followed by an independently explained test failure."""
+    """Only a completed, intact violating witness coexisting with an independently explained test failure."""
     a = FailureAttribution.model_validate(value)
     if (a.check_id != check.id or check not in state.checks or check.experiment_id != fixed.id or
             check.snapshot_id != fixed.snapshot_id or fixed.snapshot_id != state.snapshot.id):

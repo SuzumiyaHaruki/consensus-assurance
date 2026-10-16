@@ -13,8 +13,17 @@ def go_test_diagnostics(text):
             event = json.loads(line)
             if isinstance(event, dict):events.append(event)
         except ValueError:diagnostics.append(line)
-    started = {(e.get('Package'), e['Test']) for e in events if e.get('Action') == 'run' and e.get('Test')}
-    passed = any(e.get('Action') == 'pass' and (e.get('Package'), e.get('Test')) in started for e in events)
+    tests = {}
+    for event in events:
+        if not event.get('Test'):continue
+        key = (event.get('Package'), event['Test'])
+        action = event.get('Action')
+        if action == 'run':tests[key] = {'package':key[0], 'name':key[1], 'status':'unfinished'}
+        elif key in tests and action in {'pass','fail','skip'}:
+            tests[key]['status'] = {'pass':'passed','fail':'failed','skip':'skipped'}[action]
+            if 'Elapsed' in event:tests[key]['duration_seconds'] = event['Elapsed']
+    started = set(tests)
+    passed = any(t['status']=='passed' for t in tests.values())
     output = ''.join(e.get('Output', '') for e in events if e.get('Action') == 'output')
     if started:
         panic = re.search(r'(?m)^panic: .+[\s\S]*^goroutine [0-9]+ \[', output)
@@ -25,7 +34,8 @@ def go_test_diagnostics(text):
             or any(re.match(r'^(?:found packages \S+ \(.+\) and \S+ \(.+\) in .+|.*module lookup disabled by GOPROXY=off)$', line) for line in diagnostics)):
         failure = 'build_or_setup'
     else:failure = 'execution_unclassified'
-    return {'test_started':bool(started), 'test_passed':passed, 'failure_class':failure}
+    return {'test_started':bool(started), 'test_passed':passed, 'failure_class':failure,
+        'observed_tests':list(tests.values())}
 
 
 class GoModuleBackend:
@@ -33,7 +43,7 @@ class GoModuleBackend:
     version = "3"
     harness_kind = "go_test"
     harness_filename = "assurance_generated_test.go"
-    harness_instructions = "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs."
+    harness_instructions = "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. Optional test_names selects exact top-level names and their subtests; omission runs all TestAssurance tests. Unselected code still compiles and package initialization still runs. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs."
 
     def environment(self, workspace):
         return {"GOCACHE": str(workspace / ".execution/go-build"), "GOPROXY": "off", "GOSUMDB": "off",
@@ -43,6 +53,7 @@ class GoModuleBackend:
         return [Path.home() / "go/pkg/mod"]
 
     def resolve_harness(self, harness, source, target_files):
+        self.test_pattern(harness.test_names)
         package = local_package(harness.execution_package if harness.execution_package is not None else self.package)
         filename = str(Path(package) / Path(self.harness_filename).name) if harness.execution_package is not None else self.harness_filename
         if 'go.mod' not in target_files:
@@ -65,12 +76,18 @@ class GoModuleBackend:
         return filename
 
     def parse_test_result(self, check, text):
-        if check.status != ExecutionStatus.COMPLETED:return
         facts = go_test_diagnostics(text)
         check.parameters['test_started'] = facts['test_started']
+        pattern = check.command[check.command.index('-run')+1] if '-run' in check.command else ''
+        requested = pattern[2:-2].split('|') if pattern.startswith('^(') and pattern.endswith(')$') else None
+        observed = facts['observed_tests']
+        unobserved = [name for name in requested or [] if not any(t['name']==name for t in observed)]
+        all_passed = bool(observed) and not unobserved and all(t['status']=='passed' for t in observed)
+        check.parameters['test_selection'] = {'requested':requested, 'observed':observed, 'unobserved':unobserved}
+        if check.status != ExecutionStatus.COMPLETED:return
         if check.exit_code == 0:
-            check.outcome = 'tests_passed' if facts['test_passed'] else 'not_applicable'
-            if not facts['test_passed']:check.reason = 'No selected tests passed; tests were absent or skipped'
+            check.outcome = 'tests_passed' if all_passed else 'unknown' if facts['test_passed'] else 'not_applicable'
+            if not all_passed:check.reason = 'Selected tests were absent, skipped or lacked a completed result; inspect test_selection'
         else:
             failure = facts['failure_class']
             check.parameters['failure_class'] = failure
@@ -87,11 +104,19 @@ class GoModuleBackend:
             raise ValueError("target.harness_path must lie in target.execution_package")
         self.timeout = timeout
 
-    def experiment_command(self, execution_package=None, harness_filename=None):
+    @staticmethod
+    def test_pattern(test_names):
+        if test_names is None:return '^TestAssurance'
+        if not test_names or len(set(test_names))!=len(test_names) or any(
+                not name.isidentifier() or not name.startswith('TestAssurance') for name in test_names):
+            raise ValueError('Go test_names must be distinct exact top-level TestAssurance names, not patterns or subtests')
+        return '^('+'|'.join(test_names)+')$'
+
+    def experiment_command(self, execution_package=None, harness_filename=None, test_names=None):
         if harness_filename is not None and execution_package is None:
             raise ValueError("Accepted Go input lacks a fixed execution_package; historical artifacts are read-only")
         package = local_package(execution_package if execution_package is not None else self.package)
-        return ["go", "test", "-json", "-count=1", f"-timeout={self.timeout}s", "-run", "^TestAssurance", package]
+        return ["go", "test", "-json", "-count=1", f"-timeout={self.timeout}s", "-run", self.test_pattern(test_names), package]
 
     def version_command(self):
         return ["go", "version"]

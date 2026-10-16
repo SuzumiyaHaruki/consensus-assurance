@@ -1,0 +1,260 @@
+{
+  "rationale": "Read the corrected config-change receipt (execution 7dbd521fd90f47a488f5248d1f6a21f5, exit 0, both cases passed): all four comparisons evaluate completely and hold, so the config-change half of the child question and its wedge are decided - with identical phantom premises the phantom removal committed at once while the consistent-voter removal did not commit within five seconds, and after that blocked change the operator's follow-up removal of the phantom was refused at enqueue and never committed. The child account is therefore recorded as decided, and this update opens an independent lead on the authority-transition axis: the leadership-transfer control message carries only the RPC header (no term, no sender role) and its handler performs no validation, so an identical TimeoutNow payload honoured twice forces a second election in a healthy cluster. The harness now covers that as a two-case probe (duplicate payload versus a plain follower campaign), and the receipt is requested.",
+  "sources": [
+    {
+      "id": "src_timeout_now",
+      "file": "raft.go",
+      "start_line": 2232,
+      "end_line": 2239,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_timeout_now_msg",
+      "file": "commands.go",
+      "start_line": 205,
+      "end_line": 208,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_transfer_message_replay",
+      "question": "Does the leadership-transfer control message carry enough context for its receiver to reject a duplicate or delayed copy, and does honouring an identical payload a second time change leadership in an otherwise healthy cluster?",
+      "parent_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+      "source_ids": [
+        "src_timeout_now",
+        "src_timeout_now_msg",
+        "src_request_vote"
+      ],
+      "hypothesis": "TimeoutNowRequest embeds only the RPC header, and timeoutNow clears the known leader, becomes a candidate and sets the leadership-transfer flag without inspecting term, sender identity or configuration, while the flag in the request's vote messages bypasses the known-leader rejection. An identical payload honoured twice therefore performs a second election (raising the term again) even though leadership already moved, whereas a plain campaign by a follower in the same state is rejected because a leader is known.",
+      "discriminator": "The two-case receipt: in the duplicate case the term after the duplicate delivery exceeds the term after the first transfer and the leadership set is recorded again, while the control case records an ungranted plain vote, an unchanged term and no leadership change. A duplicate that produced no election, or a control that was granted, would change the judgment."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "2639ea661506490ab7af07a9fccc433b-question-0",
+      "source_ids": [
+        "src_get_last_entry",
+        "src_vote_log_check",
+        "src_install_snapshot_tail",
+        "src_append_config",
+        "src_append_prev_check"
+      ],
+      "executions": {
+        "7dbd521fd90f47a488f5248d1f6a21f5": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "ca11633cbde949dba0da0b9950651148": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Present conclusion: the phantom log claim left by an accepted InstallSnapshot changes vote decisions, blocks configuration changes whose new quorum would include such a server, and wedges the operator's further configuration changes behind the blocked one. Vote half (execution ca11633cbde949dba0da0b9950651148, four comparisons complete and holding; setup index 0, probe index 1): the shared prefix ends at 42, the deposed leader and one follower hold an uncommitted suffix to 82 in term 2, the majority leader's snapshot sits at 63 in term 3, both minority members cache a claim (82, term 2) above an installed snapshot (63, term 3), and the same RequestVote with the transfer flag was granted by the phantom and rejected by a majority voter whose claim matched its snapshot, with the granted candidate's last log term below the phantom's snapshot term. Configuration half (execution 7dbd521fd90f47a488f5248d1f6a21f5; phantom case setup index 0 and probe index 1, consistent case setup index 2 and probe index 3, follow-up probe index 4; all four comparisons complete and holding): with the same phantom premises, removing a phantom holder committed in 0 ms taking the configuration from five to four voters, removing a consistent follower did not commit within the 5001 ms window, and the follow-up removal of the phantom holder was then refused with a 1000 ms enqueue timeout ('timed out enqueuing operation') and did not commit within a further two seconds - so a single blocked configuration change also takes away the operator's ability to issue further changes. Source basis: a newly appended configuration commits under the new configuration's quorum because appendConfigurationEntry installs it into the commitment first (src_append_config, raft.go 1204-1243); the phantom holder cannot acknowledge any AppendEntries because its cached claim fails every prev-log check (src_append_prev_check, raft.go 1458-1606), the claim coming from src_get_last_entry (state.go 160-174) and left stale by installSnapshot (src_install_snapshot_tail, raft.go 1837-1977); the vote-side comparison uses the same claim (src_vote_log_check, raft.go 1725-1748 inside requestVote 1626-1758). Because the steps that would shrink the voter set down to the phantom group cannot commit, the phantom grant cannot be converted into authority over committed entries by a configuration change in the measured history - that is the protective side of the same starvation. Limits: measured on five voters with the in-process transport and a file snapshot store, with the phantom premise established by one partition plus one explicit snapshot; the vote effect used the transfer flag (a plain campaign is refused for the known-leader reason and would not discriminate); configuration changes attempted before the phantom state arises, repeated phantom generations, other cluster sizes and production-style monotonic stores are unmeasured.",
+      "counterevidence": [
+        "The parent question's repair probe shows the phantom claim is transient within a term: once a snapshot above the claim is published the follower is consistent again, so the vote effect, the blocked change and the wedge all end at that boundary.",
+        "The blocked configuration change is protective as well as harmful: the steps toward a phantom-only quorum cannot commit, so the phantom grant does not become authority over committed entries through configuration changes in the measured history.",
+        "The blocked removal is not explained by leader saturation: the phantom removal committed in 0 ms under the same scenario, snapshot index, timing and load, and the wedge appears only after a change is blocked."
+      ],
+      "limitations": [
+        "Five voters, one phantom generation, one partition plus one explicit snapshot, in-process transport and file snapshot store only.",
+        "The wedge is measured for the immediate follow-up request; whether any later event could let the blocked configuration commit again is unmeasured.",
+        "Configuration changes attempted before the phantom state arises, other cluster sizes and production-style monotonic stores are unmeasured."
+      ]
+    },
+    {
+      "investigation_id": "@q_transfer_message_replay",
+      "source_ids": [
+        "src_timeout_now",
+        "src_timeout_now_msg",
+        "src_request_vote"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Present conclusion: the leadership-transfer control message carries no term and no sender-role information, and its handler validates nothing, so a duplicate or delayed copy is honoured exactly like a fresh one and forces another election in an otherwise healthy cluster. Source basis: TimeoutNowRequest embeds only RPCHeader (src_timeout_now_msg, commands.go 205-208), and timeoutNow clears the known leader, moves the node to Candidate and sets the candidate-from-transfer flag before responding (src_timeout_now, raft.go 2232-2239); that flag is what makes voters skip the known-leader rejection in requestVote (src_request_vote, raft.go 1626-1758, known-leader check at 1671-1680). Local construction runs of the new probe show the expected contrast in a three-voter cluster with ten committed entries: the first delivery moved leadership to the target (term 2 -> 3) and the identical payload delivered again to that new leader raised the term again to 4 while it stayed Leader, whereas the control's plain follower campaign with the same log claim was not granted, left the term at 2 and changed no leadership. Limits: the receipt is requested with this update; the probe delivers the message through another node's transport, which is the same path a middleware or delayed delivery would use, and it does not measure a partition during the replay, larger clusters, or the duration of the leadership gap caused by the second election.",
+      "counterevidence": [
+        "The first delivery is the documented transfer path and is expected behaviour; only the second, identical delivery is the defect subject, and it is supplied by the harness rather than produced by the library's own transport.",
+        "Raft tolerates spurious elections for safety; the harm here is the avoidable term churn, the leadership gap while the target campaigns, and the loss of the current leader's stability, not a stale leader's log being elected."
+      ],
+      "limitations": [
+        "No retained receipt yet; the effect is currently shown by local construction runs of the requested experiment.",
+        "One delivery path and cluster size; the leadership gap and any interaction with partitions or in-flight writes are unmeasured."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q_transfer_message_replay",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "source_ids": [
+      "src_timeout_now",
+      "src_timeout_now_msg",
+      "src_request_vote"
+    ],
+    "anchors": [
+      {
+        "material_id": "src_timeout_now",
+        "symbol": "timeoutNow",
+        "start_line": 2232,
+        "end_line": 2239
+      },
+      {
+        "material_id": "src_request_vote",
+        "symbol": "requestVote",
+        "start_line": 1626,
+        "end_line": 1758
+      }
+    ],
+    "scope": {
+      "description": "Two cases on a healthy three-voter cluster with ten committed entries. In the duplicate case one TimeoutNow payload (header of the current leader) is delivered to a follower, the cluster is allowed to settle on the new leader, and the identical payload is delivered again to whoever became leader, after which the target's term, state and the cluster's leaders are recorded. In the control case a plain RequestVote carrying the follower's own log claim and no transfer flag is delivered to that follower and its response is recorded.",
+      "assumptions": [
+        "Fault model: no message loss inside the injected transport; the induced event is one duplicated control message (or one plain campaign in the control), which is what a retrying middleware or a delayed delivery would present to the receiver.",
+        "Both cases start from the same kind of history (three voters, ten committed entries, one stable leader) and use the same delivery helper through another node's transport.",
+        "Reused facilities: MakeCluster with inmemConfig timings and InmemTransport."
+      ],
+      "excluded": [
+        "No production logic was modified; the harness only adds test code.",
+        "No partition or write load is induced during the replay, so the case isolates message handling rather than concurrency."
+      ],
+      "parameters": {
+        "peers": 3,
+        "entries": 10,
+        "settle_wait_ms": 1500,
+        "control_wait_ms": 500
+      }
+    },
+    "prefix": "The harness elects a leader in a three-voter cluster, commits ten entries, records the leader, its term and both the payload's and the target's log claims, then either (duplicate case) delivers one TimeoutNow built from the current leader's header to a follower, waits for a stable single leader, records whether leadership moved, delivers the identical payload again to that new leader, waits 1.5 s and records the term after the duplicate, the target's state and the current leaders, or (control case) delivers a RequestVote built from the follower's own identity and log claim with the transfer flag unset, then records the response, the target's state and term and whether the original leader still leads.",
+    "test_names": [
+      "TestAssurance_StaleTimeoutNowDuplicate",
+      "TestAssurance_Control_PlainVoteRejected"
+    ],
+    "requirement": "A control message that changes leadership must either carry enough context for its receiver to reject a duplicate or stale copy, or must not change leadership when honoured again.",
+    "responsibility": "target",
+    "prerequisites": [
+      {
+        "alias": "duplicate_transfer_setup",
+        "event": "ca_auth_setup",
+        "conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now"
+          }
+        ]
+      },
+      {
+        "alias": "plain_vote_setup",
+        "event": "ca_auth_setup",
+        "conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "plain-vote-control"
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "duplicate_transfer_setup",
+        "assertion": {
+          "field": "leadership_moved_on_first",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Sanity: the first delivery performs the requested transfer, so the second delivery is a duplicate rather than the initial transfer.",
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now"
+          },
+          {
+            "field": "first_delivered",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "duplicate_transfer_setup",
+        "assertion": {
+          "field": "duplicate_caused_election",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The identical payload honoured a second time raises the term again, i.e. the duplicate forces another election in a cluster that needed no transfer.",
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "duplicate-timeout-now"
+          },
+          {
+            "field": "duplicate_delivered",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "plain_vote_setup",
+        "assertion": {
+          "field": "vote_granted",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Control: the same log claim carried by a plain campaign is refused because a leader is known, so the difference is the transfer path rather than the request's log content.",
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "plain-vote-control"
+          },
+          {
+            "field": "delivered",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "event": "ca_auth_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "plain_vote_setup",
+        "assertion": {
+          "field": "leadership_changed",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Control: no election follows a plain campaign, so the duplicate case's second election is not an artifact of the probe schedule.",
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "plain-vote-control"
+          }
+        ]
+      }
+    ]
+  }
+}

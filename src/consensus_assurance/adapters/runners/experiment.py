@@ -106,7 +106,7 @@ def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, actio
             check.outcome = "tests_passed"
         elif not adapter:
             check.outcome = "tests_failed"
-    if adapter and (check.status==ExecutionStatus.COMPLETED or hasattr(adapter,'execute')):
+    if adapter:
         adapter.parse_test_result(check,output(check))
     if input_manifest:
         check.artifacts.extend([str(input_manifest),str(save_delta(source,workspace,snapshot_id,phase='outcome'))])

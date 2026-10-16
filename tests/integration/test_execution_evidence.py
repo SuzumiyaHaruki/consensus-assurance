@@ -132,12 +132,90 @@ def test_narrow_later_failure_attribution_preserves_only_intact_witness(tmp_path
         state.checks[state.checks.index(check)] = altered
         with pytest.raises(ValueError):
             validate_failure(state, engine.root, fixed, altered, measurement, attribution)
+        with pytest.raises(ValueError):
+            target_receipts(state, engine.root, {check.id: [0, 1]}, reuse_failure=True)
     for update in ({'witness_indices': {0: [0]}}, {'failure_lines': [500, 501]}, {'check_id': 'other'}):
         with pytest.raises(ValueError):
             validate_failure(engine.state, engine.root, fixed, check, measurement, {**attribution, **update})
     harness = engine.root / 'fixed-experiments' / fixed.id / fixed.harness_filename
     harness.write_text(harness.read_text() + '# altered after execution\n')
     assert 'Retained experiment bytes differ' in str(assessment(engine.state, engine.root, fixed, check)['blockers'])
+
+
+def test_failed_receipt_knowledge_reuses_current_attribution_atomically(tmp_path):
+    from consensus_assurance.workflow.audit import validate_submission
+    if not shutil.which('bwrap'):
+        pytest.skip('bubblewrap is required for original isolated execution')
+    retained = {}
+    def start(state):
+        sub, files = combined(state)
+        comparison = sub['experiment']['comparisons'][0]
+        sub['experiment']['comparisons'] = [
+            {**comparison, 'applicability_conditions':[dict(field='operation', value=name)]}
+            for name in ('one', 'two')]
+        files['check.py'] += "print('CA_EVENT '+json.dumps(dict(event='admitted',operation='two',value=3,limit=3)))\n"
+        files['check.py'] += "print('CA_EVENT '+json.dumps(dict(event='returned',operation='two',value=step(3,3))))\n"
+        files['check.py'] += "assert False, 'independent fixture failure'\n"
+        return sub, files
+    def product(state, indices=(0, 1), *, attribution=True):
+        check = next(c for c in state['checks'] if c.get('experiment_id'))
+        sub, files = opinion(state, failure_attribution=dict(check_id=check['id'], witness_indices={0:[1]},
+            failure_stream='stderr', failure_lines=[1, 4], harness_lines=[8, 8]))
+        if not attribution:
+            sub.pop('interpretations')
+        sub['knowledge'] = [dict(ref='@observed', kind='fact', statement='Operation one returned zero for its admitted input.',
+            conditions='The intact first operation, independent of the fixture failure',
+            source_ids=['code'], executions={check['id']:list(indices)})]
+        if attribution:
+            sub['interpretations'][0]['knowledge'] = [dict(entry_id='@observed', revision=1)]
+        return sub, files
+    def preflight(sub):
+        path = engine.root/'draft'/'check-submission.json'
+        path.write_text(json.dumps(sub))
+        before = engine.state.model_dump(mode='json')
+        result = validate_submission(engine.state, engine.root, path.name, engine.implementation)
+        assert engine.state.model_dump(mode='json') == before
+        return result
+    def reject(state):
+        check = next(c for c in state['checks'] if c.get('experiment_id'))
+        retained['files'] = {p:p.read_bytes() for folder in ('fixed-experiments', 'logs/'+check['id'])
+            for p in (engine.root/folder).rglob('*') if p.is_file()}
+        sub, _ = product(state, attribution=False)
+        diagnostic, = preflight(sub)['diagnostics']
+        assert diagnostic['paths'] == [f"/knowledge/0/executions/{check['id']}"]
+        assert 'current Interpretation' in diagnostic['message'] and 'same update' in diagnostic['message']
+        sub, _ = product(state)
+        sub['interpretations'][0]['failure_attribution']['witness_indices'] = {0:[0]}
+        diagnostic, = preflight(sub)['diagnostics']
+        assert diagnostic['paths'] == [f"/interpretations/0/executions/{check['id']}"]
+        assert 'no complete violating witness' in diagnostic['message']
+        sub, files = product(state, indices=(0, 1, 3))
+        diagnostic, = preflight(sub)['diagnostics']
+        assert diagnostic['paths'] == [f"/knowledge/0/executions/{check['id']}"]
+        assert 'allowed event indices: [0, 1]' in diagnostic['message']
+        return sub, files
+    def accept(state):
+        assert state['current_submission']['phase'] == 'rejected'
+        assert not state['knowledge'] and not state['interpretations']
+        sub, files = product(state)
+        assert preflight(sub)['valid']
+        return sub, files
+    def supersede(state):
+        assert len(state['knowledge']) == len(state['interpretations']) == 1
+        assert state['interpretations'][0]['knowledge'][0]['entry_id'] == state['knowledge'][0]['id']
+        return opinion(state, conclusion='unresolved', rationale='Reconsider whether the fixture failure is independent')
+    def reject_historical(state):
+        sub, files = product(state, attribution=False)
+        sub['knowledge'][0]['statement'] += ' A proposed later reuse.'
+        assert not preflight(sub)['valid']
+        return sub, files
+    engine, repo = engine_for(tmp_path, [start, reject, accept, supersede, reject_historical, stop])
+    engine.agent.mock = False
+    engine.config.execution_isolation = 'bwrap'
+    state = engine.start(repo)
+    assert state.usage['experiments'] == 1 and len(state.knowledge) == 1 and len(state.interpretations) == 2
+    assert state.knowledge[0].revision == 1 and state.interpretations[-1].conclusion == 'unresolved'
+    assert all(p.read_bytes() == data for p, data in retained['files'].items())
 
 
 @pytest.mark.parametrize('failure',[False,True])
@@ -700,7 +778,7 @@ def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt
     if expired:assert state.current_submission['phase']=='executed'
 
 
-def test_repeat_without_completed_receipt_retries_with_new_action_identity(tmp_path):
+def test_repeat_interrupted_before_target_start_resumes_reserved_action(tmp_path):
     engine,repo=engine_for(tmp_path,[combined,repeat_existing,opinion,stop])
     engine.config.budget.experiments=3
     original=engine.checkpoint
@@ -718,7 +796,6 @@ def test_repeat_without_completed_receipt_retries_with_new_action_identity(tmp_p
     engine.checkpoint=original
     state=engine.resume()
     checks=[c for c in state.checks if c.experiment_id]
-    assert state.usage['experiments']==3 and len(checks)==2
-    assert checks[-1].pending_action_id!=lost_id and checks[-1].cwd!=checks[0].cwd
-    assert any(a.id==lost_id and a.status=='outcome_unknown' for a in state.action_history)
-    assert any('no completed receipt' in gap for gap in state.gaps)
+    assert state.usage['experiments']==2 and len(checks)==2
+    assert checks[-1].pending_action_id==lost_id and checks[-1].cwd!=checks[0].cwd
+    assert not any(a.id==lost_id and a.status=='outcome_unknown' for a in state.action_history)

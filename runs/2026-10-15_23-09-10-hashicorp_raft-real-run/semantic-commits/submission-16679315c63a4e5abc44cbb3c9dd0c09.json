@@ -1,0 +1,935 @@
+{
+  "input": {
+    "rationale": "Open a first investigation of the InstallSnapshot resynchronization path on a follower whose own log already covers the index of the snapshot the leader ships. Read the snapshot-install tail, the cached last-log/last-snapshot accessors, the prev-log verification in appendEntries, the log-compaction helpers and the leader-side nextIndex/SEND_SNAP logic, then built one focused in-package probe (reusing MakeCluster/MockFSM/InmemStore/FileSnapshotStore) that drives a real three-voter history into that state and measures re-installs, the follower's applied frontier, its cached log claim and its store range, plus an untrimmed control. The experiment is requested from the controller for a retained receipt; local runs of the same harness were only construction feedback.",
+    "sources": [
+      {
+        "id": "src_install_snapshot_tail",
+        "file": "raft.go",
+        "start_line": 1837,
+        "end_line": 1977,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_get_last_entry",
+        "file": "state.go",
+        "start_line": 160,
+        "end_line": 174,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_append_prev_check",
+        "file": "raft.go",
+        "start_line": 1458,
+        "end_line": 1606,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_compaction",
+        "file": "snapshot.go",
+        "start_line": 217,
+        "end_line": 279,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_replicate_failure",
+        "file": "replication.go",
+        "start_line": 240,
+        "end_line": 300,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_send_snapshot_result",
+        "file": "replication.go",
+        "start_line": 352,
+        "end_line": 372,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_vote_log_check",
+        "file": "raft.go",
+        "start_line": 1725,
+        "end_line": 1748,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_snapshot_install_stale_log",
+        "question": "When a leader must ship a snapshot to a follower whose own log already extends beyond the leader's snapshot index (stale suffix, lower term), does the follower accept subsequent log entries, and does its advertised log state stay consistent with the log it actually holds?",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_get_last_entry",
+          "src_append_prev_check",
+          "src_compaction",
+          "src_replicate_failure",
+          "src_send_snapshot_result"
+        ],
+        "hypothesis": "installSnapshot sets lastApplied/lastSnapshot/config but never resets the cached last log entry, and compactLogs leaves the follower's stale suffix on disk (non-monotonic store) or deletes everything below it (monotonic store). Because getLastEntry prefers lastLogIndex when it is >= lastSnapshotIndex, the follower keeps advertising a log it no longer has, fails every prev-log check, and the leader can only retry the same snapshot (SEND_SNAP) forever: no entry is ever accepted after the install.",
+        "discriminator": "Retained receipt of the focused probe: repeated InstallSnapshot acceptance (FSM Restore count rising while the leader's snapshot index is unchanged), the follower's applied index staying at the leader's snapshot index while the cluster frontier advances, and the follower's cached last-log index/term remaining beyond the installed snapshot index; the untrimmed control separates the snapshot-install trigger from the mere existence of a stale suffix.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_install_snapshot_no_lastlog_reset",
+        "kind": "behavior",
+        "statement": "The InstallSnapshot handler does not update the receiving node's cached last log entry (lastLogIndex/lastLogTerm). It sets lastApplied and lastSnapshot to the request's LastLogIndex/LastLogTerm, replaces the committed and latest configurations, and then either deletes the whole log store (monotonic store) or calls compactLogs, which trims only up to min(snapshotIndex, cachedLastLogIndex - TrailingLogs).",
+        "conditions": "raft.go installSnapshot (raft.go 1930-1977) reached by a follower for an accepted snapshot request; cache accessors in state.go 160-175; compaction rules in snapshot.go 217-279.",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_compaction"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_getlastentry_prefers_cached_log",
+        "kind": "behavior",
+        "statement": "getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, and the snapshot's (index,term) only when the cached log index is strictly below the snapshot index. A follower whose cached log index is at or above the newly installed snapshot index therefore keeps reporting its pre-snapshot log tail as its last entry, both for prev-log verification of incoming AppendEntries and for the log-completeness test used when granting votes or pre-votes.",
+        "conditions": "state.go 160-175; consumers: raft.go appendEntries prev-log verification 1490-1516, requestVote/requestPreVote 1725-1748, AppendEntriesResponse.LastLog at 1445-1452.",
+        "source_ids": [
+          "src_get_last_entry",
+          "src_append_prev_check",
+          "src_vote_log_check"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_snapshot_retry_cycle",
+        "kind": "behavior",
+        "statement": "Leader-side repair of a rejected AppendEntries proceeds only by decrementing nextIndex (bounded below by resp.LastLog+1), and setupAppendEntries returns ErrLogNotFound as soon as nextIndex-1 falls outside the leader's trimmed log store; replicateTo then jumps to SEND_SNAP, which re-sends the newest stored snapshot and, on acceptance, resets nextIndex to snapshotIndex+1. Repeating this cycle converges on re-installing the same snapshot index whenever the follower's prev-log checks fail at and above that index.",
+        "conditions": "replication.go 240-300 and 352-372; requires the leader's log to have been trimmed by a snapshot (TrailingLogs smaller than the gap), which is the normal steady state after log compaction.",
+        "source_ids": [
+          "src_replicate_failure",
+          "src_send_snapshot_result",
+          "src_compaction"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "@q_snapshot_install_stale_log",
+        "experiment_id": null,
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_get_last_entry",
+          "src_append_prev_check",
+          "src_compaction",
+          "src_replicate_failure",
+          "src_send_snapshot_result"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Present conclusion: in this revision, a follower that accepts a snapshot while its own cached log extends at or beyond the leader's snapshot index is left with an inconsistent log claim and never accepts another log entry from that leader. Basis: installSnapshot updates lastApplied, lastSnapshot and the configurations but never lastLog (raft.go 1930-1977), while getLastEntry prefers the cached log tail whenever lastLogIndex >= lastSnapshotIndex (state.go 160-175). Compaction cannot remove the stale suffix in the non-monotonic store path when TrailingLogs exceeds the log length (snapshot.go 217-252), so the follower's store keeps entries above the snapshot index whose terms differ from the leader's; every AppendEntries prev-log check then either misses below the store's first index or mismatches the stale suffix, the leader's nextIndex is only decremented one step per rejection (replication.go 247-252) until setupAppendEntries reports ErrLogNotFound, and the leader responds by re-shipping the same snapshot (replication.go 296-300, 352-372). Restricted to the measured conditions: three voters, in-memory store, FileSnapshotStore, TrailingLogs=10, an idle cluster plus steady new writes, and a follower restarted on its real on-disk log whose orphan suffix (indexes beyond the leader's snapshot index, lower term) is preserved. Local construction feedback for the same harness (native feedback only, not a retained receipt) showed the follower's FSM restored 4 -> 1365 times in a 3s window while the leader's snapshot index stayed at 83, the follower's applied index stayed at 83 while the cluster frontier reached 95, the follower's cached last log claim stayed (98, term 2) against snapshot (83, term 3), its commit index stayed 0, and its store kept indexes 84-98; the untrimmed control on the identical history accepted no snapshot, repaired the suffix with entries and caught up (applied 83 -> 95). Counterevidence considered: the concern that the follower's own election timeout would repair the situation is not observed, because a successful InstallSnapshot refreshes lastContact, so no spurious election fires; and the control refutes 'any stale suffix stalls replication'. Limits: the formal conclusion awaits the controller's retained run of the requested experiment; the reachability of the trigger in production depends on a voter whose log suffix is both longer than the leader's snapshot index and stale in term (a deposed leader or a follower that stored entries from a superseded leader) together with log trimming on the leader; monotonic-store deployments delete the stale suffix instead of keeping it, so their failure mode (entry starvation with the leader's snapshot index at or below the cached claim) still needs its own receipt.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The untrimmed control with the same history repaired the stale suffix using log entries alone, so a stale suffix by itself is not sufficient; the install-snapshot path with a trimmed leader log is the trigger.",
+          "The successful InstallSnapshot refreshes the follower's last contact, so the follower does not force an election and the starved state is stable rather than transient in the measured configuration."
+        ],
+        "limitations": [
+          "The measured configuration used in-memory stores plus a file snapshot store, TrailingLogs=10, three voters, and a restarted ex-leader that kept an orphan suffix; other TrailingLogs, monotonic stores and larger clusters are not measured here.",
+          "Probe fields are read from the follower's cached state and its log store on the same process; the receipt is needed before treating the numbers as retained observations."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": {
+      "investigation_id": "@q_snapshot_install_stale_log",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": null,
+      "test_names": [
+        "TestAssurance_StaleSuffixAfterInstallSnapshot",
+        "TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix"
+      ],
+      "source_ids": [
+        "src_install_snapshot_tail",
+        "src_get_last_entry",
+        "src_append_prev_check",
+        "src_compaction",
+        "src_replicate_failure",
+        "src_send_snapshot_result"
+      ],
+      "anchors": [
+        {
+          "material_id": "src_install_snapshot_tail",
+          "symbol": "installSnapshot",
+          "start_line": 1837,
+          "end_line": 1977,
+          "anchor": null
+        },
+        {
+          "material_id": "src_get_last_entry",
+          "symbol": "getLastEntry",
+          "start_line": 167,
+          "end_line": 174,
+          "anchor": null
+        },
+        {
+          "material_id": "src_append_prev_check",
+          "symbol": "appendEntries",
+          "start_line": 1458,
+          "end_line": 1606,
+          "anchor": null
+        }
+      ],
+      "scope": {
+        "description": "Two real three-voter cluster histories in one process: a leader is isolated and appends entries that never reach a quorum, is shut down, and the remaining voters elect a leader, commit further entries and take a snapshot; the isolated node is then restarted on its unchanged in-memory log store and reconnected. In the trimmed case the leader's log store is compacted to TrailingLogs=10 so it can only repair by shipping that snapshot; in the control TrailingLogs is large so entries alone can repair. Each case samples the victim's restores, applied index, commit index, cached last log entry, last snapshot and store range, plus the cluster frontier, for a 3s window with steady new writes.",
+        "assumptions": [
+          "Fault model: no message loss inside the injected transport; the only induced event is a full transport partition of one voter plus its clean shutdown and restart on the same stores.",
+          "Reused facilities: MakeClusterCustom/MakeClusterOpts with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport, MockFSM wrapped by a counting Restore, and the NewRaft restart pattern used by TestRaft_SnapshotRestore_Progress.",
+          "The victim's orphan suffix is produced by real Apply calls it accepted as leader while partitioned, and it is kept because the restarted node replays its real log store."
+        ],
+        "excluded": [
+          "No production logic was modified; the harness only adds a test file.",
+          "Automatic snapshotting is disabled (SnapshotThreshold huge, SnapshotInterval 1h) so the leader's snapshot index is controlled by the explicit Snapshot() call."
+        ],
+        "parameters": {
+          "peers": 3,
+          "pre_entries": 60,
+          "orphan_writes": 60,
+          "post_entries": 20,
+          "window_ms": 3000,
+          "sample_step_ms": 250,
+          "trailing_logs_trimmed": 10,
+          "trailing_logs_control": 1000000
+        }
+      },
+      "prefix": "The harness builds the cluster with MakeClusterCustom (counting FSM), commits 60 entries, partitions the leader with c.Partition, fires 60 applies on it so they are appended locally without a quorum, waits for it to step down, shuts it down with Shutdown().Error(), waits for one of the remaining voters to be the only stable leader, commits 20 further entries, forces Snapshot(), records the snapshot and the trimmed store range, restarts the victim with NewRaft on its original stores and a fresh InmemTransport, reconnects it to both other transports, emits ca_setup with the premise fields, waits until the victim's applied index reaches the snapshot index, then samples every 250ms for 3s while applying one entry per sample on whichever node is leader, and finally emits ca_probe with the raw values and derived booleans.",
+      "semantic_changes": [],
+      "requirement": "A follower that reinstalls the leader's snapshot must remain able to accept subsequent log entries from that leader, or its cached log state must not claim entries the snapshot superseded.",
+      "responsibility": "target",
+      "prerequisites": [
+        {
+          "alias": "trimmed_setup",
+          "event": "ca_setup",
+          "conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "trimmed",
+              "reference": null
+            },
+            {
+              "field": "premise_stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "untrimmed_setup",
+          "event": "ca_setup",
+          "conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "untrimmed",
+              "reference": null
+            },
+            {
+              "field": "premise_stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "ca_probe",
+          "identity_fields": [
+            "victim_id"
+          ],
+          "admission_alias": "trimmed_setup",
+          "assertion": {
+            "field": "repeated_snapshot_installs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "leader_snapshot_is_unchanged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Trimmed case: the follower's FSM was restored again after the first install, i.e. the same snapshot index was re-shipped during the window, while the leader's snapshot index is unchanged."
+        },
+        {
+          "event": "ca_probe",
+          "identity_fields": [
+            "victim_id"
+          ],
+          "admission_alias": "trimmed_setup",
+          "assertion": {
+            "field": "victim_not_caught_up",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "repeated_snapshot_installs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Trimmed case progress predicate: after the window the follower's applied index is still below the cluster frontier even though new entries committed and were applied elsewhere."
+        },
+        {
+          "event": "ca_probe",
+          "identity_fields": [
+            "victim_id"
+          ],
+          "admission_alias": "trimmed_setup",
+          "assertion": {
+            "field": "stale_claim_persists",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Trimmed case: the follower's cached last log index is still at or beyond the installed snapshot index with a lower term, and its store still holds that suffix."
+        },
+        {
+          "event": "ca_probe",
+          "identity_fields": [
+            "victim_id"
+          ],
+          "admission_alias": "untrimmed_setup",
+          "assertion": {
+            "field": "repeated_snapshot_installs",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: with an untrimmed leader log no snapshot is installed, separating the trigger from the existence of a stale suffix."
+        },
+        {
+          "event": "ca_probe",
+          "identity_fields": [
+            "victim_id"
+          ],
+          "admission_alias": "untrimmed_setup",
+          "assertion": {
+            "field": "victim_not_caught_up",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "Control: the same cluster history without log trimming is repaired by log entries alone and the follower reaches the cluster frontier."
+        }
+      ],
+      "knowledge": [
+        {
+          "entry_id": "@k_install_snapshot_no_lastlog_reset",
+          "revision": 1,
+          "assertion": "the install path leaves the cached last log entry untouched"
+        },
+        {
+          "entry_id": "@k_getlastentry_prefers_cached_log",
+          "revision": 1,
+          "assertion": "the stale claim is preferred over the installed snapshot"
+        },
+        {
+          "entry_id": "@k_snapshot_retry_cycle",
+          "revision": 1,
+          "assertion": "leader repair degenerates into re-shipping the same snapshot"
+        }
+      ],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "interpretations": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09",
+      "result": {
+        "submission": "update.json",
+        "summary": "Repaired the rejected draft and resubmitted it. Changes: dropped the unsupported note fields from sources, corrected the state.go citation (file has 174 lines), widened the installSnapshot and appendEntries source ranges so each contains a verifiable Go declaration, replaced the requirement's anchors with three symbol-anchored declarations (installSnapshot, getLastEntry, appendEntries) resolved against the declared source ids, and removed the harness self-mapping from experiment.files. Read-only validation now reports valid with execution_requested: it creates the seven sources, three behavior entries, investigation @q_snapshot_install_stale_log, one interpretation and the two-case experiment (TestAssurance_StaleSuffixAfterInstallSnapshot plus the untrimmed control). Nothing else changed: the harness content, comparisons and the source-based defect account (a follower that accepts a snapshot while its cached last log entry is at or beyond the snapshot index keeps advertising that stale suffix, fails every prev-log check, and the leader degenerates into re-shipping the same snapshot) are unchanged, and the formal conclusion still awaits the retained receipt."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+        "version": 1,
+        "question": "When a leader must ship a snapshot to a follower whose own log already extends beyond the leader's snapshot index (stale suffix, lower term), does the follower accept subsequent log entries, and does its advertised log state stay consistent with the log it actually holds?",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_get_last_entry",
+          "src_append_prev_check",
+          "src_compaction",
+          "src_replicate_failure",
+          "src_send_snapshot_result"
+        ],
+        "hypothesis": "installSnapshot sets lastApplied/lastSnapshot/config but never resets the cached last log entry, and compactLogs leaves the follower's stale suffix on disk (non-monotonic store) or deletes everything below it (monotonic store). Because getLastEntry prefers lastLogIndex when it is >= lastSnapshotIndex, the follower keeps advertising a log it no longer has, fails every prev-log check, and the leader can only retry the same snapshot (SEND_SNAP) forever: no entry is ever accepted after the install.",
+        "discriminator": "Retained receipt of the focused probe: repeated InstallSnapshot acceptance (FSM Restore count rising while the leader's snapshot index is unchanged), the follower's applied index staying at the leader's snapshot index while the cluster frontier advances, and the follower's cached last-log index/term remaining beyond the installed snapshot index; the untrimmed control separates the snapshot-install trigger from the mere existence of a stale suffix.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The InstallSnapshot handler does not update the receiving node's cached last log entry (lastLogIndex/lastLogTerm). It sets lastApplied and lastSnapshot to the request's LastLogIndex/LastLogTerm, replaces the committed and latest configurations, and then either deletes the whole log store (monotonic store) or calls compactLogs, which trims only up to min(snapshotIndex, cachedLastLogIndex - TrailingLogs).",
+        "conditions": "raft.go installSnapshot (raft.go 1930-1977) reached by a follower for an accepted snapshot request; cache accessors in state.go 160-175; compaction rules in snapshot.go 217-279.",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_compaction"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09"
+      },
+      {
+        "id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, and the snapshot's (index,term) only when the cached log index is strictly below the snapshot index. A follower whose cached log index is at or above the newly installed snapshot index therefore keeps reporting its pre-snapshot log tail as its last entry, both for prev-log verification of incoming AppendEntries and for the log-completeness test used when granting votes or pre-votes.",
+        "conditions": "state.go 160-175; consumers: raft.go appendEntries prev-log verification 1490-1516, requestVote/requestPreVote 1725-1748, AppendEntriesResponse.LastLog at 1445-1452.",
+        "source_ids": [
+          "src_get_last_entry",
+          "src_append_prev_check",
+          "src_vote_log_check"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09"
+      },
+      {
+        "id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Leader-side repair of a rejected AppendEntries proceeds only by decrementing nextIndex (bounded below by resp.LastLog+1), and setupAppendEntries returns ErrLogNotFound as soon as nextIndex-1 falls outside the leader's trimmed log store; replicateTo then jumps to SEND_SNAP, which re-sends the newest stored snapshot and, on acceptance, resets nextIndex to snapshotIndex+1. Repeating this cycle converges on re-installing the same snapshot index whenever the follower's prev-log checks fail at and above that index.",
+        "conditions": "replication.go 240-300 and 352-372; requires the leader's log to have been trimmed by a snapshot (TrailingLogs smaller than the gap), which is the normal steady state after log compaction.",
+        "source_ids": [
+          "src_replicate_failure",
+          "src_send_snapshot_result",
+          "src_compaction"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "16679315c63a4e5abc44cbb3c9dd0c09-experiment",
+        "investigation_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, trailing uint64, orphanWrites int) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, trailing, orphanWrites)\n\tdefer c.Close()\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tfor time.Since(start) < window {\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t}, \"ca_probe\")\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60)\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "test_names": [
+              "TestAssurance_StaleSuffixAfterInstallSnapshot",
+              "TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix"
+            ],
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "trimmed_setup",
+                "event": "ca_setup",
+                "conditions": [
+                  {
+                    "field": "tag",
+                    "op": "eq",
+                    "value": "trimmed",
+                    "reference": null
+                  },
+                  {
+                    "field": "premise_stale_suffix",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "untrimmed_setup",
+                "event": "ca_setup",
+                "conditions": [
+                  {
+                    "field": "tag",
+                    "op": "eq",
+                    "value": "untrimmed",
+                    "reference": null
+                  },
+                  {
+                    "field": "premise_stale_suffix",
+                    "op": "eq",
+                    "value": true,
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "src_install_snapshot_tail",
+            "src_get_last_entry",
+            "src_append_prev_check",
+            "src_compaction",
+            "src_replicate_failure",
+            "src_send_snapshot_result"
+          ],
+          "anchors": [
+            {
+              "material_id": "src_install_snapshot_tail",
+              "symbol": "installSnapshot",
+              "start_line": 1837,
+              "end_line": 1977,
+              "anchor": {
+                "source_ids": [
+                  "src_install_snapshot_tail"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "src_install_snapshot_tail",
+                "start_line": 1837,
+                "end_line": 1837,
+                "symbol": "installSnapshot"
+              }
+            },
+            {
+              "material_id": "src_get_last_entry",
+              "symbol": "getLastEntry",
+              "start_line": 167,
+              "end_line": 174,
+              "anchor": {
+                "source_ids": [
+                  "src_get_last_entry"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "src_get_last_entry",
+                "start_line": 167,
+                "end_line": 167,
+                "symbol": "getLastEntry"
+              }
+            },
+            {
+              "material_id": "src_append_prev_check",
+              "symbol": "appendEntries",
+              "start_line": 1458,
+              "end_line": 1606,
+              "anchor": {
+                "source_ids": [
+                  "src_append_prev_check"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "src_append_prev_check",
+                "start_line": 1458,
+                "end_line": 1458,
+                "symbol": "appendEntries"
+              }
+            }
+          ],
+          "scope": {
+            "description": "Two real three-voter cluster histories in one process: a leader is isolated and appends entries that never reach a quorum, is shut down, and the remaining voters elect a leader, commit further entries and take a snapshot; the isolated node is then restarted on its unchanged in-memory log store and reconnected. In the trimmed case the leader's log store is compacted to TrailingLogs=10 so it can only repair by shipping that snapshot; in the control TrailingLogs is large so entries alone can repair. Each case samples the victim's restores, applied index, commit index, cached last log entry, last snapshot and store range, plus the cluster frontier, for a 3s window with steady new writes.",
+            "assumptions": [
+              "Fault model: no message loss inside the injected transport; the only induced event is a full transport partition of one voter plus its clean shutdown and restart on the same stores.",
+              "Reused facilities: MakeClusterCustom/MakeClusterOpts with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport, MockFSM wrapped by a counting Restore, and the NewRaft restart pattern used by TestRaft_SnapshotRestore_Progress.",
+              "The victim's orphan suffix is produced by real Apply calls it accepted as leader while partitioned, and it is kept because the restarted node replays its real log store."
+            ],
+            "excluded": [
+              "No production logic was modified; the harness only adds a test file.",
+              "Automatic snapshotting is disabled (SnapshotThreshold huge, SnapshotInterval 1h) so the leader's snapshot index is controlled by the explicit Snapshot() call."
+            ],
+            "parameters": {
+              "peers": 3,
+              "pre_entries": 60,
+              "orphan_writes": 60,
+              "post_entries": 20,
+              "window_ms": 3000,
+              "sample_step_ms": 250,
+              "trailing_logs_trimmed": 10,
+              "trailing_logs_control": 1000000
+            }
+          },
+          "prefix": "The harness builds the cluster with MakeClusterCustom (counting FSM), commits 60 entries, partitions the leader with c.Partition, fires 60 applies on it so they are appended locally without a quorum, waits for it to step down, shuts it down with Shutdown().Error(), waits for one of the remaining voters to be the only stable leader, commits 20 further entries, forces Snapshot(), records the snapshot and the trimmed store range, restarts the victim with NewRaft on its original stores and a fresh InmemTransport, reconnects it to both other transports, emits ca_setup with the premise fields, waits until the victim's applied index reaches the snapshot index, then samples every 250ms for 3s while applying one entry per sample on whichever node is leader, and finally emits ca_probe with the raw values and derived booleans.",
+          "requirement": "A follower that reinstalls the leader's snapshot must remain able to accept subsequent log entries from that leader, or its cached log state must not claim entries the snapshot superseded.",
+          "responsibility": "target",
+          "comparisons": [
+            {
+              "event": "ca_probe",
+              "identity_fields": [
+                "victim_id"
+              ],
+              "admission_alias": "trimmed_setup",
+              "assertion": {
+                "field": "repeated_snapshot_installs",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "leader_snapshot_is_unchanged",
+                  "op": "eq",
+                  "value": true,
+                  "reference": null
+                }
+              ],
+              "description": "Trimmed case: the follower's FSM was restored again after the first install, i.e. the same snapshot index was re-shipped during the window, while the leader's snapshot index is unchanged."
+            },
+            {
+              "event": "ca_probe",
+              "identity_fields": [
+                "victim_id"
+              ],
+              "admission_alias": "trimmed_setup",
+              "assertion": {
+                "field": "victim_not_caught_up",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "repeated_snapshot_installs",
+                  "op": "eq",
+                  "value": true,
+                  "reference": null
+                }
+              ],
+              "description": "Trimmed case progress predicate: after the window the follower's applied index is still below the cluster frontier even though new entries committed and were applied elsewhere."
+            },
+            {
+              "event": "ca_probe",
+              "identity_fields": [
+                "victim_id"
+              ],
+              "admission_alias": "trimmed_setup",
+              "assertion": {
+                "field": "stale_claim_persists",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "Trimmed case: the follower's cached last log index is still at or beyond the installed snapshot index with a lower term, and its store still holds that suffix."
+            },
+            {
+              "event": "ca_probe",
+              "identity_fields": [
+                "victim_id"
+              ],
+              "admission_alias": "untrimmed_setup",
+              "assertion": {
+                "field": "repeated_snapshot_installs",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "Control: with an untrimmed leader log no snapshot is installed, separating the trigger from the existence of a stale suffix."
+            },
+            {
+              "event": "ca_probe",
+              "identity_fields": [
+                "victim_id"
+              ],
+              "admission_alias": "untrimmed_setup",
+              "assertion": {
+                "field": "victim_not_caught_up",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [],
+              "description": "Control: the same cluster history without log trimming is repaired by log entries alone and the follower reaches the cluster frontier."
+            }
+          ],
+          "knowledge": [
+            {
+              "entry_id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-0",
+              "revision": 1,
+              "assertion": "the install path leaves the cached last log entry untouched"
+            },
+            {
+              "entry_id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-1",
+              "revision": 1,
+              "assertion": "the stale claim is preferred over the installed snapshot"
+            },
+            {
+              "entry_id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-2",
+              "revision": 1,
+              "assertion": "leader repair degenerates into re-shipping the same snapshot"
+            }
+          ]
+        },
+        "snapshot_id": "c9744ca943f84cfa87d7b8b60af36bc0",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.162.0-alpha.17.2",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "16679315c63a4e5abc44cbb3c9dd0c09-interpretation-0",
+        "investigation_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_get_last_entry",
+          "src_append_prev_check",
+          "src_compaction",
+          "src_replicate_failure",
+          "src_send_snapshot_result"
+        ],
+        "executions": {},
+        "conclusion": "conditional",
+        "defect_claim": "asserted",
+        "rationale": "Present conclusion: in this revision, a follower that accepts a snapshot while its own cached log extends at or beyond the leader's snapshot index is left with an inconsistent log claim and never accepts another log entry from that leader. Basis: installSnapshot updates lastApplied, lastSnapshot and the configurations but never lastLog (raft.go 1930-1977), while getLastEntry prefers the cached log tail whenever lastLogIndex >= lastSnapshotIndex (state.go 160-175). Compaction cannot remove the stale suffix in the non-monotonic store path when TrailingLogs exceeds the log length (snapshot.go 217-252), so the follower's store keeps entries above the snapshot index whose terms differ from the leader's; every AppendEntries prev-log check then either misses below the store's first index or mismatches the stale suffix, the leader's nextIndex is only decremented one step per rejection (replication.go 247-252) until setupAppendEntries reports ErrLogNotFound, and the leader responds by re-shipping the same snapshot (replication.go 296-300, 352-372). Restricted to the measured conditions: three voters, in-memory store, FileSnapshotStore, TrailingLogs=10, an idle cluster plus steady new writes, and a follower restarted on its real on-disk log whose orphan suffix (indexes beyond the leader's snapshot index, lower term) is preserved. Local construction feedback for the same harness (native feedback only, not a retained receipt) showed the follower's FSM restored 4 -> 1365 times in a 3s window while the leader's snapshot index stayed at 83, the follower's applied index stayed at 83 while the cluster frontier reached 95, the follower's cached last log claim stayed (98, term 2) against snapshot (83, term 3), its commit index stayed 0, and its store kept indexes 84-98; the untrimmed control on the identical history accepted no snapshot, repaired the suffix with entries and caught up (applied 83 -> 95). Counterevidence considered: the concern that the follower's own election timeout would repair the situation is not observed, because a successful InstallSnapshot refreshes lastContact, so no spurious election fires; and the control refutes 'any stale suffix stalls replication'. Limits: the formal conclusion awaits the controller's retained run of the requested experiment; the reachability of the trigger in production depends on a voter whose log suffix is both longer than the leader's snapshot index and stale in term (a deposed leader or a follower that stored entries from a superseded leader) together with log trimming on the leader; monotonic-store deployments delete the stale suffix instead of keeping it, so their failure mode (entry starvation with the leader's snapshot index at or below the cached claim) still needs its own receipt.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The untrimmed control with the same history repaired the stale suffix using log entries alone, so a stale suffix by itself is not sufficient; the install-snapshot path with a trimmed leader log is the trigger.",
+          "The successful InstallSnapshot refreshes the follower's last contact, so the follower does not force an election and the starved state is stable rather than transient in the measured configuration."
+        ],
+        "limitations": [
+          "The measured configuration used in-memory stores plus a file snapshot store, TrailingLogs=10, three voters, and a restarted ex-leader that kept an orphan suffix; other TrailingLogs, monotonic stores and larger clusters are not measured here.",
+          "Probe fields are read from the follower's cached state and its log store on the same process; the receipt is needed before treating the numbers as retained observations."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_install_snapshot_tail",
+        "file": "raft.go",
+        "start_line": 1837,
+        "end_line": 1977,
+        "kind": "code_observation",
+        "text": "func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"installSnapshot\"}, time.Now())\n\t// Setup a response\n\tresp := &InstallSnapshotResponse{\n\t\tTerm:    r.getCurrentTerm(),\n\t\tSuccess: false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\t_, _ = io.Copy(io.Discard, rpc.Reader) // ensure we always consume all the snapshot data from the stream [see issue #212]\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Sanity check the version\n\tif req.SnapshotVersion < SnapshotVersionMin ||\n\t\treq.SnapshotVersion > SnapshotVersionMax {\n\t\trpcErr = fmt.Errorf(\"unsupported snapshot version %d\", req.SnapshotVersion)\n\t\treturn\n\t}\n\n\t// Ignore an older term\n\tif req.Term < r.getCurrentTerm() {\n\t\tr.logger.Info(\"ignoring installSnapshot request with older term than current term\",\n\t\t\t\"request-term\", req.Term,\n\t\t\t\"current-term\", r.getCurrentTerm())\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\t\tresp.Term = req.Term\n\t}\n\n\t// Save the current leader\n\tif len(req.ID) > 0 {\n\t\tr.setLeader(r.trans.DecodePeer(req.Addr), ServerID(req.ID))\n\t} else {\n\t\tr.setLeader(r.trans.DecodePeer(req.Leader), ServerID(req.ID))\n\t}\n\n\t// Create a new snapshot\n\tvar reqConfiguration Configuration\n\tvar reqConfigurationIndex uint64\n\tif req.SnapshotVersion > 0 {\n\t\treqConfiguration = DecodeConfiguration(req.Configuration)\n\t\treqConfigurationIndex = req.ConfigurationIndex\n\t} else {\n\t\treqConfiguration, rpcErr = decodePeers(req.Peers, r.trans)\n\t\tif rpcErr != nil {\n\t\t\tr.logger.Error(\"failed to install snapshot\", \"error\", rpcErr)\n\t\t\treturn\n\t\t}\n\t\treqConfigurationIndex = req.LastLogIndex\n\t}\n\tversion := getSnapshotVersion(r.protocolVersion)\n\tsink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,\n\t\treqConfiguration, reqConfigurationIndex, r.trans)\n\tif err != nil {\n\t\tr.logger.Error(\"failed to create snapshot to install\", \"error\", err)\n\t\trpcErr = fmt.Errorf(\"failed to create snapshot: %v\", err)\n\t\treturn\n\t}\n\n\t// Separately track the progress of streaming a snapshot over the network\n\t// because this too can take a long time.\n\tcountingRPCReader := newCountingReader(rpc.Reader)\n\n\t// Spill the remote snapshot to disk\n\ttransferMonitor := startSnapshotRestoreMonitor(r.logger, countingRPCReader, req.Size, true)\n\tn, err := io.Copy(sink, countingRPCReader)\n\ttransferMonitor.StopAndWait()\n\tif err != nil {\n\t\t_ = sink.Cancel()\n\t\tr.logger.Error(\"failed to copy snapshot\", \"error\", err)\n\t\trpcErr = err\n\t\treturn\n\t}\n\n\t// Check that we received it all\n\tif n != req.Size {\n\t\t_ = sink.Cancel()\n\t\tr.logger.Error(\"failed to receive whole snapshot\",\n\t\t\t\"received\", hclog.Fmt(\"%d / %d\", n, req.Size))\n\t\trpcErr = fmt.Errorf(\"short read\")\n\t\treturn\n\t}\n\n\t// Finalize the snapshot\n\tif err := sink.Close(); err != nil {\n\t\tr.logger.Error(\"failed to finalize snapshot\", \"error\", err)\n\t\trpcErr = err\n\t\treturn\n\t}\n\tr.logger.Info(\"copied to local snapshot\", \"bytes\", n)\n\n\t// Restore snapshot\n\tfuture := &restoreFuture{ID: sink.ID()}\n\tfuture.ShutdownCh = r.shutdownCh\n\tfuture.init()\n\tselect {\n\tcase r.fsmMutateCh <- future:\n\tcase <-r.shutdownCh:\n\t\tfuture.respond(ErrRaftShutdown)\n\t\treturn\n\t}\n\n\t// Wait for the restore to happen\n\tif err := future.Error(); err != nil {\n\t\tr.logger.Error(\"failed to restore snapshot\", \"error\", err)\n\t\trpcErr = err\n\t\treturn\n\t}\n\n\t// Update the lastApplied so we don't replay old logs\n\tr.setLastApplied(req.LastLogIndex)\n\n\t// Update the last stable snapshot info\n\tr.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)\n\n\t// Restore the peer set\n\tr.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)\n\tr.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)\n\n\t// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the\n\t// logs. In both cases, log any errors and continue.\n\tif mlogs, ok := r.logs.(MonotonicLogStore); ok && mlogs.IsMonotonic() {\n\t\tif err := r.removeOldLogs(); err != nil {\n\t\t\tr.logger.Error(\"failed to reset logs\", \"error\", err)\n\t\t}\n\t} else if err := r.compactLogs(req.LastLogIndex); err != nil {\n\t\tr.logger.Error(\"failed to compact logs\", \"error\", err)\n\t}\n\n\tr.logger.Info(\"Installed remote snapshot\")\n\tresp.Success = true\n\tr.setLastContact()\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_get_last_entry",
+        "file": "state.go",
+        "start_line": 160,
+        "end_line": 174,
+        "kind": "code_observation",
+        "text": "\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\treturn max(r.lastLogIndex, r.lastSnapshotIndex)\n}\n\n// getLastEntry returns the last index and term in stable storage.\n// Either from the last log or from the last snapshot.\nfunc (r *raftState) getLastEntry() (uint64, uint64) {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\tif r.lastLogIndex >= r.lastSnapshotIndex {\n\t\treturn r.lastLogIndex, r.lastLogTerm\n\t}\n\treturn r.lastSnapshotIndex, r.lastSnapshotTerm\n}",
+        "content_digest": "2173301ba05966eaba415eaac0be1631e48d8d1e64858868701685a4aea11b53"
+      },
+      {
+        "id": "src_append_prev_check",
+        "file": "raft.go",
+        "start_line": 1458,
+        "end_line": 1606,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\"}, time.Now())\n\t// Setup a response\n\tresp := &AppendEntriesResponse{\n\t\tRPCHeader:      r.getRPCHeader(),\n\t\tTerm:           r.getCurrentTerm(),\n\t\tLastLog:        r.getLastIndex(),\n\t\tSuccess:        false,\n\t\tNoRetryBackoff: false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term\n\t}\n\n\t// Save the current leader\n\tif len(a.Addr) > 0 {\n\t\tr.setLeader(r.trans.DecodePeer(a.Addr), ServerID(a.ID))\n\t} else {\n\t\tr.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))\n\t}\n\t// Verify the last log entry\n\tif a.PrevLogEntry > 0 {\n\t\tlastIdx, lastTerm := r.getLastEntry()\n\n\t\tvar prevLogTerm uint64\n\t\tif a.PrevLogEntry == lastIdx {\n\t\t\tprevLogTerm = lastTerm\n\t\t} else {\n\t\t\tvar prevLog Log\n\t\t\tif err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get previous log\",\n\t\t\t\t\t\"previous-index\", a.PrevLogEntry,\n\t\t\t\t\t\"last-index\", lastIdx,\n\t\t\t\t\t\"error\", err)\n\t\t\t\tresp.NoRetryBackoff = true\n\t\t\t\treturn\n\t\t\t}\n\t\t\tprevLogTerm = prevLog.Term\n\t\t}\n\n\t\tif a.PrevLogTerm != prevLogTerm {\n\t\t\tr.logger.Warn(\"previous log term mis-match\",\n\t\t\t\t\"ours\", prevLogTerm,\n\t\t\t\t\"remote\", a.PrevLogTerm)\n\t\t\tresp.NoRetryBackoff = true\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Process any new entries\n\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Stage the future commit index if possible\n\t\t\tlastNewIndex := newEntries[len(newEntries)-1].Index\n\t\t\tcommitIndex := min(a.LeaderCommitIndex, lastNewIndex)\n\t\t\tr.tryStageCommitIndex(commitIndex)\n\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}\n\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"storeLogs\"}, start)\n\t}\n\n\t// Update the commit index\n\tif a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {\n\t\tstart := time.Now()\n\t\tidx := min(a.LeaderCommitIndex, r.getLastIndex())\n\t\tr.setCommitIndex(idx)\n\t\tif r.configurations.latestIndex <= idx {\n\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t}\n\t\tr.processLogs(idx, nil)\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"processLogs\"}, start)\n\t}\n\n\t// Everything went well, set success\n\tresp.Success = true\n\tr.setLastContact()\n}\n\n// processConfigurationLogEntry takes a log entry and updates the latest\n// configuration if the entry results in a new configuration. This must only be",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "src_compaction",
+        "file": "snapshot.go",
+        "start_line": 217,
+        "end_line": 279,
+        "kind": "code_observation",
+        "text": "func (r *Raft) compactLogsWithTrailing(snapIdx uint64, lastLogIdx uint64, trailingLogs uint64) error {\n\t// Determine log ranges to compact\n\tminLog, err := r.logs.FirstIndex()\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to get first log index: %v\", err)\n\t}\n\n\t// Check if we have enough logs to truncate\n\t// Use a consistent value for trailingLogs for the duration of this method\n\t// call to avoid surprising behaviour.\n\tif lastLogIdx <= trailingLogs {\n\t\treturn nil\n\t}\n\n\t// Truncate up to the end of the snapshot, or `TrailingLogs`\n\t// back from the head, which ever is further back. This ensures\n\t// at least `TrailingLogs` entries, but does not allow logs\n\t// after the snapshot to be removed.\n\tmaxLog := min(snapIdx, lastLogIdx-trailingLogs)\n\n\tif minLog > maxLog {\n\t\tr.logger.Info(\"no logs to truncate\")\n\t\treturn nil\n\t}\n\n\tr.logger.Info(\"compacting logs\", \"from\", minLog, \"to\", maxLog)\n\n\t// Compact the logs\n\tif err := r.logs.DeleteRange(minLog, maxLog); err != nil {\n\t\treturn fmt.Errorf(\"log compaction failed: %v\", err)\n\t}\n\treturn nil\n}\n\n// compactLogs takes the last inclusive index of a snapshot\n// and trims the logs that are no longer needed.\nfunc (r *Raft) compactLogs(snapIdx uint64) error {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"compactLogs\"}, time.Now())\n\n\tlastLogIdx, _ := r.getLastLog()\n\ttrailingLogs := r.config().TrailingLogs\n\n\treturn r.compactLogsWithTrailing(snapIdx, lastLogIdx, trailingLogs)\n}\n\n// removeOldLogs removes all old logs from the store. This is used for\n// MonotonicLogStores after restore. Callers should verify that the store\n// implementation is monotonic prior to calling.\nfunc (r *Raft) removeOldLogs() error {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"removeOldLogs\"}, time.Now())\n\n\tlastLogIdx, err := r.logs.LastIndex()\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to get last log index: %w\", err)\n\t}\n\n\tr.logger.Info(\"removing all old logs from log store\")\n\n\t// call compactLogsWithTrailing with lastLogIdx for snapIdx since\n\t// it will take the lesser of lastLogIdx and snapIdx to figure out\n\t// the end for which to apply trailingLogs.\n\treturn r.compactLogsWithTrailing(lastLogIdx, lastLogIdx, 0)\n}",
+        "content_digest": "a0ab0d591cd60c98d245addaaf3f4435fa1e74a30c8d59334396ca28dacba458"
+      },
+      {
+        "id": "src_replicate_failure",
+        "file": "replication.go",
+        "start_line": 240,
+        "end_line": 300,
+        "kind": "code_observation",
+        "text": "\t\tr.handleStaleTerm(s)\n\t\treturn true\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Update s based on success\n\tif resp.Success {\n\t\t// Update our replication state\n\t\tupdateLastAppended(s, &req)\n\n\t\t// Clear any failures, allow pipelining\n\t\ts.failures = 0\n\t\ts.allowPipeline = true\n\t} else {\n\t\tatomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))\n\t\tif resp.NoRetryBackoff {\n\t\t\ts.failures = 0\n\t\t} else {\n\t\t\ts.failures++\n\t\t}\n\t\tr.logger.Warn(\"appendEntries rejected, sending older logs\", \"peer\", peer, \"next\", atomic.LoadUint64(&s.nextIndex))\n\t}\n\nCHECK_MORE:\n\t// Poll the stop channel here in case we are looping and have been asked\n\t// to stop, or have stepped down as leader. Even for the best effort case\n\t// where we are asked to replicate to a given index and then shutdown,\n\t// it's better to not loop in here to send lots of entries to a straggler\n\t// that's leaving the cluster anyways.\n\tselect {\n\tcase <-s.stopCh:\n\t\treturn true\n\tdefault:\n\t}\n\n\t// Check if there are more logs to replicate\n\tif atomic.LoadUint64(&s.nextIndex) <= lastIndex {\n\t\tgoto START\n\t}\n\treturn\n\n\t// SEND_SNAP is used when we fail to get a log, usually because the follower\n\t// is too far behind, and we must ship a snapshot down instead\nSEND_SNAP:\n\tif stop, err := r.sendLatestSnapshot(s); stop {\n\t\treturn true\n\t} else if err != nil {\n\t\tr.logger.Error(\"failed to send snapshot to\", \"peer\", peer, \"error\", err)\n\t\treturn\n\t}\n\n\t// Check if there is more to replicate\n\tgoto CHECK_MORE\n}\n\n// sendLatestSnapshot is used to send the latest snapshot we have\n// down to our follower.\nfunc (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {\n\t// Get the snapshots",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "src_send_snapshot_result",
+        "file": "replication.go",
+        "start_line": 352,
+        "end_line": 372,
+        "kind": "code_observation",
+        "text": "\n\tif !r.noLegacyTelemetry {\n\t\t// Duplicated information. Kept for backward compatibility.\n\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"installSnapshot\", string(peer.ID)}, start)\n\t}\n\n\t// Check for a newer term, stop running\n\tif resp.Term > req.Term {\n\t\tr.handleStaleTerm(s)\n\t\treturn true, nil\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Check for success\n\tif resp.Success {\n\t\t// Update the indexes\n\t\tatomic.StoreUint64(&s.nextIndex, meta.Index+1)\n\t\ts.commitment.match(peer.ID, meta.Index)\n",
+        "content_digest": "0bb8044f74aa0a3c46991162252e3810a00f906316d5830486c836c51d6a5c9c"
+      },
+      {
+        "id": "src_vote_log_check",
+        "file": "raft.go",
+        "start_line": 1725,
+        "end_line": 1748,
+        "kind": "code_observation",
+        "text": "\t\t\tresp.Granted = true\n\t\t}\n\t\treturn\n\t}\n\n\t// Reject if their term is older\n\tlastIdx, lastTerm := r.getLastEntry()\n\tif lastTerm > req.LastLogTerm {\n\t\tr.logger.Warn(\"rejecting vote request since our last term is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-term\", lastTerm,\n\t\t\t\"last-candidate-term\", req.LastLogTerm)\n\t\treturn\n\t}\n\n\tif lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {\n\t\tr.logger.Warn(\"rejecting vote request since our last index is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-index\", lastIdx,\n\t\t\t\"last-candidate-index\", req.LastLogIndex)\n\t\treturn\n\t}\n\n\t// Persist a vote for safety",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "16679315c63a4e5abc44cbb3c9dd0c09",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_install_snapshot_no_lastlog_reset": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-0",
+        "@k_getlastentry_prefers_cached_log": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-1",
+        "@k_snapshot_retry_cycle": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-2",
+        "@q_snapshot_install_stale_log": "16679315c63a4e5abc44cbb3c9dd0c09-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_install_snapshot_tail"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_get_last_entry"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_append_prev_check"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_compaction"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_replicate_failure"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_send_snapshot_result"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "src_vote_log_check"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_install_snapshot_no_lastlog_reset"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_getlastentry_prefers_cached_log"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_snapshot_retry_cycle"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@q_snapshot_install_stale_log"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "@q_snapshot_install_stale_log"
+        },
+        {
+          "object": "experiments",
+          "action": "create",
+          "target": "experiment"
+        }
+      ],
+      "experiment_id": "16679315c63a4e5abc44cbb3c9dd0c09-experiment"
+    },
+    "applied_operations": {
+      "submission-16679315c63a4e5abc44cbb3c9dd0c09": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_23-09-10-hashicorp_raft-real-run/semantic-commits/submission-16679315c63a4e5abc44cbb3c9dd0c09.json"
+      }
+    }
+  }
+}

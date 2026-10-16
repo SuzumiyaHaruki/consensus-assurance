@@ -3,7 +3,7 @@ from typing import Literal
 from pydantic import Field, StrictInt
 from .types import Record, KnowledgeUse, GapAnswer
 from .types import EventComparison, EventRequirement, FailureAttribution
-from .types import Scope, SourceAnchor
+from .types import Scope, SourceAnchor, TestNames
 
 
 class SourceRange(Record):
@@ -69,6 +69,8 @@ class ExperimentRequest(Record):
     harness_path: str
     files: dict[str, str] = {}
     execution_package: str | None = None
+    test_names: TestNames | None = Field(default=None,
+        description="Exact Go top-level TestAssurance names (including their subtests), or full Rust test names; omit to run all generated tests. Selection does not exclude other code from compilation or initialization.")
     source_ids: list[str] = Field(min_length=1)
     anchors: list[SourceAnchor] = []
     scope: Scope

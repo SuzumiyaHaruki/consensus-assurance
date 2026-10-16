@@ -1,0 +1,183 @@
+{
+  "rationale": "Two actions. (1) The per-mode execution (CheckRun 420bbfc415a14e20ad9a6689d1775917, exit 0, cases A/B/C passed) produced a decisive comparison set for the runtime question - control `holds`, mode B `holds`, mode C `violated` with valid witness index 9 and a complete witness - so I append the current account of that question on the strength of the complete chain, keeping the earlier receipts in joint_history and dropping the limitation that the successor was pending. (2) I opened an independent core-crate lead on trimming: with the node ids {1,2,5} - a configuration `ClusterConfig::validate` accepts and no test covers - the leader's `get_min_all_accepted_idx` takes the minimum over a vector sized by the largest node id, so the never-used slots for ids 3 and 4 pin it to 0 forever; `trim(None)` then reports success while compacting nothing and the documented repair `trim(Some(idx))` returns `NotAllDecided(0)`. I built and locally validated a two-case probe for that (control {1,2,3}, treatment {1,2,5}) and submit it; the harness lives in the `omnipaxos_runtime` test target only because that dependency graph builds offline here, and it drives three real `omnipaxos` instances directly through the public API with no actor layer involved.",
+  "sources": [
+    {
+      "id": "core_min_all_accepted_idx",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 186,
+      "end_line": 191,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_leader_state_sizing",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 95,
+      "end_line": 101,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_trim_guard",
+      "file": "omnipaxos/src/sequence_paxos/mod.rs",
+      "start_line": 141,
+      "end_line": 160,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_try_trim",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 414,
+      "end_line": 425,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_compaction_err",
+      "file": "omnipaxos/src/omni_paxos.rs",
+      "start_line": 480,
+      "end_line": 486,
+      "kind": "document_statement"
+    },
+    {
+      "id": "docs_trim_contract",
+      "file": "docs/omnipaxos/compaction.md",
+      "start_line": 8,
+      "end_line": 30,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_trim_sparse_ids",
+      "question": "In the core crate, when the cluster configuration contains node ids that are not contiguous, can the leader ever advance the compacted index with `trim` once every configured server has decided an entry, and does the documented `trim(Some(idx))` repair path make progress?",
+      "source_ids": [
+        "core_min_all_accepted_idx",
+        "core_leader_state_sizing",
+        "core_trim_guard",
+        "core_try_trim",
+        "core_compaction_err",
+        "docs_trim_contract"
+      ],
+      "hypothesis": "Provisional: `LeaderState::with` sizes `accepted_indexes` by the largest node id, so for a configuration such as {1,2,5} the slots for ids 3 and 4 stay 0; `get_min_all_accepted_idx` minimises over that vector rather than over the configured servers, so `trim(None)` computes a trim index of 0, `InternalStorage::try_trim(0)` finds nothing to compact and `trim` returns `Ok(())` while `get_compacted_idx()` stays where it was. `trim(Some(k))` with any k >= 1 fails the guard `idx <= min_all_accepted_idx` and returns `CompactionErr::NotAllDecided(0)`, so the documented retry path - 'users can retry with omni_paxos.trim(Some(idx)) which will then succeed' - also makes no progress, and the log can only be compacted by snapshotting.",
+      "discriminator": "The submitted two-case probe: control {1,2,3} versus treatment {1,2,5}, both with all three servers having decided the same entry. It changes the judgment if the sparse configuration also advances the compacted index (or returns a trim index other than 0), or if an explicit `trim(Some(k))` call succeeds there."
+    },
+    {
+      "id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+      "discriminator": "Settled by the complete comparison set; still unmeasured and able to change the conditions rather than the defect: how the tick-period/round-trip relation bounds the window in which the `ok` arm wins (only 2 ms and 80 ms were exercised), and whether a follower origin whose index comes from the leader's `Assigned` reply reaches the same false success (same cause and responsibility, so a variant rather than a separate question)."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q_trim_sparse_ids",
+    "harness_path": "omnipaxos_runtime/tests/assurance_trim.rs",
+    "execution_package": "./omnipaxos_runtime",
+    "source_ids": [
+      "core_min_all_accepted_idx",
+      "core_leader_state_sizing",
+      "core_trim_guard",
+      "core_try_trim",
+      "core_compaction_err",
+      "docs_trim_contract"
+    ],
+    "scope": {
+      "description": "Two runs of one cluster shape with three real `OmniPaxos` instances driven directly through the public API in a single process (lossless in-process delivery, node 1 elected, one entry appended on the leader and decided by every configured server). Case A is the control configuration {1,2,3}; case B is the treatment configuration {1,2,5}, identical in every other respect. Each run then calls `trim(None)` on the leader, samples `get_compacted_idx()`, and calls `trim(Some(decided_idx_before_trim))` on the leader.",
+      "assumptions": [
+        "Node ids need not be contiguous: `ClusterConfig::validate` only requires more than one node, a non-zero configuration id, a valid quorum, and that the node set contains this server's pid; nothing in the manifest, docs or tests requires consecutive ids, and the existing suites always use 1..=N.",
+        "In-process lossless message delivery on top of real `MemoryStorage` preserves the protocol properties needed for trimming: every configured server decides the entry before the trim calls.",
+        "Node 1 carries leader_priority 1 so the elected leader in both cases is the same node, making the two cases differ only in the node-id set.",
+        "The leader's own accepted index and its peers' accepted indexes are the only inputs to the trim guard in these runs; no compaction error is injected."
+      ],
+      "excluded": [
+        "Any claim about snapshot-based compaction (`snapshot` is not called here).",
+        "Any claim about clusters with more nodes or other sparse id sets than {1,2,3} and {1,2,5}.",
+        "Any safety claim: this probe measures progress/availability of trimming, not log consistency."
+      ],
+      "parameters": {
+        "cases": {"A": "nodes 1,2,3", "B": "nodes 1,2,5"},
+        "batch_size": 1,
+        "quorum": "majority",
+        "entries_appended": 1,
+        "leader_priority": {"1": 1, "2": 0, "5": 0},
+        "delivery": "in-process, lossless, 30 ticks per pump"
+      }
+    },
+    "prefix": "Build one `OmniPaxos<TestEntry, MemoryStorage<TestEntry>>` per node id (configuration_id 1, election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, node 1 leader_priority 1), keep them in a pid-keyed map, and elect node 1 by calling `try_become_leader()` on it and pumping (each pump: `tick()` every instance, then take_outgoing_messages and deliver each message to its receiver's `handle_incoming`) until another node reports `get_current_leader() == Some((1, true))`. Emit the admission event with mode, node list and elected leader. Then append one entry on node 1 and pump until every configured server reports `get_decided_idx() >= 1`; sample the leader's decided and compacted indexes; call `trim(None)`; sample the compacted index again and report whether it advanced; then call `trim(Some(decided_idx_before_trim))`, sample the compacted index and report the call's result and whether it advanced. Emit the outcome under the mode-specific event name with the node list, the leader, the decided index, both trim results and both compaction outcomes.",
+    "responsibility": "The decisive inputs are produced by the target: `LeaderState::with` allocates `accepted_indexes` for every id up to the largest one, `LeaderState::get_min_all_accepted_idx` reduces over that whole vector, and `SequencePaxos::trim` compares the caller's index against that reduced value before calling `InternalStorage::try_trim`, which no-ops when the target index does not exceed the current compacted index. The caller only supplies the optional trim index.",
+    "prerequisites": [
+      {
+        "alias": "admission_a",
+        "event": "admission",
+        "conditions": [
+          {"field": "mode", "op": "eq", "value": "A"},
+          {"field": "nodes", "op": "eq", "value": "1,2,3"},
+          {"field": "leader", "op": "eq", "value": 1}
+        ]
+      },
+      {
+        "alias": "admission_b",
+        "event": "admission",
+        "conditions": [
+          {"field": "mode", "op": "eq", "value": "B"},
+          {"field": "nodes", "op": "eq", "value": "1,2,5"},
+          {"field": "leader", "op": "eq", "value": 1}
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "trim_outcome_a",
+        "identity_fields": ["mode", "nodes", "leader"],
+        "admission_alias": "admission_a",
+        "assertion": {"field": "trim_none_advanced_compaction", "op": "eq", "value": true},
+        "applicability_conditions": [{"field": "all_servers_decided", "op": "eq", "value": true}],
+        "description": "Control: with contiguous node ids and every server having decided the entry, trim(None) advances the compacted index."
+      },
+      {
+        "event": "trim_outcome_b",
+        "identity_fields": ["mode", "nodes", "leader"],
+        "admission_alias": "admission_b",
+        "assertion": {"field": "trim_none_advanced_compaction", "op": "eq", "value": true},
+        "applicability_conditions": [{"field": "all_servers_decided", "op": "eq", "value": true}],
+        "description": "Treatment: with sparse node ids and every configured server having decided the entry, trim(None) is predicted to report success without advancing the compacted index; a false value is the violating witness."
+      }
+    ],
+    "semantic_changes": [
+      "The two cases differ only in the configured node-id set; the probe is a separate harness target from the runtime completion probe and does not include the actor layer."
+    ]
+  },
+  "interpretations": [
+    {
+      "investigation_id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+      "experiment_id": "b280ae68f24344fda53d809e8d9de05e-experiment",
+      "source_ids": [
+        "actor_drain_notifiers",
+        "actor_record_assignment",
+        "actor_pending_assigned_field",
+        "actor_append_tracked",
+        "handle_append_notify_contract",
+        "event_superseded_contract",
+        "actor_run_tick_branch",
+        "actor_cmd_append_notify",
+        "example_durability_caller",
+        "runtime_test_expectation"
+      ],
+      "executions": {
+        "420bbfc415a14e20ad9a6689d1775917": [1, 5, 9],
+        "fc17700defb243bfad08ed6717fb32fd": [9],
+        "3fea35115a164e10bd378355a297b42f": [1, 5, 9]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "joint_history": "All three receipts are revisions of one experiment lineage (51798029045d462699a54d5065e069eb-experiment, then 7fe56f0c8c6745a18e94af7244e746b9-experiment with admission identity fields added, then b280ae68f24344fda53d809e8d9de05e-experiment with mode-specific result event names). Scenario steps, tick periods, assertions and applicability are identical across them; the three cited events agree field for field in all three runs (mode A: resolved ok, assigned_idx 1, entry_at_assigned_idx decided:11; mode B: resolved superseded, assigned_idx 1, origin decided index 0; mode C: resolved ok, assigned_idx 1, entry_at_assigned_idx decided:22, entry_equals_submitted false). The v1 receipt supplied parsed events before the comparison chain could be evaluated, v2 supplied the first evaluated comparison, and v3 supplies the complete chain; no preprocessing or measurement difference beyond those emission and selection changes exists between them.",
+      "rationale": "Current account, now carried by a complete comparison chain. In the actor layer an `append_notify` assignment is only `(log index, ballot at assignment)`, and `drain_notifiers` answers `Ok(assigned_idx)` as soon as `assigned_idx <= local decided index`, before it evaluates the ballot-change arm and without comparing the caller's entry with what occupies that index. Retained execution 420bbfc415a14e20ad9a6689d1775917 evaluates the three declared predicates: the control comparison - Ok implies the caller's entry is at the returned index when there is no partition - `holds` (evaluated from event 1, complete), the mode-B comparison - the documented Superseded resolution is delivered for the same lost-entry setup with 2 ms ticks - `holds` (event 5, complete), and the mode-C comparison - the same predicate under 80 ms ticks - `violated` with valid witness index 9 and a complete witness: event 9 resolved `ok` with assigned index 1 while the decided entry at index 1 was the new leader's entry 22 and the origin's decided log held only `22`, after the origin spent the whole partition with decided index 0 (its entry accepted but undecided) and had re-synchronized to node 3's leadership. So the caller of a lost write is told, with an unqualified success, that the index its entry was assigned to is decided, while the entry itself is in no decided log; the identical lost-entry state instead yields the documented `Superseded` when a tick falls between the origin's promise change and its decided-index advance, which makes the resolution a function of tick scheduling rather than of the durable outcome. The caller-facing consequence is sourced in this repository: the async example documents `append_notify` as synchronous durability confirmation for a specific entry 'decided at its assigned index' and announces the returned index without re-reading the log there, and the existing runtime test only asserts a non-zero index and a non-empty suffix, so the shipped pattern relies on exactly the signal that can be false here and no test pins the entry at the returned index. Scope: this actor layer, whole-message-loss with election-timeout takeover, batch_size 1, majority quorum.",
+      "counterevidence": [
+        "The entry-point documentation promises only that the future resolves \"when the assigned log index is decided\", and for Superseded advises re-reading the returned index; read that way `Ok(idx)` is a claim about the index and not about the caller's value, so a caller that verifies the entry at the returned index is not misled. This weakens the caller-facing consequence but not the schedule dependence, since one lost-entry state cannot legitimately yield both `Superseded` and `Ok` if the signal describes state rather than timing.",
+        "A new leader must adopt any value a majority-overlapping write quorum already accepted, so an entry that reached a write quorum cannot be replaced; the loss needs a local-only assignment, which the receipts support (origin decided index 0 while partitioned, the new leader's event reporting entry 22 decided at index 1, its decided values `22` only).",
+        "The `Superseded` arm does not confirm the caller's entry either; it stops waiting. The two arms differ in what they claim, and the defect is that the optimistic claim can be delivered for the same state.",
+        "The mode-B comparison returning `holds` shows the documented arm does win in ordinary timing, so the defect is not that the code never reports Superseded."
+      ],
+      "limitations": [
+        "In-process in-memory transport, no crash or restart: the origin is re-synchronized from the new leader, not recovered from storage, so nothing here extends to the persistence/fail-recovery path.",
+        "One cluster shape and one fault pattern (both directions of the old leader's links dropped, election-timeout takeover, batch_size 1, majority quorum, the second entry appended through the new leader). Follower-origin assignments, batching above 1 and flexible quorums are unmeasured.",
+        "The schedule dependence is characterised by two tick periods only (2 ms and 80 ms) around a round trip of about 2-4 ms; it bounds neither the deployment frequency of the false success nor the exact tick/RTT threshold."
+      ]
+    }
+  ]
+}

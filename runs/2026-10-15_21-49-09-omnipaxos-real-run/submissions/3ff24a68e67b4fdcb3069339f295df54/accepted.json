@@ -1,0 +1,281 @@
+{
+  "rationale": "Continuing the safety-axis lead from the answered reordering question with the two faults it did not cover, as its discriminator recorded: duplication of replication messages, and replay of a replaced leader's messages after the rest of the cluster has moved to a newer ballot. The probe reuses the same in-process driver and adds a transport fault layer (hold-from, duplicate-to, capture-first-AcceptDecide, replay-held). Locally all three cases behave as the source account predicts - control, duplication of every message addressed to node 2, and a takeover where 507 retained messages from the old leader were replayed after the heal - each ending with the same decided values (1,2,3,7,8,9) on all three nodes, and in the stale case all three nodes following node 3 afterwards, so the submitted execution is a bounded negative pair on these faults; the receipt is the evidence, not this local run.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q_duplication_stale_replay",
+      "question": "In the core crate, do two faults the captured suites do not exercise preserve agreement and progress: (a) every replication message addressed to one follower delivered twice, and (b) a leader cut off from both followers while they take over, after which the replaced leader's retained messages are replayed to them once the link is restored?",
+      "source_ids": [
+        "core_check_valid_ballot",
+        "core_decided_advance_gates"
+      ],
+      "hypothesis": "Provisional: a duplicate carries a sequence number the follower has already consumed, so `check_msg_status` classifies it as outdated and the message is ignored, while a replaced leader's messages carry a ballot below the followers' promises and are rejected by `check_valid_ballot`; in both cases the nodes should still agree on the decided values and keep deciding new entries.",
+      "discriminator": "The submitted three-case probe. It changes the judgment if the duplication or replay case ends with differing decided values across nodes, if the expected entries are not all decided, or if the control case diverges (which would point at the harness). It does not change the judgment if the fault never actually took effect, which the outcome events report explicitly.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@q_duplication_stale_replay",
+    "harness_path": "omnipaxos_runtime/tests/assurance_faults.rs",
+    "files": {},
+    "execution_package": "./omnipaxos_runtime",
+    "test_names": null,
+    "source_ids": [
+      "core_check_valid_ballot",
+      "core_decided_advance_gates"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three runs of one cluster shape with three real `OmniPaxos` instances driven directly through the public API in a single process (in-process delivery, node 1 the elected leader, node 2 the follower under observation, node 3 the third acceptor). All runs first decide entries 1..=3 as a baseline. Case A then decides 7 and 8 with no fault. Case B delivers every message addressed to node 2 twice while 7 and 8 are decided. Case C cuts node 1 off from both followers so that they elect node 3, lets node 3 decide 7 and 8, then restores the link and replays every message node 1 had sent while cut off, before deciding a final entry 9 through the current leader.",
+      "assumptions": [
+        "Duplicate delivery and delayed delivery of already-sent messages are permitted faults; the core carries sequence numbers for the first and ballot checks for the second, and no caller duty in the docs rules them out.",
+        "Faults are applied in the transport only: no target logic is modified, and the leader is unaware of duplication, holding or replay.",
+        "Logical ticks driven by the harness exercise the election and resend timeouts deterministically rather than by wall-clock timing.",
+        "The instances run with batch_size 1, majority quorum and no snapshots, so decisions are observable immediately through `read_decided_suffix`."
+      ],
+      "excluded": [
+        "Any claim about message corruption, reordering (probed separately) or storage faults.",
+        "Any claim about the actor layer: the probe drives the core crate directly.",
+        "Any claim about occurrence rates: one schedule per case."
+      ],
+      "parameters": {
+        "nodes": "1,2,3",
+        "leader": 1,
+        "follower_under_observation": 2,
+        "baseline_entries": "1..=3",
+        "later_entries": "7,8 and a final 9",
+        "duplication": "case B: every message addressed to node 2 delivered twice",
+        "stale_replay": "case C: messages from node 1 held while it is cut off, then replayed after the heal",
+        "ticks_per_pump": 30
+      }
+    },
+    "prefix": "For each case: build one `OmniPaxos<TestEntry, MemoryStorage<TestEntry>>` per node id (configuration_id 1, election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, node 1 leader_priority 1), elect node 1 by calling `try_become_leader()` and pumping until node 2 reports it as the accepted leader, append entries 1..=3 on node 1 and pump until every node has decided at least 3, then emit the admission event. Case A appends 7 and 8 on node 1. Case B sets the transport to deliver every message addressed to node 2 twice and then appends 7 and 8 on node 1. Case C sets the transport to hold every message sent by node 1, pumps until a node other than 1 reports itself as the accepted leader, appends 7 and 8 on that new leader, pumps, then clears the hold, replays all retained messages and pumps again. Finally append entry 9 through the current leader and pump fifteen rounds; then read each node's decided suffix and emit, under the mode-specific event name, the decided values and indexes per node, whether all three nodes' decided values are equal, whether exactly the expected entries were decided, how many messages were replayed, and each node's current leader.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "The decisive inputs are produced by the target: the follower's sequence-number check decides what a duplicate means, and `check_valid_ballot` decides what a replaced leader's message means; the harness only chooses the delivery schedule and never inspects or repairs protocol state.",
+    "prerequisites": [
+      {
+        "alias": "admission_a",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "A",
+            "reference": null
+          },
+          {
+            "field": "nodes",
+            "op": "eq",
+            "value": "1,2,3",
+            "reference": null
+          },
+          {
+            "field": "follower",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_b",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "B",
+            "reference": null
+          },
+          {
+            "field": "nodes",
+            "op": "eq",
+            "value": "1,2,3",
+            "reference": null
+          },
+          {
+            "field": "follower",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_c",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "C",
+            "reference": null
+          },
+          {
+            "field": "nodes",
+            "op": "eq",
+            "value": "1,2,3",
+            "reference": null
+          },
+          {
+            "field": "follower",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "fault_outcome_a",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "all_three_values_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: no fault, all nodes agree."
+      },
+      {
+        "event": "fault_outcome_a",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "expected_entries_all_decided",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: every expected entry decided."
+      },
+      {
+        "event": "fault_outcome_b",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "all_three_values_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "duplicate_to_node2",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Duplication: agreement survives duplicate delivery. Expected holds."
+      },
+      {
+        "event": "fault_outcome_b",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "expected_entries_all_decided",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "duplicate_to_node2",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Duplication: progress survives. Expected holds."
+      },
+      {
+        "event": "fault_outcome_c",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_c",
+        "assertion": {
+          "field": "all_three_values_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_replay",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Stale replay: after the takeover and the replay of the replaced leader's messages, all nodes agree. Expected holds."
+      },
+      {
+        "event": "fault_outcome_c",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_c",
+        "assertion": {
+          "field": "expected_entries_all_decided",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_replay",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Stale replay: the entries decided before, during and after the takeover are all decided everywhere. Expected holds."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

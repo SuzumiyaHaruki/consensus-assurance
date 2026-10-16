@@ -1,0 +1,86 @@
+{
+  "rationale": "Read the fourth receipt (execution 20c7c72772474093bd6093a37b84448f, exit 0, both cases passed): all six boundary comparisons evaluate completely and hold, so the two limits the account still stated are resolved. The monotonic-store case stalls exactly like the non-monotonic one (restores 5 -> 1102 in 3s, applied fixed at 83 while the frontier reached 95, claim persisting) and its install branch had emptied the log store (first and last index 0, no suffix kept), which isolates the cached claim rather than any surviving suffix as the operative state. The repair case first records the stall (applied below the frontier while restores accumulated), then drives the leader past the claim of 97, publishes a snapshot at 98, and the follower resumes: applied 83 -> 109, commit 109, claim repaired to a consistent value. With the mechanism and both boundaries decided, this update records the settled account, drops the two resolved limits, states the source-reasoned bound on the vote-side consequence together with its configuration-change caveat, and registers the vote/authority question as a child investigation whose discriminator is the same request decided differently by a phantom holder and by a consistent voter in a five-voter cluster.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q_phantom_claim_vote_decision",
+      "question": "Does a server whose cached last log entry still exceeds its installed snapshot index decide vote requests differently from a server whose cached state matches its snapshot, and can a quorum of such servers be reached under permitted use?",
+      "source_ids": [
+        "src_get_last_entry",
+        "src_vote_log_check",
+        "src_install_snapshot_tail"
+      ],
+      "hypothesis": "requestVote and requestPreVote evaluate log completeness with getLastEntry, so a phantom claim replaces the installed snapshot as the voter's notion of its own log: the same request is granted by the phantom holder and rejected by a voter whose cached state is consistent. The phantom suffix was uncommitted (a quorum storing it would have committed it), so its holders were a minority of the configuration that created it, which bounds the effect to availability unless a configuration change later makes that group a majority.",
+      "discriminator": "A five-voter history in which the deposed leader and one follower hold an uncommitted suffix while the other three commit a newer-term history and publish a snapshot below that suffix index; after both minority members install it, the same RequestVote (the stale follower's real log claim, carrying the leadership-transfer flag so the known-leader rejection does not mask the log test) is delivered to a phantom holder and to a consistent voter. A grant by the phantom holder together with a rejection by the consistent voter would establish the changed decision; an equal outcome would refute it.",
+      "disposition": null,
+      "parent_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "src_install_snapshot_tail",
+        "src_get_last_entry",
+        "src_append_prev_check",
+        "src_compaction",
+        "src_replicate_failure",
+        "src_send_snapshot_result"
+      ],
+      "executions": {
+        "20c7c72772474093bd6093a37b84448f": [
+          0,
+          14,
+          15,
+          33
+        ],
+        "b6089b103bbb467199d051f4492e82c8": [
+          0,
+          14,
+          15,
+          29
+        ],
+        "5e63769a85ac4b5f90ebe12a4ddcc5fd": [
+          0,
+          14,
+          15,
+          29
+        ],
+        "d1897256143f4de2b0477a3460ae392b": [
+          0,
+          14,
+          15,
+          29
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Present conclusion: a follower that accepts an InstallSnapshot whose index does not exceed its own cached last log index keeps advertising a log it no longer holds, fails every prev-log check from that leader and accepts no further log entry, while the leader retries the same snapshot indefinitely; the starvation ends only when a snapshot above the cached claim is published. Source basis: installSnapshot sets lastApplied, lastSnapshot and the configurations but never lastLog (src_install_snapshot_tail, raft.go 1837-1977, tail at 1952-1977); getLastEntry prefers the cached log tail whenever lastLogIndex >= lastSnapshotIndex (src_get_last_entry, state.go 160-174); prev-log verification then misses below the log store's first index or mismatches the stale suffix (src_append_prev_check, raft.go 1458-1606); the leader walks nextIndex down one step per rejection (src_replicate_failure, replication.go 240-300) until setupAppendEntries reports ErrLogNotFound, which jumps to SEND_SNAP and, on acceptance, resets nextIndex to snapshotIndex+1 (src_send_snapshot_result, replication.go 352-372); the non-monotonic compaction path keeps any suffix above the snapshot index while the monotonic branch (removeOldLogs, src_compaction) deletes the whole store without resetting the claim. Decided evidence, four receipts of the same experiment family: the trimmed case reproduces the signature in every run (settled comparison set in execution b6089b103bbb467199d051f4492e82c8: repeated_snapshot_installs, victim_not_caught_up and stale_claim_persists all hold on the trimmed probe at index 14, with the untrimmed control negative on the same fields at index 29), and the fourth receipt resolves both boundaries. Monotonic store (execution 20c7c72772474093bd6093a37b84448f, probe at index 14): restores 5 -> 1102 in the 3s window with applied index fixed at 83 while the cluster frontier reached 95, the cached claim persisting, and the log store emptied to first index 0 / last index 0 - so the stall does not depend on a surviving suffix, only on the cached claim outranking the installed snapshot. Repair boundary (same receipt, probe at index 33): the stall was measured before the intervention, then the leader's applied index was driven past the follower's claim of 97, a snapshot at 98 was published, and the follower resumed - applied 83 -> 109 equal to the frontier, commit index 109, cached claim repaired to a consistent value - which confirms the stated bound: the starvation lasts while the newest snapshot stays at or below the claim and ends when one lands above it. Safety-relevant reading of the same root cause: the phantom claim is also what requestVote uses for its own log (src_vote_log_check), so the voter's notion of its log can outrank its durable snapshot. Reasoning bounds this: the phantom suffix lies beyond the commit index of the term that created it, so its holders were a minority of that configuration, and a leader's snapshot index can never fall below committed history; a quorum of phantoms therefore needs a configuration change that turns that minority into a majority of a new configuration, which is not measured and is the discriminator of the child question registered with this update. Limits: measured configuration is three voters, InmemStore plus FileSnapshotStore (and its monotonic wrapper), TrailingLogs=10 against a large control, an idle cluster with one write per 250ms sample, 3-4s windows and one induced partition; the follower's commit index stays 0 through the install path and is reported as an advertised-state inconsistency rather than an independent defect; production BoltDB-style stores, other TrailingLogs values, longer windows, larger clusters and the vote-decision consequence remain subject to their own receipts.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The untrimmed control accepted no snapshot, repaired the stale suffix with ordinary log entries and reached the cluster frontier in every run, so a stale suffix alone does not stall replication; the trimmed leader log together with the install path is the trigger.",
+        "A successful InstallSnapshot refreshes the follower's last contact, so the follower never campaigned: every receipt shows one stable leader set for the whole window with the follower's term fixed, so the starved state is stable rather than self-healing by election.",
+        "The starvation is bounded, not permanent: the repair probe shows recovery once a snapshot above the cached claim is published (claim 97, snapshot 98, follower then applied to the frontier), so the claim is that starvation lasts while the newest snapshot index stays at or below the claim.",
+        "The monotonic-store case empties the log store and still stalls, so the surviving on-disk suffix is not required for the defect; this narrows the cause to the cached log claim and the snapshot index relationship."
+      ],
+      "limitations": [
+        "Measured configuration only: three voters, InmemStore plus FileSnapshotStore (and its in-process monotonic wrapper), TrailingLogs=10 against a large control, an idle cluster with one write per 250ms sample, 3-4s windows and a single induced partition.",
+        "The vote-decision consequence of the phantom claim is source-derived; the child investigation @q_phantom_claim_vote_decision holds its discriminator, and the minority bound it relies on assumes no configuration change between the orphaned suffix and the snapshot install.",
+        "The follower's commit index was never advanced by the install path (0 while applied was 83) and is reported as an advertised-state inconsistency, not as an independent defect.",
+        "A production BoltDB-style monotonic store, other TrailingLogs values, larger clusters and longer windows are unmeasured."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

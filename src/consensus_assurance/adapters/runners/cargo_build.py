@@ -167,10 +167,22 @@ def diagnostics(text):
     finishes=[m.get('success') for m in messages if m.get('reason')=='build-finished']
     started=bool(re.search(r'(?m)^running [1-9][0-9]* tests?$',text))
     result=re.search(r'(?m)^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;',text)
+    tests=[];current=None
+    for line in text.splitlines():
+        match=re.match(r'^test (\S+) \.\.\.\s*(.*)$',line)
+        if match:
+            current={'name':match[1],'status':'unfinished'};tests.append(current)
+            line=match[2]
+        elif line.startswith('test result: '):current=None
+        if current is not None and re.fullmatch(r'ok|FAILED|ignored(?:, .*)?',line):
+            current['status']='passed' if line=='ok' else 'failed' if line=='FAILED' else 'skipped'
+    # A nocapture print can resemble a result; retain the last marker up to the
+    # next native test or summary, and leave an interrupted final test unknown.
+    if current is not None:current['status']='unfinished'
     return {'compiler_artifacts':artifacts, 'build_finished':finishes[-1] if finishes else None,
         'build_activity':bool(artifacts or re.search(r'(?m)^\s*Compiling ',text)),
         'test_started':started, 'test_passed':bool(result and int(result[1])>0),
-        'test_summary_recorded':bool(result)}
+        'test_summary_recorded':bool(result), 'observed_tests':tests}
 
 
 def tool_inputs(adapter,deadline=None):
@@ -390,23 +402,26 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
         if not expected.is_file():raise ValueError('Saved Cargo execution lost its fixed build inputs; cannot reconstruct them for result reuse')
     record=None;basis=None
     try:
-        record,basis=inputs(adapter,runner,snapshot_id,command,deadline)
         if executed:
             check=executed[0]
+            if not check.ended_at and not check.parameters.get('preparation_failure'):
+                raise ValueError('Target outcome unknown; same-action replay is prohibited; use an explicit new attempt')
+            verify(adapter,runner.root,snapshot_id,None if check.ended_at else deadline)
+            record=expected
             if check.parameters.get('preparation_failure'):return check
             if check.command!=sandbox_command(command,workspace,mode,adapter.read_only_roots(),VIEW):
                 raise ValueError('Saved Cargo execution command differs from the fixed input')
-            if not check.ended_at:raise ValueError('Target outcome unknown; same-action replay is prohibited; use an explicit new attempt')
             if 'lock_unchanged' in check.parameters and 'changed_target_files' in check.parameters:
                 return check
             # A raw process receipt cannot establish post-execution integrity. Do not
             # repair its workspace and then treat the repaired files as old evidence.
-            retain_diagnostics(check,output(check))
+            adapter.parse_test_result(check,output(check))
             check.parameters.update(execution_backend={'name':adapter.name,'version':adapter.version},
                 action_seconds=None,action_started_at=None,changed_target_files=None,build_inputs=str(record.relative_to(runner.root)))
             if check.status==ExecutionStatus.COMPLETED:check.status=ExecutionStatus.ERROR
             check.outcome='unknown';check.reason='Target receipt recovered without integrity postprocessing; no target replay; action total unrecorded'
             return check
+        record,basis=inputs(adapter,runner,snapshot_id,command,deadline)
         cached,receipt=seed(adapter,runner,snapshot_id,command,record,basis,deadline)
         if receipt['basis_digest']!=digest(record.read_bytes()):raise ValueError('Cargo seed belongs to different build inputs')
         lock=workspace/basis['lock']['path']
@@ -448,3 +463,15 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
     if prior:check.reason='; '.join(filter(None,[check.reason,'Interrupted action total unrecorded; original subprocess timings retained']))
     write_json(runner.root/'logs'/check.id/'check.json',check)
     return check
+
+
+def cleanup(workspace):
+    """Release controller-owned build copies only after evidence is durable."""
+    directory = workspace / '.execution'
+    if any(path.is_symlink() for path in (directory, workspace, *workspace.parents)):
+        raise ValueError('Cargo cleanup cannot traverse a linked workspace or execution directory')
+    for path in [directory / 'cargo-target', *directory.glob('cargo-copy-*')]:
+        if path.is_symlink():
+            raise ValueError('Cargo cleanup cannot follow linked build copies')
+        if path.is_dir():
+            shutil.rmtree(path)

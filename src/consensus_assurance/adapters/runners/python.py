@@ -12,8 +12,9 @@ class PythonBackend:
     def read_only_roots(self):
         return []
     def parse_test_result(self, check, text):
+        from consensus_assurance.core.types import ExecutionStatus
+        if check.status != ExecutionStatus.COMPLETED:return
         if any(message in text for message in ("SyntaxError:", "ModuleNotFoundError:", "ImportError:")):
-            from consensus_assurance.core.types import ExecutionStatus
             check.status = ExecutionStatus.ERROR
             check.reason = "Harness syntax or import error"
             return
@@ -24,9 +25,12 @@ class PythonBackend:
     def resolve_harness(self, harness, source, target_files):
         if harness.execution_package is not None:
             raise ValueError("Python does not support execution_package overrides")
+        if harness.test_names is not None:
+            raise ValueError("Python does not support test_names selection")
         return self.harness_filename
-    def experiment_command(self, execution_package=None, harness_filename=None):
+    def experiment_command(self, execution_package=None, harness_filename=None, test_names=None):
         if execution_package is not None:raise ValueError("Python does not support execution_package overrides")
+        if test_names is not None:raise ValueError("Python does not support test_names selection")
         return [sys.executable, harness_filename or self.harness_filename]
     def version_command(self):
         return [sys.executable, "--version"]

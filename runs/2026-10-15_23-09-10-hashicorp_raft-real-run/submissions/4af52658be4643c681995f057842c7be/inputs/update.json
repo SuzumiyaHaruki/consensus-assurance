@@ -1,0 +1,194 @@
+{
+  "rationale": "Read the child receipt (execution ca11633cbde949dba0da0b9950651148, exit 0, test passed): all four comparisons evaluate completely and hold, so the vote-decision half of @q_phantom_claim_vote_decision is decided - one identical RequestVote is granted by the phantom holder and rejected by the majority voter whose cached state matches its snapshot, and the granted candidate's last log term is below the phantom's snapshot term. With that half settled the remaining half is quorum reachability, so the harness gained a configuration-change probe: the same five-voter phantom history now attempts to remove either a phantom voter (leaving three consistent voters in the new quorum) or a consistent voter (leaving a new quorum that includes a phantom). Local construction runs show the first committing immediately and the second not committing within the five-second window under identical load, which both gives an operational consequence of the starvation and supports the argument that the same starvation blocks the steps that would turn the phantom group into a quorum. This update records that account and requests the config-change receipt.",
+  "sources": [
+    {
+      "id": "src_append_config",
+      "file": "raft.go",
+      "start_line": 1204,
+      "end_line": 1243,
+      "kind": "code_observation"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "2639ea661506490ab7af07a9fccc433b-question-0",
+      "source_ids": [
+        "src_get_last_entry",
+        "src_vote_log_check",
+        "src_install_snapshot_tail",
+        "src_append_config",
+        "src_append_prev_check"
+      ],
+      "executions": {
+        "ca11633cbde949dba0da0b9950651148": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "Present conclusion: the phantom log claim left by an accepted InstallSnapshot changes how a server decides votes, and the same starvation also blocks configuration changes whose new quorum would include such a server. Vote half, decided by the retained receipt (execution ca11633cbde949dba0da0b9950651148; setup at event index 0, probe at index 1): the shared prefix ends at 42, the deposed leader and one follower hold an uncommitted suffix to 82 in term 2, the majority leader's snapshot sits at 63 in term 3, and both minority members therefore cache a claim (82, term 2) above an installed snapshot (63, term 3) while a majority voter keeps a consistent claim (63, term 3). One RequestVote with term 4 and the candidate's real claim (82, term 2), carrying the leadership-transfer flag, was delivered to both: the phantom granted it (response term 4) and the consistent voter rejected it (response term 4, granted false), so the same request produced different decisions and the granted authority rested on entries the voter's own snapshot had superseded (candidate last log term 2 below snapshot term 3). Source basis for the difference: requestVote evaluates completeness with getLastEntry (src_request_vote, raft.go 1626-1758, test at 1725-1748), which prefers the cached claim whenever it is at or above the snapshot index (src_get_last_entry, state.go 160-174), and installSnapshot never resets that claim (src_install_snapshot_tail, raft.go 1837-1977). Reachability half: a phantom suffix lies beyond the commit index of its term, so its holders are a minority of that configuration, and the configuration steps that would make them a quorum are themselves blocked because a newly appended configuration commits under the new configuration's quorum (src_append_config, raft.go 1204-1243, which installs the new configuration into the commitment before the entry commits), and the phantom cannot acknowledge any AppendEntries because its cached claim fails every prev-log check (src_append_prev_check, raft.go 1458-1606). Local construction runs of the new probe show the asymmetry: removing a phantom voter committed immediately under the same load, while removing a consistent voter did not commit within five seconds, which is the first step of any shrink toward a phantom-only voter set. Limits: the config-change probe has no retained receipt yet; the described wedge of subsequent configuration changes stays source-derived and unmeasured; the vote half is measured in one five-voter history with the transfer flag, and a plain campaign never reaches the log test because the known-leader rejection fires first; configuration changes that are attempted before the phantom state arises, repeated phantom generations and larger clusters are unmeasured.",
+      "counterevidence": [
+        "The parent question's repair probe shows the phantom claim is a transient state within a term: a snapshot published above the claim restores consistency, so neither the vote effect nor the config-change effect persists once the leader's snapshot index passes the claim.",
+        "The blocked configuration change is also a protective interaction: the steps that would shrink the voter set down to the phantom group cannot commit, so the phantom grant cannot be converted into authority over committed entries through a configuration change in the measured history.",
+        "Both minority members hold the same phantom claim, so the candidate in the probe is a real node with a real log claim, not a synthetic one; the only supplied element is the leadership-transfer flag on its request."
+      ],
+      "limitations": [
+        "The vote decision is measured in one history; the config-change outcome is currently construction feedback only and its receipt is requested with this update.",
+        "The blocked removal leaves the leader with a locally adopted latest configuration that has not committed, which per source would also close the leader's configuration-change gate; that second-order wedge is unmeasured.",
+        "Configuration changes attempted before the phantom state arises, repeated phantom generations, other cluster sizes and production-style monotonic stores are unmeasured."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "2639ea661506490ab7af07a9fccc433b-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "source_ids": [
+      "src_get_last_entry",
+      "src_vote_log_check",
+      "src_install_snapshot_tail",
+      "src_append_config",
+      "src_append_prev_check"
+    ],
+    "anchors": [
+      {
+        "material_id": "src_append_config",
+        "symbol": "appendConfigurationEntry",
+        "start_line": 1204,
+        "end_line": 1243
+      },
+      {
+        "material_id": "src_get_last_entry",
+        "symbol": "getLastEntry",
+        "start_line": 167,
+        "end_line": 174
+      },
+      {
+        "material_id": "src_install_snapshot_tail",
+        "symbol": "installSnapshot",
+        "start_line": 1837,
+        "end_line": 1977
+      }
+    ],
+    "scope": {
+      "description": "Two cases built on the already validated five-voter phantom history: forty entries committed on all voters, the current leader and one follower partitioned together and given forty further entries that never reach a quorum of five, the remaining three voters electing a leader, committing twenty entries and publishing a snapshot at an index below the suffix end so both minority members become phantom holders after healing. One case then removes a phantom voter; the other removes a consistent follower. Both removals are issued on the majority leader and awaited for five seconds, and the phantom premise is recorded before the attempt.",
+      "assumptions": [
+        "Fault model unchanged: no message loss inside the injected transport; the induced events are one partition of two voters from three, retention of the minority suffix, one explicit snapshot, and one RemoveServer attempt.",
+        "The comparison between the two cases holds the history, snapshot index, timing and leader load identical; only the identity of the removed voter differs, and it is chosen so the new configuration's quorum either excludes or includes a phantom holder.",
+        "Reused facilities: MakeClusterCustom with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport and MockFSM."
+      ],
+      "excluded": [
+        "No production logic was modified; the harness only adds test code.",
+        "Automatic snapshotting is disabled so the published snapshot index is controlled by the explicit Snapshot() call."
+      ],
+      "parameters": {
+        "peers": 5,
+        "pre_entries": 40,
+        "orphan_writes": 40,
+        "post_entries": 20,
+        "trailing_logs": 10,
+        "config_change_wait_ms": 5000
+      }
+    },
+    "prefix": "Each case repeats the phantom setup: elect a leader in a five-voter cluster, commit forty entries, partition the leader with one follower, drive forty further applies on the deposed leader so the pair shares an uncommitted suffix, wait for the pair to stop leading, wait for one of the remaining three to be the only stable leader, commit twenty entries there and force Snapshot(), heal the partition and wait until both minority members have installed the snapshot. The case then records the premise (claim above snapshot on both minority members, consistent claim on a majority voter) and issues RemoveServer on the majority leader for either a phantom holder or a consistent follower, waiting up to five seconds for the future and recording whether it committed, the elapsed time, the configuration sizes the leader reports before and after, and whether the removed voter held a phantom claim.",
+    "test_names": [
+      "TestAssurance_ConfigChangeRemovePhantom",
+      "TestAssurance_ConfigChangeRemoveConsistent"
+    ],
+    "requirement": "A configuration change must either commit or fail observably within a bounded time rather than block indefinitely because a voter whose cached log claim was superseded by its own snapshot can no longer accept log entries.",
+    "responsibility": "target",
+    "prerequisites": [
+      {
+        "alias": "phantom_removal_setup",
+        "event": "ca_vote_setup",
+        "conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-phantom"
+          },
+          {
+            "field": "premise_phantom_claims",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "alias": "consistent_removal_setup",
+        "event": "ca_vote_setup",
+        "conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-consistent"
+          },
+          {
+            "field": "premise_phantom_claims",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "ca_config_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "phantom_removal_setup",
+        "assertion": {
+          "field": "config_change_committed",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Removing a phantom voter commits promptly: the remaining configuration still contains three voters that accept entries.",
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-phantom"
+          },
+          {
+            "field": "target_is_phantom",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      {
+        "event": "ca_config_probe",
+        "identity_fields": [
+          "target_id"
+        ],
+        "admission_alias": "consistent_removal_setup",
+        "assertion": {
+          "field": "config_change_committed",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Removing a consistent voter does not commit within the window: the new configuration's quorum includes a phantom holder, so the entry can never gather its acknowledgements.",
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-consistent"
+          },
+          {
+            "field": "target_is_phantom",
+            "op": "eq",
+            "value": false
+          }
+        ]
+      }
+    ],
+    "previous_id": "d5c4b2446ee345c4982d77fafedd380e-experiment",
+    "revision_reason": "The vote-decision comparisons are decided, so the harness now covers the reachability half instead of repeating them: the same five-voter phantom setup gained an optional RemoveServer attempt on either a phantom holder or a consistent follower, and only those two cases are selected. The vote probe and the earlier cases stay in the file for reuse.",
+    "semantic_changes": [
+      "The phantom scenario gained an optional configuration-change attempt selecting the removed voter's role, with a five-second bounded wait and the leader's reported configuration sizes recorded before and after.",
+      "Two new comparison subjects: a removal that commits when a quorum of consistent voters remains, and a removal that does not commit when the new quorum needs a phantom holder."
+    ]
+  }
+}

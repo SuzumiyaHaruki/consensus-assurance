@@ -1,0 +1,220 @@
+{
+  "rationale": "Construction and execution request for the registered question. I built a focused three-case probe for the actor layer (draft/harness_notify.rs) and validated it locally in a scratch copy of the captured tree (native feedback only, not retained evidence): a control case where the entry is replicated and decided, and two partition cases that differ *only* in actor tick period. Locally, the same lost-entry state resolved `Superseded` with 2 ms ticks (3/3 runs) and `Ok(assigned_idx)` with 80 ms ticks (5/5 runs) while the decided entry at that index was the new leader's entry, so the proposed inference is now narrower than first registered: the Ok arm shadows the documented Superseded resolution not automatically, but exactly when the origin's promise change and its decided-index advance both land inside one tick period. This update registers that refinement on the existing question, adds the two source anchors used for the tick quantisation, and submits the harness as the fixed experiment. The experiment switches the crate basis to `omnipaxos_runtime` because the harness configured for this run (`omnipaxos/tests/assurance_generated.rs`, crate `omnipaxos`) cannot link the actor layer at all; the build basis for that crate is not listed in build_inputs, so this execution is a first attempt on an unprepared target.",
+  "sources": [
+    {
+      "id": "actor_run_tick_branch",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 682,
+      "end_line": 692,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_cmd_append_notify",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 599,
+      "end_line": 621,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": [
+        "actor_drain_notifiers",
+        "actor_record_assignment",
+        "actor_pending_assigned_field",
+        "actor_append_tracked",
+        "handle_append_notify_contract",
+        "event_superseded_contract",
+        "actor_run_tick_branch",
+        "actor_cmd_append_notify"
+      ],
+      "hypothesis": "Refined: drain_notifiers is the only place that resolves a pending append_notify, and it is called only from the actor's tick branch, so the resolution instant is quantised by tick_period. The Ok arm compares only the assigned index against the local decided index, with the assignment ballot unused, and it is evaluated before the ballot-change arm; the Superseded arm therefore decides only when a tick falls between the origin's promise change and the origin's decided-index advance past the assigned index. When both updates land inside one tick period (tick period much larger than the one-round-trip gap between the Prepare and the AcceptSync that re-synchronizes the origin), the first arm wins and a caller whose entry was accepted only locally by a replaced leader receives Ok(assigned_idx) although the decided log at that index holds the new leader's entry.",
+      "discriminator": "Pending: the fixed execution of the registered probe. It changes the judgment if mode C resolves Superseded or Timeout rather than Ok, if the decided entry at the returned index equals the caller's submitted value, or if the origin's decided index never reaches the assigned index, and it changes the schedule-dependence claim if mode B (2 ms ticks) also resolves Ok with a different entry at that index.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+    "harness_path": "omnipaxos_runtime/tests/assurance_generated.rs",
+    "files": {},
+    "execution_package": "./omnipaxos_runtime",
+    "test_names": null,
+    "source_ids": [
+      "actor_drain_notifiers",
+      "actor_record_assignment",
+      "actor_pending_assigned_field",
+      "actor_append_tracked",
+      "handle_append_notify_contract",
+      "event_superseded_contract",
+      "actor_run_tick_branch",
+      "actor_cmd_append_notify"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One real in-process cluster shape (three OmniPaxos actors over an in-memory transport, majority quorum, batch_size 1, node 1 forced into the leader role), run three times with different admissions. Mode A (control): no partition, so entry 11 appended through the origin is replicated and decided normally. Modes B and C: node 1's links to both followers are cut in both directions, node 1 - still the leader in the accept phase - takes entry 11 (so it can only be accepted locally and assigned an index), the two followers elect node 3, which decides entry 22 at the same first index, and node 1 is then reconnected so the new leader re-synchronizes it. B and C differ only in the actor tick period (2 ms vs 80 ms), which controls whether a drain_notifiers pass can run between the origin's promise change and its decided-index advance.",
+      "assumptions": [
+        "Message loss/partition is a permitted fault for this protocol; the core tolerates lost messages via its resend path, and the harness drops whole messages inside the transport without adding backpressure.",
+        "Each node is a real OmniPaxos instance with MemoryStorage, batch_size 1 and a majority quorum, driven only through the public actor handle; no target logic is modified.",
+        "Node 1 carries leader_priority 1 so the pre-partition leader is stable; a higher priority only breaks ties at equal ballot number, and in modes B/C the followers reach a strictly higher ballot number through the election-timeout takeover path, so the priority cannot prevent the new election.",
+        "drain_notifiers runs only from the tick branch, so the resolution instant is quantised by tick_period; the gap between the origin's Prepare handling and the AcceptSync that follows it is one round trip (about 2-4 ms here)."
+      ],
+      "excluded": [
+        "Any claim about entries other than the two submitted values (11 by the origin, 22 by the new leader).",
+        "Any claim about transports, runtimes or timings other than the in-process in-memory transport used here.",
+        "Durable/crash recovery: the origin is re-synchronized in-process, it is not restarted, so no storage-persistence claim follows from these cases."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "cluster_configuration_id": 1,
+        "batch_size": 1,
+        "quorum": "majority",
+        "leader_priority": {
+          "1": 1,
+          "2": 0,
+          "3": 0
+        },
+        "tick_ms": {
+          "A": 2,
+          "B": 2,
+          "C": 80
+        },
+        "egress_ms": 1,
+        "election_tick_timeout": 3,
+        "resend_message_tick_timeout": {
+          "A": 5,
+          "B": 5,
+          "C": 4
+        },
+        "append_notify_timeout_s": {
+          "A": 20,
+          "B": 20,
+          "C": 60
+        }
+      }
+    },
+    "prefix": "Per case: build three OmniPaxos instances (pids 1..3, configuration_id 1, nodes [1,2,3], MemoryStorage, batch_size 1, election_tick_timeout 3, node 1 leader_priority 1) and spawn each as an actor through spawn_actor with a tokio-backed AsyncRuntime adapter (tick_period per case, egress_period 1 ms). Wire every node's outgoing_messages() receiver into a task that consults a per-direction block set and, unless the link is blocked, delivers the message with peer.handle_incoming(). Admission: call handles[1].try_become_leader() until all three nodes report current_leader() == (1, true) and still do so after four election timeouts; emit the admission event with the mode. Mode A: await handles[1].append_notify(TestEntry(11)) and then read the origin's decided suffix. Modes B/C: block (1,2) and (1,3) both ways, spawn handles[1].append_notify(TestEntry(11)) as a task, sleep one tick period, wait until nodes 2 and 3 both report a leader other than 1 with accepted=true, await handles[new_leader].append_notify(TestEntry(22)), then unblock both links and await the origin's future. Emit new_leader_elected, new_leader_append (with the new leader's decided values) and notify_resolution, the last carrying the resolved variant (ok / superseded / timeout / ...), the assigned index, the decided entry at that index and, only when that index was actually observed in the decided log, whether it equals the submitted value.",
+    "semantic_changes": [
+      "Cases A, B and C share one invocation and are separated by admission only: A has no partition, B and C use the identical partition and differ solely in tick_ms (2 vs 80)."
+    ],
+    "requirement": null,
+    "responsibility": "The decisive inputs are produced by the target itself: the actor assigns the caller's entry an index from its own local accept as leader, records the assignment as (index, ballot) with no entry identity, and drain_notifiers derives the resolution from the local decided index alone, evaluating the Ok arm before the ballot-change arm. The caller supplies only the entry value.",
+    "prerequisites": [
+      {
+        "alias": "admission_a",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "A",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_b",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "B",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_c",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "C",
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "notify_resolution",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "entry_equals_submitted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "resolved",
+          "op": "eq",
+          "value": "ok",
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "Control: without a partition the success resolution names an index whose decided entry is the caller's entry."
+      },
+      {
+        "event": "notify_resolution",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "resolved",
+          "op": "eq",
+          "value": "superseded",
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Same lost-entry setup with a 2 ms tick: the documented heuristic resolution is the one delivered."
+      },
+      {
+        "event": "notify_resolution",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_c",
+        "assertion": {
+          "field": "entry_equals_submitted",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "resolved",
+          "op": "eq",
+          "value": "ok",
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "Same lost-entry setup with an 80 ms tick: if the resolution is Ok, the returned index must hold the caller's entry. A false value is the violating witness; if mode C resolves anything else, the antecedent does not hold and the assertion is not applicable."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

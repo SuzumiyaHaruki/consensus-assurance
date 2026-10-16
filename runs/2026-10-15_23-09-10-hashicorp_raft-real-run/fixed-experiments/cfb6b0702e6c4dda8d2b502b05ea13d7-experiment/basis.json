@@ -1,0 +1,442 @@
+{
+  "id": "cfb6b0702e6c4dda8d2b502b05ea13d7-experiment",
+  "investigation_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+  "version": 2,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caClose shuts the cluster down with a bounded wait. The stock cluster helper\n// panics if a replication goroutine is still inside a long snapshot RPC, which\n// is a teardown artifact rather than an observation, so keep the exit path\n// finite and still clean the temporary directories.\nfunc caClose(c *cluster) {\n\tvar futures []Future\n\tfor _, r := range c.rafts {\n\t\tfutures = append(futures, r.Shutdown())\n\t}\n\tdone := make(chan struct{})\n\tgo func() {\n\t\tdefer close(done)\n\t\tfor _, f := range futures {\n\t\t\t_ = f.Error()\n\t\t}\n\t}()\n\tselect {\n\tcase <-done:\n\tcase <-time.After(3 * time.Second):\n\t}\n\tfor _, d := range c.dirs {\n\t\t_ = os.RemoveAll(d)\n\t}\n}\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, tag string, trailing uint64, orphanWrites int) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                      tag,\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, tag, trailing, orphanWrites)\n\tdefer caClose(c)\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tfor time.Since(start) < window {\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t}, \"ca_probe\")\n\n\t// Stop the induced snapshot pressure before teardown so the shutdown path\n\t// stays bounded; this runs after every measured sample.\n\tc.Disconnect(victim.localAddr)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssurance_StaleSuffixAfterInstallSnapshot",
+        "TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix"
+      ],
+      "description": "",
+      "semantic_changes": [
+        "ca_setup now emits tag ('trimmed'/'untrimmed') so the prerequisite alias conditions can associate the admission event with the measured ca_probe.",
+        "Teardown disconnects the victim after the measured window and waits with a bounded timeout instead of the stock cluster helper's panic-on-timeout path."
+      ],
+      "prerequisites": [
+        {
+          "alias": "trimmed_setup",
+          "event": "ca_setup",
+          "conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "trimmed",
+              "reference": null
+            },
+            {
+              "field": "premise_stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "untrimmed_setup",
+          "event": "ca_setup",
+          "conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "untrimmed",
+              "reference": null
+            },
+            {
+              "field": "premise_stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "src_install_snapshot_tail",
+      "src_get_last_entry",
+      "src_append_prev_check",
+      "src_compaction",
+      "src_replicate_failure",
+      "src_send_snapshot_result"
+    ],
+    "anchors": [
+      {
+        "material_id": "src_install_snapshot_tail",
+        "symbol": "installSnapshot",
+        "start_line": 1837,
+        "end_line": 1977,
+        "anchor": {
+          "source_ids": [
+            "src_install_snapshot_tail"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_install_snapshot_tail",
+          "start_line": 1837,
+          "end_line": 1837,
+          "symbol": "installSnapshot"
+        }
+      },
+      {
+        "material_id": "src_get_last_entry",
+        "symbol": "getLastEntry",
+        "start_line": 167,
+        "end_line": 174,
+        "anchor": {
+          "source_ids": [
+            "src_get_last_entry"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_get_last_entry",
+          "start_line": 167,
+          "end_line": 167,
+          "symbol": "getLastEntry"
+        }
+      },
+      {
+        "material_id": "src_append_prev_check",
+        "symbol": "appendEntries",
+        "start_line": 1458,
+        "end_line": 1606,
+        "anchor": {
+          "source_ids": [
+            "src_append_prev_check"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_append_prev_check",
+          "start_line": 1458,
+          "end_line": 1458,
+          "symbol": "appendEntries"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Two real three-voter cluster histories in one process, unchanged from the first run: a leader is isolated and appends entries that never reach a quorum, is shut down, and the remaining voters elect a leader, commit further entries and take a snapshot; the isolated node is then restarted on its unchanged in-memory log store and reconnected. In the trimmed case the leader's store is compacted to TrailingLogs=10 so only the snapshot can repair the follower; in the control TrailingLogs is large so entries repair it. Each case samples the victim's restores, applied index, commit index, cached last log entry, last snapshot and store range, plus the cluster frontier, for a 3s window with steady new writes.",
+      "assumptions": [
+        "Fault model: no message loss inside the injected transport; the only induced event is a full transport partition of one voter plus its clean shutdown and restart on the same stores.",
+        "Reused facilities: MakeClusterCustom/MakeClusterOpts with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport, MockFSM wrapped by a counting Restore, and the NewRaft restart pattern used by TestRaft_SnapshotRestore_Progress.",
+        "The victim's orphan suffix is produced by real Apply calls it accepted as leader while partitioned and is preserved because the restarted node replays its real log store.",
+        "Teardown now disconnects the victim after the measured window and waits with a bounded timeout instead of the stock cluster helper's panic-on-timeout path; this runs after every sampled value is recorded and does not affect the measurements."
+      ],
+      "excluded": [
+        "No production logic was modified; the harness only adds a test file.",
+        "Automatic snapshotting is disabled (SnapshotThreshold huge, SnapshotInterval 1h) so the leader's snapshot index is controlled by the explicit Snapshot() call."
+      ],
+      "parameters": {
+        "peers": 3,
+        "pre_entries": 60,
+        "orphan_writes": 60,
+        "post_entries": 20,
+        "window_ms": 3000,
+        "sample_step_ms": 250,
+        "trailing_logs_trimmed": 10,
+        "trailing_logs_control": 1000000
+      }
+    },
+    "prefix": "The harness builds the cluster with MakeClusterCustom (counting FSM), commits 60 entries, partitions the leader with c.Partition, fires 60 applies on it so they are appended locally without a quorum, waits for it to step down, shuts it down with Shutdown().Error(), waits for one of the remaining voters to be the only stable leader, commits 20 further entries, forces Snapshot(), records the snapshot and the trimmed store range, restarts the victim with NewRaft on its original stores and a fresh InmemTransport, reconnects it to both other transports, emits ca_setup carrying tag plus the premise fields, waits until the victim's applied index reaches the snapshot index, then samples every 250ms for 3s while applying one entry per sample on whichever node is leader, emits ca_probe with the raw values and derived booleans, and finally disconnects the victim before bounded teardown.",
+    "requirement": "A follower that reinstalls the leader's snapshot must remain able to accept subsequent log entries from that leader, or its cached log state must not claim entries the snapshot superseded.",
+    "responsibility": "target",
+    "comparisons": [
+      {
+        "event": "ca_probe",
+        "identity_fields": [
+          "victim_id"
+        ],
+        "admission_alias": "trimmed_setup",
+        "assertion": {
+          "field": "repeated_snapshot_installs",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "leader_snapshot_is_unchanged",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Trimmed case: the follower's FSM was restored again after the first install, i.e. the same snapshot index was re-shipped during the window, while the leader's snapshot index is unchanged."
+      },
+      {
+        "event": "ca_probe",
+        "identity_fields": [
+          "victim_id"
+        ],
+        "admission_alias": "trimmed_setup",
+        "assertion": {
+          "field": "victim_not_caught_up",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "repeated_snapshot_installs",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Trimmed case progress predicate: after the window the follower's applied index is still below the cluster frontier even though new entries committed and were applied elsewhere."
+      },
+      {
+        "event": "ca_probe",
+        "identity_fields": [
+          "victim_id"
+        ],
+        "admission_alias": "trimmed_setup",
+        "assertion": {
+          "field": "stale_claim_persists",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Trimmed case: the follower's cached last log index is still at or beyond the installed snapshot index with a lower term, and its store still holds that suffix."
+      },
+      {
+        "event": "ca_probe",
+        "identity_fields": [
+          "victim_id"
+        ],
+        "admission_alias": "untrimmed_setup",
+        "assertion": {
+          "field": "repeated_snapshot_installs",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: with an untrimmed leader log no snapshot is installed, separating the trigger from the existence of a stale suffix."
+      },
+      {
+        "event": "ca_probe",
+        "identity_fields": [
+          "victim_id"
+        ],
+        "admission_alias": "untrimmed_setup",
+        "assertion": {
+          "field": "victim_not_caught_up",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: the same cluster history without log trimming is repaired by log entries alone and the follower reaches the cluster frontier."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "c9744ca943f84cfa87d7b8b60af36bc0",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "cfb6b0702e6c4dda8d2b502b05ea13d7",
+  "previous_id": "16679315c63a4e5abc44cbb3c9dd0c09-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, trailing uint64, orphanWrites int) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, trailing, orphanWrites)\n\tdefer c.Close()\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tfor time.Since(start) < window {\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t}, \"ca_probe\")\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "test_names": [
+          "TestAssurance_StaleSuffixAfterInstallSnapshot",
+          "TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix"
+        ],
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "trimmed_setup",
+            "event": "ca_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "trimmed",
+                "reference": null
+              },
+              {
+                "field": "premise_stale_suffix",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "untrimmed_setup",
+            "event": "ca_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "untrimmed",
+                "reference": null
+              },
+              {
+                "field": "premise_stale_suffix",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caClose shuts the cluster down with a bounded wait. The stock cluster helper\n// panics if a replication goroutine is still inside a long snapshot RPC, which\n// is a teardown artifact rather than an observation, so keep the exit path\n// finite and still clean the temporary directories.\nfunc caClose(c *cluster) {\n\tvar futures []Future\n\tfor _, r := range c.rafts {\n\t\tfutures = append(futures, r.Shutdown())\n\t}\n\tdone := make(chan struct{})\n\tgo func() {\n\t\tdefer close(done)\n\t\tfor _, f := range futures {\n\t\t\t_ = f.Error()\n\t\t}\n\t}()\n\tselect {\n\tcase <-done:\n\tcase <-time.After(3 * time.Second):\n\t}\n\tfor _, d := range c.dirs {\n\t\t_ = os.RemoveAll(d)\n\t}\n}\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, tag string, trailing uint64, orphanWrites int) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                      tag,\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, tag, trailing, orphanWrites)\n\tdefer caClose(c)\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tfor time.Since(start) < window {\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t}, \"ca_probe\")\n\n\t// Stop the induced snapshot pressure before teardown so the shutdown path\n\t// stays bounded; this runs after every measured sample.\n\tc.Disconnect(victim.localAddr)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "test_names": [
+          "TestAssurance_StaleSuffixAfterInstallSnapshot",
+          "TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix"
+        ],
+        "description": "",
+        "semantic_changes": [
+          "ca_setup now emits tag ('trimmed'/'untrimmed') so the prerequisite alias conditions can associate the admission event with the measured ca_probe.",
+          "Teardown disconnects the victim after the measured window and waits with a bounded timeout instead of the stock cluster helper's panic-on-timeout path."
+        ],
+        "prerequisites": [
+          {
+            "alias": "trimmed_setup",
+            "event": "ca_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "trimmed",
+                "reference": null
+              },
+              {
+                "field": "premise_stale_suffix",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "untrimmed_setup",
+            "event": "ca_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "untrimmed",
+                "reference": null
+              },
+              {
+                "field": "premise_stale_suffix",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Two real three-voter cluster histories in one process: a leader is isolated and appends entries that never reach a quorum, is shut down, and the remaining voters elect a leader, commit further entries and take a snapshot; the isolated node is then restarted on its unchanged in-memory log store and reconnected. In the trimmed case the leader's log store is compacted to TrailingLogs=10 so it can only repair by shipping that snapshot; in the control TrailingLogs is large so entries alone can repair. Each case samples the victim's restores, applied index, commit index, cached last log entry, last snapshot and store range, plus the cluster frontier, for a 3s window with steady new writes.",
+        "assumptions": [
+          "Fault model: no message loss inside the injected transport; the only induced event is a full transport partition of one voter plus its clean shutdown and restart on the same stores.",
+          "Reused facilities: MakeClusterCustom/MakeClusterOpts with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport, MockFSM wrapped by a counting Restore, and the NewRaft restart pattern used by TestRaft_SnapshotRestore_Progress.",
+          "The victim's orphan suffix is produced by real Apply calls it accepted as leader while partitioned, and it is kept because the restarted node replays its real log store."
+        ],
+        "excluded": [
+          "No production logic was modified; the harness only adds a test file.",
+          "Automatic snapshotting is disabled (SnapshotThreshold huge, SnapshotInterval 1h) so the leader's snapshot index is controlled by the explicit Snapshot() call."
+        ],
+        "parameters": {
+          "peers": 3,
+          "pre_entries": 60,
+          "orphan_writes": 60,
+          "post_entries": 20,
+          "window_ms": 3000,
+          "sample_step_ms": 250,
+          "trailing_logs_trimmed": 10,
+          "trailing_logs_control": 1000000
+        }
+      },
+      "after": {
+        "description": "Two real three-voter cluster histories in one process, unchanged from the first run: a leader is isolated and appends entries that never reach a quorum, is shut down, and the remaining voters elect a leader, commit further entries and take a snapshot; the isolated node is then restarted on its unchanged in-memory log store and reconnected. In the trimmed case the leader's store is compacted to TrailingLogs=10 so only the snapshot can repair the follower; in the control TrailingLogs is large so entries repair it. Each case samples the victim's restores, applied index, commit index, cached last log entry, last snapshot and store range, plus the cluster frontier, for a 3s window with steady new writes.",
+        "assumptions": [
+          "Fault model: no message loss inside the injected transport; the only induced event is a full transport partition of one voter plus its clean shutdown and restart on the same stores.",
+          "Reused facilities: MakeClusterCustom/MakeClusterOpts with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport, MockFSM wrapped by a counting Restore, and the NewRaft restart pattern used by TestRaft_SnapshotRestore_Progress.",
+          "The victim's orphan suffix is produced by real Apply calls it accepted as leader while partitioned and is preserved because the restarted node replays its real log store.",
+          "Teardown now disconnects the victim after the measured window and waits with a bounded timeout instead of the stock cluster helper's panic-on-timeout path; this runs after every sampled value is recorded and does not affect the measurements."
+        ],
+        "excluded": [
+          "No production logic was modified; the harness only adds a test file.",
+          "Automatic snapshotting is disabled (SnapshotThreshold huge, SnapshotInterval 1h) so the leader's snapshot index is controlled by the explicit Snapshot() call."
+        ],
+        "parameters": {
+          "peers": 3,
+          "pre_entries": 60,
+          "orphan_writes": 60,
+          "post_entries": 20,
+          "window_ms": 3000,
+          "sample_step_ms": 250,
+          "trailing_logs_trimmed": 10,
+          "trailing_logs_control": 1000000
+        }
+      }
+    },
+    "prefix": {
+      "before": "The harness builds the cluster with MakeClusterCustom (counting FSM), commits 60 entries, partitions the leader with c.Partition, fires 60 applies on it so they are appended locally without a quorum, waits for it to step down, shuts it down with Shutdown().Error(), waits for one of the remaining voters to be the only stable leader, commits 20 further entries, forces Snapshot(), records the snapshot and the trimmed store range, restarts the victim with NewRaft on its original stores and a fresh InmemTransport, reconnects it to both other transports, emits ca_setup with the premise fields, waits until the victim's applied index reaches the snapshot index, then samples every 250ms for 3s while applying one entry per sample on whichever node is leader, and finally emits ca_probe with the raw values and derived booleans.",
+      "after": "The harness builds the cluster with MakeClusterCustom (counting FSM), commits 60 entries, partitions the leader with c.Partition, fires 60 applies on it so they are appended locally without a quorum, waits for it to step down, shuts it down with Shutdown().Error(), waits for one of the remaining voters to be the only stable leader, commits 20 further entries, forces Snapshot(), records the snapshot and the trimmed store range, restarts the victim with NewRaft on its original stores and a fresh InmemTransport, reconnects it to both other transports, emits ca_setup carrying tag plus the premise fields, waits until the victim's applied index reaches the snapshot index, then samples every 250ms for 3s while applying one entry per sample on whichever node is leader, emits ca_probe with the raw values and derived booleans, and finally disconnects the victim before bounded teardown."
+    },
+    "knowledge": {
+      "before": [
+        {
+          "entry_id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-0",
+          "revision": 1,
+          "assertion": "the install path leaves the cached last log entry untouched"
+        },
+        {
+          "entry_id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-1",
+          "revision": 1,
+          "assertion": "the stale claim is preferred over the installed snapshot"
+        },
+        {
+          "entry_id": "16679315c63a4e5abc44cbb3c9dd0c09-knowledge-2",
+          "revision": 1,
+          "assertion": "leader repair degenerates into re-shipping the same snapshot"
+        }
+      ],
+      "after": []
+    }
+  },
+  "revision_reason": "The first run's comparisons all resolved unknown because the admission event ca_setup omitted the mode field `tag` used by the trimmed_setup/untrimmed_setup alias conditions, so no admission could be associated; teardown could also race the leader's long-running InstallSnapshot RPC and panic the stock cluster helper. The harness now emits tag in ca_setup and tears down with a bounded wait after disconnecting the victim. Scenario, stores, comparisons, assertions, anchors and test selection are unchanged."
+}

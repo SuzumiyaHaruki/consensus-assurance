@@ -1,0 +1,600 @@
+{
+  "id": "649c070d44144ba8a0ec3a9e362bfa72-experiment",
+  "investigation_id": "2639ea661506490ab7af07a9fccc433b-question-0",
+  "version": 3,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caClose shuts the cluster down with a bounded wait. The stock cluster helper\n// panics if a replication goroutine is still inside a long snapshot RPC, which\n// is a teardown artifact rather than an observation, so keep the exit path\n// finite and still clean the temporary directories.\nfunc caClose(c *cluster) {\n\tvar futures []Future\n\tfor _, r := range c.rafts {\n\t\tfutures = append(futures, r.Shutdown())\n\t}\n\tdone := make(chan struct{})\n\tgo func() {\n\t\tdefer close(done)\n\t\tfor _, f := range futures {\n\t\t\t_ = f.Error()\n\t\t}\n\t}()\n\tselect {\n\tcase <-done:\n\tcase <-time.After(3 * time.Second):\n\t}\n\tfor _, d := range c.dirs {\n\t\t_ = os.RemoveAll(d)\n\t}\n}\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, tag string, trailing uint64, orphanWrites int, monotonic bool) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMonotonicLogs: monotonic,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                      tag,\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int, monotonic bool, repairAfter time.Duration) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, tag, trailing, orphanWrites, monotonic)\n\tdefer caClose(c)\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tvar (\n\t\trepairDone            bool\n\t\tappliedBeforeRepair   uint64\n\t\trestoresBeforeRepair  int64\n\t\tclusterBeforeRepair   uint64\n\t\tclaimAtRepair         uint64\n\t\tnewSnapshotIndex      uint64\n\t)\n\tfor time.Since(start) < window {\n\t\tif repairAfter > 0 && !repairDone && time.Since(start) >= repairAfter {\n\t\t\t// Boundary probe: keep writing until the leader's applied index passes\n\t\t\t// the follower's stale claim, then publish a snapshot at that higher\n\t\t\t// index and let the leader offer it. If the account is right, the\n\t\t\t// follower's prev-log checks start matching again once the installed\n\t\t\t// snapshot index exceeds its cached claim.\n\t\t\tappliedBeforeRepair = victim.getLastApplied()\n\t\t\trestoresBeforeRepair = victimFSM.restoreCount()\n\t\t\tclusterBeforeRepair = caMaxApplied(c.rafts)\n\t\t\tclaimAtRepair, _ = victim.getLastLog()\n\t\t\tfor i := 0; i < 80 && leader.getState() == Leader && leader.getLastApplied() <= claimAtRepair; i++ {\n\t\t\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"repair-%03d\", i)), time.Second).Error(); err != nil {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t\tif sf := leader.Snapshot(); sf != nil {\n\t\t\t\tif err := sf.Error(); err == nil {\n\t\t\t\t\tif snaps, err := leader.snapshots.List(); err == nil && len(snaps) > 0 {\n\t\t\t\t\t\tnewSnapshotIndex = snaps[0].Index\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\trepairDone = true\n\t\t}\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t\t\"monotonic_log_store\":          monotonic,\n\t\t\"repair_attempted\":             repairDone,\n\t\t\"victim_claim_at_repair\":       claimAtRepair,\n\t\t\"victim_applied_before_repair\": appliedBeforeRepair,\n\t\t\"victim_restores_before_repair\": restoresBeforeRepair,\n\t\t\"cluster_max_applied_before_repair\": clusterBeforeRepair,\n\t\t\"stall_observed_before_repair\": repairDone && appliedBeforeRepair < clusterBeforeRepair && restoresBeforeRepair > startRestores,\n\t\t\"new_snapshot_index_after_repair\": newSnapshotIndex,\n\t\t\"victim_caught_up_within_window\": endApplied+3 >= clusterMax,\n\t}, \"ca_probe\")\n\n\t// Stop the induced snapshot pressure before teardown so the shutdown path\n\t// stays bounded; this runs after every measured sample.\n\tc.Disconnect(victim.localAddr)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60, false, 0)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60, false, 0)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot_MonotonicStore repeats the\n// trimmed case with a MonotonicLogStore, where the install path deletes the\n// whole log store instead of keeping a suffix above the snapshot index.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot_MonotonicStore(t *testing.T) {\n\tcaRunProbe(t, \"trimmed-monotonic\", 3*time.Second, 10, 60, true, 0)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot_HigherSnapshotRepairs probes the\n// boundary of the stall: once the leader commits past the follower's stale\n// claim and publishes a snapshot above it, the follower is expected to accept\n// entries again.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot_HigherSnapshotRepairs(t *testing.T) {\n\tcaRunProbe(t, \"trimmed-repair\", 4*time.Second, 10, 60, false, 1200*time.Millisecond)\n}\n\n// caPhantomVoteProbe builds a five-voter cluster in which the deposed leader and\n// one follower keep an uncommitted suffix while the other three voters commit a\n// newer term and publish a snapshot below that suffix, then delivers one\n// RequestVote (the stale follower's real log claim, carrying the\n// leadership-transfer flag so the known-leader rejection cannot mask the\n// log-completeness test) to a phantom holder and to a voter whose cached state\n// matches its snapshot.\nfunc caPhantomVoteProbe(t *testing.T, tag string, orphanWrites, postEntries int, configChange string) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       5,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\tdefer caClose(c)\n\n\tlead := c.Leader()\n\t_ = c.WaitForFollowers(4)\n\tfor i := 0; i < 40; i++ {\n\t\tif err := lead.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"pre apply: %v\", err)\n\t\t}\n\t}\n\n\tvar others []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != lead {\n\t\t\tothers = append(others, r)\n\t\t}\n\t}\n\tstaleFollower := others[0]\n\tmajority := others[1:]\n\tsharedLast := lead.LastIndex()\n\n\t// Isolate the deposed leader together with one follower; the pair is still a\n\t// minority of five, so the suffix they exchange is never committed.\n\tc.Partition([]ServerAddress{lead.localAddr, staleFollower.localAddr})\n\tbase := lead.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = lead.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif lead.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) &&\n\t\t(staleFollower.LastIndex() < lead.LastIndex() || lead.getState() == Leader) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tsuffixLast := lead.LastIndex()\n\t_, suffixTerm := lead.getLastLog()\n\n\tnewLeader := caWaitLeader(majority, 5*time.Second)\n\tif newLeader == nil {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no majority leader\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tfor i := 0; i < postEntries; i++ {\n\t\tif err := newLeader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0).Error(); err != nil {\n\t\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"post apply failed\"}, \"ca_vote_skipped\")\n\t\t\treturn\n\t\t}\n\t}\n\tif err := newLeader.Snapshot().Error(); err != nil {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"snapshot failed\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tsnaps, err := newLeader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no snapshot\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tleaderSnap := snaps[0]\n\n\t// Heal the partition and let the minority members install the snapshot, which\n\t// sits below the suffix they still claim.\n\tc.FullyConnect()\n\tinstalled := func(r *Raft) bool {\n\t\tidx, _ := r.getLastSnapshot()\n\t\treturn idx > 0\n\t}\n\tinstallDeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(installDeadline) && !(installed(lead) && installed(staleFollower)) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tphantomClaimIdx, phantomClaimTerm := lead.getLastLog()\n\tphantomSnapIdx, phantomSnapTerm := lead.getLastSnapshot()\n\tphantomApplied := lead.getLastApplied()\n\tsecondClaimIdx, secondClaimTerm := staleFollower.getLastLog()\n\tsecondSnapIdx, _ := staleFollower.getLastSnapshot()\n\tconsistent := newLeader\n\tfor _, r := range majority {\n\t\tif r != newLeader {\n\t\t\tconsistent = r\n\t\t\tbreak\n\t\t}\n\t}\n\tconsClaimIdx, consClaimTerm := consistent.getLastLog()\n\tconsSnapIdx, consSnapTerm := consistent.getLastSnapshot()\n\tconsApplied := consistent.getLastApplied()\n\tcandIdx, candTerm := staleFollower.getLastLog()\n\n\tpremise := phantomSnapIdx > 0 && phantomClaimIdx >= phantomSnapIdx &&\n\t\tsecondSnapIdx > 0 && secondClaimIdx >= secondSnapIdx\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                            tag,\n\t\t\"phantom_id\":                     string(lead.localID),\n\t\t\"second_phantom_id\":              string(staleFollower.localID),\n\t\t\"candidate_id\":                   string(staleFollower.localID),\n\t\t\"consistent_id\":                  string(consistent.localID),\n\t\t\"leader_snapshot_index\":          leaderSnap.Index,\n\t\t\"leader_snapshot_term\":           leaderSnap.Term,\n\t\t\"shared_prefix_last_index\":       sharedLast,\n\t\t\"uncommitted_suffix_last_index\":  suffixLast,\n\t\t\"uncommitted_suffix_term\":        suffixTerm,\n\t\t\"phantom_claim_index\":            phantomClaimIdx,\n\t\t\"phantom_claim_term\":             phantomClaimTerm,\n\t\t\"phantom_snapshot_index\":         phantomSnapIdx,\n\t\t\"phantom_snapshot_term\":          phantomSnapTerm,\n\t\t\"phantom_applied_index\":          phantomApplied,\n\t\t\"second_phantom_claim_index\":     secondClaimIdx,\n\t\t\"second_phantom_claim_term\":      secondClaimTerm,\n\t\t\"second_phantom_snapshot_index\":  secondSnapIdx,\n\t\t\"consistent_claim_index\":         consClaimIdx,\n\t\t\"consistent_claim_term\":          consClaimTerm,\n\t\t\"consistent_snapshot_index\":      consSnapIdx,\n\t\t\"consistent_snapshot_term\":       consSnapTerm,\n\t\t\"consistent_applied_index\":       consApplied,\n\t\t\"candidate_last_log_index\":       candIdx,\n\t\t\"candidate_last_log_term\":        candTerm,\n\t\t\"premise_phantom_claims\":         premise,\n\t}, \"ca_vote_setup\")\n\tif !premise {\n\t\treturn\n\t}\n\n\tif configChange != \"\" {\n\t\t// Configuration-change probe: removing a phantom voter still leaves a\n\t\t// quorum of consistent voters, while removing a consistent voter leaves a\n\t\t// quorum that includes a phantom, whose cached claim blocks every\n\t\t// AppendEntries from this leader.\n\t\tvar target *Raft\n\t\tif configChange == \"phantom\" {\n\t\t\ttarget = staleFollower\n\t\t} else {\n\t\t\tfor _, r := range majority {\n\t\t\t\tif r != newLeader {\n\t\t\t\t\ttarget = r\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif target == nil {\n\t\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no config target\"}, \"ca_vote_skipped\")\n\t\t\treturn\n\t\t}\n\t\tsizeBefore := 0\n\t\tif f := newLeader.GetConfiguration(); f.Error() == nil {\n\t\t\tsizeBefore = len(f.Configuration().Servers)\n\t\t}\n\t\tstart := time.Now()\n\t\tfut := newLeader.RemoveServer(target.localID, 0, time.Second)\n\t\tdone := make(chan error, 1)\n\t\tgo func() { done <- fut.Error() }()\n\t\tcommitted := false\n\t\terrText := \"\"\n\t\tselect {\n\t\tcase err := <-done:\n\t\t\tcommitted = err == nil\n\t\t\tif err != nil {\n\t\t\t\terrText = err.Error()\n\t\t\t}\n\t\tcase <-time.After(5 * time.Second):\n\t\t\terrText = \"not committed within window\"\n\t\t}\n\t\telapsed := time.Since(start).Milliseconds()\n\t\tsizeAfter := 0\n\t\tif f := newLeader.GetConfiguration(); f.Error() == nil {\n\t\t\tsizeAfter = len(f.Configuration().Servers)\n\t\t}\n\t\t_, targetIsPhantom := func() (uint64, bool) {\n\t\t\tidx, _ := target.getLastSnapshot()\n\t\t\tclaim, _ := target.getLastLog()\n\t\t\treturn idx, idx > 0 && claim >= idx\n\t\t}()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                    tag,\n\t\t\t\"phantom_id\":             string(lead.localID),\n\t\t\t\"second_phantom_id\":      string(staleFollower.localID),\n\t\t\t\"leader_id\":              string(newLeader.localID),\n\t\t\t\"target_id\":              string(target.localID),\n\t\t\t\"target_is_phantom\":      targetIsPhantom,\n\t\t\t\"phantom_claim_exceeds_snapshot\": phantomClaimIdx > phantomSnapIdx && phantomClaimTerm < phantomSnapTerm,\n\t\t\t\"config_size_before\":     sizeBefore,\n\t\t\t\"config_size_after\":      sizeAfter,\n\t\t\t\"config_change_committed\": committed,\n\t\t\t\"config_change_error\":    errText,\n\t\t\t\"config_change_ms\":       elapsed,\n\t\t\t\"window_ms\":              int64(5000),\n\t\t}, \"ca_config_probe\")\n\n\t\tif !committed {\n\t\t\t// Second change after a blocked one: the leader's latest\n\t\t\t// configuration never committed, so the change gate that requires\n\t\t\t// latestIndex == committedIndex should refuse further requests. The\n\t\t\t// phantom holder is the voter an operator would want to remove.\n\t\t\tstart2 := time.Now()\n\t\t\tfut2 := newLeader.RemoveServer(staleFollower.localID, 0, time.Second)\n\t\t\tdone2 := make(chan error, 1)\n\t\t\tgo func() { done2 <- fut2.Error() }()\n\t\t\tcommitted2 := false\n\t\t\terrText2 := \"\"\n\t\t\tselect {\n\t\t\tcase err := <-done2:\n\t\t\t\tcommitted2 = err == nil\n\t\t\t\tif err != nil {\n\t\t\t\t\terrText2 = err.Error()\n\t\t\t\t}\n\t\t\tcase <-time.After(2 * time.Second):\n\t\t\t\terrText2 = \"not committed within window\"\n\t\t\t}\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                    tag,\n\t\t\t\t\"phantom_id\":             string(lead.localID),\n\t\t\t\t\"second_target_id\":       string(staleFollower.localID),\n\t\t\t\t\"second_change_error\":    errText2,\n\t\t\t\t\"second_change_rejected\": errText2 == ErrEnqueueTimeout.Error(),\n\t\t\t\t\"second_change_committed\": committed2,\n\t\t\t\t\"second_change_ms\":       time.Since(start2).Milliseconds(),\n\t\t\t\t\"window_ms\":              int64(2000),\n\t\t\t}, \"ca_config_probe2\")\n\t\t}\n\t\tc.Disconnect(lead.localAddr)\n\t\treturn\n\t}\n\n\tencoded := staleFollower.trans.EncodePeer(staleFollower.localID, staleFollower.localAddr)\n\treq := &RequestVoteRequest{\n\t\tRPCHeader: RPCHeader{\n\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\tID:              []byte(staleFollower.localID),\n\t\t\tAddr:            encoded,\n\t\t},\n\t\tTerm:               consistent.getCurrentTerm() + 1,\n\t\tCandidate:          encoded,\n\t\tLastLogIndex:       candIdx,\n\t\tLastLogTerm:        candTerm,\n\t\tLeadershipTransfer: true,\n\t}\n\t// Both targets are under snapshot pressure from the leader's retry loop, so\n\t// deliver with bounded retries and record how many attempts each needed.\n\tdeliver := func(target ServerAddress) (RequestVoteResponse, int, bool, string) {\n\t\tvar resp RequestVoteResponse\n\t\tlastErr := \"\"\n\t\tfor attempt := 1; attempt <= 6; attempt++ {\n\t\t\tif err := staleFollower.trans.RequestVote(staleFollower.localID, target, req, &resp); err == nil {\n\t\t\t\treturn resp, attempt, true, \"\"\n\t\t\t}\n\t\t\tlastErr = fmt.Sprintf(\"%v\", staleFollower.trans.RequestVote(staleFollower.localID, target, req, &resp))\n\t\t\ttime.Sleep(100 * time.Millisecond)\n\t\t}\n\t\treturn resp, 6, false, lastErr\n\t}\n\tphantomResp, phantomAttempts, phantomOK, phantomErr := deliver(lead.localAddr)\n\tconsistentResp, consistentAttempts, consistentOK, consistentErr := deliver(consistent.localAddr)\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                            tag,\n\t\t\"phantom_id\":                     string(lead.localID),\n\t\t\"consistent_id\":                  string(consistent.localID),\n\t\t\"candidate_id\":                   string(staleFollower.localID),\n\t\t\"request_term\":                   req.Term,\n\t\t\"candidate_last_log_index\":       req.LastLogIndex,\n\t\t\"candidate_last_log_term\":        req.LastLogTerm,\n\t\t\"phantom_delivered\":              phantomOK,\n\t\t\"phantom_attempts\":               phantomAttempts,\n\t\t\"consistent_delivered\":           consistentOK,\n\t\t\"consistent_attempts\":            consistentAttempts,\n\t\t\"phantom_delivery_error\":         phantomErr,\n\t\t\"consistent_delivery_error\":      consistentErr,\n\t\t\"consistent_state\":               consistent.getState().String(),\n\t\t\"leader_id_after_probe\":          string(newLeader.localID),\n\t\t\"phantom_granted\":                phantomResp.Granted,\n\t\t\"phantom_response_term\":          phantomResp.Term,\n\t\t\"consistent_granted\":             consistentResp.Granted,\n\t\t\"consistent_response_term\":       consistentResp.Term,\n\t\t\"phantom_claim_exceeds_snapshot\": phantomClaimIdx > phantomSnapIdx && phantomClaimTerm < phantomSnapTerm,\n\t\t\"candidate_lacks_snapshot_term\":  req.LastLogTerm < phantomSnapTerm,\n\t\t\"vote_decision_differs\":          phantomResp.Granted != consistentResp.Granted,\n\t}, \"ca_vote_probe\")\n\n\tc.Disconnect(lead.localAddr)\n}\n\n// TestAssurance_PhantomClaimVoteDecision delivers one RequestVote to a phantom\n// holder and to a consistent voter in the same five-voter history.\nfunc TestAssurance_PhantomClaimVoteDecision(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"phantom-vote\", 40, 20, \"\")\n}\n\n// TestAssurance_ConfigChangeRemovePhantom removes a phantom voter: the remaining\n// four voters still contain three consistent voters, so the change should commit.\nfunc TestAssurance_ConfigChangeRemovePhantom(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"config-remove-phantom\", 40, 20, \"phantom\")\n}\n\n// TestAssurance_ConfigChangeRemoveConsistent removes a consistent voter: the new\n// configuration's quorum then includes a phantom holder, whose cached claim\n// blocks every AppendEntries from the leader.\nfunc TestAssurance_ConfigChangeRemoveConsistent(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"config-remove-consistent\", 40, 20, \"consistent\")\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssurance_ConfigChangeRemovePhantom",
+        "TestAssurance_ConfigChangeRemoveConsistent"
+      ],
+      "description": "",
+      "semantic_changes": [
+        "ca_config_probe now emits phantom_id and second_phantom_id so the admission event and the result event share an identity.",
+        "A blocked configuration change is followed by a second RemoveServer for the phantom holder, emitted as ca_config_probe2 with the enqueue outcome and a two-second commit window."
+      ],
+      "prerequisites": [
+        {
+          "alias": "phantom_removal_setup",
+          "event": "ca_vote_setup",
+          "conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-phantom",
+              "reference": null
+            },
+            {
+              "field": "premise_phantom_claims",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "consistent_removal_setup",
+          "event": "ca_vote_setup",
+          "conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-consistent",
+              "reference": null
+            },
+            {
+              "field": "premise_phantom_claims",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "src_get_last_entry",
+      "src_vote_log_check",
+      "src_install_snapshot_tail",
+      "src_append_config",
+      "src_append_prev_check"
+    ],
+    "anchors": [
+      {
+        "material_id": "src_append_config",
+        "symbol": "appendConfigurationEntry",
+        "start_line": 1204,
+        "end_line": 1243,
+        "anchor": {
+          "source_ids": [
+            "src_append_config"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_append_config",
+          "start_line": 1204,
+          "end_line": 1204,
+          "symbol": "appendConfigurationEntry"
+        }
+      },
+      {
+        "material_id": "src_get_last_entry",
+        "symbol": "getLastEntry",
+        "start_line": 167,
+        "end_line": 174,
+        "anchor": {
+          "source_ids": [
+            "src_get_last_entry"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_get_last_entry",
+          "start_line": 167,
+          "end_line": 167,
+          "symbol": "getLastEntry"
+        }
+      },
+      {
+        "material_id": "src_install_snapshot_tail",
+        "symbol": "installSnapshot",
+        "start_line": 1837,
+        "end_line": 1977,
+        "anchor": {
+          "source_ids": [
+            "src_install_snapshot_tail"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "src_install_snapshot_tail",
+          "start_line": 1837,
+          "end_line": 1837,
+          "symbol": "installSnapshot"
+        }
+      }
+    ],
+    "scope": {
+      "description": "The same two-case configuration-change probe on the validated five-voter phantom history, with the probe events now carrying the phantom identity and, when a removal is blocked, a follow-up removal attempt. Case one removes a phantom voter; case two removes a consistent follower; in case two a further RemoveServer for the phantom holder is then attempted with a one-second enqueue timeout and awaited for two seconds.",
+      "assumptions": [
+        "Fault model unchanged: no message loss inside the injected transport; induced events are one partition of two voters from three, retention of the minority suffix, one explicit snapshot, and the RemoveServer attempts.",
+        "Both cases keep history, snapshot index, timing and leader load identical so the removed voter's role is the only difference; the follow-up attempt uses the ordinary public API with the documented enqueue timeout.",
+        "Reused facilities: MakeClusterCustom with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport and MockFSM."
+      ],
+      "excluded": [
+        "No production logic was modified; the harness only adds test code.",
+        "Automatic snapshotting stays disabled so the published snapshot index is controlled by the explicit Snapshot() call."
+      ],
+      "parameters": {
+        "peers": 5,
+        "pre_entries": 40,
+        "orphan_writes": 40,
+        "post_entries": 20,
+        "trailing_logs": 10,
+        "config_change_wait_ms": 5000,
+        "followup_wait_ms": 2000
+      }
+    },
+    "prefix": "Each case repeats the phantom setup (elect, commit forty entries, partition the leader with one follower, drive forty uncommitted applies on the deposed leader, wait for the pair to stop leading, wait for a majority leader, commit twenty entries and force Snapshot(), heal, wait for both minority members to install the snapshot), records the premise, then issues RemoveServer for the phantom holder or for a consistent follower and waits up to five seconds. When the first removal does not commit, a second RemoveServer for the phantom holder is issued with a one-second enqueue timeout and awaited for two seconds, and both outcomes are emitted.",
+    "requirement": "A configuration change must either commit or fail observably within a bounded time rather than block indefinitely because a voter whose cached log claim was superseded by its own snapshot can no longer accept log entries, and a blocked change must not prevent the operator from issuing further configuration changes.",
+    "responsibility": "target",
+    "comparisons": [
+      {
+        "event": "ca_config_probe",
+        "identity_fields": [
+          "phantom_id"
+        ],
+        "admission_alias": "phantom_removal_setup",
+        "assertion": {
+          "field": "config_change_committed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-phantom",
+            "reference": null
+          },
+          {
+            "field": "target_is_phantom",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Removing a phantom voter commits promptly: the remaining configuration still contains three voters that accept entries."
+      },
+      {
+        "event": "ca_config_probe",
+        "identity_fields": [
+          "phantom_id"
+        ],
+        "admission_alias": "consistent_removal_setup",
+        "assertion": {
+          "field": "config_change_committed",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-consistent",
+            "reference": null
+          },
+          {
+            "field": "target_is_phantom",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Removing a consistent voter does not commit within the window: the new configuration's quorum includes a phantom holder, so the entry cannot gather its acknowledgements."
+      },
+      {
+        "event": "ca_config_probe2",
+        "identity_fields": [
+          "phantom_id"
+        ],
+        "admission_alias": "consistent_removal_setup",
+        "assertion": {
+          "field": "second_change_rejected",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-consistent",
+            "reference": null
+          }
+        ],
+        "description": "After the blocked change the operator's follow-up removal of the phantom holder is refused at enqueue time, so the wedge is not limited to the blocked entry itself."
+      },
+      {
+        "event": "ca_config_probe2",
+        "identity_fields": [
+          "phantom_id"
+        ],
+        "admission_alias": "consistent_removal_setup",
+        "assertion": {
+          "field": "second_change_committed",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "tag",
+            "op": "eq",
+            "value": "config-remove-consistent",
+            "reference": null
+          }
+        ],
+        "description": "The follow-up change also does not commit within its window, matching the closed configuration-change gate."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "c9744ca943f84cfa87d7b8b60af36bc0",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "649c070d44144ba8a0ec3a9e362bfa72",
+  "previous_id": "4af52658be4643c681995f057842c7be-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caClose shuts the cluster down with a bounded wait. The stock cluster helper\n// panics if a replication goroutine is still inside a long snapshot RPC, which\n// is a teardown artifact rather than an observation, so keep the exit path\n// finite and still clean the temporary directories.\nfunc caClose(c *cluster) {\n\tvar futures []Future\n\tfor _, r := range c.rafts {\n\t\tfutures = append(futures, r.Shutdown())\n\t}\n\tdone := make(chan struct{})\n\tgo func() {\n\t\tdefer close(done)\n\t\tfor _, f := range futures {\n\t\t\t_ = f.Error()\n\t\t}\n\t}()\n\tselect {\n\tcase <-done:\n\tcase <-time.After(3 * time.Second):\n\t}\n\tfor _, d := range c.dirs {\n\t\t_ = os.RemoveAll(d)\n\t}\n}\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, tag string, trailing uint64, orphanWrites int, monotonic bool) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMonotonicLogs: monotonic,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                      tag,\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int, monotonic bool, repairAfter time.Duration) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, tag, trailing, orphanWrites, monotonic)\n\tdefer caClose(c)\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tvar (\n\t\trepairDone            bool\n\t\tappliedBeforeRepair   uint64\n\t\trestoresBeforeRepair  int64\n\t\tclusterBeforeRepair   uint64\n\t\tclaimAtRepair         uint64\n\t\tnewSnapshotIndex      uint64\n\t)\n\tfor time.Since(start) < window {\n\t\tif repairAfter > 0 && !repairDone && time.Since(start) >= repairAfter {\n\t\t\t// Boundary probe: keep writing until the leader's applied index passes\n\t\t\t// the follower's stale claim, then publish a snapshot at that higher\n\t\t\t// index and let the leader offer it. If the account is right, the\n\t\t\t// follower's prev-log checks start matching again once the installed\n\t\t\t// snapshot index exceeds its cached claim.\n\t\t\tappliedBeforeRepair = victim.getLastApplied()\n\t\t\trestoresBeforeRepair = victimFSM.restoreCount()\n\t\t\tclusterBeforeRepair = caMaxApplied(c.rafts)\n\t\t\tclaimAtRepair, _ = victim.getLastLog()\n\t\t\tfor i := 0; i < 80 && leader.getState() == Leader && leader.getLastApplied() <= claimAtRepair; i++ {\n\t\t\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"repair-%03d\", i)), time.Second).Error(); err != nil {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t\tif sf := leader.Snapshot(); sf != nil {\n\t\t\t\tif err := sf.Error(); err == nil {\n\t\t\t\t\tif snaps, err := leader.snapshots.List(); err == nil && len(snaps) > 0 {\n\t\t\t\t\t\tnewSnapshotIndex = snaps[0].Index\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\trepairDone = true\n\t\t}\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t\t\"monotonic_log_store\":          monotonic,\n\t\t\"repair_attempted\":             repairDone,\n\t\t\"victim_claim_at_repair\":       claimAtRepair,\n\t\t\"victim_applied_before_repair\": appliedBeforeRepair,\n\t\t\"victim_restores_before_repair\": restoresBeforeRepair,\n\t\t\"cluster_max_applied_before_repair\": clusterBeforeRepair,\n\t\t\"stall_observed_before_repair\": repairDone && appliedBeforeRepair < clusterBeforeRepair && restoresBeforeRepair > startRestores,\n\t\t\"new_snapshot_index_after_repair\": newSnapshotIndex,\n\t\t\"victim_caught_up_within_window\": endApplied+3 >= clusterMax,\n\t}, \"ca_probe\")\n\n\t// Stop the induced snapshot pressure before teardown so the shutdown path\n\t// stays bounded; this runs after every measured sample.\n\tc.Disconnect(victim.localAddr)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60, false, 0)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60, false, 0)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot_MonotonicStore repeats the\n// trimmed case with a MonotonicLogStore, where the install path deletes the\n// whole log store instead of keeping a suffix above the snapshot index.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot_MonotonicStore(t *testing.T) {\n\tcaRunProbe(t, \"trimmed-monotonic\", 3*time.Second, 10, 60, true, 0)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot_HigherSnapshotRepairs probes the\n// boundary of the stall: once the leader commits past the follower's stale\n// claim and publishes a snapshot above it, the follower is expected to accept\n// entries again.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot_HigherSnapshotRepairs(t *testing.T) {\n\tcaRunProbe(t, \"trimmed-repair\", 4*time.Second, 10, 60, false, 1200*time.Millisecond)\n}\n\n// caPhantomVoteProbe builds a five-voter cluster in which the deposed leader and\n// one follower keep an uncommitted suffix while the other three voters commit a\n// newer term and publish a snapshot below that suffix, then delivers one\n// RequestVote (the stale follower's real log claim, carrying the\n// leadership-transfer flag so the known-leader rejection cannot mask the\n// log-completeness test) to a phantom holder and to a voter whose cached state\n// matches its snapshot.\nfunc caPhantomVoteProbe(t *testing.T, tag string, orphanWrites, postEntries int, configChange string) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       5,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\tdefer caClose(c)\n\n\tlead := c.Leader()\n\t_ = c.WaitForFollowers(4)\n\tfor i := 0; i < 40; i++ {\n\t\tif err := lead.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"pre apply: %v\", err)\n\t\t}\n\t}\n\n\tvar others []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != lead {\n\t\t\tothers = append(others, r)\n\t\t}\n\t}\n\tstaleFollower := others[0]\n\tmajority := others[1:]\n\tsharedLast := lead.LastIndex()\n\n\t// Isolate the deposed leader together with one follower; the pair is still a\n\t// minority of five, so the suffix they exchange is never committed.\n\tc.Partition([]ServerAddress{lead.localAddr, staleFollower.localAddr})\n\tbase := lead.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = lead.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif lead.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) &&\n\t\t(staleFollower.LastIndex() < lead.LastIndex() || lead.getState() == Leader) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tsuffixLast := lead.LastIndex()\n\t_, suffixTerm := lead.getLastLog()\n\n\tnewLeader := caWaitLeader(majority, 5*time.Second)\n\tif newLeader == nil {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no majority leader\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tfor i := 0; i < postEntries; i++ {\n\t\tif err := newLeader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0).Error(); err != nil {\n\t\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"post apply failed\"}, \"ca_vote_skipped\")\n\t\t\treturn\n\t\t}\n\t}\n\tif err := newLeader.Snapshot().Error(); err != nil {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"snapshot failed\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tsnaps, err := newLeader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no snapshot\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tleaderSnap := snaps[0]\n\n\t// Heal the partition and let the minority members install the snapshot, which\n\t// sits below the suffix they still claim.\n\tc.FullyConnect()\n\tinstalled := func(r *Raft) bool {\n\t\tidx, _ := r.getLastSnapshot()\n\t\treturn idx > 0\n\t}\n\tinstallDeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(installDeadline) && !(installed(lead) && installed(staleFollower)) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tphantomClaimIdx, phantomClaimTerm := lead.getLastLog()\n\tphantomSnapIdx, phantomSnapTerm := lead.getLastSnapshot()\n\tphantomApplied := lead.getLastApplied()\n\tsecondClaimIdx, secondClaimTerm := staleFollower.getLastLog()\n\tsecondSnapIdx, _ := staleFollower.getLastSnapshot()\n\tconsistent := newLeader\n\tfor _, r := range majority {\n\t\tif r != newLeader {\n\t\t\tconsistent = r\n\t\t\tbreak\n\t\t}\n\t}\n\tconsClaimIdx, consClaimTerm := consistent.getLastLog()\n\tconsSnapIdx, consSnapTerm := consistent.getLastSnapshot()\n\tconsApplied := consistent.getLastApplied()\n\tcandIdx, candTerm := staleFollower.getLastLog()\n\n\tpremise := phantomSnapIdx > 0 && phantomClaimIdx >= phantomSnapIdx &&\n\t\tsecondSnapIdx > 0 && secondClaimIdx >= secondSnapIdx\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                            tag,\n\t\t\"phantom_id\":                     string(lead.localID),\n\t\t\"second_phantom_id\":              string(staleFollower.localID),\n\t\t\"candidate_id\":                   string(staleFollower.localID),\n\t\t\"consistent_id\":                  string(consistent.localID),\n\t\t\"leader_snapshot_index\":          leaderSnap.Index,\n\t\t\"leader_snapshot_term\":           leaderSnap.Term,\n\t\t\"shared_prefix_last_index\":       sharedLast,\n\t\t\"uncommitted_suffix_last_index\":  suffixLast,\n\t\t\"uncommitted_suffix_term\":        suffixTerm,\n\t\t\"phantom_claim_index\":            phantomClaimIdx,\n\t\t\"phantom_claim_term\":             phantomClaimTerm,\n\t\t\"phantom_snapshot_index\":         phantomSnapIdx,\n\t\t\"phantom_snapshot_term\":          phantomSnapTerm,\n\t\t\"phantom_applied_index\":          phantomApplied,\n\t\t\"second_phantom_claim_index\":     secondClaimIdx,\n\t\t\"second_phantom_claim_term\":      secondClaimTerm,\n\t\t\"second_phantom_snapshot_index\":  secondSnapIdx,\n\t\t\"consistent_claim_index\":         consClaimIdx,\n\t\t\"consistent_claim_term\":          consClaimTerm,\n\t\t\"consistent_snapshot_index\":      consSnapIdx,\n\t\t\"consistent_snapshot_term\":       consSnapTerm,\n\t\t\"consistent_applied_index\":       consApplied,\n\t\t\"candidate_last_log_index\":       candIdx,\n\t\t\"candidate_last_log_term\":        candTerm,\n\t\t\"premise_phantom_claims\":         premise,\n\t}, \"ca_vote_setup\")\n\tif !premise {\n\t\treturn\n\t}\n\n\tif configChange != \"\" {\n\t\t// Configuration-change probe: removing a phantom voter still leaves a\n\t\t// quorum of consistent voters, while removing a consistent voter leaves a\n\t\t// quorum that includes a phantom, whose cached claim blocks every\n\t\t// AppendEntries from this leader.\n\t\tvar target *Raft\n\t\tif configChange == \"phantom\" {\n\t\t\ttarget = staleFollower\n\t\t} else {\n\t\t\tfor _, r := range majority {\n\t\t\t\tif r != newLeader {\n\t\t\t\t\ttarget = r\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif target == nil {\n\t\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no config target\"}, \"ca_vote_skipped\")\n\t\t\treturn\n\t\t}\n\t\tsizeBefore := 0\n\t\tif f := newLeader.GetConfiguration(); f.Error() == nil {\n\t\t\tsizeBefore = len(f.Configuration().Servers)\n\t\t}\n\t\tstart := time.Now()\n\t\tfut := newLeader.RemoveServer(target.localID, 0, time.Second)\n\t\tdone := make(chan error, 1)\n\t\tgo func() { done <- fut.Error() }()\n\t\tcommitted := false\n\t\terrText := \"\"\n\t\tselect {\n\t\tcase err := <-done:\n\t\t\tcommitted = err == nil\n\t\t\tif err != nil {\n\t\t\t\terrText = err.Error()\n\t\t\t}\n\t\tcase <-time.After(5 * time.Second):\n\t\t\terrText = \"not committed within window\"\n\t\t}\n\t\telapsed := time.Since(start).Milliseconds()\n\t\tsizeAfter := 0\n\t\tif f := newLeader.GetConfiguration(); f.Error() == nil {\n\t\t\tsizeAfter = len(f.Configuration().Servers)\n\t\t}\n\t\t_, targetIsPhantom := func() (uint64, bool) {\n\t\t\tidx, _ := target.getLastSnapshot()\n\t\t\tclaim, _ := target.getLastLog()\n\t\t\treturn idx, idx > 0 && claim >= idx\n\t\t}()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                    tag,\n\t\t\t\"leader_id\":              string(newLeader.localID),\n\t\t\t\"target_id\":              string(target.localID),\n\t\t\t\"target_is_phantom\":      targetIsPhantom,\n\t\t\t\"phantom_claim_exceeds_snapshot\": phantomClaimIdx > phantomSnapIdx && phantomClaimTerm < phantomSnapTerm,\n\t\t\t\"config_size_before\":     sizeBefore,\n\t\t\t\"config_size_after\":      sizeAfter,\n\t\t\t\"config_change_committed\": committed,\n\t\t\t\"config_change_error\":    errText,\n\t\t\t\"config_change_ms\":       elapsed,\n\t\t\t\"window_ms\":              int64(5000),\n\t\t}, \"ca_config_probe\")\n\t\tc.Disconnect(lead.localAddr)\n\t\treturn\n\t}\n\n\tencoded := staleFollower.trans.EncodePeer(staleFollower.localID, staleFollower.localAddr)\n\treq := &RequestVoteRequest{\n\t\tRPCHeader: RPCHeader{\n\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\tID:              []byte(staleFollower.localID),\n\t\t\tAddr:            encoded,\n\t\t},\n\t\tTerm:               consistent.getCurrentTerm() + 1,\n\t\tCandidate:          encoded,\n\t\tLastLogIndex:       candIdx,\n\t\tLastLogTerm:        candTerm,\n\t\tLeadershipTransfer: true,\n\t}\n\t// Both targets are under snapshot pressure from the leader's retry loop, so\n\t// deliver with bounded retries and record how many attempts each needed.\n\tdeliver := func(target ServerAddress) (RequestVoteResponse, int, bool, string) {\n\t\tvar resp RequestVoteResponse\n\t\tlastErr := \"\"\n\t\tfor attempt := 1; attempt <= 6; attempt++ {\n\t\t\tif err := staleFollower.trans.RequestVote(staleFollower.localID, target, req, &resp); err == nil {\n\t\t\t\treturn resp, attempt, true, \"\"\n\t\t\t}\n\t\t\tlastErr = fmt.Sprintf(\"%v\", staleFollower.trans.RequestVote(staleFollower.localID, target, req, &resp))\n\t\t\ttime.Sleep(100 * time.Millisecond)\n\t\t}\n\t\treturn resp, 6, false, lastErr\n\t}\n\tphantomResp, phantomAttempts, phantomOK, phantomErr := deliver(lead.localAddr)\n\tconsistentResp, consistentAttempts, consistentOK, consistentErr := deliver(consistent.localAddr)\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                            tag,\n\t\t\"phantom_id\":                     string(lead.localID),\n\t\t\"consistent_id\":                  string(consistent.localID),\n\t\t\"candidate_id\":                   string(staleFollower.localID),\n\t\t\"request_term\":                   req.Term,\n\t\t\"candidate_last_log_index\":       req.LastLogIndex,\n\t\t\"candidate_last_log_term\":        req.LastLogTerm,\n\t\t\"phantom_delivered\":              phantomOK,\n\t\t\"phantom_attempts\":               phantomAttempts,\n\t\t\"consistent_delivered\":           consistentOK,\n\t\t\"consistent_attempts\":            consistentAttempts,\n\t\t\"phantom_delivery_error\":         phantomErr,\n\t\t\"consistent_delivery_error\":      consistentErr,\n\t\t\"consistent_state\":               consistent.getState().String(),\n\t\t\"leader_id_after_probe\":          string(newLeader.localID),\n\t\t\"phantom_granted\":                phantomResp.Granted,\n\t\t\"phantom_response_term\":          phantomResp.Term,\n\t\t\"consistent_granted\":             consistentResp.Granted,\n\t\t\"consistent_response_term\":       consistentResp.Term,\n\t\t\"phantom_claim_exceeds_snapshot\": phantomClaimIdx > phantomSnapIdx && phantomClaimTerm < phantomSnapTerm,\n\t\t\"candidate_lacks_snapshot_term\":  req.LastLogTerm < phantomSnapTerm,\n\t\t\"vote_decision_differs\":          phantomResp.Granted != consistentResp.Granted,\n\t}, \"ca_vote_probe\")\n\n\tc.Disconnect(lead.localAddr)\n}\n\n// TestAssurance_PhantomClaimVoteDecision delivers one RequestVote to a phantom\n// holder and to a consistent voter in the same five-voter history.\nfunc TestAssurance_PhantomClaimVoteDecision(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"phantom-vote\", 40, 20, \"\")\n}\n\n// TestAssurance_ConfigChangeRemovePhantom removes a phantom voter: the remaining\n// four voters still contain three consistent voters, so the change should commit.\nfunc TestAssurance_ConfigChangeRemovePhantom(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"config-remove-phantom\", 40, 20, \"phantom\")\n}\n\n// TestAssurance_ConfigChangeRemoveConsistent removes a consistent voter: the new\n// configuration's quorum then includes a phantom holder, whose cached claim\n// blocks every AppendEntries from the leader.\nfunc TestAssurance_ConfigChangeRemoveConsistent(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"config-remove-consistent\", 40, 20, \"consistent\")\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "test_names": [
+          "TestAssurance_ConfigChangeRemovePhantom",
+          "TestAssurance_ConfigChangeRemoveConsistent"
+        ],
+        "description": "",
+        "semantic_changes": [
+          "The phantom scenario gained an optional configuration-change attempt selecting the removed voter's role, with a five-second bounded wait and the leader's reported configuration sizes recorded before and after.",
+          "Two new comparison subjects: a removal that commits when a quorum of consistent voters remains, and a removal that does not commit when the new quorum needs a phantom holder."
+        ],
+        "prerequisites": [
+          {
+            "alias": "phantom_removal_setup",
+            "event": "ca_vote_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "config-remove-phantom",
+                "reference": null
+              },
+              {
+                "field": "premise_phantom_claims",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "consistent_removal_setup",
+            "event": "ca_vote_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "config-remove-consistent",
+                "reference": null
+              },
+              {
+                "field": "premise_phantom_claims",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caClose shuts the cluster down with a bounded wait. The stock cluster helper\n// panics if a replication goroutine is still inside a long snapshot RPC, which\n// is a teardown artifact rather than an observation, so keep the exit path\n// finite and still clean the temporary directories.\nfunc caClose(c *cluster) {\n\tvar futures []Future\n\tfor _, r := range c.rafts {\n\t\tfutures = append(futures, r.Shutdown())\n\t}\n\tdone := make(chan struct{})\n\tgo func() {\n\t\tdefer close(done)\n\t\tfor _, f := range futures {\n\t\t\t_ = f.Error()\n\t\t}\n\t}()\n\tselect {\n\tcase <-done:\n\tcase <-time.After(3 * time.Second):\n\t}\n\tfor _, d := range c.dirs {\n\t\t_ = os.RemoveAll(d)\n\t}\n}\n\n// assuranceRestoreCounter counts FSM Restore invocations, which is how a\n// follower observes each accepted InstallSnapshot.\ntype assuranceRestoreCounter struct {\n\t*MockFSM\n\trestores int64\n}\n\nfunc (f *assuranceRestoreCounter) Restore(inp io.ReadCloser) error {\n\tif err := f.MockFSM.Restore(inp); err != nil {\n\t\treturn err\n\t}\n\tatomic.AddInt64(&f.restores, 1)\n\treturn nil\n}\n\nfunc (f *assuranceRestoreCounter) restoreCount() int64 { return atomic.LoadInt64(&f.restores) }\n\nfunc caEmit(fields map[string]interface{}, event string) {\n\tfields[\"event\"] = event\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"ca_emit_error\\\",\\\"err\\\":%q}\\n\", err.Error())\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// caWaitLeader returns a node from rs that is the only leader for a few\n// consecutive polls, or nil.\nfunc caWaitLeader(rs []*Raft, d time.Duration) *Raft {\n\tdeadline := time.Now().Add(d)\n\tvar last *Raft\n\tstreak := 0\n\tfor time.Now().Before(deadline) {\n\t\tvar cur *Raft\n\t\tn := 0\n\t\tfor _, r := range rs {\n\t\t\tif r.getState() == Leader {\n\t\t\t\tcur = r\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\tif n == 1 && cur == last {\n\t\t\tstreak++\n\t\t\tif streak >= 3 {\n\t\t\t\treturn cur\n\t\t\t}\n\t\t} else {\n\t\t\tlast = cur\n\t\t\tstreak = 0\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc caMaxApplied(rs []*Raft) uint64 {\n\tvar out uint64\n\tfor _, r := range rs {\n\t\tif a := r.getLastApplied(); a > out {\n\t\t\tout = a\n\t\t}\n\t}\n\treturn out\n}\n\nfunc caLeaders(rs []*Raft) string {\n\tout := \"\"\n\tfor _, r := range rs {\n\t\tif r.getState() == Leader {\n\t\t\tout += fmt.Sprintf(\"%s@t%d \", r.localID, r.getCurrentTerm())\n\t\t}\n\t}\n\tif out == \"\" {\n\t\treturn \"none\"\n\t}\n\treturn out\n}\n\n// caStaleSuffixScenario drives a real three-voter cluster into the state where\n// one voter holds a log suffix that extends beyond the snapshot index of the\n// current leader, with a lower term, and the leader's log has been trimmed by\n// that snapshot. It returns the handles needed to observe the repair path.\nfunc caStaleSuffixScenario(t *testing.T, tag string, trailing uint64, orphanWrites int, monotonic bool) (*cluster, int, *Raft, *Raft, *assuranceRestoreCounter, *SnapshotMeta, bool) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = trailing\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       3,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMonotonicLogs: monotonic,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\n\tinitLeader := c.Leader()\n\t_ = c.Followers()\n\n\tvar f Future\n\tfor i := 0; i < 60; i++ {\n\t\tf = initLeader.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\tt.Fatalf(\"pre apply: %v\", err)\n\t}\n\n\tvictimIdx := c.IndexOf(initLeader)\n\tvictim := initLeader\n\tvictimFSM := c.fsms[victimIdx].(*assuranceRestoreCounter)\n\toldTrans := c.trans[victimIdx]\n\n\t// Isolate the leader and let it append entries that never reach a quorum.\n\tc.Partition([]ServerAddress{victim.localAddr})\n\tbase := victim.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = victim.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif victim.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getState() == Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\torphanLast := victim.LastIndex()\n\n\t// Shut the victim down so its term does not escalate while it is away: the\n\t// restart replays its real on-disk log, keeping the orphan suffix.\n\tif err := victim.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"victim shutdown: %v\", err)\n\t}\n\n\tvar near []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != victim {\n\t\t\tnear = append(near, r)\n\t\t}\n\t}\n\tleader := caWaitLeader(near, 5*time.Second)\n\tif leader == nil {\n\t\treturn c, victimIdx, victim, nil, victimFSM, nil, false\n\t}\n\tfor i := 0; i < 20; i++ {\n\t\tf = leader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0)\n\t}\n\tif err := f.Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tif err := leader.Snapshot().Error(); err != nil {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnaps, err := leader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\treturn c, victimIdx, victim, leader, victimFSM, nil, false\n\t}\n\tsnap := snaps[0]\n\tleaderLast, _ := leader.logs.LastIndex()\n\n\taddr, newTrans := NewInmemTransport(oldTrans.LocalAddr())\n\tcfg := victim.config()\n\tcfg.LocalID = victim.localID\n\n\trestarted, err := NewRaft(&cfg, victim.fsm, victim.logs, victim.stable, victim.snapshots, newTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"victim restart: %v\", err)\n\t}\n\tc.rafts[victimIdx] = restarted\n\tc.trans[victimIdx] = newTrans\n\n\tlastLogIdx, lastLogTerm := restarted.getLastLog()\n\tsnapLogIdx, _ := restarted.getLastSnapshot()\n\tstoreFirst, _ := restarted.logs.FirstIndex()\n\tstoreLast, _ := restarted.logs.LastIndex()\n\n\tpremise := lastLogIdx >= snap.Index && lastLogTerm < snap.Term && orphanLast >= snap.Index\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                      tag,\n\t\t\"victim_id\":                string(restarted.localID),\n\t\t\"victim_peer_index\":        victimIdx,\n\t\t\"victim_restart_addr\":      string(addr),\n\t\t\"victim_last_log_index\":    lastLogIdx,\n\t\t\"victim_last_log_term\":     lastLogTerm,\n\t\t\"victim_last_snapshot_idx\": snapLogIdx,\n\t\t\"victim_store_first\":       storeFirst,\n\t\t\"victim_store_last\":        storeLast,\n\t\t\"victim_orphan_last_index\": orphanLast,\n\t\t\"victim_restores_at_setup\": victimFSM.restoreCount(),\n\t\t\"leader_id\":                string(leader.localID),\n\t\t\"leader_last_index\":        leaderLast,\n\t\t\"leader_snapshot_index\":    snap.Index,\n\t\t\"leader_snapshot_term\":     snap.Term,\n\t\t\"leader_trailing_logs\":     trailing,\n\t\t\"premise_stale_suffix\":     premise,\n\t}, \"ca_setup\")\n\tif !premise {\n\t\treturn c, victimIdx, restarted, leader, victimFSM, snap, false\n\t}\n\n\t// Reconnect the restarted victim to the other two voters.\n\tfor j, ot := range c.trans {\n\t\tif j == victimIdx {\n\t\t\tcontinue\n\t\t}\n\t\tnewTrans.Connect(ot.LocalAddr(), ot)\n\t\tot.Connect(addr, newTrans)\n\t}\n\treturn c, victimIdx, restarted, leader, victimFSM, snap, true\n}\n\nfunc caRunProbe(t *testing.T, tag string, window time.Duration, trailing uint64, orphanWrites int, monotonic bool, repairAfter time.Duration) {\n\tc, victimIdx, victim, leader, victimFSM, snap, ready := caStaleSuffixScenario(t, tag, trailing, orphanWrites, monotonic)\n\tdefer caClose(c)\n\tif !ready {\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":    tag,\n\t\t\t\"reason\": \"scenario premise not established\",\n\t\t}, \"ca_probe_skipped\")\n\t\treturn\n\t}\n\n\t// Wait for the first InstallSnapshot to land on the victim.\n\tinstallDeadline := time.Now().Add(3 * time.Second)\n\tfor victim.getLastApplied() < snap.Index && time.Now().Before(installDeadline) {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(50 * time.Millisecond)\n\n\tstartApplied := victim.getLastApplied()\n\tstartRestores := victimFSM.restoreCount()\n\tstartLastLogIdx, startLastLogTerm := victim.getLastLog()\n\tstartSnapIdx, _ := victim.getLastSnapshot()\n\n\tstep := 250 * time.Millisecond\n\tstart := time.Now()\n\tlastLeaderSet := \"\"\n\tleaderSetChanges := 0\n\tsamples := 0\n\tvar (\n\t\trepairDone            bool\n\t\tappliedBeforeRepair   uint64\n\t\trestoresBeforeRepair  int64\n\t\tclusterBeforeRepair   uint64\n\t\tclaimAtRepair         uint64\n\t\tnewSnapshotIndex      uint64\n\t)\n\tfor time.Since(start) < window {\n\t\tif repairAfter > 0 && !repairDone && time.Since(start) >= repairAfter {\n\t\t\t// Boundary probe: keep writing until the leader's applied index passes\n\t\t\t// the follower's stale claim, then publish a snapshot at that higher\n\t\t\t// index and let the leader offer it. If the account is right, the\n\t\t\t// follower's prev-log checks start matching again once the installed\n\t\t\t// snapshot index exceeds its cached claim.\n\t\t\tappliedBeforeRepair = victim.getLastApplied()\n\t\t\trestoresBeforeRepair = victimFSM.restoreCount()\n\t\t\tclusterBeforeRepair = caMaxApplied(c.rafts)\n\t\t\tclaimAtRepair, _ = victim.getLastLog()\n\t\t\tfor i := 0; i < 80 && leader.getState() == Leader && leader.getLastApplied() <= claimAtRepair; i++ {\n\t\t\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"repair-%03d\", i)), time.Second).Error(); err != nil {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t\tif sf := leader.Snapshot(); sf != nil {\n\t\t\t\tif err := sf.Error(); err == nil {\n\t\t\t\t\tif snaps, err := leader.snapshots.List(); err == nil && len(snaps) > 0 {\n\t\t\t\t\t\tnewSnapshotIndex = snaps[0].Index\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\trepairDone = true\n\t\t}\n\t\tterms := map[uint64]bool{}\n\t\tfor _, r := range c.rafts {\n\t\t\tterms[r.getCurrentTerm()] = true\n\t\t}\n\t\tls := caLeaders(c.rafts)\n\t\tif ls != lastLeaderSet {\n\t\t\tleaderSetChanges++\n\t\t\tlastLeaderSet = ls\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                       tag,\n\t\t\t\t\"t_ms\":                      time.Since(start).Milliseconds(),\n\t\t\t\t\"victim_id\":                 string(victim.localID),\n\t\t\t\t\"leaders\":                   ls,\n\t\t\t\t\"victim_term\":               victim.getCurrentTerm(),\n\t\t\t\t\"victim_state\":              victim.getState().String(),\n\t\t\t\t\"distinct_terms_in_cluster\": len(terms),\n\t\t\t}, \"ca_leader_set\")\n\t\t}\n\t\tstFirst, _ := victim.logs.FirstIndex()\n\t\tstLast, _ := victim.logs.LastIndex()\n\t\tllIdx, llTerm := victim.getLastLog()\n\t\tlsIdx, _ := victim.getLastSnapshot()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                   tag,\n\t\t\t\"t_ms\":                  time.Since(start).Milliseconds(),\n\t\t\t\"victim_id\":             string(victim.localID),\n\t\t\t\"victim_applied\":        victim.getLastApplied(),\n\t\t\t\"victim_commit\":         victim.getCommitIndex(),\n\t\t\t\"victim_last_log_index\": llIdx,\n\t\t\t\"victim_last_log_term\":  llTerm,\n\t\t\t\"victim_snapshot_index\": lsIdx,\n\t\t\t\"victim_store_first\":    stFirst,\n\t\t\t\"victim_store_last\":     stLast,\n\t\t\t\"victim_restores\":       victimFSM.restoreCount(),\n\t\t\t\"victim_term\":           victim.getCurrentTerm(),\n\t\t\t\"victim_state\":          victim.getState().String(),\n\t\t\t\"cluster_max_applied\":   caMaxApplied(c.rafts),\n\t\t}, \"ca_sample\")\n\t\t// Keep committing new entries so that the cluster frontier moves while\n\t\t// the victim's own progress is measured against it.\n\t\tfor _, l := range c.rafts {\n\t\t\tif l.getState() == Leader {\n\t\t\t\t_ = l.Apply([]byte(fmt.Sprintf(\"during-%03d\", samples)), 200*time.Millisecond)\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tsamples++\n\t\ttime.Sleep(step)\n\t}\n\n\tendApplied := victim.getLastApplied()\n\tendRestores := victimFSM.restoreCount()\n\tendLastLogIdx, endLastLogTerm := victim.getLastLog()\n\tendSnapIdx, _ := victim.getLastSnapshot()\n\tendStoreFirst, _ := victim.logs.FirstIndex()\n\tendStoreLast, _ := victim.logs.LastIndex()\n\tclusterMax := caMaxApplied(c.rafts)\n\tleaderLast, _ := leader.logs.LastIndex()\n\tleaderFirst, _ := leader.logs.FirstIndex()\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                          tag,\n\t\t\"victim_id\":                    string(victim.localID),\n\t\t\"victim_peer_index\":            victimIdx,\n\t\t\"window_ms\":                    window.Milliseconds(),\n\t\t\"samples\":                      samples,\n\t\t\"victim_applied_start\":         startApplied,\n\t\t\"victim_applied_end\":           endApplied,\n\t\t\"victim_restores_start\":        startRestores,\n\t\t\"victim_restores_end\":          endRestores,\n\t\t\"victim_last_log_index_start\":  startLastLogIdx,\n\t\t\"victim_last_log_term_start\":   startLastLogTerm,\n\t\t\"victim_last_log_index_end\":    endLastLogIdx,\n\t\t\"victim_last_log_term_end\":     endLastLogTerm,\n\t\t\"victim_snapshot_index_start\":  startSnapIdx,\n\t\t\"victim_snapshot_index_end\":    endSnapIdx,\n\t\t\"victim_store_first_end\":       endStoreFirst,\n\t\t\"victim_store_last_end\":        endStoreLast,\n\t\t\"victim_commit_index_end\":      victim.getCommitIndex(),\n\t\t\"victim_term_end\":              victim.getCurrentTerm(),\n\t\t\"leader_last_index_end\":        leaderLast,\n\t\t\"leader_store_first_end\":       leaderFirst,\n\t\t\"leader_snapshot_index_end\":    snap.Index,\n\t\t\"leader_snapshot_term_end\":     snap.Term,\n\t\t\"cluster_max_applied_end\":      clusterMax,\n\t\t\"distinct_leader_sets_seen\":    leaderSetChanges,\n\t\t\"leader_snapshot_is_unchanged\": endSnapIdx == snap.Index,\n\t\t\"repeated_snapshot_installs\":   endRestores > startRestores,\n\t\t\"stale_claim_persists\":         endLastLogIdx >= endSnapIdx && endLastLogTerm < snap.Term,\n\t\t\"victim_not_caught_up\":         endApplied < clusterMax,\n\t\t\"victim_store_suffix_kept\":     endStoreLast > endSnapIdx,\n\t\t\"victim_applied_active\":        endApplied > startApplied,\n\t\t\"leader_log_trimmed\":           leaderFirst > 1,\n\t\t\"monotonic_log_store\":          monotonic,\n\t\t\"repair_attempted\":             repairDone,\n\t\t\"victim_claim_at_repair\":       claimAtRepair,\n\t\t\"victim_applied_before_repair\": appliedBeforeRepair,\n\t\t\"victim_restores_before_repair\": restoresBeforeRepair,\n\t\t\"cluster_max_applied_before_repair\": clusterBeforeRepair,\n\t\t\"stall_observed_before_repair\": repairDone && appliedBeforeRepair < clusterBeforeRepair && restoresBeforeRepair > startRestores,\n\t\t\"new_snapshot_index_after_repair\": newSnapshotIndex,\n\t\t\"victim_caught_up_within_window\": endApplied+3 >= clusterMax,\n\t}, \"ca_probe\")\n\n\t// Stop the induced snapshot pressure before teardown so the shutdown path\n\t// stays bounded; this runs after every measured sample.\n\tc.Disconnect(victim.localAddr)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot drives the trimmed-leader case:\n// the leader can only repair the stale follower by shipping a snapshot, and the\n// snapshot lands at an index the follower's own (stale) log already covers.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot(t *testing.T) {\n\tcaRunProbe(t, \"trimmed\", 3*time.Second, 10, 60, false, 0)\n}\n\n// TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix is the control for\n// the same cluster history without log trimming: entries alone repair the\n// stale suffix, so the trigger is excluded.\nfunc TestAssurance_Control_UntrimmedLeaderRepairsStaleSuffix(t *testing.T) {\n\tcaRunProbe(t, \"untrimmed\", 3*time.Second, 1000000, 60, false, 0)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot_MonotonicStore repeats the\n// trimmed case with a MonotonicLogStore, where the install path deletes the\n// whole log store instead of keeping a suffix above the snapshot index.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot_MonotonicStore(t *testing.T) {\n\tcaRunProbe(t, \"trimmed-monotonic\", 3*time.Second, 10, 60, true, 0)\n}\n\n// TestAssurance_StaleSuffixAfterInstallSnapshot_HigherSnapshotRepairs probes the\n// boundary of the stall: once the leader commits past the follower's stale\n// claim and publishes a snapshot above it, the follower is expected to accept\n// entries again.\nfunc TestAssurance_StaleSuffixAfterInstallSnapshot_HigherSnapshotRepairs(t *testing.T) {\n\tcaRunProbe(t, \"trimmed-repair\", 4*time.Second, 10, 60, false, 1200*time.Millisecond)\n}\n\n// caPhantomVoteProbe builds a five-voter cluster in which the deposed leader and\n// one follower keep an uncommitted suffix while the other three voters commit a\n// newer term and publish a snapshot below that suffix, then delivers one\n// RequestVote (the stale follower's real log claim, carrying the\n// leadership-transfer flag so the known-leader rejection cannot mask the\n// log-completeness test) to a phantom holder and to a voter whose cached state\n// matches its snapshot.\nfunc caPhantomVoteProbe(t *testing.T, tag string, orphanWrites, postEntries int, configChange string) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 10\n\tconf.SnapshotThreshold = 1 << 40\n\tconf.SnapshotInterval = time.Hour\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:       5,\n\t\tBootstrap:   true,\n\t\tConf:        conf,\n\t\tMakeFSMFunc: func() FSM { return &assuranceRestoreCounter{MockFSM: &MockFSM{}} },\n\t})\n\tdefer caClose(c)\n\n\tlead := c.Leader()\n\t_ = c.WaitForFollowers(4)\n\tfor i := 0; i < 40; i++ {\n\t\tif err := lead.Apply([]byte(fmt.Sprintf(\"pre-%03d\", i)), 0).Error(); err != nil {\n\t\t\tt.Fatalf(\"pre apply: %v\", err)\n\t\t}\n\t}\n\n\tvar others []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != lead {\n\t\t\tothers = append(others, r)\n\t\t}\n\t}\n\tstaleFollower := others[0]\n\tmajority := others[1:]\n\tsharedLast := lead.LastIndex()\n\n\t// Isolate the deposed leader together with one follower; the pair is still a\n\t// minority of five, so the suffix they exchange is never committed.\n\tc.Partition([]ServerAddress{lead.localAddr, staleFollower.localAddr})\n\tbase := lead.LastIndex()\n\tfor i := 0; i < orphanWrites; i++ {\n\t\t_ = lead.Apply([]byte(fmt.Sprintf(\"orphan-%03d\", i)), 0)\n\t\tif lead.LastIndex()-base >= uint64(orphanWrites) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) &&\n\t\t(staleFollower.LastIndex() < lead.LastIndex() || lead.getState() == Leader) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tsuffixLast := lead.LastIndex()\n\t_, suffixTerm := lead.getLastLog()\n\n\tnewLeader := caWaitLeader(majority, 5*time.Second)\n\tif newLeader == nil {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no majority leader\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tfor i := 0; i < postEntries; i++ {\n\t\tif err := newLeader.Apply([]byte(fmt.Sprintf(\"post-%03d\", i)), 0).Error(); err != nil {\n\t\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"post apply failed\"}, \"ca_vote_skipped\")\n\t\t\treturn\n\t\t}\n\t}\n\tif err := newLeader.Snapshot().Error(); err != nil {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"snapshot failed\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tsnaps, err := newLeader.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no snapshot\"}, \"ca_vote_skipped\")\n\t\treturn\n\t}\n\tleaderSnap := snaps[0]\n\n\t// Heal the partition and let the minority members install the snapshot, which\n\t// sits below the suffix they still claim.\n\tc.FullyConnect()\n\tinstalled := func(r *Raft) bool {\n\t\tidx, _ := r.getLastSnapshot()\n\t\treturn idx > 0\n\t}\n\tinstallDeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(installDeadline) && !(installed(lead) && installed(staleFollower)) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tphantomClaimIdx, phantomClaimTerm := lead.getLastLog()\n\tphantomSnapIdx, phantomSnapTerm := lead.getLastSnapshot()\n\tphantomApplied := lead.getLastApplied()\n\tsecondClaimIdx, secondClaimTerm := staleFollower.getLastLog()\n\tsecondSnapIdx, _ := staleFollower.getLastSnapshot()\n\tconsistent := newLeader\n\tfor _, r := range majority {\n\t\tif r != newLeader {\n\t\t\tconsistent = r\n\t\t\tbreak\n\t\t}\n\t}\n\tconsClaimIdx, consClaimTerm := consistent.getLastLog()\n\tconsSnapIdx, consSnapTerm := consistent.getLastSnapshot()\n\tconsApplied := consistent.getLastApplied()\n\tcandIdx, candTerm := staleFollower.getLastLog()\n\n\tpremise := phantomSnapIdx > 0 && phantomClaimIdx >= phantomSnapIdx &&\n\t\tsecondSnapIdx > 0 && secondClaimIdx >= secondSnapIdx\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                            tag,\n\t\t\"phantom_id\":                     string(lead.localID),\n\t\t\"second_phantom_id\":              string(staleFollower.localID),\n\t\t\"candidate_id\":                   string(staleFollower.localID),\n\t\t\"consistent_id\":                  string(consistent.localID),\n\t\t\"leader_snapshot_index\":          leaderSnap.Index,\n\t\t\"leader_snapshot_term\":           leaderSnap.Term,\n\t\t\"shared_prefix_last_index\":       sharedLast,\n\t\t\"uncommitted_suffix_last_index\":  suffixLast,\n\t\t\"uncommitted_suffix_term\":        suffixTerm,\n\t\t\"phantom_claim_index\":            phantomClaimIdx,\n\t\t\"phantom_claim_term\":             phantomClaimTerm,\n\t\t\"phantom_snapshot_index\":         phantomSnapIdx,\n\t\t\"phantom_snapshot_term\":          phantomSnapTerm,\n\t\t\"phantom_applied_index\":          phantomApplied,\n\t\t\"second_phantom_claim_index\":     secondClaimIdx,\n\t\t\"second_phantom_claim_term\":      secondClaimTerm,\n\t\t\"second_phantom_snapshot_index\":  secondSnapIdx,\n\t\t\"consistent_claim_index\":         consClaimIdx,\n\t\t\"consistent_claim_term\":          consClaimTerm,\n\t\t\"consistent_snapshot_index\":      consSnapIdx,\n\t\t\"consistent_snapshot_term\":       consSnapTerm,\n\t\t\"consistent_applied_index\":       consApplied,\n\t\t\"candidate_last_log_index\":       candIdx,\n\t\t\"candidate_last_log_term\":        candTerm,\n\t\t\"premise_phantom_claims\":         premise,\n\t}, \"ca_vote_setup\")\n\tif !premise {\n\t\treturn\n\t}\n\n\tif configChange != \"\" {\n\t\t// Configuration-change probe: removing a phantom voter still leaves a\n\t\t// quorum of consistent voters, while removing a consistent voter leaves a\n\t\t// quorum that includes a phantom, whose cached claim blocks every\n\t\t// AppendEntries from this leader.\n\t\tvar target *Raft\n\t\tif configChange == \"phantom\" {\n\t\t\ttarget = staleFollower\n\t\t} else {\n\t\t\tfor _, r := range majority {\n\t\t\t\tif r != newLeader {\n\t\t\t\t\ttarget = r\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif target == nil {\n\t\t\tcaEmit(map[string]interface{}{\"tag\": tag, \"reason\": \"no config target\"}, \"ca_vote_skipped\")\n\t\t\treturn\n\t\t}\n\t\tsizeBefore := 0\n\t\tif f := newLeader.GetConfiguration(); f.Error() == nil {\n\t\t\tsizeBefore = len(f.Configuration().Servers)\n\t\t}\n\t\tstart := time.Now()\n\t\tfut := newLeader.RemoveServer(target.localID, 0, time.Second)\n\t\tdone := make(chan error, 1)\n\t\tgo func() { done <- fut.Error() }()\n\t\tcommitted := false\n\t\terrText := \"\"\n\t\tselect {\n\t\tcase err := <-done:\n\t\t\tcommitted = err == nil\n\t\t\tif err != nil {\n\t\t\t\terrText = err.Error()\n\t\t\t}\n\t\tcase <-time.After(5 * time.Second):\n\t\t\terrText = \"not committed within window\"\n\t\t}\n\t\telapsed := time.Since(start).Milliseconds()\n\t\tsizeAfter := 0\n\t\tif f := newLeader.GetConfiguration(); f.Error() == nil {\n\t\t\tsizeAfter = len(f.Configuration().Servers)\n\t\t}\n\t\t_, targetIsPhantom := func() (uint64, bool) {\n\t\t\tidx, _ := target.getLastSnapshot()\n\t\t\tclaim, _ := target.getLastLog()\n\t\t\treturn idx, idx > 0 && claim >= idx\n\t\t}()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"tag\":                    tag,\n\t\t\t\"phantom_id\":             string(lead.localID),\n\t\t\t\"second_phantom_id\":      string(staleFollower.localID),\n\t\t\t\"leader_id\":              string(newLeader.localID),\n\t\t\t\"target_id\":              string(target.localID),\n\t\t\t\"target_is_phantom\":      targetIsPhantom,\n\t\t\t\"phantom_claim_exceeds_snapshot\": phantomClaimIdx > phantomSnapIdx && phantomClaimTerm < phantomSnapTerm,\n\t\t\t\"config_size_before\":     sizeBefore,\n\t\t\t\"config_size_after\":      sizeAfter,\n\t\t\t\"config_change_committed\": committed,\n\t\t\t\"config_change_error\":    errText,\n\t\t\t\"config_change_ms\":       elapsed,\n\t\t\t\"window_ms\":              int64(5000),\n\t\t}, \"ca_config_probe\")\n\n\t\tif !committed {\n\t\t\t// Second change after a blocked one: the leader's latest\n\t\t\t// configuration never committed, so the change gate that requires\n\t\t\t// latestIndex == committedIndex should refuse further requests. The\n\t\t\t// phantom holder is the voter an operator would want to remove.\n\t\t\tstart2 := time.Now()\n\t\t\tfut2 := newLeader.RemoveServer(staleFollower.localID, 0, time.Second)\n\t\t\tdone2 := make(chan error, 1)\n\t\t\tgo func() { done2 <- fut2.Error() }()\n\t\t\tcommitted2 := false\n\t\t\terrText2 := \"\"\n\t\t\tselect {\n\t\t\tcase err := <-done2:\n\t\t\t\tcommitted2 = err == nil\n\t\t\t\tif err != nil {\n\t\t\t\t\terrText2 = err.Error()\n\t\t\t\t}\n\t\t\tcase <-time.After(2 * time.Second):\n\t\t\t\terrText2 = \"not committed within window\"\n\t\t\t}\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"tag\":                    tag,\n\t\t\t\t\"phantom_id\":             string(lead.localID),\n\t\t\t\t\"second_target_id\":       string(staleFollower.localID),\n\t\t\t\t\"second_change_error\":    errText2,\n\t\t\t\t\"second_change_rejected\": errText2 == ErrEnqueueTimeout.Error(),\n\t\t\t\t\"second_change_committed\": committed2,\n\t\t\t\t\"second_change_ms\":       time.Since(start2).Milliseconds(),\n\t\t\t\t\"window_ms\":              int64(2000),\n\t\t\t}, \"ca_config_probe2\")\n\t\t}\n\t\tc.Disconnect(lead.localAddr)\n\t\treturn\n\t}\n\n\tencoded := staleFollower.trans.EncodePeer(staleFollower.localID, staleFollower.localAddr)\n\treq := &RequestVoteRequest{\n\t\tRPCHeader: RPCHeader{\n\t\t\tProtocolVersion: conf.ProtocolVersion,\n\t\t\tID:              []byte(staleFollower.localID),\n\t\t\tAddr:            encoded,\n\t\t},\n\t\tTerm:               consistent.getCurrentTerm() + 1,\n\t\tCandidate:          encoded,\n\t\tLastLogIndex:       candIdx,\n\t\tLastLogTerm:        candTerm,\n\t\tLeadershipTransfer: true,\n\t}\n\t// Both targets are under snapshot pressure from the leader's retry loop, so\n\t// deliver with bounded retries and record how many attempts each needed.\n\tdeliver := func(target ServerAddress) (RequestVoteResponse, int, bool, string) {\n\t\tvar resp RequestVoteResponse\n\t\tlastErr := \"\"\n\t\tfor attempt := 1; attempt <= 6; attempt++ {\n\t\t\tif err := staleFollower.trans.RequestVote(staleFollower.localID, target, req, &resp); err == nil {\n\t\t\t\treturn resp, attempt, true, \"\"\n\t\t\t}\n\t\t\tlastErr = fmt.Sprintf(\"%v\", staleFollower.trans.RequestVote(staleFollower.localID, target, req, &resp))\n\t\t\ttime.Sleep(100 * time.Millisecond)\n\t\t}\n\t\treturn resp, 6, false, lastErr\n\t}\n\tphantomResp, phantomAttempts, phantomOK, phantomErr := deliver(lead.localAddr)\n\tconsistentResp, consistentAttempts, consistentOK, consistentErr := deliver(consistent.localAddr)\n\n\tcaEmit(map[string]interface{}{\n\t\t\"tag\":                            tag,\n\t\t\"phantom_id\":                     string(lead.localID),\n\t\t\"consistent_id\":                  string(consistent.localID),\n\t\t\"candidate_id\":                   string(staleFollower.localID),\n\t\t\"request_term\":                   req.Term,\n\t\t\"candidate_last_log_index\":       req.LastLogIndex,\n\t\t\"candidate_last_log_term\":        req.LastLogTerm,\n\t\t\"phantom_delivered\":              phantomOK,\n\t\t\"phantom_attempts\":               phantomAttempts,\n\t\t\"consistent_delivered\":           consistentOK,\n\t\t\"consistent_attempts\":            consistentAttempts,\n\t\t\"phantom_delivery_error\":         phantomErr,\n\t\t\"consistent_delivery_error\":      consistentErr,\n\t\t\"consistent_state\":               consistent.getState().String(),\n\t\t\"leader_id_after_probe\":          string(newLeader.localID),\n\t\t\"phantom_granted\":                phantomResp.Granted,\n\t\t\"phantom_response_term\":          phantomResp.Term,\n\t\t\"consistent_granted\":             consistentResp.Granted,\n\t\t\"consistent_response_term\":       consistentResp.Term,\n\t\t\"phantom_claim_exceeds_snapshot\": phantomClaimIdx > phantomSnapIdx && phantomClaimTerm < phantomSnapTerm,\n\t\t\"candidate_lacks_snapshot_term\":  req.LastLogTerm < phantomSnapTerm,\n\t\t\"vote_decision_differs\":          phantomResp.Granted != consistentResp.Granted,\n\t}, \"ca_vote_probe\")\n\n\tc.Disconnect(lead.localAddr)\n}\n\n// TestAssurance_PhantomClaimVoteDecision delivers one RequestVote to a phantom\n// holder and to a consistent voter in the same five-voter history.\nfunc TestAssurance_PhantomClaimVoteDecision(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"phantom-vote\", 40, 20, \"\")\n}\n\n// TestAssurance_ConfigChangeRemovePhantom removes a phantom voter: the remaining\n// four voters still contain three consistent voters, so the change should commit.\nfunc TestAssurance_ConfigChangeRemovePhantom(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"config-remove-phantom\", 40, 20, \"phantom\")\n}\n\n// TestAssurance_ConfigChangeRemoveConsistent removes a consistent voter: the new\n// configuration's quorum then includes a phantom holder, whose cached claim\n// blocks every AppendEntries from the leader.\nfunc TestAssurance_ConfigChangeRemoveConsistent(t *testing.T) {\n\tcaPhantomVoteProbe(t, \"config-remove-consistent\", 40, 20, \"consistent\")\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "test_names": [
+          "TestAssurance_ConfigChangeRemovePhantom",
+          "TestAssurance_ConfigChangeRemoveConsistent"
+        ],
+        "description": "",
+        "semantic_changes": [
+          "ca_config_probe now emits phantom_id and second_phantom_id so the admission event and the result event share an identity.",
+          "A blocked configuration change is followed by a second RemoveServer for the phantom holder, emitted as ca_config_probe2 with the enqueue outcome and a two-second commit window."
+        ],
+        "prerequisites": [
+          {
+            "alias": "phantom_removal_setup",
+            "event": "ca_vote_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "config-remove-phantom",
+                "reference": null
+              },
+              {
+                "field": "premise_phantom_claims",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "consistent_removal_setup",
+            "event": "ca_vote_setup",
+            "conditions": [
+              {
+                "field": "tag",
+                "op": "eq",
+                "value": "config-remove-consistent",
+                "reference": null
+              },
+              {
+                "field": "premise_phantom_claims",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Two cases built on the already validated five-voter phantom history: forty entries committed on all voters, the current leader and one follower partitioned together and given forty further entries that never reach a quorum of five, the remaining three voters electing a leader, committing twenty entries and publishing a snapshot at an index below the suffix end so both minority members become phantom holders after healing. One case then removes a phantom voter; the other removes a consistent follower. Both removals are issued on the majority leader and awaited for five seconds, and the phantom premise is recorded before the attempt.",
+        "assumptions": [
+          "Fault model unchanged: no message loss inside the injected transport; the induced events are one partition of two voters from three, retention of the minority suffix, one explicit snapshot, and one RemoveServer attempt.",
+          "The comparison between the two cases holds the history, snapshot index, timing and leader load identical; only the identity of the removed voter differs, and it is chosen so the new configuration's quorum either excludes or includes a phantom holder.",
+          "Reused facilities: MakeClusterCustom with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport and MockFSM."
+        ],
+        "excluded": [
+          "No production logic was modified; the harness only adds test code.",
+          "Automatic snapshotting is disabled so the published snapshot index is controlled by the explicit Snapshot() call."
+        ],
+        "parameters": {
+          "peers": 5,
+          "pre_entries": 40,
+          "orphan_writes": 40,
+          "post_entries": 20,
+          "trailing_logs": 10,
+          "config_change_wait_ms": 5000
+        }
+      },
+      "after": {
+        "description": "The same two-case configuration-change probe on the validated five-voter phantom history, with the probe events now carrying the phantom identity and, when a removal is blocked, a follow-up removal attempt. Case one removes a phantom voter; case two removes a consistent follower; in case two a further RemoveServer for the phantom holder is then attempted with a one-second enqueue timeout and awaited for two seconds.",
+        "assumptions": [
+          "Fault model unchanged: no message loss inside the injected transport; induced events are one partition of two voters from three, retention of the minority suffix, one explicit snapshot, and the RemoveServer attempts.",
+          "Both cases keep history, snapshot index, timing and leader load identical so the removed voter's role is the only difference; the follow-up attempt uses the ordinary public API with the documented enqueue timeout.",
+          "Reused facilities: MakeClusterCustom with inmemConfig timings, InmemStore, FileSnapshotStore, InmemTransport and MockFSM."
+        ],
+        "excluded": [
+          "No production logic was modified; the harness only adds test code.",
+          "Automatic snapshotting stays disabled so the published snapshot index is controlled by the explicit Snapshot() call."
+        ],
+        "parameters": {
+          "peers": 5,
+          "pre_entries": 40,
+          "orphan_writes": 40,
+          "post_entries": 20,
+          "trailing_logs": 10,
+          "config_change_wait_ms": 5000,
+          "followup_wait_ms": 2000
+        }
+      }
+    },
+    "prefix": {
+      "before": "Each case repeats the phantom setup: elect a leader in a five-voter cluster, commit forty entries, partition the leader with one follower, drive forty further applies on the deposed leader so the pair shares an uncommitted suffix, wait for the pair to stop leading, wait for one of the remaining three to be the only stable leader, commit twenty entries there and force Snapshot(), heal the partition and wait until both minority members have installed the snapshot. The case then records the premise (claim above snapshot on both minority members, consistent claim on a majority voter) and issues RemoveServer on the majority leader for either a phantom holder or a consistent follower, waiting up to five seconds for the future and recording whether it committed, the elapsed time, the configuration sizes the leader reports before and after, and whether the removed voter held a phantom claim.",
+      "after": "Each case repeats the phantom setup (elect, commit forty entries, partition the leader with one follower, drive forty uncommitted applies on the deposed leader, wait for the pair to stop leading, wait for a majority leader, commit twenty entries and force Snapshot(), heal, wait for both minority members to install the snapshot), records the premise, then issues RemoveServer for the phantom holder or for a consistent follower and waits up to five seconds. When the first removal does not commit, a second RemoveServer for the phantom holder is issued with a one-second enqueue timeout and awaited for two seconds, and both outcomes are emitted."
+    },
+    "requirement": {
+      "before": "A configuration change must either commit or fail observably within a bounded time rather than block indefinitely because a voter whose cached log claim was superseded by its own snapshot can no longer accept log entries.",
+      "after": "A configuration change must either commit or fail observably within a bounded time rather than block indefinitely because a voter whose cached log claim was superseded by its own snapshot can no longer accept log entries, and a blocked change must not prevent the operator from issuing further configuration changes."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "ca_config_probe",
+          "identity_fields": [
+            "target_id"
+          ],
+          "admission_alias": "phantom_removal_setup",
+          "assertion": {
+            "field": "config_change_committed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-phantom",
+              "reference": null
+            },
+            {
+              "field": "target_is_phantom",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Removing a phantom voter commits promptly: the remaining configuration still contains three voters that accept entries."
+        },
+        {
+          "event": "ca_config_probe",
+          "identity_fields": [
+            "target_id"
+          ],
+          "admission_alias": "consistent_removal_setup",
+          "assertion": {
+            "field": "config_change_committed",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-consistent",
+              "reference": null
+            },
+            {
+              "field": "target_is_phantom",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Removing a consistent voter does not commit within the window: the new configuration's quorum includes a phantom holder, so the entry can never gather its acknowledgements."
+        }
+      ],
+      "after": [
+        {
+          "event": "ca_config_probe",
+          "identity_fields": [
+            "phantom_id"
+          ],
+          "admission_alias": "phantom_removal_setup",
+          "assertion": {
+            "field": "config_change_committed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-phantom",
+              "reference": null
+            },
+            {
+              "field": "target_is_phantom",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Removing a phantom voter commits promptly: the remaining configuration still contains three voters that accept entries."
+        },
+        {
+          "event": "ca_config_probe",
+          "identity_fields": [
+            "phantom_id"
+          ],
+          "admission_alias": "consistent_removal_setup",
+          "assertion": {
+            "field": "config_change_committed",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-consistent",
+              "reference": null
+            },
+            {
+              "field": "target_is_phantom",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Removing a consistent voter does not commit within the window: the new configuration's quorum includes a phantom holder, so the entry cannot gather its acknowledgements."
+        },
+        {
+          "event": "ca_config_probe2",
+          "identity_fields": [
+            "phantom_id"
+          ],
+          "admission_alias": "consistent_removal_setup",
+          "assertion": {
+            "field": "second_change_rejected",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-consistent",
+              "reference": null
+            }
+          ],
+          "description": "After the blocked change the operator's follow-up removal of the phantom holder is refused at enqueue time, so the wedge is not limited to the blocked entry itself."
+        },
+        {
+          "event": "ca_config_probe2",
+          "identity_fields": [
+            "phantom_id"
+          ],
+          "admission_alias": "consistent_removal_setup",
+          "assertion": {
+            "field": "second_change_committed",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "tag",
+              "op": "eq",
+              "value": "config-remove-consistent",
+              "reference": null
+            }
+          ],
+          "description": "The follow-up change also does not commit within its window, matching the closed configuration-change gate."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Both config-change comparisons resolved unknown because the probe event carried no identity field present in its admission event, so the alias could not be associated; the probe now emits phantom_id and second_phantom_id, and both comparisons use phantom_id. The blocked case also gained a follow-up RemoveServer for the phantom holder with the ordinary enqueue timeout, giving the wedge its own comparison subjects. Scenario, timing, anchors and the phantom premise are unchanged, and the earlier cases stay in the file."
+}

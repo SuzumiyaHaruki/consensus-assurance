@@ -1,0 +1,60 @@
+{
+  "rationale": "Dispatches the decoupling case that the last discriminator asked for, after a local run whose result already changes the reading. The harness now takes the follower's flush deadline as a parameter (`flush_batch_tick_timeout`) instead of the fixed hundred ticks, and the new case keeps the tick period at 1000 ms - the period where the shift was reproduced three times - while reducing that deadline to two ticks. Locally the fresh call then returned index 4 with entry 33 actually at index 4 and entry 33 at the returned index (`assigned_idx_matches_true_index` true), and the origin's decided values were 11,12,22,33,34,35, so its earlier buffered entries survived instead of being discarded; `decided_after_resync` was 3 rather than 0. So the shift does not follow from the tick period alone: with a fast follower flush at the same tick period it did not occur, which means the follower's flush deadline participates in the condition, as the source trace implied. This narrows the account rather than contradicting the violation, which remains reproduced under the original configuration; I am submitting the case so the decoupling rests on a receipt, and leaving the corrected interpretation and knowledge revision for the next update because the evidence for them only exists once this receipt does.",
+  "investigations": [
+    {
+      "id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+      "discriminator": "Pending the submitted case's receipt. Locally the same 1000 ms tick period with a two-tick follower flush returned the correct index and kept the origin's earlier entries decided, so the tick period alone does not produce the shift; what remains open is which of the two factors is necessary, which a pair of runs varying only one of them (large tick with fast flush, already covered locally; small tick with slow flush) would settle."
+    }
+  ],
+  "experiment": {
+    "investigation_id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+    "previous_id": "b9cc8977f2f54a82bad05608f52883b9-experiment",
+    "revision_reason": "Adds the follower's flush-batch tick timeout as a parameter of the harness (the cases so far all used the fixed value 100) and one case that keeps the tick period at 1000 ms while setting that timeout to 2 ticks, so the tick period and the follower's flush deadline vary independently. The existing cases, their constructions and their comparisons are unchanged; a fresh execution is required because the harness bytes changed.",
+    "harness_path": "omnipaxos_runtime/tests/assurance_shift.rs",
+    "execution_package": "./omnipaxos_runtime",
+    "test_names": ["case_m_large_tick_fast_flush"],
+    "source_ids": [
+      "actor_record_assignment",
+      "actor_pending_assigned_field",
+      "actor_append_tracked",
+      "actor_drain_notifiers",
+      "handle_append_notify_contract",
+      "core_flush_batch_follower",
+      "core_flush_batch_tick"
+    ],
+    "scope": {
+      "description": "One run of the same lost-entry scenario at a 1000 ms tick period in which every node's flush-batch tick timeout is two ticks instead of the previous hundred, so a follower that receives a single replicated entry flushes it within about two ticks and the new leader can decide that entry during the run. The run buffers two `append_notify` entries on the origin, cuts it off so node 3 takes over and accepts entry 22, restores the links, re-elects the origin, buffers a fresh entry 33 with two filler appends, and reports the returned index against the entry's true position together with the entry at the returned index and each node's decided values.",
+      "assumptions": [
+        "Reducing `flush_batch_tick_timeout` changes only how soon a follower replies `Accepted` for a partially filled batch; it does not change the batching size, the quorum or the message flow.",
+        "The tick period, the scenario steps and the measured quantities are the same as the 1000 ms case that violated, so a difference in outcome is attributable to the flush deadline rather than to the schedule.",
+        "No target logic is modified; the harness only configures the timeout through the public server config."
+      ],
+      "excluded": [
+        "Any claim about which factor is necessary for the shift: this case varies one of them only at one tick period.",
+        "Any claim about the internal placeholder queue, which is unobservable through the public API.",
+        "Any claim about tick periods other than 1000 ms with a fast flush."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "batch_size": 3,
+        "tick_ms": 1000,
+        "flush_batch_tick_timeout": 2,
+        "buffered_entries": "11,12",
+        "new_leader_entry": 22,
+        "fresh_entry": 33,
+        "filler_appends": "34,35"
+      }
+    },
+    "prefix": "Build three actors with batch_size 3, a 1000 ms tick period and a flush-batch tick timeout of two ticks, node 1 carrying leader_priority 1. Elect node 1 and emit the admission event. Buffer `append_notify(11)` and `append_notify(12)` on node 1 so both are deferred into its batch. Block node 1's links to nodes 2 and 3 both ways, wait until nodes 2 and 3 report node 3 as the accepted leader, and call `append_notify(22)` on it. Unblock the links and sleep about eight ticks so a re-synchronisation can happen. Call `try_become_leader()` on node 1 until it reports itself as the accepted leader, spawn `append_notify(33)` on it, follow with plain appends 34 and 35, sleep, and await the fresh call. Read node 1's decided suffix, find the 1-based position of entry 33 and the entry at the returned index, and emit the outcome event with the resolution, the returned index, the true position, whether they agree, the entry at the returned index and the decided values.",
+    "responsibility": "The decisive inputs come from the target: the flush-batch timeout governs when a follower's partially filled batch is flushed and therefore when it replies `Accepted`, and `reconcile_unconfirmed` maps queued placeholders to index advances to compute the index it reports. The harness chooses the configuration and the schedule and reads the endpoints.",
+    "prerequisites": [
+      {"alias": "admission_m", "event": "admission", "conditions": [{"field": "mode", "op": "eq", "value": "M"}, {"field": "origin", "op": "eq", "value": 1}, {"field": "submitted_value", "op": "eq", "value": 33}]}
+    ],
+    "comparisons": [
+      {"event": "shift_outcome_m", "identity_fields": ["mode", "origin", "submitted_value"], "admission_alias": "admission_m", "antecedent": {"field": "resolved", "op": "eq", "value": "ok"}, "assertion": {"field": "assigned_idx_matches_true_index", "op": "eq", "value": true}, "description": "If the fresh call resolves Ok, the returned index must be the entry's true position. Locally this held with a fast follower flush at the same tick period where the slow flush violated, so a violation here would refute the decoupling reading."}
+    ],
+    "semantic_changes": [
+      "The flush-batch tick timeout became a harness parameter and one case varies it at a fixed tick period; existing cases are unchanged."
+    ]
+  }
+}

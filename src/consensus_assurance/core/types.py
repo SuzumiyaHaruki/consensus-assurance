@@ -1,9 +1,9 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 
 
@@ -17,6 +17,15 @@ def now() -> str:
 
 class Record(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+def distinct_test_names(names):
+    if len(set(names)) != len(names) or any(not name or name.strip() != name for name in names):
+        raise ValueError("test_names must contain distinct, nonempty exact names")
+    return names
+
+
+TestNames = Annotated[list[StrictStr], Field(min_length=1), AfterValidator(distinct_test_names)]
 
 
 class ExecutionStatus(str, Enum):
@@ -220,6 +229,7 @@ class Harness(Record):
     source: str = Field(min_length=1)
     files: dict[str, str] = {}
     execution_package: str | None = None
+    test_names: TestNames | None = None
     description: str = ""
     semantic_changes: list[str] = []
     prerequisites: list[EventRequirement] = []

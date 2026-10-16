@@ -1,0 +1,489 @@
+{
+  "input": {
+    "rationale": "First research update of this fresh session. I read the captured OmniPaxos tree (core Sequence Paxos decision/authority machinery plus the added async actor layer) and registered one sourced question: the actor's completion signal for `append_notify` is decided by log-index progress alone, so a write whose entry never reached a write quorum can be reported as resolved with `Ok(assigned_idx)` even though a *different* value is decided at that index. Sources read this turn: omnipaxos/src/sequence_paxos/{mod,leader,follower}.rs, omnipaxos/src/storage/{mod,internal_storage,state_cache}.rs, omnipaxos/src/{omni_paxos,ballot_leader_election,messages,util}.rs, omnipaxos_storage/src/*, omnipaxos_runtime/src/*, docs/omnipaxos/*, and the existing test suites (read only; none executed). No execution this turn: the configured harness target is omnipaxos/tests/assurance_generated.rs in crate `omnipaxos`, which cannot link `omnipaxos_runtime` (it is not in omnipaxos's dependencies/dev-dependencies), and reaching the actor code requires switching the experiment crate to an unprepared basis, so I recorded the account and the discriminator instead of spending the execution on a harness that cannot observe the question. Next action: build one focused in-process actor probe for that question.",
+    "sources": [
+      {
+        "id": "actor_drain_notifiers",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 201,
+        "end_line": 222,
+        "kind": "code_observation"
+      },
+      {
+        "id": "actor_record_assignment",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 335,
+        "end_line": 343,
+        "kind": "code_observation"
+      },
+      {
+        "id": "actor_pending_assigned_field",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 60,
+        "end_line": 76,
+        "kind": "code_observation"
+      },
+      {
+        "id": "actor_append_tracked",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 370,
+        "end_line": 395,
+        "kind": "code_observation"
+      },
+      {
+        "id": "handle_append_notify_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 114,
+        "end_line": 129,
+        "kind": "interface_statement"
+      },
+      {
+        "id": "event_superseded_contract",
+        "file": "omnipaxos_runtime/src/event.rs",
+        "start_line": 48,
+        "end_line": 58,
+        "kind": "interface_statement"
+      },
+      {
+        "id": "leader_majority_promises_adopt",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 257,
+        "end_line": 284,
+        "kind": "code_observation"
+      },
+      {
+        "id": "storage_sync_log_adopts",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 313,
+        "end_line": 375,
+        "kind": "code_observation"
+      },
+      {
+        "id": "leader_is_chosen",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 260,
+        "end_line": 270,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_completion_false_positive",
+        "question": "In the async actor layer, when an entry is accepted at a log index by the leader it was assigned to but is then dropped by a later leader change before decision, what resolution does the originating `append_notify` receive once the origin's local decided index reaches that index, and what does that resolution establish about the caller's entry?",
+        "source_ids": [
+          "actor_drain_notifiers",
+          "actor_record_assignment",
+          "actor_pending_assigned_field",
+          "actor_append_tracked",
+          "handle_append_notify_contract",
+          "event_superseded_contract",
+          "leader_majority_promises_adopt",
+          "storage_sync_log_adopts"
+        ],
+        "hypothesis": "Provisional: `drain_notifiers` matches the completion arm `Some((idx, _)) if idx <= decided` before evaluating the ballot-change arm, so a pending call whose entry was dropped and replaced by a different value at the same index resolves with `Ok(idx)`; the origin's `Ok(idx)` then does not entail that the caller's entry is decided at `idx`, and the documented `Superseded` resolution for a leader change after acceptance but before decision is not produced.",
+        "discriminator": "An execution that (i) lets a node's `append_notify` obtain an assignment at index i from a leader, (ii) prevents that entry from reaching a write quorum (drop the outgoing replication messages / partition the leader) and lets a new leader decide a *different* entry at i, (iii) restores the original node so its local decided index reaches i. The judgment changes if the origin resolves `Err(Superseded{log_entry_idx: i})` instead of `Ok(i)`, if the value at i in the origin's decided log is the caller's entry, or if no such lost-assignment interleaving is constructible under the actor's own routing.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_resolution_arm_order",
+        "kind": "behavior",
+        "statement": "`ActorState::drain_notifiers` resolves a pending `append_notify` in a fixed arm order: a pending whose recorded assignment satisfies `assigned_idx <= local decided index` is answered `Ok(assigned_idx)` first; only when that does not hold and the ballot recorded at assignment is lower than the node's current promise is `Err(AppendError::Superseded { log_entry_idx: assigned_idx })` sent; otherwise the deadline arm `now > deadline` yields `Err(Timeout)` and unsettled pendings are retained for the next tick. The `Ok` arm compares only the index against the local decided index, with the assignment ballot and the entry's identity unused.",
+        "conditions": "Applies while the actor loop's tick branch runs and the pending entry has `assigned = Some((idx, ballot))`; the node's local decided index is read from the same `OmniPaxos` instance as the promise ballot used by the `Superseded` arm.",
+        "source_ids": [
+          "actor_drain_notifiers"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_assignment_carries_no_identity",
+        "kind": "fact",
+        "statement": "In this actor layer an assignment is only the pair `(log index, ballot in effect at assignment)`; `Pending::assigned: Option<(usize, Ballot)>` and `record_assignment(id, idx, ballot)` store no value, digest or entry id that could be compared against the entry actually stored at `idx` in the decided log. An index recorded through `append_tracked` (local accept as leader) or through `AsyncRuntimeMsg::Assigned` (leader reply) is therefore indistinguishable, from the completion signal alone, from a later different entry decided at the same index.",
+        "conditions": "Applies to `append_notify` completion on the origin actor, for assignments produced by the leader-side immediate accept path and by the leader's `Assigned` reply; `EntryId` identifies the caller's *pending call*, never the log slot's content.",
+        "source_ids": [
+          "actor_record_assignment",
+          "actor_pending_assigned_field",
+          "actor_append_tracked"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_local_accept_is_not_quorum",
+        "kind": "behavior",
+        "statement": "A node that is leader and in `Phase::Accept` advances its own accepted index as soon as it appends an entry locally; entries are replicated afterwards by `AcceptDecide`/`Accepted` and only a write-quorum of reported accepted indexes makes an index chosen (`LeaderState::is_chosen` counts accepted indexes against the accept quorum). Consequently a locally accepted index can exist in the leader's log without any follower holding it, and a subsequent leader adopts only the log of the promise with the highest `(n_accepted, accepted_idx)` via `InternalStorage::sync_log`, which can replace that index with a different value.",
+        "conditions": "Applies with the majority or flexible quorum configured for the cluster, when the replication messages of that index do not reach a write quorum before leadership changes; it does not apply to an index already chosen by a write quorum, which a new leader must retain.",
+        "source_ids": [
+          "leader_majority_promises_adopt",
+          "storage_sync_log_adopts",
+          "leader_is_chosen"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [
+      {
+        "investigation_id": "@q_completion_false_positive",
+        "question": "Is the lost-assignment interleaving reachable in a real in-process actor cluster under the permitted fault model (dropped inter-node messages, election-timeout leader change), and does the origin then resolve `Ok(assigned_idx)` while the entry at that index in its decided log is a different value?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [
+      {
+        "investigation_id": "@q_completion_false_positive",
+        "experiment_id": null,
+        "source_ids": [
+          "actor_drain_notifiers",
+          "actor_record_assignment",
+          "actor_pending_assigned_field",
+          "actor_append_tracked",
+          "handle_append_notify_contract",
+          "event_superseded_contract"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account, source-only. `append_notify` is documented as resolving the future \"when the assigned log index is decided\", and the assignment it waits on is only `(index, ballot-at-assignment)`; nothing in the actor compares the caller's entry with what is decided at that index. `drain_notifiers` therefore answers `Ok(idx)` purely from local index progress, and the `Superseded` arm — documented as the resolution when \"a leader change occurred after the entry was accepted at the given index but before it was decided\" — is evaluated only after the `Ok` arm, so it is reached only while the local decided index is still below `idx`. Combining that with the leader-side path, where an entry is accepted locally (and assigned) before any write quorum is reached, a leader change that loses that entry and lets a different entry be decided at the same index makes `Ok(idx)` the resolution the caller receives; the caller cannot tell that case from a genuine success at `idx` from the returned value alone, and would have to re-read the decided log at `idx` and compare values, a check the public documentation recommends only for `Superseded`. I am not asserting the defect yet: the arm order is unambiguous in source, but I have no execution showing the interleaving is reachable through the actor's own routing and that the origin's decided index reaches `idx` while its promise is already the new ballot, which is what would make `Ok` (rather than `Superseded`) the delivered resolution. One necessary premise is instead well-sourced: a locally accepted index can be present in a leader's log with no follower holding it, and a new leader adopts only one promise's log, so a different value can occupy that index afterwards; the `Superseded` doc's own hedge acknowledges exactly this index-reuse uncertainty.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "`handle.rs:114-129` defines the success condition as the *assigned log index* being decided, and for `Superseded` tells callers to re-read the returned index themselves if they need certainty (`handle.rs:127-129`). Under that reading `Ok(idx)` is a weaker claim than \"the caller's entry is at idx\", so the observed arm order is consistent with the entry-point documentation even though it overrides the `Superseded` definition in `event.rs:48-58`.",
+          "A new leader is required to adopt any value a majority-overlapping write quorum already accepted, so the entry is lost only when its assignee never reached a write quorum; the `Superseded` variant's doc says the entry \"can still end up decided at log_entry_idx under the new ballot\", i.e. some leader changes preserve the index content rather than replacing it."
+        ],
+        "limitations": [
+          "Source-only account this turn: no execution measured the resolution variant, the entry at the assigned index in the origin's decided log, or the timing between the origin's promise change and its decided index reaching the assigned index.",
+          "The actor layer is not linked into the harness target configured for this run (`omnipaxos/tests/assurance_generated.rs` in crate `omnipaxos`); `omnipaxos_runtime` is neither a dependency nor a dev-dependency of `omnipaxos`, and `omnipaxos::handle_incoming` discards leaked `AsyncRuntime` messages. Judging this question by execution requires switching the experiment crate to `omnipaxos_runtime`, whose build basis is not prepared in `build_inputs`, so the first such execution may need a heavy dependency build.",
+          "The scope read this turn is the captured snapshot only; the failure also depends on the caller's own interpretation of `Ok`, since a caller that re-reads the decided log at the returned index and compares values would not be misled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "interpretations": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "7428c4a1533941c1bcd9707354ba9245",
+      "result": {
+        "submission": "update.json",
+        "summary": "Oriented in the captured OmniPaxos snapshot (core Sequence Paxos decision/authority paths, storage, BLE, and the added async actor layer; existing tests read, none run) and filed the first sourced records: one investigation on whether `append_notify` can report `Ok(assigned_idx)` for an entry dropped by a leader change and replaced at the same index, three knowledge statements (the `drain_notifiers` arm order; assignments carrying only index+ballot with no entry identity; a locally accepted index being unreachable by followers before a write quorum), one necessary gap on reachability of that interleaving, and a question-level source-only Interpretation concluding unresolved with the documented `Superseded` wording and the new-leader adoption rule as counterevidence. No execution this turn: the configured harness target (omnipaxos/tests/assurance_generated.rs in crate `omnipaxos`) cannot link `omnipaxos_runtime`, so the discriminating in-process actor probe still needs a switch to an unprepared crate basis — that build and probe are the unfinished next action. Draft validated (valid, no_change=false, execution_requested=false)."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+        "version": 1,
+        "question": "In the async actor layer, when an entry is accepted at a log index by the leader it was assigned to but is then dropped by a later leader change before decision, what resolution does the originating `append_notify` receive once the origin's local decided index reaches that index, and what does that resolution establish about the caller's entry?",
+        "source_ids": [
+          "actor_drain_notifiers",
+          "actor_record_assignment",
+          "actor_pending_assigned_field",
+          "actor_append_tracked",
+          "handle_append_notify_contract",
+          "event_superseded_contract",
+          "leader_majority_promises_adopt",
+          "storage_sync_log_adopts"
+        ],
+        "hypothesis": "Provisional: `drain_notifiers` matches the completion arm `Some((idx, _)) if idx <= decided` before evaluating the ballot-change arm, so a pending call whose entry was dropped and replaced by a different value at the same index resolves with `Ok(idx)`; the origin's `Ok(idx)` then does not entail that the caller's entry is decided at `idx`, and the documented `Superseded` resolution for a leader change after acceptance but before decision is not produced.",
+        "discriminator": "An execution that (i) lets a node's `append_notify` obtain an assignment at index i from a leader, (ii) prevents that entry from reaching a write quorum (drop the outgoing replication messages / partition the leader) and lets a new leader decide a *different* entry at i, (iii) restores the original node so its local decided index reaches i. The judgment changes if the origin resolves `Err(Superseded{log_entry_idx: i})` instead of `Ok(i)`, if the value at i in the origin's decided log is the caller's entry, or if no such lost-assignment interleaving is constructible under the actor's own routing.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "7428c4a1533941c1bcd9707354ba9245-gap-0",
+            "question": "Is the lost-assignment interleaving reachable in a real in-process actor cluster under the permitted fault model (dropped inter-node messages, election-timeout leader change), and does the origin then resolve `Ok(assigned_idx)` while the entry at that index in its decided log is a different value?",
+            "experiment_id": null,
+            "operation_id": "7428c4a1533941c1bcd9707354ba9245"
+          }
+        ],
+        "history": [],
+        "operation_id": "7428c4a1533941c1bcd9707354ba9245"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "7428c4a1533941c1bcd9707354ba9245-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "`ActorState::drain_notifiers` resolves a pending `append_notify` in a fixed arm order: a pending whose recorded assignment satisfies `assigned_idx <= local decided index` is answered `Ok(assigned_idx)` first; only when that does not hold and the ballot recorded at assignment is lower than the node's current promise is `Err(AppendError::Superseded { log_entry_idx: assigned_idx })` sent; otherwise the deadline arm `now > deadline` yields `Err(Timeout)` and unsettled pendings are retained for the next tick. The `Ok` arm compares only the index against the local decided index, with the assignment ballot and the entry's identity unused.",
+        "conditions": "Applies while the actor loop's tick branch runs and the pending entry has `assigned = Some((idx, ballot))`; the node's local decided index is read from the same `OmniPaxos` instance as the promise ballot used by the `Superseded` arm.",
+        "source_ids": [
+          "actor_drain_notifiers"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7428c4a1533941c1bcd9707354ba9245"
+      },
+      {
+        "id": "7428c4a1533941c1bcd9707354ba9245-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In this actor layer an assignment is only the pair `(log index, ballot in effect at assignment)`; `Pending::assigned: Option<(usize, Ballot)>` and `record_assignment(id, idx, ballot)` store no value, digest or entry id that could be compared against the entry actually stored at `idx` in the decided log. An index recorded through `append_tracked` (local accept as leader) or through `AsyncRuntimeMsg::Assigned` (leader reply) is therefore indistinguishable, from the completion signal alone, from a later different entry decided at the same index.",
+        "conditions": "Applies to `append_notify` completion on the origin actor, for assignments produced by the leader-side immediate accept path and by the leader's `Assigned` reply; `EntryId` identifies the caller's *pending call*, never the log slot's content.",
+        "source_ids": [
+          "actor_record_assignment",
+          "actor_pending_assigned_field",
+          "actor_append_tracked"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7428c4a1533941c1bcd9707354ba9245"
+      },
+      {
+        "id": "7428c4a1533941c1bcd9707354ba9245-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "A node that is leader and in `Phase::Accept` advances its own accepted index as soon as it appends an entry locally; entries are replicated afterwards by `AcceptDecide`/`Accepted` and only a write-quorum of reported accepted indexes makes an index chosen (`LeaderState::is_chosen` counts accepted indexes against the accept quorum). Consequently a locally accepted index can exist in the leader's log without any follower holding it, and a subsequent leader adopts only the log of the promise with the highest `(n_accepted, accepted_idx)` via `InternalStorage::sync_log`, which can replace that index with a different value.",
+        "conditions": "Applies with the majority or flexible quorum configured for the cluster, when the replication messages of that index do not reach a write quorum before leadership changes; it does not apply to an index already chosen by a write quorum, which a new leader must retain.",
+        "source_ids": [
+          "leader_majority_promises_adopt",
+          "storage_sync_log_adopts",
+          "leader_is_chosen"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7428c4a1533941c1bcd9707354ba9245"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "7428c4a1533941c1bcd9707354ba9245-interpretation-0",
+        "investigation_id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "actor_drain_notifiers",
+          "actor_record_assignment",
+          "actor_pending_assigned_field",
+          "actor_append_tracked",
+          "handle_append_notify_contract",
+          "event_superseded_contract"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current account, source-only. `append_notify` is documented as resolving the future \"when the assigned log index is decided\", and the assignment it waits on is only `(index, ballot-at-assignment)`; nothing in the actor compares the caller's entry with what is decided at that index. `drain_notifiers` therefore answers `Ok(idx)` purely from local index progress, and the `Superseded` arm — documented as the resolution when \"a leader change occurred after the entry was accepted at the given index but before it was decided\" — is evaluated only after the `Ok` arm, so it is reached only while the local decided index is still below `idx`. Combining that with the leader-side path, where an entry is accepted locally (and assigned) before any write quorum is reached, a leader change that loses that entry and lets a different entry be decided at the same index makes `Ok(idx)` the resolution the caller receives; the caller cannot tell that case from a genuine success at `idx` from the returned value alone, and would have to re-read the decided log at `idx` and compare values, a check the public documentation recommends only for `Superseded`. I am not asserting the defect yet: the arm order is unambiguous in source, but I have no execution showing the interleaving is reachable through the actor's own routing and that the origin's decided index reaches `idx` while its promise is already the new ballot, which is what would make `Ok` (rather than `Superseded`) the delivered resolution. One necessary premise is instead well-sourced: a locally accepted index can be present in a leader's log with no follower holding it, and a new leader adopts only one promise's log, so a different value can occupy that index afterwards; the `Superseded` doc's own hedge acknowledges exactly this index-reuse uncertainty.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "`handle.rs:114-129` defines the success condition as the *assigned log index* being decided, and for `Superseded` tells callers to re-read the returned index themselves if they need certainty (`handle.rs:127-129`). Under that reading `Ok(idx)` is a weaker claim than \"the caller's entry is at idx\", so the observed arm order is consistent with the entry-point documentation even though it overrides the `Superseded` definition in `event.rs:48-58`.",
+          "A new leader is required to adopt any value a majority-overlapping write quorum already accepted, so the entry is lost only when its assignee never reached a write quorum; the `Superseded` variant's doc says the entry \"can still end up decided at log_entry_idx under the new ballot\", i.e. some leader changes preserve the index content rather than replacing it."
+        ],
+        "limitations": [
+          "Source-only account this turn: no execution measured the resolution variant, the entry at the assigned index in the origin's decided log, or the timing between the origin's promise change and its decided index reaching the assigned index.",
+          "The actor layer is not linked into the harness target configured for this run (`omnipaxos/tests/assurance_generated.rs` in crate `omnipaxos`); `omnipaxos_runtime` is neither a dependency nor a dev-dependency of `omnipaxos`, and `omnipaxos::handle_incoming` discards leaked `AsyncRuntime` messages. Judging this question by execution requires switching the experiment crate to `omnipaxos_runtime`, whose build basis is not prepared in `build_inputs`, so the first such execution may need a heavy dependency build.",
+          "The scope read this turn is the captured snapshot only; the failure also depends on the caller's own interpretation of `Ok`, since a caller that re-reads the decided log at the returned index and compares values would not be misled."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "7428c4a1533941c1bcd9707354ba9245"
+      }
+    ],
+    "materials": [
+      {
+        "id": "actor_drain_notifiers",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 201,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_record_assignment",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 335,
+        "end_line": 343,
+        "kind": "code_observation",
+        "text": "    fn record_assignment(&mut self, id: EntryId, idx: usize, ballot: Ballot) {\n        for p in self.pending.iter_mut() {\n            if p.id == id {\n                p.assigned = Some((idx, ballot));\n                return;\n            }\n        }\n        // No matching pending — late reply after timeout drain, or duplicate. Ignore.\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_pending_assigned_field",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 60,
+        "end_line": 76,
+        "kind": "code_observation",
+        "text": "{\n    id: EntryId,\n    /// The entry, retained until dispatched (accepted locally or sent as a\n    /// `TaggedProposal`). While `Some`, `try_dispatch_undispatched` retries it\n    /// each tick — this is what lets `append_notify` be called before a\n    /// leader is known.\n    undispatched: Option<T>,\n    /// `(assigned_idx, ballot_at_assignment)`. `None` until either:\n    ///   (a) we accepted the entry ourselves as leader, or\n    ///   (b) we received `AsyncRuntimeMsg::Assigned` from the leader.\n    assigned: Option<(usize, Ballot)>,\n    deadline: Instant,\n    reply: oneshot::Sender<Result<usize, AppendError<T>>>,\n}\n\n/// What to do, once its index is known, for a write buffered in the shared\n/// batch buffer. Every code path that can add to that buffer pushes one of",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_append_tracked",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 370,
+        "end_line": 395,
+        "kind": "code_observation",
+        "text": "    fn append_tracked(\n        &mut self,\n        intent: TrackIntent,\n        entry: T,\n    ) -> Result<Option<(usize, Ballot)>, ProposeErr<T>> {\n        let accepted_before = self.op.get_accepted_idx();\n        let batched_before = self.op.get_batched_len();\n        self.op.append(entry)?;\n        let accepted_after = self.op.get_accepted_idx();\n        let batched_after = self.op.get_batched_len();\n        if accepted_after > accepted_before {\n            let ballot = self.op.get_promise();\n            if let TrackIntent::Local(id) = intent {\n                self.record_assignment(id, accepted_after, ballot);\n            }\n            Ok(Some((accepted_after, ballot)))\n        } else if batched_after > batched_before {\n            // Genuinely deferred by batching.\n            self.unconfirmed_local\n                .push_back((intent, self.op.get_promise()));\n            Ok(None)\n        } else {\n            // Went somewhere else entirely (forwarded, or buffered pending a\n            // Prepare -> Accept transition) -- nothing entered the shared\n            // batch buffer, so there's nothing to track here.\n            Ok(None)",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "handle_append_notify_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 114,
+        "end_line": 129,
+        "kind": "interface_statement",
+        "text": "    /// Append an entry and await its decided log index.\n    ///\n    /// Works from any node: the actor tags the entry with a unique id, routes it to\n    /// the current leader, and resolves the future when the assigned log index is\n    /// decided. If no leader is known yet, the call waits rather than failing fast --\n    /// it resolves once a leader is elected, or with `Timeout` if none is elected in\n    /// time. Fails with:\n    /// - [`AppendError::Timeout`] if the entry is not decided within\n    ///   [`RuntimeConfig::append_notify_timeout`] (including when no leader was ever\n    ///   elected in that time);\n    /// - [`AppendError::Propose`] if the underlying propose call itself failed (e.g. a\n    ///   reconfiguration is already pending) -- only when this node owns the pending\n    ///   call, otherwise it still resolves via `Timeout`;\n    /// - [`AppendError::Superseded`] if a leader change occurred before decision --\n    ///   a heuristic, not a certainty; see its doc comment for why, and check the\n    ///   returned index yourself if you need to know for sure;",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "event_superseded_contract",
+        "file": "omnipaxos_runtime/src/event.rs",
+        "start_line": 48,
+        "end_line": 58,
+        "kind": "interface_statement",
+        "text": "    /// A leader change occurred after the entry was accepted at the given index but\n    /// before it was decided. This is a *heuristic*, not a certainty: a new leader is\n    /// required to adopt any value a majority-overlapping quorum may have already\n    /// accepted, so the entry can still end up decided at `log_entry_idx` under the\n    /// new ballot -- we just stop waiting rather than confirm it. Check\n    /// [`OmniPaxosHandle::read_decided_suffix`](super::OmniPaxosHandle::read_decided_suffix)\n    /// at that index if you need to know for sure before re-appending.\n    Superseded {\n        /// The log index the entry was assigned before the leader change.\n        log_entry_idx: usize,\n    },",
+        "content_digest": "c5ff151f7ee21767be3c8b53dba3aaf23deaafcf0d9188610b21ea1a6a9f9c8c"
+      },
+      {
+        "id": "leader_majority_promises_adopt",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 257,
+        "end_line": 284,
+        "kind": "code_observation",
+        "text": "    fn handle_majority_promises(&mut self) {\n        let max_promise_sync = self.leader_state.take_max_promise_sync();\n        let decided_idx = self.leader_state.get_max_decided_idx();\n        let mut new_accepted_idx = self\n            .internal_storage\n            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync)\n            .expect(WRITE_ERROR_MSG);\n        if !self.accepted_reconfiguration() {\n            if !self.buffered_proposals.is_empty() {\n                let entries = std::mem::take(&mut self.buffered_proposals);\n                new_accepted_idx = self\n                    .internal_storage\n                    .append_entries_without_batching(entries)\n                    .expect(WRITE_ERROR_MSG);\n            }\n            if let Some(ss) = self.buffered_stopsign.take() {\n                self.internal_storage\n                    .append_stopsign(ss)\n                    .expect(WRITE_ERROR_MSG);\n                new_accepted_idx = self.internal_storage.get_accepted_idx();\n            }\n        }\n        self.state = (Role::Leader, Phase::Accept);\n        self.leader_state\n            .set_accepted_idx(self.pid, new_accepted_idx);\n        for pid in self.leader_state.get_promised_followers() {\n            self.send_accsync(pid);\n        }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "storage_sync_log_adopts",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 313,
+        "end_line": 375,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn sync_log(\n        &mut self,\n        accepted_round: Ballot,\n        decided_idx: usize,\n        log_sync: Option<LogSync<T>>,\n    ) -> StorageResult<usize> {\n        self.state_cache.accepted_round = accepted_round;\n        self.state_cache.decided_idx = decided_idx;\n        let mut sync_txn: Vec<StorageOp<T>> = vec![\n            StorageOp::SetAcceptedRound(accepted_round),\n            StorageOp::SetDecidedIndex(decided_idx),\n        ];\n        if let Some(sync) = log_sync {\n            match sync.decided_snapshot {\n                Some(SnapshotType::Complete(c)) => {\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(c)));\n                }\n                Some(SnapshotType::Delta(d)) => {\n                    let mut snapshot = self.create_decided_snapshot()?;\n                    snapshot.merge(d);\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(snapshot)));\n                }\n                None => (),\n            }\n            self.state_cache.accepted_idx = sync.sync_idx + sync.suffix.len();\n            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));\n            match sync.stopsign {\n                Some(ss) => {\n                    self.state_cache.stopsign = Some(ss.clone());\n                    self.state_cache.accepted_idx += 1;\n                    sync_txn.push(StorageOp::SetStopsign(Some(ss)));\n                }\n                None if self.state_cache.stopsign.is_some() => {\n                    self.state_cache.stopsign = None;\n                    sync_txn.push(StorageOp::SetStopsign(None));\n                }\n                None => (),\n            }\n        }\n        self.storage.write_atomically(sync_txn)?;\n        Ok(self.state_cache.accepted_idx)\n    }\n\n    fn create_decided_snapshot(&mut self) -> StorageResult<T::Snapshot> {\n        let log_decided_idx = self.get_decided_idx_without_stopsign();\n        self.create_snapshot(log_decided_idx)\n    }\n\n    pub(crate) fn create_snapshot(&self, compact_idx: usize) -> StorageResult<T::Snapshot> {\n        let current_compacted_idx = self.get_compacted_idx();\n        if compact_idx < current_compacted_idx {\n            Err(CompactionErr::TrimmedIndex(current_compacted_idx))?\n        }\n        let entries = self\n            .storage\n            .get_entries(current_compacted_idx, compact_idx)?;\n        let delta = T::Snapshot::create(entries.as_slice());",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "leader_is_chosen",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 260,
+        "end_line": 270,
+        "kind": "code_observation",
+        "text": "}\n\n/// The entry read in the log.\n#[derive(Debug, Clone)]\npub enum LogEntry<T>\nwhere\n    T: Entry,\n{\n    /// The entry is decided.\n    Decided(T),\n    /// The entry is NOT decided. Might be removed from the log at a later time.",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "7428c4a1533941c1bcd9707354ba9245",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_resolution_arm_order": "7428c4a1533941c1bcd9707354ba9245-knowledge-0",
+        "@k_assignment_carries_no_identity": "7428c4a1533941c1bcd9707354ba9245-knowledge-1",
+        "@k_local_accept_is_not_quorum": "7428c4a1533941c1bcd9707354ba9245-knowledge-2",
+        "@q_completion_false_positive": "7428c4a1533941c1bcd9707354ba9245-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "actor_drain_notifiers"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "actor_record_assignment"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "actor_pending_assigned_field"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "actor_append_tracked"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "handle_append_notify_contract"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "event_superseded_contract"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "leader_majority_promises_adopt"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "storage_sync_log_adopts"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "leader_is_chosen"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_resolution_arm_order"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_assignment_carries_no_identity"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_local_accept_is_not_quorum"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@q_completion_false_positive"
+        },
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "@q_completion_false_positive"
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-7428c4a1533941c1bcd9707354ba9245": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-15_21-49-09-omnipaxos-real-run/semantic-commits/submission-7428c4a1533941c1bcd9707354ba9245.json"
+      }
+    }
+  }
+}

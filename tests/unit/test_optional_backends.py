@@ -44,21 +44,29 @@ def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspa
     backend=CargoBackend(TargetConfig(execution_package='sample'))
     shutil.copytree(rust_workspace,tmp_path/'source')
     files=capture(rust_workspace).files;workspace=tmp_path/'workspace';shutil.copytree(rust_workspace,workspace)
-    harness=Harness(kind='rust_test',source='#[test] fn measured() { println!("CA_EVENT {{\\"event\\":\\"returned\\",\\"value\\":{}}}",sample::step(2,3)); }',
-        description='Observe an actual public library call',semantic_changes=[])
+    harness=Harness(kind='rust_test',source='#[test] fn measured() { println!("CA_EVENT {{\\"event\\":\\"returned\\",\\"value\\":{}}}",sample::step(2,3)); }\n'
+        '#[test] fn control() {}\n#[test] fn unrelated() { panic!("must not run"); }',
+        description='Observe an actual public library call',semantic_changes=[],test_names=['measured','control'])
     filename=backend.resolve_harness(harness,rust_workspace,files)
     assert filename=='sample/tests/assurance_generated.rs' and harness.execution_package=='./sample'
     install_harness(workspace,filename,harness,files)
     runner=ProcessRunner(tmp_path)
-    command=backend.experiment_command(harness.execution_package,filename)
+    command=backend.experiment_command(harness.execution_package,filename,harness.test_names)
     backend.package='.'
-    assert backend.experiment_command(harness.execution_package,filename)==command
+    assert backend.experiment_command(harness.execution_package,filename,harness.test_names)==command
     check=run_experiment(runner,command,workspace,'rust-fixture',60,'bwrap',adapter=backend)
     assert check.outcome=='tests_passed',Path(check.stderr).read_text()
+    assert {t['name'] for t in check.parameters['test_selection']['observed']}=={'measured','control'}
     assert extract_events(check)[0]['value']==3
     assert capture(rust_workspace).files==files and not (rust_workspace/'Cargo.lock').exists()
     assert (workspace/'Cargo.lock').exists()
     assert backend.cache not in backend.read_only_roots()
+    retained={Path(path):Path(path).read_bytes() for path in (check.stdout,check.stderr)}
+    seed=tmp_path/check.parameters['seed_record']
+    backend.cleanup(workspace)
+    assert not (workspace/'.execution/cargo-target').exists() and seed.is_file()
+    assert all(path.read_bytes()==data for path,data in retained.items())
+    command=backend.experiment_command(harness.execution_package,filename)
     for source,outcome,failure in [
         ('invalid Rust', 'unknown','build_or_setup'),
         ('#[test] fn failed() { panic!("actual failure"); }','tests_failed','test_failure'),
@@ -67,6 +75,8 @@ def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspa
         (workspace/filename).write_text(source)
         check=run_experiment(runner,command,workspace,'rust-fixture',60,'bwrap',adapter=backend)
         assert (check.outcome,check.parameters.get('failure_class'))==(outcome,failure),Path(check.stderr).read_text()
+        backend.cleanup(workspace)
+        assert not (workspace/'.execution/cargo-target').exists() and seed.is_file()
     (workspace/filename).write_text('#[test] fn slow() { std::thread::sleep(std::time::Duration::from_secs(5)); }')
     check=run_experiment(runner,command,workspace,'rust-fixture',1,'bwrap',adapter=backend)
     assert check.status==ExecutionStatus.TIMEOUT and check.outcome=='unknown' and check.parameters['test_started']
@@ -143,6 +153,7 @@ def test_shared_seed_identity_and_directory_boundaries(tmp_path):
         resolved_features=[],lock={'path':'Cargo.lock','digest':'lock'})
     command=['cargo','test','--','--nocapture']
     expected=cargo_build.compatibility(basis,command)
+    assert cargo_build.compatibility(basis,command+['--exact','one','two'])==expected
     for field in ('source_files','source_modes','lock','tools','policy','test_target'):
         changed=copy.deepcopy(basis);changed[field]='different'
         if field=='lock':changed[field]={'path':'Cargo.lock','digest':'different'}
@@ -274,5 +285,64 @@ def test_python_rejects_go_override_and_go_default_path_conflict(tmp_path):
     from consensus_assurance.core.config import TargetConfig
     harness=Harness(kind='python',source='print(1)',description='Local check',semantic_changes=[],execution_package='.')
     with pytest.raises(ValueError,match='does not support'):PythonBackend().resolve_harness(harness,tmp_path,{})
+    with pytest.raises(ValueError,match='test_names'):
+        PythonBackend().resolve_harness(harness.model_copy(update={'execution_package':None,'test_names':['check']}),tmp_path,{})
     with pytest.raises(ValueError,match='target.harness_path'):
         GoModuleBackend(TargetConfig(execution_package='internal/core',harness_path='assurance_generated_test.go'))
+
+
+def test_exact_test_selection_validation():
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.runners.cargo import CargoBackend
+    from consensus_assurance.core.submissions import ExperimentRequest
+    from pydantic import TypeAdapter
+    from consensus_assurance.core.types import TestNames
+    for names in ([],[''],['a','a'],[' a'],[1]):
+        with pytest.raises(ValueError):TypeAdapter(TestNames).validate_python(names)
+    assert 'test_names' in ExperimentRequest.model_json_schema()['properties']
+    for names in (['TestOther'],['TestAssurance.*'],['TestAssurance/child'],['--run']):
+        with pytest.raises(ValueError):GoModuleBackend.test_pattern(names)
+    for names in (['module::*'],['--ignored'],['module::'],['module/test']):
+        with pytest.raises(ValueError):CargoBackend.test_filters(names)
+    assert CargoBackend.test_filters(['module::case','control'])==['--exact','module::case','control']
+
+
+@pytest.mark.parametrize('backend_name',['go','rust'])
+@pytest.mark.parametrize('case,expected',[
+    ('passed','tests_passed'),('missing','unknown'),('absent','not_applicable'),
+    ('skipped','unknown'),('failed','tests_failed'),('timeout','unknown')])
+def test_selected_native_results_preserve_partial_and_unknown_status(backend_name,case,expected):
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.runners.cargo import CargoBackend
+    from consensus_assurance.core.types import CheckRun,ExecutionStatus
+    names=['TestAssuranceOne','TestAssuranceTwo'] if backend_name=='go' else ['module::one','control']
+    backend=GoModuleBackend() if backend_name=='go' else CargoBackend.__new__(CargoBackend)
+    if backend_name=='rust':backend.cargo=Path('/usr/bin/cargo');backend.package='.';backend.harness_filename='tests/check.rs'
+    check=CheckRun(action='experiment',cwd='/tmp',snapshot_id='fixture',
+        command=backend.experiment_command(test_names=names),
+        status=ExecutionStatus.TIMEOUT if case=='timeout' else ExecutionStatus.COMPLETED,
+        exit_code=None if case=='timeout' else 1 if case=='failed' else 0)
+    endings=[('pass' if backend_name=='go' else 'ok')]*2
+    endings[1]={'skipped':'skip' if backend_name=='go' else 'ignored',
+        'failed':'fail' if backend_name=='go' else 'FAILED','timeout':None}.get(case,endings[1])
+    count=0 if case=='absent' else 1 if case=='missing' else 2
+    if backend_name=='go':
+        events=[]
+        for name,end in zip(names[:count],endings):
+            events.append({'Action':'run','Test':name,'Package':'fixture'})
+            if end:events.append({'Action':end,'Test':name,'Package':'fixture'})
+        text='\n'.join(json.dumps(event) for event in events)
+    else:
+        text=f'running {count} tests\n'
+        for name,end in zip(names[:count],endings):
+            text+=f'test {name} ... CA_EVENT {{"event":"measured"}}\n'
+            if name==names[1] and case in {'failed','timeout'}:text+='ok\n'
+            text+=end+'\n' if end else ''
+        if case!='timeout':text+=f'test result: {"FAILED" if case=="failed" else "ok"}. {0 if count==0 else 2 if case=="passed" else 1} passed; {int(case=="failed")} failed;\n'
+    backend.parse_test_result(check,text)
+    selection=check.parameters['test_selection']
+    assert selection['requested']==names and check.outcome==expected
+    assert selection['unobserved']==names[count:]
+    if case=='failed':assert selection['observed'][-1]['status']=='failed'
+    if case=='timeout':
+        assert check.status==ExecutionStatus.TIMEOUT and selection['observed'][-1]['status']=='unfinished'

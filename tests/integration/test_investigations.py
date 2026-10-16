@@ -9,6 +9,49 @@ from consensus_assurance.workflow.knowledge import open_gaps
 from consensus_assurance.workflow.research import operation_summary, excerpt
 
 
+def test_test_selection_is_fixed_across_repeat_and_changed_as_successor(tmp_path, go_module):
+    import shutil
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    if not shutil.which('go'):
+        pytest.skip('Go unavailable')
+    harness = '''package service
+import ("fmt"; "testing")
+func TestAssuranceA(t *testing.T) { fmt.Println(`CA_EVENT {"event":"A"}`) }
+func TestAssuranceB(t *testing.T) { fmt.Println(`CA_EVENT {"event":"B"}`) }
+func TestAssuranceOld(t *testing.T) { t.Fatal("Unselected old case") }
+'''
+    def start(state):
+        return {'rationale':'Select one generated test',
+            'sources':[dict(id='code',file='value.go',start_line=1,end_line=4,kind='code_observation')],
+            'investigations':[dict(ref='@q',question='Observe selected cases',source_ids=['code'])],
+            'experiment':dict(investigation_id='@q',harness_path='check.go',source_ids=['code'],
+                scope={'description':'Selected generated test'},prefix='Invoke the selected test',test_names=['TestAssuranceA'])}, {'check.go':harness}
+    def repeat(state):
+        return {'rationale':'Repeat the saved selection', 'repeat_experiment_id':state['experiments'][0]['id']}, {
+            'check.go':'package service\n', 'unused-selection.json':'["TestAssuranceB"]'}
+    def successor(state):
+        sub,files=start(state)
+        return {'rationale':'Select a different case from the same retained code', 'experiment':{
+            **sub['experiment'], 'investigation_id':state['investigations'][0]['id'],
+            'test_names':['TestAssuranceB'], 'previous_id':state['experiments'][0]['id'],
+            'revision_reason':'Select case B instead of A'}},files
+    engine,repo=engine_for(tmp_path,[start,repeat,successor,stop])
+    shutil.copytree(go_module,repo,dirs_exist_ok=True)
+    engine.implementation=GoModuleBackend()
+    engine.config.execution_backend='go_module'
+    state=engine.start(repo)
+    assert len(state.experiments)==2 and state.usage['experiments']==3
+    old,new=state.experiments
+    assert old.basis.harness.test_names==['TestAssuranceA']
+    assert new.previous_id==old.id and new.basis.harness.test_names==['TestAssuranceB']
+    checks=[c for c in state.checks if c.action=='experiment']
+    assert [[event['event'] for event in extract_events(c)] for c in checks]==[['A'],['A'],['B']]
+    assert [c.experiment_id for c in checks]==[old.id,old.id,new.id]
+    from consensus_assurance.workflow.research import execution_feedback
+    assert execution_feedback(state,engine.root,new,checks[-1])['test_selection']['requested']==['TestAssuranceB']
+
+
 @pytest.mark.parametrize('gap',[False,True])
 def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
     seen = []
@@ -85,7 +128,7 @@ def test_combined_local_start_and_interpretation_feedback(tmp_path,gap):
     assert not any(name in type(state).model_fields for name in ('units','claims','bindings','relations','evidence','findings'))
 
 
-@pytest.mark.parametrize('large',['many_events','large_value','missing_long_identity'])
+@pytest.mark.parametrize('large',['many_events','large_value','missing_long_identity','repeated_diagnostics'])
 def test_execution_feedback_omits_whole_large_event_sets_without_rewriting_receipts(tmp_path,large):
     def start(state):
         sub,files=combined(state)
@@ -93,6 +136,7 @@ def test_execution_feedback_omits_whole_large_event_sets_without_rewriting_recei
             'many_events':"for i in range(9): print('CA_EVENT '+json.dumps(dict(event='extra',operation=str(i))))\nprint('CA_EVENT not-json')\n",
             'large_value':"print('CA_EVENT '+json.dumps(dict(event='extra',operation='large',value='x'*7000)))\n",
             'missing_long_identity':"for name in ('admitted','returned'): print('CA_EVENT '+json.dumps(dict(event=name,operation='x'*7000)))\n",
+            'repeated_diagnostics':"for i in range(12):\n for name in ('admitted','returned'): print('CA_EVENT '+json.dumps(dict(event=name,operation=str(i),limit=3)))\n",
         }[large]
         return sub,files
     def inspect(state):
@@ -107,15 +151,24 @@ def test_execution_feedback_omits_whole_large_event_sets_without_rewriting_recei
             assert value['comparisons'][0]['result']['missing_indices']
             assert value['comparisons'][0]['omitted_detail_counts']['diagnostics']>0
             assert 'x'*7000 not in json.dumps(value)
+        if large in {'missing_long_identity','repeated_diagnostics'}:
+            assert value['diagnostic_summary'] and not value['diagnostic_groups_omitted']
+            diagnostic=value['diagnostic_summary'][0]
+            assert diagnostic['comparison_index']==0 and 'Missing' in diagnostic['reason']
+            location=diagnostic['locations'][0]
+            assert location['output_location']==raw['events'][location['event_index']]['_ca_observation']['location']
+            if large=='repeated_diagnostics':
+                assert diagnostic['occurrences']==12 and len(diagnostic['locations'])==3
+                assert len(json.dumps(value['diagnostic_summary']))<4000
         assert e.state.model_dump(mode='json')==before
         assert all(p.read_bytes()==data for p,data in saved.items())
-        indices=[1] if large=='many_events' else [1,len(raw['events'])-1]
+        indices=[1] if large in {'many_events','repeated_diagnostics'} else [1,len(raw['events'])-1]
         return opinion(state,conclusion='conditional',executions={value['id']:indices})
     def cited(state):
         value=operation_summary(e.state,e.root)['interpretation_changes'][0]['executions'][0]
         raw=json.loads((e.root/value['observations']).read_text())
         assert value['cited_events']==[{'event_index':1,'observation':raw['events'][1]}]
-        assert value['omitted_cited_indices']==([] if large=='many_events' else [len(raw['events'])-1])
+        assert value['omitted_cited_indices']==([] if large in {'many_events','repeated_diagnostics'} else [len(raw['events'])-1])
         assert value['parsing_error_count']==len(raw['parsing_errors'])==int(large=='many_events')
         assert value['prerequisites']==raw['prerequisites']
         comparison=value['comparisons'][0]
@@ -123,6 +176,8 @@ def test_execution_feedback_omits_whole_large_event_sets_without_rewriting_recei
         if large=='missing_long_identity':
             assert comparison['missing_indices'] and not comparison['comparison_complete']
             assert comparison['diagnostic_count']>0 and comparison['limitation_count']>0
+        if large=='repeated_diagnostics':
+            assert value['diagnostic_summary'][0]['occurrences']==12
         assert 'Explicitly cited subset' in value['selection'] and 'x'*7000 not in json.dumps(value)
         return stop(state)
     e,repo=engine_for(tmp_path,[start,inspect,cited])

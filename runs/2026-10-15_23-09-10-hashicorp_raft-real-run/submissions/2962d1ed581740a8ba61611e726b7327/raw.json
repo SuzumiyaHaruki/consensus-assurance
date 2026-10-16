@@ -1,0 +1,104 @@
+{
+  "rationale": "Read the quantified impact receipt (execution 911dce1c4a2849d4a868d72c50403c78, exit 0, both cases passed): all five comparisons evaluate completely and hold, so the replay effect and its cost are decided - one identical TimeoutNow payload honoured a second time raised the term (3 -> 4), one client write out of 138 attempts was refused with 'node is not the leader' at the first step, the refusal window was shorter than one 10 ms step, and one sample in 138 showed no leader, while the control's plain campaign stayed refused with no leadership change. While reading for the next lead I also traced the network transport's heartbeat fast path (net_transport.go 721-727 calls the raft handler inline on the connection goroutine) and confirmed it applies only to pure heartbeats (replication.go's heartbeat request carries no previous entry and no commit index, which is exactly the fast-path condition), so that handler touches only lock-protected or atomic state and the concurrency concern is narrower than the two contradictory comments suggest. The remaining question in that handler is a different one, registered here: an AppendEntries whose term is older still moves a non-follower to Follower and writes the older term into the stable store, which a stale leader's heartbeat can trigger against a current leader.",
+  "sources": [
+    {
+      "id": "src_fastpath_contract",
+      "file": "api.go",
+      "start_line": 625,
+      "end_line": 632,
+      "kind": "document_statement"
+    },
+    {
+      "id": "src_net_heartbeat_fastpath",
+      "file": "net_transport.go",
+      "start_line": 655,
+      "end_line": 730,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_heartbeat_req",
+      "file": "replication.go",
+      "start_line": 388,
+      "end_line": 412,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_stale_heartbeat_stepdown",
+      "question": "Does an AppendEntries message whose term is older than the receiver's still move a non-follower to Follower and write the older term into the stable store, and can a stale leader's heartbeat therefore depose the current leader and lower its persisted term?",
+      "parent_id": "16679315c63a4e5abc44cbb3c9dd0c09-question-0",
+      "source_ids": [
+        "src_append_prev_check",
+        "src_heartbeat_req",
+        "src_net_heartbeat_fastpath",
+        "src_fastpath_contract"
+      ],
+      "hypothesis": "In appendEntries the term/state transition fires on `a.Term > r.getCurrentTerm() || (r.getState() != Follower && !candidateFromLeadershipTransfer.Load())`, and the second disjunct ignores the term entirely, so a message with an older term still sets Follower and calls setCurrentTerm(a.Term) - persisting a lower term. The heartbeat goroutine's request carries no previous entry and no leader commit index, which is exactly the condition the network transport uses for its inline fast path, so a stale leader's heartbeat reaches this transition without any log content to reject it.",
+      "discriminator": "A three-voter cluster in which one voter is partitioned early, keeps believing it leads, and later exchanges heartbeats with a healthy current leader of a higher term: record that leader's state and its persisted current term before and after the stale message, then check whether the stale leader can win the resulting election. If the current leader keeps leader state and its persisted term is unchanged, the suspicion is refuted; if it steps down with a lower persisted term, the effect is established and the follow-on question is whether the stale leader's log can then win."
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "2c066843eb7a4e9d85db8bbbd0ccf363-question-0",
+      "source_ids": [
+        "src_timeout_now",
+        "src_timeout_now_msg",
+        "src_request_vote"
+      ],
+      "executions": {
+        "911dce1c4a2849d4a868d72c50403c78": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "a38d65ea01ee4e2ea53193c166144cdd": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "cfeb8d63a1134a859021ca15bc7f098b": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "explained",
+      "defect_claim": "asserted",
+      "rationale": "Present conclusion: the leadership-transfer control message is not idempotent and carries no context with which a receiver could reject a duplicate or stale copy, so the same payload honoured twice forces a second election, and a client operation issued in that window is refused. Decided evidence across three receipts of the same two cases: the first (execution cfeb8d63a1134a859021ca15bc7f098b) resolved the four original comparisons as complete holds - the first payload moved leadership to the target (term 2 -> 3), the identical payload raised the term to 4 with the same node still Leader, and the control's plain campaign with an equal log claim was refused, left the term at 2 and changed no leadership; the second (execution a38d65ea01ee4e2ea53193c166144cdd) measured the aftermath and corrected my earlier local-run reading by showing the client write issued at the duplicate rejected with 'node is not the leader'; the third (execution 911dce1c4a2849d4a868d72c50403c78) quantified it and resolved all five comparisons as complete holds - 1 rejection out of 138 write attempts, both rejection offsets at 0 ms so the refusal lasted less than the 10 ms sampling step, 1 leaderless sample out of 138, term 4 with the same node re-elected. Source basis: TimeoutNowRequest embeds only RPCHeader with no term and no sender role (src_timeout_now_msg, commands.go 205-208), timeoutNow clears the known leader, moves the node to Candidate and sets the candidate-from-transfer flag without validating anything (src_timeout_now, raft.go 2232-2239), and that flag is what lets voters skip the known-leader rejection in requestVote (src_request_vote, raft.go 1626-1758). Limits: three voters, in-process transport, no partition, one duplicate, and a refusal window bounded only by the sampling step; delayed rather than duplicated delivery, partitions during replay, larger clusters and interaction with in-flight writes are unmeasured.",
+      "counterevidence": [
+        "The first delivery is the documented transfer path; only the identical second delivery is the defect subject, and that delivery is supplied by the harness rather than produced by the library's own transport.",
+        "The measured impact is bounded: one refused write in a sub-10 ms window, one leaderless sample, the same node re-elected, no change of leader identity and no unsafe outcome, because the vote's log-completeness test still guards the replay."
+      ],
+      "limitations": [
+        "The refusal window is bounded by the 10 ms sampling step rather than measured exactly; the run observed one rejection at the first step and none afterwards.",
+        "One cluster size and one delivery path; delayed delivery, partitions during replay, larger clusters and in-flight write interactions are unmeasured."
+      ]
+    },
+    {
+      "investigation_id": "@q_stale_heartbeat_stepdown",
+      "source_ids": [
+        "src_append_prev_check",
+        "src_heartbeat_req",
+        "src_net_heartbeat_fastpath",
+        "src_fastpath_contract"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Present conclusion: the source shows that appendEntries moves any non-follower to Follower and adopts the message's term whenever the message term is greater OR the node is not already a follower (src_append_prev_check, raft.go 1458-1606, transition block around 1478-1489), and the heartbeat goroutine's request carries only the header, term and leader address (src_heartbeat_req, replication.go 388-412), so a stale leader's heartbeat is not filtered by any log content. Two narrower facts bound the concern: the network transport's inline fast path applies exactly to such pure heartbeats (src_net_heartbeat_fastpath, net_transport.go 655-730, with the fast-path condition at 671-676 and the inline call at 721-727) and those messages touch only lock-protected or atomic state (leader identity, state, term, last contact), because the same request shape carries no previous entry and no leader commit index, which skips the log, configuration and commit paths; and the api.go comment asserts the handler must be safe to call concurrently (src_fastpath_contract, api.go 625-632) while the handler's own comment says it must only be called from the main thread (raft.go 1433-1436), a contradiction whose reconciliation is that the pure-heartbeat path mutates only guarded fields. What remains open is the transition itself: an older-term message arriving at a leader makes that leader a follower and persists the older term, which a stale leader's heartbeat can deliver. No observation yet shows a leader stepping down or a persisted term decreasing, so the defect judgment is unresolved rather than asserted, and the discriminator above is the requested next step. Limits: the transition is shared with the normal (non-fast-path) delivery, so any effect is not fast-path specific; nothing here shows whether a stale leader's log could then win, and the term-regression direction would have to be checked against the vote records, which are persisted separately.",
+      "counterevidence": [
+        "The same transition exists on the normal main-thread path, so it is not introduced by the concurrency the fast-path comments argue about.",
+        "The fast-path heartbeats carry no log content, so they cannot corrupt logs, configurations or the FSM; only the state, term, leader identity and last-contact fields can change.",
+        "No observation yet shows the effect: the suspicion rests on source reading only."
+      ],
+      "limitations": [
+        "Unobserved: the probe described as the discriminator has not been run, so both the step-down and any persisted term regression are unconfirmed.",
+        "Reachability requires two leaders of different terms that can still exchange heartbeats, which no measurement here has constructed.",
+        "The vote record is persisted separately from the current term, so a term regression would need its own check for any vote consequence."
+      ]
+    }
+  ]
+}

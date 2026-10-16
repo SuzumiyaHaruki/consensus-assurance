@@ -1,0 +1,457 @@
+{
+  "rationale": "Interpreting the trim execution and bounding the runtime defect's condition. (1) CheckRun fe11b982193b4d7c811c9572ec41b223 (exit 0, both cases passed) evaluated the trim comparisons completely: control {1,2,3} `holds` (trim(None) moved the compacted index 0 -> 1 with all servers decided) and treatment {1,2,5} `violated` with valid witness index 3 (trim(None) returned `ok` while the compacted index stayed 0, and the documented repair `trim(Some(1))` returned `NotAllDecided(0)`), so I append the account for that question and promote the behaviour to knowledge. The same source reasoning generalises the trigger: the flaw needs a phantom slot in the id range, i.e. any configuration whose largest node id exceeds the number of nodes, not only the sparse example probed. (2) For the runtime question I built a tick-period sweep (harness_sweep.rs, validated locally: with a ~2 ms re-synchronisation round trip the false success appears at 8, 16, 40 and 80 ms ticks and the documented Superseded arm at 2 and 4 ms) and submit it, because the crate's own default tick period is 10 ms - so under the defaults the false success, not the documented heuristic error, is the expected outcome of this interleaving. The sweep adds a derived boolean with its operands kept visible so every case is evaluable by one uniform predicate.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "001fd2ebc2ba4ede86f41115ec2f1544-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "Measured and settled for the probed configuration; the source-derived generalisation (any id set with a phantom slot, e.g. {2,3,4} or {1,3}) and any behaviour once the log has been snapshotted rather than trimmed are untested variants of the same cause, not separate questions.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    },
+    {
+      "id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "The sweep submitted here should settle how the tick period against the re-synchronisation round trip bounds the false success; the remaining unmeasured item is the follower-origin variant, where the index arrives through the leader's `Assigned` reply instead of the origin's own local accept (same cause and responsibility, so a variant rather than a separate question).",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@k_trim_sparse_ids",
+      "kind": "behavior",
+      "statement": "With a configuration whose largest node id exceeds the number of nodes, the leader cannot advance the compacted index through `trim`. `LeaderState::with` allocates `accepted_indexes` for every id up to the largest one, phantom slots (ids that are not in the configuration) are never written, and `LeaderState::get_min_all_accepted_idx` minimises over that whole vector, so the reduced value is 0 no matter how far the real servers have decided. `SequencePaxos::trim` therefore computes a trim index of 0 for `trim(None)`, `InternalStorage::try_trim(0)` finds nothing to compact and the call returns `Ok(())` while `get_compacted_idx()` is unchanged; `trim(Some(k))` for any k >= 1 fails the guard `idx <= min_all_accepted_idx` and returns `CompactionErr::NotAllDecided(0)`, so the documented repair step ('users can retry with omni_paxos.trim(Some(idx)) which will then succeed') cannot succeed. Measured on real instances with nodes {1,2,3} versus {1,2,5}, one entry decided by every configured server: control compacted 0 -> 1, treatment stayed at 0 with `trim_none_result` = ok and `trim_explicit_result` = not_all_decided:0.",
+      "conditions": "Core crate with MemoryStorage, in-process lossless delivery, three servers, majority quorum, batch_size 1, one decided entry, leader node 1 in both cases. The trigger is any id set with a gap below the largest id (equivalently max_id > node count): {1,2,5} was executed, {2,3,4} or {1,3} follow from the same sizing and were not executed. Snapshot-based compaction is not affected by the reduced value (`try_snapshot` uses the decided index) and remains available as a workaround; decision counting is not affected either, because `is_chosen` only counts slots whose accepted index is at least the candidate index and phantom slots hold 0.",
+      "source_ids": [
+        "core_min_all_accepted_idx",
+        "core_leader_state_sizing",
+        "core_trim_guard",
+        "core_try_trim",
+        "core_compaction_err",
+        "docs_trim_contract"
+      ],
+      "executions": {
+        "fe11b982193b4d7c811c9572ec41b223": [
+          1,
+          3
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "001fd2ebc2ba4ede86f41115ec2f1544-question-0",
+      "experiment_id": "001fd2ebc2ba4ede86f41115ec2f1544-experiment",
+      "source_ids": [
+        "core_min_all_accepted_idx",
+        "core_leader_state_sizing",
+        "core_trim_guard",
+        "core_try_trim",
+        "core_compaction_err",
+        "docs_trim_contract"
+      ],
+      "executions": {
+        "fe11b982193b4d7c811c9572ec41b223": [
+          1,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current account. `LeaderState::with` allocates one accepted-index slot per id up to the largest id in the configuration, and `LeaderState::get_min_all_accepted_idx` reduces over that whole vector instead of over the configured servers, so any id set with a phantom slot below the largest id pins the reduced value at 0 however far the real servers have decided. `SequencePaxos::trim` compares the caller-supplied index against that reduced value and then asks `InternalStorage::try_trim` to compact; the measured control shows the intended behaviour (nodes {1,2,3}, one entry decided by all three, `trim(None)` returned `ok` and moved the compacted index 0 -> 1) while the treatment (nodes {1,2,5}, same state: all servers decided, `decided_idx_before_trim` 1) is evaluated `violated` with valid witness index 3: `trim(None)` reported `ok` with the compacted index still 0, and the documented repair `trim(Some(1))` returned `NotAllDecided(0)` because the guard requires an index at or below the reduced value of 0. Two consequences follow for a legal configuration: the trim API silently reports success while making no progress, and the log can then only be compacted by snapshotting, so the documented 'highest trimmable index' semantics and the documented retry path both fail. Configuration is accepted by the target's own validation (`ClusterConfig::validate` requires only more than one node, a non-zero configuration id, valid quorums and that the node set contains this server's pid; the docs and existing suites never state or use contiguous ids), so the configuration's own producer admits the state that the trim consumer mishandles. The trigger generalises to any id set with a gap below the maximum (for instance {2,3,4} or {1,3}); that generalisation is derived from the sizing code and was not executed. The scope is progress/availability of trimming, not safety: `is_chosen` counts only slots whose accepted index reaches the candidate index and phantom slots hold 0, so decision formation is unaffected, and `try_snapshot` uses the decided index rather than the reduced value, so snapshotting still compacts.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "Trimming is optional compaction: the cluster keeps making progress and the log stays correct, so the defect costs unbounded log growth and a misleading success return rather than lost work.",
+        "`try_snapshot` does not consult the reduced value, so a caller that snapshots (with or without `local_only`) can compact under the same configuration; the defect is confined to the trim path.",
+        "The probe used MemoryStorage and a lossless in-process transport; a storage backend that refuses the no-op trim or a network that changes the timing could alter the observed surface, though the reduced value is computed in the core and does not depend on storage.",
+        "Only one sparse id set ({1,2,5}) was executed; the generalisation to other gapped sets rests on the sizing code, not on measurement."
+      ],
+      "limitations": [
+        "Three servers, one decided entry, batch_size 1, majority quorum, node 1 leading in both cases; larger clusters or logs with several entries are unmeasured (the reduced value does not depend on either, but the probe does not demonstrate that).",
+        "No snapshot or trim-with-snapshot case was run, so the claim that snapshotting remains available is source-derived from `try_snapshot`/`InternalStorage`, not measured here.",
+        "The `trim_explicit_result` in the control was `ok` with no further compaction (the index was already compacted by the preceding `trim(None)`), so the control confirms only that `trim(None)` compacts and that a later explicit call at that index is accepted."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "7428c4a1533941c1bcd9707354ba9245-question-0",
+    "harness_path": "omnipaxos_runtime/tests/assurance_sweep.rs",
+    "files": {},
+    "execution_package": "./omnipaxos_runtime",
+    "test_names": null,
+    "source_ids": [
+      "actor_drain_notifiers",
+      "actor_record_assignment",
+      "actor_pending_assigned_field",
+      "actor_append_tracked",
+      "handle_append_notify_contract",
+      "event_superseded_contract",
+      "actor_run_tick_branch",
+      "actor_cmd_append_notify",
+      "example_durability_caller"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Tick-period sweep of the already-established lost-entry scenario, run as one invocation of seven cases over the same in-process cluster shape (three OmniPaxos actors, in-memory transport, majority quorum, batch_size 1, node 1 forced into the leader role, egress 1 ms so the re-synchronisation round trip is about 2 ms). Case A is the no-partition control at 2 ms; case B repeats the partition at 2 ms; cases C, D, E, F and G use the identical partition and differ only in tick period (80, 4, 8, 16 and 40 ms). Each case emits its result under its own event name and reports the resolved variant, the assigned index, the decided entry at that index, whether it equals the submitted value, and a derived boolean `ok_claimed_entry_absent` whose operands stay visible.",
+      "assumptions": [
+        "Message loss/partition is a permitted fault; whole messages are dropped in the transport with the receiving side still draining, so no backpressure is introduced.",
+        "Only the tick period differs between the partition cases; node ids, priorities, quorum, batch size, egress period, election and resend tick counts and the append_notify timeout are otherwise equal (resend_message_tick_timeout is 5 ticks for A-E and 4 for G).",
+        "The crate's `RuntimeConfig::default()` tick period is 10 ms, which is why the 8, 16 and 40 ms cases matter for the deployment question.",
+        "Each node is a real OmniPaxos instance with MemoryStorage driven only through the public actor handle."
+      ],
+      "excluded": [
+        "Any claim about entries other than the submitted values 11 (origin) and 22 (new leader).",
+        "Any claim about the exact tick/RTT threshold beyond the sampled points 2, 4, 8, 16, 40 and 80 ms.",
+        "Any claim about follower-origin assignments, batching above 1, flexible quorums or crash recovery."
+      ],
+      "parameters": {
+        "nodes": 3,
+        "quorum": "majority",
+        "batch_size": 1,
+        "egress_ms": 1,
+        "election_tick_timeout": 3,
+        "tick_ms": {
+          "A": 2,
+          "B": 2,
+          "C": 80,
+          "D": 4,
+          "E": 8,
+          "F": 16,
+          "G": 40
+        },
+        "partition": {
+          "A": "none",
+          "B-G": "node1<->{2,3} both directions"
+        }
+      }
+    },
+    "prefix": "Same scenario as the settled runtime probe, run once per case. Build three OmniPaxos instances (pids 1..3, configuration_id 1, MemoryStorage, batch_size 1, election_tick_timeout 3, node 1 leader_priority 1), spawn each through spawn_actor with a tokio-backed AsyncRuntime adapter at the case's tick period and a 1 ms egress period, and wire outgoing_messages() to the receiver's handle_incoming() through a transport task that consults a per-direction block set. Elect node 1 and emit the admission event (mode, setup, origin 1, submitted_value 11, tick period) once all three nodes report it as the accepted leader after four election timeouts. Case A: await handles[1].append_notify(TestEntry(11)) with no partition. Cases B-G: block (1,2) and (1,3) both ways, spawn handles[1].append_notify(TestEntry(11)), sleep one tick period, wait until nodes 2 and 3 report a leader other than 1, await handles[new_leader].append_notify(TestEntry(22)), then unblock and await the origin's future. Emit new_leader_elected, new_leader_append and the mode-specific outcome event carrying resolved, assigned_idx, entry_at_assigned_idx, entry_equals_submitted (only when the index was observed), entry_present_matches_submitted and ok_claimed_entry_absent.",
+    "semantic_changes": [
+      "Seventh case set added around the already-settled scenario; each case has its own admission, result event name and comparison, and the derived boolean `ok_claimed_entry_absent` makes the single predicate 'no success claim for an absent entry' evaluable for every tick period."
+    ],
+    "requirement": null,
+    "responsibility": "The decisive inputs come from the target: the actor assigns the index from its own local accept as leader, stores only (index, ballot), and `drain_notifiers` - reachable only from the tick branch - answers `Ok(assigned_idx)` from the local decided index before it evaluates the ballot-change arm, with no comparison against the entry occupying that index.",
+    "prerequisites": [
+      {
+        "alias": "admission_a",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "A",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_b",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "B",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_c",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "C",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_d",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "D",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_e",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "E",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_f",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "F",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission_g",
+        "event": "admission",
+        "conditions": [
+          {
+            "field": "mode",
+            "op": "eq",
+            "value": "G",
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "submitted_value",
+            "op": "eq",
+            "value": 11,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "notify_resolution_a",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control at 2 ms with no partition: no success claim for an absent entry."
+      },
+      {
+        "event": "notify_resolution_b",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Partition at 2 ms: predicted holds (Superseded is the documented arm)."
+      },
+      {
+        "event": "notify_resolution_c",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_c",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Partition at 80 ms: previously violated; predicated to stay violated."
+      },
+      {
+        "event": "notify_resolution_d",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_d",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Partition at 4 ms: predicted holds (tick period still shorter than the re-synchronisation round trip)."
+      },
+      {
+        "event": "notify_resolution_e",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_e",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Partition at 8 ms: predicted violated (false success at the default-like tick period)."
+      },
+      {
+        "event": "notify_resolution_f",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_f",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Partition at 16 ms: predicted violated."
+      },
+      {
+        "event": "notify_resolution_g",
+        "identity_fields": [
+          "mode",
+          "origin",
+          "submitted_value"
+        ],
+        "admission_alias": "admission_g",
+        "assertion": {
+          "field": "ok_claimed_entry_absent",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Partition at 40 ms: predicted violated."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

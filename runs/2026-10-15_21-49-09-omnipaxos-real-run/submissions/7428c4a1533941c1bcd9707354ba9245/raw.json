@@ -1,0 +1,150 @@
+{
+  "rationale": "First research update of this fresh session. I read the captured OmniPaxos tree (core Sequence Paxos decision/authority machinery plus the added async actor layer) and registered one sourced question: the actor's completion signal for `append_notify` is decided by log-index progress alone, so a write whose entry never reached a write quorum can be reported as resolved with `Ok(assigned_idx)` even though a *different* value is decided at that index. Sources read this turn: omnipaxos/src/sequence_paxos/{mod,leader,follower}.rs, omnipaxos/src/storage/{mod,internal_storage,state_cache}.rs, omnipaxos/src/{omni_paxos,ballot_leader_election,messages,util}.rs, omnipaxos_storage/src/*, omnipaxos_runtime/src/*, docs/omnipaxos/*, and the existing test suites (read only; none executed). No execution this turn: the configured harness target is omnipaxos/tests/assurance_generated.rs in crate `omnipaxos`, which cannot link `omnipaxos_runtime` (it is not in omnipaxos's dependencies/dev-dependencies), and reaching the actor code requires switching the experiment crate to an unprepared basis, so I recorded the account and the discriminator instead of spending the execution on a harness that cannot observe the question. Next action: build one focused in-process actor probe for that question.",
+  "sources": [
+    {
+      "id": "actor_drain_notifiers",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 201,
+      "end_line": 222,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_record_assignment",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 335,
+      "end_line": 343,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_pending_assigned_field",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 60,
+      "end_line": 76,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_append_tracked",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 370,
+      "end_line": 395,
+      "kind": "code_observation"
+    },
+    {
+      "id": "handle_append_notify_contract",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 114,
+      "end_line": 129,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "event_superseded_contract",
+      "file": "omnipaxos_runtime/src/event.rs",
+      "start_line": 48,
+      "end_line": 58,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "leader_majority_promises_adopt",
+      "file": "omnipaxos/src/sequence_paxos/leader.rs",
+      "start_line": 257,
+      "end_line": 284,
+      "kind": "code_observation"
+    },
+    {
+      "id": "storage_sync_log_adopts",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 313,
+      "end_line": 375,
+      "kind": "code_observation"
+    },
+    {
+      "id": "leader_is_chosen",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 260,
+      "end_line": 270,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_completion_false_positive",
+      "question": "In the async actor layer, when an entry is accepted at a log index by the leader it was assigned to but is then dropped by a later leader change before decision, what resolution does the originating `append_notify` receive once the origin's local decided index reaches that index, and what does that resolution establish about the caller's entry?",
+      "source_ids": [
+        "actor_drain_notifiers",
+        "actor_record_assignment",
+        "actor_pending_assigned_field",
+        "actor_append_tracked",
+        "handle_append_notify_contract",
+        "event_superseded_contract",
+        "leader_majority_promises_adopt",
+        "storage_sync_log_adopts"
+      ],
+      "hypothesis": "Provisional: `drain_notifiers` matches the completion arm `Some((idx, _)) if idx <= decided` before evaluating the ballot-change arm, so a pending call whose entry was dropped and replaced by a different value at the same index resolves with `Ok(idx)`; the origin's `Ok(idx)` then does not entail that the caller's entry is decided at `idx`, and the documented `Superseded` resolution for a leader change after acceptance but before decision is not produced.",
+      "discriminator": "An execution that (i) lets a node's `append_notify` obtain an assignment at index i from a leader, (ii) prevents that entry from reaching a write quorum (drop the outgoing replication messages / partition the leader) and lets a new leader decide a *different* entry at i, (iii) restores the original node so its local decided index reaches i. The judgment changes if the origin resolves `Err(Superseded{log_entry_idx: i})` instead of `Ok(i)`, if the value at i in the origin's decided log is the caller's entry, or if no such lost-assignment interleaving is constructible under the actor's own routing."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_resolution_arm_order",
+      "kind": "behavior",
+      "statement": "`ActorState::drain_notifiers` resolves a pending `append_notify` in a fixed arm order: a pending whose recorded assignment satisfies `assigned_idx <= local decided index` is answered `Ok(assigned_idx)` first; only when that does not hold and the ballot recorded at assignment is lower than the node's current promise is `Err(AppendError::Superseded { log_entry_idx: assigned_idx })` sent; otherwise the deadline arm `now > deadline` yields `Err(Timeout)` and unsettled pendings are retained for the next tick. The `Ok` arm compares only the index against the local decided index, with the assignment ballot and the entry's identity unused.",
+      "conditions": "Applies while the actor loop's tick branch runs and the pending entry has `assigned = Some((idx, ballot))`; the node's local decided index is read from the same `OmniPaxos` instance as the promise ballot used by the `Superseded` arm.",
+      "source_ids": [
+        "actor_drain_notifiers"
+      ]
+    },
+    {
+      "ref": "@k_assignment_carries_no_identity",
+      "kind": "fact",
+      "statement": "In this actor layer an assignment is only the pair `(log index, ballot in effect at assignment)`; `Pending::assigned: Option<(usize, Ballot)>` and `record_assignment(id, idx, ballot)` store no value, digest or entry id that could be compared against the entry actually stored at `idx` in the decided log. An index recorded through `append_tracked` (local accept as leader) or through `AsyncRuntimeMsg::Assigned` (leader reply) is therefore indistinguishable, from the completion signal alone, from a later different entry decided at the same index.",
+      "conditions": "Applies to `append_notify` completion on the origin actor, for assignments produced by the leader-side immediate accept path and by the leader's `Assigned` reply; `EntryId` identifies the caller's *pending call*, never the log slot's content.",
+      "source_ids": [
+        "actor_record_assignment",
+        "actor_pending_assigned_field",
+        "actor_append_tracked"
+      ]
+    },
+    {
+      "ref": "@k_local_accept_is_not_quorum",
+      "kind": "behavior",
+      "statement": "A node that is leader and in `Phase::Accept` advances its own accepted index as soon as it appends an entry locally; entries are replicated afterwards by `AcceptDecide`/`Accepted` and only a write-quorum of reported accepted indexes makes an index chosen (`LeaderState::is_chosen` counts accepted indexes against the accept quorum). Consequently a locally accepted index can exist in the leader's log without any follower holding it, and a subsequent leader adopts only the log of the promise with the highest `(n_accepted, accepted_idx)` via `InternalStorage::sync_log`, which can replace that index with a different value.",
+      "conditions": "Applies with the majority or flexible quorum configured for the cluster, when the replication messages of that index do not reach a write quorum before leadership changes; it does not apply to an index already chosen by a write quorum, which a new leader must retain.",
+      "source_ids": [
+        "leader_majority_promises_adopt",
+        "storage_sync_log_adopts",
+        "leader_is_chosen"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@q_completion_false_positive",
+      "question": "Is the lost-assignment interleaving reachable in a real in-process actor cluster under the permitted fault model (dropped inter-node messages, election-timeout leader change), and does the origin then resolve `Ok(assigned_idx)` while the entry at that index in its decided log is a different value?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_completion_false_positive",
+      "source_ids": [
+        "actor_drain_notifiers",
+        "actor_record_assignment",
+        "actor_pending_assigned_field",
+        "actor_append_tracked",
+        "handle_append_notify_contract",
+        "event_superseded_contract"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Current account, source-only. `append_notify` is documented as resolving the future \"when the assigned log index is decided\", and the assignment it waits on is only `(index, ballot-at-assignment)`; nothing in the actor compares the caller's entry with what is decided at that index. `drain_notifiers` therefore answers `Ok(idx)` purely from local index progress, and the `Superseded` arm — documented as the resolution when \"a leader change occurred after the entry was accepted at the given index but before it was decided\" — is evaluated only after the `Ok` arm, so it is reached only while the local decided index is still below `idx`. Combining that with the leader-side path, where an entry is accepted locally (and assigned) before any write quorum is reached, a leader change that loses that entry and lets a different entry be decided at the same index makes `Ok(idx)` the resolution the caller receives; the caller cannot tell that case from a genuine success at `idx` from the returned value alone, and would have to re-read the decided log at `idx` and compare values, a check the public documentation recommends only for `Superseded`. I am not asserting the defect yet: the arm order is unambiguous in source, but I have no execution showing the interleaving is reachable through the actor's own routing and that the origin's decided index reaches `idx` while its promise is already the new ballot, which is what would make `Ok` (rather than `Superseded`) the delivered resolution. One necessary premise is instead well-sourced: a locally accepted index can be present in a leader's log with no follower holding it, and a new leader adopts only one promise's log, so a different value can occupy that index afterwards; the `Superseded` doc's own hedge acknowledges exactly this index-reuse uncertainty.",
+      "counterevidence": [
+        "`handle.rs:114-129` defines the success condition as the *assigned log index* being decided, and for `Superseded` tells callers to re-read the returned index themselves if they need certainty (`handle.rs:127-129`). Under that reading `Ok(idx)` is a weaker claim than \"the caller's entry is at idx\", so the observed arm order is consistent with the entry-point documentation even though it overrides the `Superseded` definition in `event.rs:48-58`.",
+        "A new leader is required to adopt any value a majority-overlapping write quorum already accepted, so the entry is lost only when its assignee never reached a write quorum; the `Superseded` variant's doc says the entry \"can still end up decided at log_entry_idx under the new ballot\", i.e. some leader changes preserve the index content rather than replacing it."
+      ],
+      "limitations": [
+        "Source-only account this turn: no execution measured the resolution variant, the entry at the assigned index in the origin's decided log, or the timing between the origin's promise change and its decided index reaching the assigned index.",
+        "The actor layer is not linked into the harness target configured for this run (`omnipaxos/tests/assurance_generated.rs` in crate `omnipaxos`); `omnipaxos_runtime` is neither a dependency nor a dev-dependency of `omnipaxos`, and `omnipaxos::handle_incoming` discards leaked `AsyncRuntime` messages. Judging this question by execution requires switching the experiment crate to `omnipaxos_runtime`, whose build basis is not prepared in `build_inputs`, so the first such execution may need a heavy dependency build.",
+        "The scope read this turn is the captured snapshot only; the failure also depends on the caller's own interpretation of `Ok`, since a caller that re-reads the decided log at the returned index and compares values would not be misled."
+      ]
+    }
+  ]
+}

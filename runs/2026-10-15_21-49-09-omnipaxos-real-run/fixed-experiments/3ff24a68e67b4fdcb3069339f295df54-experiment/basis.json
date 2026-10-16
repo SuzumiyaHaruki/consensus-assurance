@@ -1,0 +1,282 @@
+{
+  "id": "3ff24a68e67b4fdcb3069339f295df54-experiment",
+  "investigation_id": "3ff24a68e67b4fdcb3069339f295df54-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "rust_test",
+      "source": "//! Focused probe for two faults the captured suites do not exercise: duplication of\n//! replication messages, and replay of a replaced leader's messages after the rest of the\n//! cluster has moved to a newer ballot.\n//!\n//! Lives in the `omnipaxos_runtime` test target because that dependency graph builds\n//! offline here; it drives three real `OmniPaxos` instances directly through the public\n//! API and never touches the actor layer.\n\nuse std::collections::BTreeMap;\n\nuse omnipaxos::{\n    messages::{sequence_paxos::PaxosMsg, Message},\n    storage::{Entry, Snapshot},\n    util::LogEntry,\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct TestEntry(u64);\n\n#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\n\nimpl Snapshot<TestEntry> for NoSnapshot {\n    fn create(_entries: &[TestEntry]) -> Self {\n        NoSnapshot\n    }\n    fn merge(&mut self, _delta: Self) {}\n    fn use_snapshots() -> bool {\n        false\n    }\n}\n\nimpl Entry for TestEntry {\n    type Snapshot = NoSnapshot;\n}\n\ntype Op = OmniPaxos<TestEntry, MemoryStorage<TestEntry>>;\n\nfn build(pid: u64, nodes: Vec<u64>) -> Op {\n    let cluster_config = ClusterConfig {\n        configuration_id: 1,\n        nodes,\n        flexible_quorum: None,\n    };\n    #[allow(clippy::needless_update)]\n    let server_config = ServerConfig {\n        pid,\n        election_tick_timeout: 3,\n        resend_message_tick_timeout: 5,\n        buffer_size: 1024,\n        batch_size: 1,\n        flush_batch_tick_timeout: 100,\n        leader_priority: if pid == 1 { 1 } else { 0 },\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config,\n        server_config,\n    }\n    .build(MemoryStorage::default())\n    .unwrap()\n}\n\n/// Transport faults the harness can apply while pumping.\n#[derive(Default)]\nstruct Wire {\n    /// Messages whose sender is this pid are diverted into `held` instead of delivered.\n    hold_from: Option<u64>,\n    /// Diverted messages, kept for replay.\n    held: Vec<Message<TestEntry>>,\n    /// Messages addressed to this pid are delivered twice.\n    duplicate_to: Option<u64>,\n    /// The first `AcceptDecide` addressed to this pid is diverted into `captured`.\n    capture_to: Option<u64>,\n    captured: Option<Message<TestEntry>>,\n}\n\nfn deliver(ops: &mut BTreeMap<u64, Op>, from: u64, m: Message<TestEntry>) {\n    let to = m.get_receiver();\n    if to == from {\n        return;\n    }\n    if let Some(dst) = ops.get_mut(&to) {\n        dst.handle_incoming(m);\n    }\n}\n\nfn pump(ops: &mut BTreeMap<u64, Op>, wire: &mut Wire, rounds: usize) {\n    for _ in 0..rounds {\n        let pids: Vec<u64> = ops.keys().copied().collect();\n        for pid in &pids {\n            ops.get_mut(pid).unwrap().tick();\n        }\n        for pid in &pids {\n            let mut buf = Vec::new();\n            ops.get_mut(pid).unwrap().take_outgoing_messages(&mut buf);\n            for m in buf {\n                let from = m.get_sender();\n                let to = m.get_receiver();\n                if Some(from) == wire.hold_from {\n                    wire.held.push(m);\n                    continue;\n                }\n                if Some(to) == wire.capture_to && wire.captured.is_none() {\n                    if let Message::SequencePaxos(p) = &m {\n                        if matches!(&p.msg, PaxosMsg::AcceptDecide(_)) {\n                            wire.captured = Some(m);\n                            continue;\n                        }\n                    }\n                }\n                let duplicate = Some(to) == wire.duplicate_to;\n                let copy = if duplicate { Some(m.clone()) } else { None };\n                deliver(ops, from, m);\n                if let Some(c) = copy {\n                    deliver(ops, from, c);\n                }\n            }\n        }\n    }\n}\n\nfn replay_held(ops: &mut BTreeMap<u64, Op>, wire: &mut Wire) -> usize {\n    let held = std::mem::take(&mut wire.held);\n    let count = held.len();\n    for m in held {\n        let from = m.get_sender();\n        deliver(ops, from, m);\n    }\n    count\n}\n\nfn emit(event: &str, fields: &[(&str, String)]) {\n    let mut line = format!(\"{{\\\"event\\\":\\\"{}\\\"\", event);\n    for (k, v) in fields {\n        line.push_str(&format!(\",\\\"{}\\\":{}\", k, v));\n    }\n    line.push('}');\n    println!(\"CA_EVENT {}\", line);\n}\n\nfn q(v: &str) -> String {\n    format!(\"\\\"{}\\\"\", v)\n}\n\nfn n(v: usize) -> String {\n    v.to_string()\n}\n\nfn decided_values(op: &Op) -> (usize, Vec<u64>) {\n    let decided_idx = op.get_decided_idx();\n    let values = op\n        .read_decided_suffix(0)\n        .map(|entries| {\n            entries\n                .into_iter()\n                .filter_map(|e| match e {\n                    LogEntry::Decided(TestEntry(v)) => Some(v),\n                    _ => None,\n                })\n                .collect::<Vec<u64>>()\n        })\n        .unwrap_or_default();\n    (decided_idx, values)\n}\n\nfn join(values: &[u64]) -> String {\n    values\n        .iter()\n        .map(|v| v.to_string())\n        .collect::<Vec<_>>()\n        .join(\",\")\n}\n\nfn leader_pid(op: &Op) -> String {\n    op.get_current_leader()\n        .map(|(pid, _)| pid.to_string())\n        .unwrap_or_else(|| \"none\".to_string())\n}\n\nfn run_case(mode: &str, duplicate: bool, stale_replay: bool) {\n    let nodes = vec![1u64, 2, 3];\n    let mut ops: BTreeMap<u64, Op> = nodes\n        .iter()\n        .map(|pid| (*pid, build(*pid, nodes.clone())))\n        .collect();\n    let mut wire = Wire::default();\n\n    // Elect node 1 and decide a baseline of three entries everywhere.\n    let mut elected = false;\n    for _ in 0..200 {\n        ops.get_mut(&1).unwrap().try_become_leader();\n        pump(&mut ops, &mut wire, 30);\n        if let Some((pid, true)) = ops.get(&2).unwrap().get_current_leader() {\n            if pid == 1 {\n                elected = true;\n                break;\n            }\n        }\n    }\n    for v in 1..=3u64 {\n        ops.get_mut(&1).unwrap().append(TestEntry(v)).unwrap();\n    }\n    let mut baseline_ok = false;\n    for _ in 0..40 {\n        pump(&mut ops, &mut wire, 30);\n        if ops.values().all(|op| op.get_decided_idx() >= 3) {\n            baseline_ok = true;\n            break;\n        }\n    }\n    emit(\n        \"admission\",\n        &[\n            (\"mode\", q(mode)),\n            (\"nodes\", q(\"1,2,3\")),\n            (\"follower\", n(2)),\n            (\"leader_elected\", if elected { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"baseline_three_decided_everywhere\", if baseline_ok { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"duplicate_to_node2\", if duplicate { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"stale_replay\", if stale_replay { \"true\".to_string() } else { \"false\".to_string() }),\n        ],\n    );\n    if !elected || !baseline_ok {\n        emit(\n            &format!(\"fault_outcome_{}\", mode.to_lowercase()),\n            &[(\"mode\", q(mode)), (\"stage\", q(\"setup_incomplete\"))],\n        );\n        return;\n    }\n\n    let mut replayed = 0usize;\n    let mut new_leader = 1u64;\n    let mut appended_by_new_leader: Vec<u64> = Vec::new();\n\n    if stale_replay {\n        // Cut the leader off from both followers and let them take over. Messages it sends\n        // are retained so they can be replayed afterwards.\n        wire.hold_from = Some(1);\n        let mut takeover = false;\n        for _ in 0..40 {\n            pump(&mut ops, &mut wire, 30);\n            for pid in [2u64, 3] {\n                if let Some((leader, true)) = ops.get(&pid).unwrap().get_current_leader() {\n                    if leader != 1 {\n                        new_leader = leader;\n                        takeover = true;\n                    }\n                }\n            }\n            if takeover {\n                break;\n            }\n        }\n        // The new leader decides two entries while the old leader is cut off.\n        for v in [7u64, 8] {\n            ops.get_mut(&new_leader).unwrap().append(TestEntry(v)).unwrap();\n            appended_by_new_leader.push(v);\n        }\n        for _ in 0..10 {\n            pump(&mut ops, &mut wire, 30);\n        }\n        // Heal: the old leader is reachable again and its retained messages are replayed.\n        wire.hold_from = None;\n        replayed = replay_held(&mut ops, &mut wire);\n    } else {\n        // The new leader is the same node; two more entries advance the log.\n        for v in [7u64, 8] {\n            ops.get_mut(&1).unwrap().append(TestEntry(v)).unwrap();\n            appended_by_new_leader.push(v);\n        }\n    }\n\n    if duplicate {\n        wire.duplicate_to = Some(2);\n    }\n    for _ in 0..10 {\n        pump(&mut ops, &mut wire, 30);\n    }\n\n    // A final proposal through whichever node currently leads, then settle.\n    let final_leader = ops\n        .iter()\n        .find_map(|(pid, op)| op.get_current_leader().filter(|(_, a)| *a).map(|(l, _)| if op.get_pid() == l { *pid } else { *pid }))\n        .unwrap_or(1);\n    let proposer = if stale_replay { new_leader } else { final_leader };\n    ops.get_mut(&proposer)\n        .unwrap()\n        .append(TestEntry(9))\n        .unwrap();\n    for _ in 0..15 {\n        pump(&mut ops, &mut wire, 30);\n    }\n    wire.duplicate_to = None;\n\n    let (leader_decided, leader_values) = decided_values(ops.get(&1).unwrap());\n    let (second_decided, second_values) = decided_values(ops.get(&2).unwrap());\n    let (third_decided, third_values) = decided_values(ops.get(&3).unwrap());\n    let all_equal = leader_values == second_values && second_values == third_values;\n    let expected = [1u64, 2, 3, 7, 8, 9];\n    let mut sorted = leader_values.clone();\n    sorted.sort_unstable();\n    let has_expected = sorted == expected.to_vec();\n\n    emit(\n        &format!(\"fault_outcome_{}\", mode.to_lowercase()),\n        &[\n            (\"mode\", q(mode)),\n            (\"nodes\", q(\"1,2,3\")),\n            (\"follower\", n(2)),\n            (\"duplicate_to_node2\", if duplicate { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"stale_replay\", if stale_replay { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"stale_messages_replayed\", n(replayed)),\n            (\"new_leader_pid\", n(new_leader as usize)),\n            (\"final_proposer_pid\", n(proposer as usize)),\n            (\"leader1_decided_idx\", n(leader_decided)),\n            (\"node2_decided_idx\", n(second_decided)),\n            (\"node3_decided_idx\", n(third_decided)),\n            (\"leader1_decided_values\", q(&join(&leader_values))),\n            (\"node2_decided_values\", q(&join(&second_values))),\n            (\"node3_decided_values\", q(&join(&third_values))),\n            (\"all_three_values_equal\", if all_equal { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"expected_entries_all_decided\", if has_expected { \"true\".to_string() } else { \"false\".to_string() }),\n            (\"node1_current_leader_pid\", q(&leader_pid(ops.get(&1).unwrap()))),\n            (\"node2_current_leader_pid\", q(&leader_pid(ops.get(&2).unwrap()))),\n        ],\n    );\n}\n\n/// Control: no fault, entries decided in order by the original leader.\n#[test]\nfn case_a_control() {\n    run_case(\"A\", false, false);\n}\n\n/// Duplication: every message addressed to node 2 is delivered twice.\n#[test]\nfn case_b_duplicated_delivery() {\n    run_case(\"B\", true, false);\n}\n\n/// Stale replay: the followers take over while the old leader is cut off, then the old\n/// leader's retained messages are replayed to them after the heal.\n#[test]\nfn case_c_stale_leader_replay() {\n    run_case(\"C\", false, true);\n}\n",
+      "files": {},
+      "execution_package": "./omnipaxos_runtime",
+      "test_names": null,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admission_a",
+          "event": "admission",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "A",
+              "reference": null
+            },
+            {
+              "field": "nodes",
+              "op": "eq",
+              "value": "1,2,3",
+              "reference": null
+            },
+            {
+              "field": "follower",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admission_b",
+          "event": "admission",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "B",
+              "reference": null
+            },
+            {
+              "field": "nodes",
+              "op": "eq",
+              "value": "1,2,3",
+              "reference": null
+            },
+            {
+              "field": "follower",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admission_c",
+          "event": "admission",
+          "conditions": [
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "C",
+              "reference": null
+            },
+            {
+              "field": "nodes",
+              "op": "eq",
+              "value": "1,2,3",
+              "reference": null
+            },
+            {
+              "field": "follower",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "core_check_valid_ballot",
+      "core_decided_advance_gates"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three runs of one cluster shape with three real `OmniPaxos` instances driven directly through the public API in a single process (in-process delivery, node 1 the elected leader, node 2 the follower under observation, node 3 the third acceptor). All runs first decide entries 1..=3 as a baseline. Case A then decides 7 and 8 with no fault. Case B delivers every message addressed to node 2 twice while 7 and 8 are decided. Case C cuts node 1 off from both followers so that they elect node 3, lets node 3 decide 7 and 8, then restores the link and replays every message node 1 had sent while cut off, before deciding a final entry 9 through the current leader.",
+      "assumptions": [
+        "Duplicate delivery and delayed delivery of already-sent messages are permitted faults; the core carries sequence numbers for the first and ballot checks for the second, and no caller duty in the docs rules them out.",
+        "Faults are applied in the transport only: no target logic is modified, and the leader is unaware of duplication, holding or replay.",
+        "Logical ticks driven by the harness exercise the election and resend timeouts deterministically rather than by wall-clock timing.",
+        "The instances run with batch_size 1, majority quorum and no snapshots, so decisions are observable immediately through `read_decided_suffix`."
+      ],
+      "excluded": [
+        "Any claim about message corruption, reordering (probed separately) or storage faults.",
+        "Any claim about the actor layer: the probe drives the core crate directly.",
+        "Any claim about occurrence rates: one schedule per case."
+      ],
+      "parameters": {
+        "nodes": "1,2,3",
+        "leader": 1,
+        "follower_under_observation": 2,
+        "baseline_entries": "1..=3",
+        "later_entries": "7,8 and a final 9",
+        "duplication": "case B: every message addressed to node 2 delivered twice",
+        "stale_replay": "case C: messages from node 1 held while it is cut off, then replayed after the heal",
+        "ticks_per_pump": 30
+      }
+    },
+    "prefix": "For each case: build one `OmniPaxos<TestEntry, MemoryStorage<TestEntry>>` per node id (configuration_id 1, election_tick_timeout 3, resend_message_tick_timeout 5, batch_size 1, node 1 leader_priority 1), elect node 1 by calling `try_become_leader()` and pumping until node 2 reports it as the accepted leader, append entries 1..=3 on node 1 and pump until every node has decided at least 3, then emit the admission event. Case A appends 7 and 8 on node 1. Case B sets the transport to deliver every message addressed to node 2 twice and then appends 7 and 8 on node 1. Case C sets the transport to hold every message sent by node 1, pumps until a node other than 1 reports itself as the accepted leader, appends 7 and 8 on that new leader, pumps, then clears the hold, replays all retained messages and pumps again. Finally append entry 9 through the current leader and pump fifteen rounds; then read each node's decided suffix and emit, under the mode-specific event name, the decided values and indexes per node, whether all three nodes' decided values are equal, whether exactly the expected entries were decided, how many messages were replayed, and each node's current leader.",
+    "requirement": null,
+    "responsibility": "The decisive inputs are produced by the target: the follower's sequence-number check decides what a duplicate means, and `check_valid_ballot` decides what a replaced leader's message means; the harness only chooses the delivery schedule and never inspects or repairs protocol state.",
+    "comparisons": [
+      {
+        "event": "fault_outcome_a",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "all_three_values_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: no fault, all nodes agree."
+      },
+      {
+        "event": "fault_outcome_a",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_a",
+        "assertion": {
+          "field": "expected_entries_all_decided",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: every expected entry decided."
+      },
+      {
+        "event": "fault_outcome_b",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "all_three_values_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "duplicate_to_node2",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Duplication: agreement survives duplicate delivery. Expected holds."
+      },
+      {
+        "event": "fault_outcome_b",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_b",
+        "assertion": {
+          "field": "expected_entries_all_decided",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "duplicate_to_node2",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Duplication: progress survives. Expected holds."
+      },
+      {
+        "event": "fault_outcome_c",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_c",
+        "assertion": {
+          "field": "all_three_values_equal",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_replay",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Stale replay: after the takeover and the replay of the replaced leader's messages, all nodes agree. Expected holds."
+      },
+      {
+        "event": "fault_outcome_c",
+        "identity_fields": [
+          "mode",
+          "nodes",
+          "follower"
+        ],
+        "admission_alias": "admission_c",
+        "assertion": {
+          "field": "expected_entries_all_decided",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_replay",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Stale replay: the entries decided before, during and after the takeover are all decided everywhere. Expected holds."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "f2313b6a761845ca82e89ebd95e29cf8",
+  "configuration": {
+    "backend": "cargo",
+    "target": {
+      "expected_module": null,
+      "variant": "omnipaxos",
+      "analysis_roots": [],
+      "execution_package": "omnipaxos",
+      "harness_path": "omnipaxos/tests/assurance_generated.rs"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+    }
+  },
+  "harness_filename": "omnipaxos_runtime/tests/assurance_generated.rs",
+  "operation_id": "3ff24a68e67b4fdcb3069339f295df54",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

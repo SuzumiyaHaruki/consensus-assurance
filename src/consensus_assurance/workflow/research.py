@@ -187,6 +187,9 @@ def execution_locator(check, fixed=None):
         'stdout':check.stdout, 'stderr':check.stderr}
     if fixed:
         value.update(fixed_experiment_locator(fixed))
+    if selection := check.parameters.get('test_selection'):
+        value['test_selection'] = {**selection, 'observed':selection['observed'][:20],
+            'observed_omitted_count':max(0, len(selection['observed'])-20)}
     return value
 
 
@@ -195,6 +198,45 @@ def source_locations(state, ids):
              **({'path':'agent-source/'+m.file, 'start_line':m.start_line, 'end_line':m.end_line}
                 if m.file in state.snapshot.files else {})}
             for m in state.materials if m.id in ids]
+
+
+def diagnostic_summary(observed, remaining=None):
+    """Bound error previews independently of event volume; preserve exact record locators."""
+    remaining = remaining if remaining is not None else {}
+    remaining.setdefault('diagnostic_groups', 8)
+    remaining.setdefault('diagnostic_chars', 4000)
+    groups = {}
+    def add(comparison_index, reason, index=None):
+        key = (comparison_index, reason)
+        entry = groups.setdefault(key, {'comparison_index':comparison_index, 'reason':excerpt(reason, 500),
+            'occurrences':0, 'locations':[]})
+        entry['occurrences'] += 1
+        if index is not None and len(entry['locations']) < 3:
+            event = observed['events'][index]
+            provenance = event.get('_ca_observation', {})
+            entry['locations'].append({'event_index':index,
+                'stream':excerpt(str(event['_ca_stream']), 200) if event.get('_ca_stream') is not None else None,
+                'output_location':provenance.get('location')})
+    for index, result in enumerate(observed['comparisons']):
+        for diagnostic in result['diagnostics']:
+            add(index, diagnostic['reason'], diagnostic['event_index'])
+        if not result['diagnostics']:
+            for limitation in result['limitations']:
+                add(index, limitation)
+    for index, event in enumerate(observed['events']):
+        if event.get('event') == 'invalid_observation':
+            add(None, event.get('reason', 'Invalid observation'), index)
+    shown = []
+    for entry in groups.values():
+        length = len(json.dumps(entry, ensure_ascii=False))
+        if not remaining['diagnostic_groups'] or length > remaining['diagnostic_chars']:
+            break
+        shown.append(entry)
+        remaining['diagnostic_groups'] -= 1
+        remaining['diagnostic_chars'] -= length
+    return {'diagnostic_summary':shown, 'diagnostic_groups_omitted':len(groups)-len(shown),
+        'diagnostic_scope':'Grouped error previews with up to three locations per cause; '
+            'complete diagnostics and correlations remain in the observations record.'}
 
 
 def execution_feedback(state, root, fixed, check):
@@ -217,6 +259,7 @@ def execution_feedback(state, root, fixed, check):
     value.update(event_count=len(events), events=events if inline else [],
         events_omitted_count=0 if inline else len(events),
         parsing_error_count=len(observed['parsing_errors']), prerequisites=observed['prerequisites'])
+    value.update(diagnostic_summary(observed))
     for comparison, result in zip(value['comparisons'], observed['comparisons'], strict=True):
         omitted = {} if inline else {k:len(result[k]) for k in ('correlations','diagnostics','limitations')}
         comparison['result'] = {k:v for k,v in result.items() if k not in omitted}
@@ -261,6 +304,7 @@ def cited_execution_feedback(state, root, check, fixed, previous, current, owner
         remaining['events'] -= 1
         remaining['chars'] -= size
     return {**value, 'cited_events':shown, 'event_count':len(raw['events']),
+        **diagnostic_summary(raw, remaining),
         'shared_cited_events':shared,
         'omitted_cited_indices':sorted(set(indices) - {e['event_index'] for e in [*shown,*shared]}),
         'parsing_error_count':len(raw['parsing_errors']), 'prerequisites':raw['prerequisites'],
