@@ -1,0 +1,230 @@
+# HashiCorp Raft correctness audit
+
+Source identity: `0f543c056e7e577a54b819a62116335c9661a13a`
+
+The implementation's new `RestoreCommittedLogs` startup mode has three
+independently reproducible correctness defects. All occur with supported
+configuration values and do not require a cluster-wide fault.
+
+## Finding 1: committed-log recovery discards the persisted cluster configuration
+
+Severity: high
+
+Affected code:
+
+- `api.go:607-625`: `NewRaft` invokes `restoreFromCommittedLogs`, then starts its
+  configuration scan at `max(snapshotIndex, lastApplied)+1`.
+- `api.go:720-755`: `restoreFromCommittedLogs` sets `lastApplied` to the persisted
+  commit index via `processLogs`.
+- `raft.go:1296-1363`: `processLogs` applies entries to the FSM, but never calls
+  `processConfigurationLogEntry` or updates `r.configurations`.
+
+Expected behavior: enabling `RestoreCommittedLogs` should replay the committed
+log suffix to the FSM without losing Raft's own persistent state. In particular,
+after restart, the latest committed configuration must be reconstructed from
+configuration entries in that suffix. This is the behavior of the same startup
+path with `RestoreCommittedLogs` disabled, and is required before the node can
+evaluate elections or membership safely.
+
+Actual behavior: on startup, `processLogs` advances `lastApplied` through the
+persisted commit index. The subsequent configuration scan deliberately starts
+after `lastApplied`, so it skips every configuration entry in the replayed
+range. No other recovery step populates `r.configurations`. A restarted node can
+therefore have an empty or stale `latest` configuration even though its log
+contains the committed current configuration.
+
+This occurs without a snapshot. With one bootstrapped voter and one committed
+client command, the persisted tracker reaches the committed no-op and command.
+After restart, the log still contains the bootstrap configuration at index 1,
+but `restarted.GetConfiguration()` returns an empty configuration and the node
+logs `initial configuration: index=0 servers=[]`.
+
+Reproduction: `TestAuditRestoreCommittedLogsRestoresConfiguration` in
+`audit_repro_test.go`.
+
+Command:
+
+```text
+go test -run '^TestAuditRestoreCommittedLogsRestoresConfiguration$' -count=1 -v .
+```
+
+Observed result:
+
+```text
+server-...: initial configuration: index=1 servers="[{Suffrage:Voter ID:server-... Address:...}]"
+server-...: initial configuration: index=0 servers=[]
+audit_repro_test.go:64: configuration after recovery = [], want local server "server-..."
+--- FAIL: TestAuditRestoreCommittedLogsRestoresConfiguration (0.33s)
+```
+
+The first `initial configuration` line is the original startup. The second is
+the recovery-enabled restart immediately after `NewRaft` returns.
+Running this test ten times produced ten failures, so the observation is not a
+startup race.
+
+The same defect occurs with a snapshot containing an older configuration. A
+separate reproducer installs a valid snapshot at index 1 with the old
+configuration, stores a committed configuration change at index 2, and restarts.
+Recovery keeps the old configuration from the snapshot instead of installing
+the newer committed configuration. This is
+`TestAuditRestoreCommittedLogsAppliesConfigurationAfterSnapshot` in
+`audit_repro_test.go`.
+
+Command:
+
+```text
+go test -run '^TestAuditRestoreCommittedLogsAppliesConfigurationAfterSnapshot$' -count=1 -v .
+```
+
+Observed result:
+
+```text
+initial configuration: index=1 servers="[{...}]"
+audit_repro_test.go:237: configuration after recovery = {Servers:[one server]}, want {Servers:[two servers]}
+--- FAIL: TestAuditRestoreCommittedLogsAppliesConfigurationAfterSnapshot (0.00s)
+```
+
+Alternative considered: perhaps the FSM-side configuration application is
+intended to replace the Raft configuration scan. It cannot: `processLogs` only
+queues `commitTuple`s for `runFSM`; `runFSM` may call an application
+`ConfigurationStore`, but never mutates `Raft.configurations`, which is used by
+elections, quorum calculation, and `GetConfiguration`.
+
+## Finding 2: startup deadlocks while replaying enough committed batches
+
+Severity: medium; deterministic availability failure during startup
+
+Affected code:
+
+- `api.go:607-628`: committed-log recovery completes before `runFSM` is started.
+- `api.go:560`: `fsmMutateCh` has a fixed buffer of 128 items.
+- `raft.go:1302-1317`: `processLogs` sends one batch per `MaxAppendEntries`
+  entries and blocks when the channel is full.
+
+Expected behavior: `NewRaft` should return after replaying any number of
+persisted committed entries that fit the supported configuration. Writes to the
+FSM mutation channel must have a live consumer or must not outnumber its buffer
+before startup completes.
+
+Actual behavior: `restoreFromCommittedLogs` calls `processLogs`, which must put
+every batch on `fsmMutateCh`; however, `runFSM` is only started after recovery
+returns. Consequently, more than 128 batches block `NewRaft` forever while it
+waits for a consumer it has not yet launched.
+
+With the supported `MaxAppendEntries = 1`, only 129 committed entries that
+produce FSM batches are needed to trigger the deadlock. The reproducer commits
+130 such entries, including the bootstrap configuration, and leaves one later
+entry in storage. With larger legal batch sizes, the required committed log
+count is correspondingly larger, but remains finite and can occur in normal
+operation.
+
+Reproduction: `TestAuditRestoreCommittedLogsDoesNotDeadlockBeforeRunFSM` in
+`audit_repro_test.go`.
+
+Commands:
+
+```text
+go test -run '^TestAuditRestoreCommittedLogsDoesNotDeadlockBeforeRunFSM$' -count=1 -v .
+```
+
+Observed result:
+
+```text
+audit_repro_test.go:126: NewRaft deadlocked while restoring 130 committed entries
+--- FAIL: TestAuditRestoreCommittedLogsDoesNotDeadlockBeforeRunFSM (2.00s)
+```
+
+Alternative considered: `BatchApplyCh` could relieve the problem if it allowed
+`runFSM` to consume during recovery, but it does not. It buffers `applyCh`, not
+`fsmMutateCh`, and the FSM goroutine is not started until after
+`restoreFromCommittedLogs` returns.
+
+## Finding 3: recovery moves the public commit index behind restored FSM state
+
+Severity: low to medium; persistent state inconsistency visible through the
+public API
+
+Affected code:
+
+- `api.go:598-607`: `restoreSnapshot` restores the FSM and sets `lastApplied` to
+  the snapshot index.
+- `api.go:746-753`: `restoreFromCommittedLogs` unconditionally replaces the
+  commit index with the tracker's value.
+
+Expected behavior: `commitIndex` is the highest log entry known to be committed,
+while `lastApplied` is the highest entry applied to the FSM. The restored
+snapshot necessarily represents committed state, so
+`CommitIndex() >= AppliedIndex()` must hold.
+
+Actual behavior: taking a snapshot does not append a log entry, so the last
+durably staged commit can be one or more indices behind the snapshot. On a
+restart, snapshot restore sets `lastApplied` to the snapshot index 3, then
+committed-log recovery sets `commitIndex` to the stale tracker value 2.
+`Raft.CommitIndex()` consequently reports 2 while `Raft.AppliedIndex()` reports
+3. The code does not raise the recovered value to `lastApplied`.
+
+This is a local state-invariant/API defect. A later leader heartbeat can repair
+the in-memory value, but until then commit status is false and monitoring or
+logic based on the public index sees impossible state.
+
+Reproduction:
+`TestAuditRestoreCommittedLogsDoesNotRegressCommitBehindSnapshot` in
+`audit_repro_test.go`.
+
+Command:
+
+```text
+go test -run '^TestAuditRestoreCommittedLogsDoesNotRegressCommitBehindSnapshot$' -count=1 -v .
+```
+
+Observed result:
+
+```text
+restored from snapshot: id=2-3-... last-index=3 ...
+skipping application of old log: index=2
+audit_repro_test.go:170: commit index regressed behind restored state: commit=2 applied=3
+--- FAIL: TestAuditRestoreCommittedLogsDoesNotRegressCommitBehindSnapshot (0.38s)
+```
+
+The snapshot regression reproduced in ten consecutive runs.
+
+Alternative considered: a low recovered commit index might merely reduce the
+optimization benefit if it were only internal. That does not explain the public
+contradiction with `AppliedIndex`, and `CommitIndex` is documented as the highest
+known committed entry. Recovery should use at least `max(trackerIndex,
+lastApplied)`.
+
+## Combined reproduction
+
+Command:
+
+```text
+go test -run '^TestAudit' -count=1 -v .
+```
+
+Observed result:
+
+```text
+--- FAIL: TestAuditRestoreCommittedLogsRestoresConfiguration (0.33s)
+--- FAIL: TestAuditRestoreCommittedLogsDoesNotDeadlockBeforeRunFSM (2.00s)
+--- FAIL: TestAuditRestoreCommittedLogsDoesNotRegressCommitBehindSnapshot (0.38s)
+--- FAIL: TestAuditRestoreCommittedLogsAppliesConfigurationAfterSnapshot (0.00s)
+FAIL
+FAIL	github.com/hashicorp/raft	2.771s
+```
+
+No captured source or dependency files were modified. The regression tests are
+isolated in `work/audit_repro_test.go`.
+
+The full suite was also run in the isolated local-network runner with
+`go test ./...` after all audit tests were added. All pre-existing tests
+passed; the only failures were the four audit test functions above, covering
+the three findings. The complete runner log is execution
+`d6e2274cbc9c45c3bbbffbdcf43b2e0b`.
+
+## Unresolved work
+
+- Examine whether the in-memory commit-tracking store violates its own
+  atomicity contract in useful crash simulations.
+- Consider multi-node restart and leadership-liveness consequences of the
+  lost configuration; the local configuration defect is already established.
