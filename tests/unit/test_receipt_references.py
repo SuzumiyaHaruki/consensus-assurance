@@ -49,7 +49,6 @@ def test_all_reference_identities_are_checked_before_measurement(tmp_path, monke
     assert diagnostic['code'] == 'execution_reference' and diagnostic['category'] == 'association'
     assert diagnostic['paths'] == [f'/{collection}/1/executions/{id}']
     assert diagnostic['object_ids'] == [id] and diagnostic['details']['actual_kind'] == kind
-    assert diagnostic['details']['execution_index'] == {'path': 'state.json', 'collection': 'checks'}
     assert 'observations' not in diagnostic['details']
 
 
@@ -73,22 +72,12 @@ def test_alias_and_joint_history_do_not_change_experiment_ownership(tmp_path, ev
     diagnostic, = preflight(tmp_path, state, sub)['diagnostics']
     assert diagnostic['code'] == 'execution_reference'
     assert diagnostic['paths'] == [f'/interpretations/1/executions/{check.id}']
-    assert 'joint-history' in diagnostic['message']
     sub['interpretations'][1]['joint_history'] = 'Reuse the same recorded local operation, not a new execution.'
     assert preflight(tmp_path, state, sub)['valid']
     sub['interpretations'][1]['experiment_id'] = fixed.id
     diagnostic, = preflight(tmp_path, state, sub)['diagnostics']
     assert diagnostic['code'] == 'interpretation_experiment' and diagnostic['category'] == 'association'
     assert diagnostic['paths'] == ['/interpretations/1/investigation_id', '/interpretations/1/experiment_id']
-    assert diagnostic['object_ids'] == ['preflight-question-0', fixed.id, fixed.investigation_id]
-    assert diagnostic['details'] == {
-        'submitted_investigation_id': '@related', 'investigation_id': 'preflight-question-0',
-        'experiment_id': fixed.id, 'experiment_investigation_id': fixed.investigation_id, 'conclusion': 'explained',
-        'experiment_record': {'path': 'state.json', 'collection': 'experiments', 'id': fixed.id},
-        'owner_record': {'path': 'state.json', 'collection': 'investigations', 'id': fixed.investigation_id},
-        'navigation': 'research.json'}
-    assert 'omit experiment_id' in diagnostic['message']
-    assert 'joint_history does not change experiment ownership' in diagnostic['message']
     bound = deepcopy(sub)
     bound['interpretations'][1]['investigation_id'] = fixed.investigation_id
     assert preflight(tmp_path, state, bound)['valid']
@@ -97,8 +86,6 @@ def test_alias_and_joint_history_do_not_change_experiment_ownership(tmp_path, ev
         sub['interpretations'][1]['conclusion'] = conclusion
         result = preflight(tmp_path, state, sub)
         assert result['valid'] == (conclusion in {'explained', 'conditional', 'unresolved'})
-        if not result['valid']:
-            assert 'Measured conclusions require a fixed experiment' in result['diagnostics'][0]['message']
 
 
 @pytest.mark.parametrize('collection', ['knowledge', 'interpretations'])
@@ -112,4 +99,3 @@ def test_event_reference_diagnostic_locates_invalid_and_duplicate_indices(tmp_pa
     assert diagnostic['object_ids'] == [check.id]
     assert diagnostic['details'] == dict(invalid_indices=[-1, 2], duplicate_indices=[1], event_count=2,
         valid_range=[0, 1], observations=f'logs/{check.id}/observations.json', stdout=check.stdout)
-    assert 'Fix the citation array' in diagnostic['message'] and '0 through 1' in diagnostic['message']

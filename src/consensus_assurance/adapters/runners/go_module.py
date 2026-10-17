@@ -42,7 +42,7 @@ def go_test_diagnostics(text):
 
 class GoModuleBackend:
     name = "go_module"
-    version = "4"
+    version = "5"
     harness_kind = "go_test"
     harness_filename = "assurance_generated_test.go"
     harness_instructions = "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. Optional test_names selects exact top-level names and their subtests; omission runs all TestAssurance tests. Unselected code still compiles and package initialization still runs. execution_package is repository-relative; the nearest captured go.mod selects the execution module. Local replacements must remain in the captured repository; Go workspaces are unsupported. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs."
@@ -119,9 +119,15 @@ class GoModuleBackend:
         modules = self.local_modules(workspace, module, {str(p.relative_to(workspace)) for p in workspace.rglob('go.mod')})
         if module != Path('.'):
             command = [command[0], '-C', str(module), *command[1:-1], local_package(str(package.relative_to(module)))]
-        check = run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action, adapter=self, prepared=True)
+        # Reuse compiled objects within this run; source copies and test execution remain independent.
+        cache = runner.root / '.execution/go-build'
+        if cache.parent.is_symlink() or cache.is_symlink():
+            raise ValueError('Go build cache must be a private directory inside the run')
+        cache.mkdir(parents=True, exist_ok=True)
+        check = run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action, adapter=self, prepared=True,
+                               writable_roots=(cache,), env_overrides={'GOCACHE':str(cache)})
         check.parameters.update(module_directory=str(module), local_modules=modules,
-                                module_execution_cwd=str(workspace/module))
+                                module_execution_cwd=str(workspace/module), go_build_cache=str(cache))
         return check
 
     def parse_test_result(self, check, text):

@@ -1,0 +1,185 @@
+{
+  "id": "64b6f78684b04f8ea393a5827f5457c7-experiment",
+  "investigation_id": "533b966489544f45b4fcf14f6edce57f-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * Each case bootstraps five members, demotes two to non-voters, and cuts the\n//     leader from the two remaining voters while leaving the non-voters\n//     reachable, so the leader can reach only itself among voters.\n//   * The case then repeats VerifyLeader every 50 ms and records how many\n//     consecutive verifications succeeded and how long the first failure took.\n//   * The two cases differ only in the configured lease and the timeouts above\n//     it, so the measured window can be compared across settings.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc vlEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc vlRun(t *testing.T, name string, lease, heartbeat, election, window time.Duration) {\n\tt.Helper()\n\tconf := inmemConfig(t)\n\tconf.LeaderLeaseTimeout = lease\n\tconf.HeartbeatTimeout = heartbeat\n\tconf.ElectionTimeout = election\n\tc := MakeClusterCustom(t, &MakeClusterOpts{Peers: 5, Bootstrap: true, Conf: conf})\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader\")\n\t}\n\tvar others []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader {\n\t\t\tothers = append(others, r)\n\t\t}\n\t}\n\tfor _, r := range others[:2] {\n\t\tif err := leader.DemoteVoter(r.localID, 0, 5*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"demote: %v\", err)\n\t\t}\n\t}\n\ttime.Sleep(heartbeat / 2)\n\n\tleaderTrans := leader.trans.(*InmemTransport)\n\tfor _, r := range others[2:] {\n\t\tleaderTrans.Disconnect(r.localAddr)\n\t\tr.trans.(*InmemTransport).Disconnect(leader.localAddr)\n\t}\n\tvlEmit(t, map[string]interface{}{\n\t\t\"event\":               \"vl_case_\" + name,\n\t\t\"case\":                name,\n\t\t\"lease_ms\":            int(lease / time.Millisecond),\n\t\t\"heartbeat_ms\":        int(heartbeat / time.Millisecond),\n\t\t\"election_ms\":         int(election / time.Millisecond),\n\t\t\"members\":             5,\n\t\t\"nonvoters\":           2,\n\t\t\"voters\":              3,\n\t\t\"nonvoters_reachable\": 2,\n\t\t\"voters_reachable\":    1,\n\t})\n\n\tfirstStart := time.Now()\n\tfirstErr := leader.VerifyLeader().Error()\n\tfirstOK := firstErr == nil\n\tfirstMS := int(time.Since(firstStart) / time.Millisecond)\n\n\tsuccesses := 0\n\tmsUntilFailure := -1\n\tloopStart := time.Now()\n\tfor time.Since(loopStart) < window {\n\t\tf := leader.VerifyLeader()\n\t\tdone := make(chan error, 1)\n\t\tgo func() { done <- f.Error() }()\n\t\tvar err error\n\t\tselect {\n\t\tcase err = <-done:\n\t\tcase <-time.After(lease):\n\t\t\terr = fmt.Errorf(\"no completion\")\n\t\t}\n\t\tif err == nil {\n\t\t\tsuccesses++\n\t\t\ttime.Sleep(50 * time.Millisecond)\n\t\t\tcontinue\n\t\t}\n\t\tmsUntilFailure = int(time.Since(loopStart) / time.Millisecond)\n\t\tbreak\n\t}\n\tvlEmit(t, map[string]interface{}{\n\t\t\"event\":            \"vl_result_\" + name,\n\t\t\"case\":             name,\n\t\t\"lease_ms\":         int(lease / time.Millisecond),\n\t\t\"heartbeat_ms\":     int(heartbeat / time.Millisecond),\n\t\t\"election_ms\":      int(election / time.Millisecond),\n\t\t\"members\":          5,\n\t\t\"nonvoters\":        2,\n\t\t\"first_verify_ok\":  firstOK,\n\t\t\"first_verify_ms\":  firstMS,\n\t\t\"loop_successes\":   successes,\n\t\t\"ms_until_failure\": msUntilFailure,\n\t\t\"window_ms\":        int(window / time.Millisecond),\n\t\t\"state_after\":      leader.State().String(),\n\t})\n\tt.Logf(\"case=%s lease=%v firstOK=%v successes=%d msUntilFailure=%d\",\n\t\tname, lease, firstOK, successes, msUntilFailure)\n}\n\nfunc TestAssuranceVerifyLeaseWindow(t *testing.T) {\n\tt.Run(\"lease_500ms\", func(t *testing.T) {\n\t\tvlRun(t, \"lease_500ms\", 500*time.Millisecond, 500*time.Millisecond, 600*time.Millisecond, 2*time.Second)\n\t})\n\tt.Run(\"lease_1s\", func(t *testing.T) {\n\t\tvlRun(t, \"lease_1s\", time.Second, time.Second, time.Second, 2500*time.Millisecond)\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceVerifyLeaseWindow"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_500ms",
+          "event": "vl_case_lease_500ms",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "lease_500ms",
+              "reference": null
+            },
+            {
+              "field": "lease_ms",
+              "op": "eq",
+              "value": 500,
+              "reference": null
+            },
+            {
+              "field": "voters_reachable",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "nonvoters_reachable",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_1s",
+          "event": "vl_case_lease_1s",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "lease_1s",
+              "reference": null
+            },
+            {
+              "field": "lease_ms",
+              "op": "eq",
+              "value": 1000,
+              "reference": null
+            },
+            {
+              "field": "voters_reachable",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "nonvoters_reachable",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "api_verify_doc",
+      "raft_verify_leader",
+      "future_verify_vote",
+      "raft_leader_lease",
+      "raft_quorum_size",
+      "membership_doc_nonvoter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two five-member clusters with two non-voters each, the leader cut from the two remaining voters but still reachable to both non-voters, run at a 500 ms and a 1 s leader lease, each repeating VerifyLeader every 50 ms until the first failure.",
+      "assumptions": [
+        "The leader is cut from the voters after the demotions have been applied, so the configuration has three voters and two non-voters in both cases.",
+        "The heartbeat and election timeouts are set equal to or above the lease, respecting the library's ordering constraint.",
+        "The first verification is issued immediately after the cut, so its result describes the state before the lease expires.",
+        "The loop stops at the first failure and records the elapsed time; a case that never fails reports -1."
+      ],
+      "excluded": [
+        "No successor is elected in these cases, so no read is issued and no stale-read question is answered here.",
+        "Only two lease settings are exercised; the 2 s setting was attempted during construction and aborted because the cluster helper's stability wait is shorter than the election timeout it implies.",
+        "The non-voters stay reachable in both cases; the all-cut control is covered by other receipts."
+      ],
+      "parameters": {
+        "members": 5,
+        "voters": 3,
+        "nonvoters": 2,
+        "voters_reachable": 1,
+        "nonvoters_reachable": 2,
+        "leases_ms": [
+          500,
+          1000
+        ],
+        "loop_interval_ms": 50
+      }
+    },
+    "prefix": "Each case bootstraps five members with the configured lease, heartbeat and election timeouts, demotes two peers, waits half a heartbeat, cuts the leader's transport from the two remaining voters, and emits a case event with the suffrage counts and reachability. It then issues one VerifyLeader and records whether it succeeded and how long it took, and repeats VerifyLeader every 50 ms up to the case window, counting consecutive successes and recording the elapsed time at the first failure together with the leader's state afterwards.",
+    "requirement": null,
+    "responsibility": "The library decides which acknowledgements count towards a verification and when a leader that can no longer reach its voters stops acting as leader. A verification that succeeds while the leader reaches only itself among voters is the gap; the length of time that remains possible is set by the library's own lease handling, so it should follow the configured lease rather than a fixed delay.",
+    "comparisons": [
+      {
+        "event": "vl_result_lease_500ms",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_500ms",
+        "assertion": {
+          "field": "first_verify_ok",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "With one of three voters reachable, the first verification under a 500 ms lease must fail; a true witness contradicts it."
+      },
+      {
+        "event": "vl_result_lease_1s",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_1s",
+        "assertion": {
+          "field": "first_verify_ok",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "With one of three voters reachable, the first verification under a 1 s lease must fail; a true witness contradicts it."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "533b966489544f45b4fcf14f6edce57f-knowledge-0",
+        "revision": 5,
+        "assertion": "VerifyLeader sizes a voter quorum but registers the verification on every replication stream, including non-voters, whose acks increment its vote count."
+      },
+      {
+        "entry_id": "533b966489544f45b4fcf14f6edce57f-knowledge-1",
+        "revision": 5,
+        "assertion": "checkLeaderLease counts only voters, unlike VerifyLeader."
+      }
+    ]
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "64b6f78684b04f8ea393a5827f5457c7",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

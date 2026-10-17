@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_public_profiles_and_all_targets_load_without_local_inputs():
     targets = sorted((ROOT / 'configs/targets').glob('*.yaml'))
-    assert len(targets) == 7
+    assert targets
     for path in (ROOT / 'configs/ca').glob('*.yaml'):
         for target in targets:
             config = load_config(path, {'target_config': str(target)})

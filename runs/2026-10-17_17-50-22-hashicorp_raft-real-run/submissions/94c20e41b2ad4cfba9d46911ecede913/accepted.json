@@ -1,0 +1,199 @@
+{
+  "rationale": "The corrected phantom-configuration account now states its remaining gap precisely: a grown phantom configuration {A,B,C} admits the quorum {A,C}, which omits a committed voter, and the earlier grow runs could not exercise that shape only because the added third member was unreachable. This experiment tests it. Three real nodes run over in-memory transports; A and B are bootstrapped as the committed two-voter set and C runs with no configuration, so the membership guards in requestVote, which apply only when the receiving node has a non-empty configuration, do not reject C and it will vote and accept entries. The leader's store fails exactly the AddVoter(C) write, then the leader is cut from the other committed voter while C stays reachable. If the phantom quorum is real, the leader should re-elect with its own vote plus C's and commit a client command the committed voter never receives; cutting C as well should leave the same node unable to re-elect or commit. A local probe of this harness produced exactly that pair, and the formal run is requested so the pairing rests on a retained receipt rather than on the probe.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "6491640ed49a4c7b8f5150438d350e36-question-0",
+    "harness_path": "exp_phantom_grown_quorum_test.go",
+    "files": {},
+    "execution_package": null,
+    "test_names": [
+      "TestAssurancePhantomGrownQuorum"
+    ],
+    "source_ids": [
+      "raft_append_config",
+      "raft_dispatch_logs",
+      "raft_quorum_size2",
+      "raft_elect_self",
+      "raft_setup_leader_state",
+      "raft_start_stop_repl",
+      "raft_vote_nonvoter",
+      "membership_doc_defs"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three real nodes over in-memory transports with 300 ms heartbeat, election and lease timeouts. Nodes A and B are bootstrapped with the committed two-voter configuration {A,B}; node C is started with no configuration and no bootstrap, which is the state of a server named by an AddVoter call before that call is logged, and it is reachable from both committed voters. The leader's log store fails exactly the StoreLogs call carrying AddVoter(C), so the in-memory latest configuration becomes {leader, other committed voter, C} at an index the stored log never reaches. The harness then removes the leader's ability to reach the other committed voter in both directions and records whether the leader re-elects, whether a client command commits, and where each of the three logs ends. The trigger leaves C reachable; the control also removes the leader's ability to reach C.",
+      "assumptions": [
+        "All three nodes run the captured code; C is a genuine raft.Node with an empty log, an empty stable store and no bootstrap configuration, not a stub that merely answers RPCs.",
+        "The injected failure is a single StoreLogs call returning an error; the store accepts later writes.",
+        "Cutting a route with the in-memory transport's Disconnect models a network partition, not a process stop: the cut node keeps running and keeps its own view.",
+        "A command is treated as committed when its Apply future returns nil, the client-visible completion point.",
+        "The committed configuration remains {A,B} throughout, so any commit requires both committed voters, and a commit the other committed voter lacks is unsupported by that configuration."
+      ],
+      "excluded": [
+        "No restart, no snapshot and no repair of the phantom configuration after the observation.",
+        "No non-voter in the committed configuration and no concurrent client traffic.",
+        "The partition is applied after the failed configuration write, so a network failure that precedes or coincides with the write is not exercised."
+      ],
+      "parameters": {
+        "members": 3,
+        "committed_voters": 2,
+        "injected_failures": 1,
+        "timeouts_ms": 300,
+        "cases": 2
+      }
+    },
+    "prefix": "The harness creates three in-memory transports and connects every pair in both directions, bootstraps the two-voter configuration {A,B} on the stores of A and B, and starts three rafts: A and B from their bootstrapped stores, and C with an empty log, an empty stable store and no configuration, so every membership guard that tests a non-empty server list does not apply to it. It waits up to ten seconds for A or B to lead, records which member leads, arms that leader's log store to fail the next StoreLogs call, and calls AddVoter('C', address-of-C) with a five-second timeout. It emits pg_case_<case> with the returned error, the in-memory latest configuration index and servers, the last stored log index and the number of voters in the phantom configuration. It then disconnects the leader's transport from the other committed voter's address and that voter's transport from the leader's address, and in the control case also disconnects the leader from C and C from the leader. It waits up to ten seconds for the leader to be Leader again, applies one command with a three-second timeout, and emits pg_result_<case> with the re-election flag, the apply result, the leader's commit index, each of the three last log indices, whether the committed voter holds the committed index, whether C holds it, and commit_without_committed_voter, which is true only when the apply succeeded and the other committed voter's log ends below the leader's commit index.",
+    "semantic_changes": [
+      "The cluster now has three running nodes instead of two, and the added server C is reachable and answers vote and append RPCs rather than being an unreachable name.",
+      "The harness partitions the leader from the other committed voter after the failed configuration write, and the control case additionally cuts C, so each case isolates the supporter set the phantom configuration admits.",
+      "Two cases replace the earlier shrink/grow pair, and the events report the phantom voter count, C's log index and whether the committed voter holds the committed index."
+    ],
+    "requirement": null,
+    "responsibility": "The library owns both the durability of a configuration change and the supporter set used for elections and commitment. A configuration entry that was never stored cannot be the configuration under which a node counts votes or commits entries; adopting it anyway lets a server the committed configuration does not include supply the decisive acknowledgement for a commit, so a client is told a command is committed while the committed voters are split.",
+    "prerequisites": [
+      {
+        "alias": "admit_reachable",
+        "event": "pg_case_grow_reachable_new_server",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "grow_reachable_new_server",
+            "reference": null
+          },
+          {
+            "field": "failure_injected",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admit_cut",
+        "event": "pg_case_grow_cut_new_server",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "grow_cut_new_server",
+            "reference": null
+          },
+          {
+            "field": "failure_injected",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "add_failed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The failed configuration write must be reported as a failure in the reachable-new-server case."
+      },
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "latest_index_exceeds_log",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The in-memory latest configuration must not refer to an index beyond the stored log after the failed AddVoter."
+      },
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "commit_without_committed_voter",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A command committed while the leader cannot reach the other committed voter must not exist, because the committed two-voter configuration needs that voter."
+      },
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "committed_peer_has_entry",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The other committed voter must hold every committed index, whatever set of acknowledgements the leader counted."
+      },
+      {
+        "event": "pg_result_grow_cut_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_cut",
+        "assertion": {
+          "field": "re_elected",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: with both the committed voter and the new server cut, the phantom configuration of three voters has no attainable second vote, so the node must not regain leadership."
+      },
+      {
+        "event": "pg_result_grow_cut_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_cut",
+        "assertion": {
+          "field": "commit_without_committed_voter",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: no command may commit once the only remote voter available to the phantom configuration is also unreachable, which is what shows the trigger's commit depended on that server."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

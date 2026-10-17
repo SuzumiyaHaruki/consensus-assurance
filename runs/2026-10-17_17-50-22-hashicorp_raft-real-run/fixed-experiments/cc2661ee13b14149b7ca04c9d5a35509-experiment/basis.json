@@ -1,0 +1,118 @@
+{
+  "id": "cc2661ee13b14149b7ca04c9d5a35509-experiment",
+  "investigation_id": "830b0f3ff5a14266b056ad4a6d0c877b-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * Same follower race as the jitter probes, but the stable store performs a\n//     real file write plus fsync for every current-term update instead of\n//     sleeping for a synthetic delay.\n//   * This tests whether the inversion appears under genuine disk latency\n//     rather than under an injected sleep.\n//   * The harness records the inversion count, the number of attempts, and the\n//     mean and maximum duration of the term write so the latency actually\n//     exercised is visible in the receipt.\n\nimport (\n\t\"encoding/binary\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\ntype fsyncStore struct {\n\t*InmemStore\n\tmu       sync.Mutex\n\tfile     *os.File\n\ttotal    time.Duration\n\tmax      time.Duration\n\twrites   int\n}\n\nfunc newFsyncStore(dir string) (*fsyncStore, error) {\n\tf, err := os.Create(filepath.Join(dir, \"term.bin\"))\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn &fsyncStore{InmemStore: NewInmemStore(), file: f}, nil\n}\n\nfunc (s *fsyncStore) SetUint64(key []byte, val uint64) error {\n\tif string(key) == string(keyCurrentTerm) {\n\t\tvar buf [8]byte\n\t\tbinary.LittleEndian.PutUint64(buf[:], val)\n\t\tstart := time.Now()\n\t\tif _, err := s.file.WriteAt(buf[:], 0); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tif err := s.file.Sync(); err != nil {\n\t\t\treturn err\n\t\t}\n\t\td := time.Since(start)\n\t\ts.mu.Lock()\n\t\ts.total += d\n\t\ts.writes++\n\t\tif d > s.max {\n\t\t\ts.max = d\n\t\t}\n\t\ts.mu.Unlock()\n\t}\n\treturn s.InmemStore.SetUint64(key, val)\n}\n\nfunc (s *fsyncStore) stats() (time.Duration, time.Duration, int) {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\tif s.writes == 0 {\n\t\treturn 0, 0, 0\n\t}\n\treturn s.total / time.Duration(s.writes), s.max, s.writes\n}\n\ntype fsFSM struct{ mu sync.Mutex }\n\nfunc (f *fsFSM) Apply(*Log) interface{}         { return nil }\nfunc (f *fsFSM) Snapshot() (FSMSnapshot, error) { return &fsSnapshot{}, nil }\nfunc (f *fsFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype fsSnapshot struct{}\n\nfunc (s *fsSnapshot) Persist(SnapshotSink) error { return nil }\nfunc (s *fsSnapshot) Release()                  {}\n\nfunc fsEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc TestAssuranceHeartbeatFsync(t *testing.T) {\n\tconst attempts = 200\n\tstore, err := newFsyncStore(t.TempDir())\n\tif err != nil {\n\t\tt.Fatalf(\"store: %v\", err)\n\t}\n\tsnaps := NewInmemSnapshotStore()\n\taddr, trans := NewInmemTransport(\"F\")\n\ttrans.Connect(addr, trans)\n\n\tconf := DefaultConfig()\n\tconf.LocalID = \"F\"\n\tconf.Logger = hclog.NewNullLogger()\n\tconf.LogLevel = \"ERROR\"\n\tconf.ElectionTimeout = 30 * time.Second\n\tconf.HeartbeatTimeout = 30 * time.Second\n\tconf.LeaderLeaseTimeout = 30 * time.Second\n\tconf.CommitTimeout = time.Second\n\n\tcfg := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"F\", Address: addr},\n\t\t{Suffrage: Voter, ID: \"A\", Address: \"A\"},\n\t\t{Suffrage: Voter, ID: \"B\", Address: \"B\"},\n\t}}\n\tif err := BootstrapCluster(conf, store, store, snaps, trans, cfg); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tr, err := NewRaft(conf, &fsFSM{}, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\tdefer func() { _ = r.Shutdown().Error() }()\n\tleader := trans.EncodePeer(\"A\", \"A\")\n\n\tfsEmit(t, map[string]interface{}{\n\t\t\"event\":    \"cd_case_fsync_term_writes\",\n\t\t\"case\":     \"fsync_term_writes\",\n\t\t\"attempts\": attempts,\n\t\t\"mode\":     \"file_write_plus_fsync\",\n\t})\n\n\tinversions := 0\n\tfor i := 0; i < attempts; i++ {\n\t\tcur := r.CurrentTerm()\n\t\tlast := r.LastIndex()\n\n\t\thbDone := make(chan struct{})\n\t\tgo func(term uint64) {\n\t\t\tdefer close(hbDone)\n\t\t\trpc := RPC{Command: &AppendEntriesRequest{RPCHeader: r.getRPCHeader(), Term: term, Leader: leader},\n\t\t\t\tRespChan: make(chan RPCResponse, 1)}\n\t\t\tr.processHeartbeat(rpc)\n\t\t}(cur + 1)\n\n\t\treq := &AppendEntriesRequest{RPCHeader: r.getRPCHeader(), Term: cur + 2, Leader: leader,\n\t\t\tPrevLogEntry: last, LeaderCommitIndex: last + 1,\n\t\t\tEntries: []*Log{{Index: last + 1, Term: cur + 2, Type: LogCommand, Data: []byte(\"x\")}}}\n\t\tif last == 0 {\n\t\t\treq.PrevLogTerm = 0\n\t\t} else {\n\t\t\tvar prev Log\n\t\t\tif err := r.logs.GetLog(last, &prev); err == nil {\n\t\t\t\treq.PrevLogTerm = prev.Term\n\t\t\t}\n\t\t}\n\t\tresp := &AppendEntriesResponse{}\n\t\tif err := trans.AppendEntries(\"A\", addr, req, resp); err != nil {\n\t\t\tt.Fatalf(\"appendEntries: %v\", err)\n\t\t}\n\t\t<-hbDone\n\t\tif r.CurrentTerm() < cur+2 {\n\t\t\tinversions++\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tmean, max, writes := store.stats()\n\tfsEmit(t, map[string]interface{}{\n\t\t\"event\":            \"cd_result_fsync_term_writes\",\n\t\t\"case\":             \"fsync_term_writes\",\n\t\t\"attempts\":         attempts,\n\t\t\"inversion_count\":  inversions,\n\t\t\"term_writes\":      writes,\n\t\t\"mean_write_us\":    int(mean / time.Microsecond),\n\t\t\"max_write_us\":     int(max / time.Microsecond),\n\t})\n\tt.Logf(\"attempts=%d inversions=%d writes=%d mean=%v max=%v\", attempts, inversions, writes, mean, max)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceHeartbeatFsync"
+      ],
+      "description": "",
+      "semantic_changes": [
+        "The current-term write now performs a real file write and fsync instead of sleeping for a random interval.",
+        "The result event reports the measured mean and maximum write latency and the number of term writes, so the exercised latency is inspectable.",
+        "There is one case only; the earlier jitter receipts remain the low-latency control."
+      ],
+      "prerequisites": [
+        {
+          "alias": "admit_fsync",
+          "event": "cd_case_fsync_term_writes",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "fsync_term_writes",
+              "reference": null
+            },
+            {
+              "field": "attempts",
+              "op": "eq",
+              "value": 200,
+              "reference": null
+            },
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "file_write_plus_fsync",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "contract_heartbeat_handler",
+      "raft_process_heartbeat",
+      "raft_append_term_handling",
+      "raft_set_current_term",
+      "net_heartbeat_classify",
+      "divergence_async_heartbeats"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One follower node in a three-voter configuration that no live peer drives, with a stable store that writes the eight bytes of the current term to a real file and calls fsync before updating the in-memory value. Two hundred attempts each issue one fast-path heartbeat carrying cur+1 on its own goroutine while a term cur+2 AppendEntries with one entry goes through the transport's consumer path; an attempt counts as an inversion when the node's term afterwards is below the higher term it was sent. The harness records the inversion count, the number of term writes, and the mean and maximum duration of the file write plus fsync.",
+      "assumptions": [
+        "The file write and fsync happen before the in-memory stable value is updated, mirroring a store that persists before acknowledging, so the latency sits in the same place as the synthetic delay it replaces.",
+        "The measured latency is a property of this container's filesystem; the mean and maximum are recorded so the receipt shows what was actually exercised.",
+        "The heartbeat shape and the term-two-above AppendEntries are the same as in the jitter experiments, so the cases differ only in what makes the term write slow."
+      ],
+      "excluded": [
+        "No synthetic delay at all: the only latency is the filesystem's.",
+        "No real leader, partition or quorum; the requests remain crafted.",
+        "No control without any write latency, which the earlier jitter receipts already supply."
+      ],
+      "parameters": {
+        "attempts": 200,
+        "members": 3,
+        "store": "file write plus fsync per current-term update"
+      }
+    },
+    "prefix": "The harness creates a temporary directory, opens a term file in it, and wraps an in-memory stable store so that a write to the current-term key encodes the value, writes it at offset zero, calls Sync, and only then forwards to the in-memory store while recording the duration. It bootstraps a three-voter configuration with 30 s timeouts, starts one raft, and repeats the attempt 200 times: read the current term and last index, start the fast-path heartbeat on a goroutine through processHeartbeat with a term one above current, send a term-two-above AppendEntries carrying one entry through the transport, wait for the heartbeat, and count an inversion when the node's term is afterwards below the higher term. Between attempts it sleeps one millisecond. It emits cd_case_fsync_term_writes before the loop and cd_result_fsync_term_writes afterwards with the inversion count, the number of term writes, and the mean and maximum write duration in microseconds.",
+    "requirement": null,
+    "responsibility": "The library accepts concurrent heartbeats specifically so that election timeouts need not cover disk latency, which means the term update must stay monotonic when the stable-store write takes as long as a real fsync. A delay injected by the harness shows the mechanism; a real file write plus fsync shows the exposure under latency the deployment actually has.",
+    "comparisons": [
+      {
+        "event": "cd_result_fsync_term_writes",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_fsync",
+        "assertion": {
+          "field": "inversion_count",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "With a real fsync on the current-term write, no attempt may end below the higher term it was sent."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "cc2661ee13b14149b7ca04c9d5a35509",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

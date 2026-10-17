@@ -1,0 +1,176 @@
+{
+  "id": "49133fbf233a47c287e4644facc4af06-experiment",
+  "investigation_id": "1255b78953904846987cdc19826340c8-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * The startup replay pushes one commitTuple per MaxAppendEntries entries into\n//     r.fsmMutateCh, whose capacity is fixed at 128 in the captured code, and the\n//     only consumer is started after NewRaft returns.\n//   * Earlier work measured the boundary at MaxAppendEntries=64 (8192 entries)\n//     and MaxAppendEntries=1024 (131072 entries). This harness moves the batch\n//     size to its smallest legal value, 1, so the predicted boundary is 128\n//     entries rather than 8192.\n//   * Cases: exactly 128 replayed entries, which is 128 batches and should\n//     return, and 129 entries, which is 129 batches and should not.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"runtime\"\n\t\"strings\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\nconst rbBatchCapacity = 128\n\ntype rbFSM struct {\n\tmu      sync.Mutex\n\tapplied int\n}\n\nfunc (f *rbFSM) Apply(*Log) interface{} {\n\tf.mu.Lock()\n\tf.applied++\n\tf.mu.Unlock()\n\treturn nil\n}\n\nfunc (f *rbFSM) Snapshot() (FSMSnapshot, error) { return &rbSnapshot{}, nil }\n\nfunc (f *rbFSM) Restore(io.ReadCloser) error {\n\tf.mu.Lock()\n\tf.applied = 0\n\tf.mu.Unlock()\n\treturn nil\n}\n\nfunc (f *rbFSM) count() int {\n\tf.mu.Lock()\n\tdefer f.mu.Unlock()\n\treturn f.applied\n}\n\ntype rbSnapshot struct{}\n\nfunc (s *rbSnapshot) Persist(SnapshotSink) error { return nil }\nfunc (s *rbSnapshot) Release()                  {}\n\nfunc rbEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc rbConfig(id string) *Config {\n\tconf := DefaultConfig()\n\tconf.LocalID = ServerID(id)\n\tconf.Logger = hclog.NewNullLogger()\n\tconf.LogLevel = \"ERROR\"\n\tconf.HeartbeatTimeout = 50 * time.Millisecond\n\tconf.ElectionTimeout = 50 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 50 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.RestoreCommittedLogs = true\n\tconf.MaxAppendEntries = 1\n\treturn conf\n}\n\nfunc rbBlockedProducers() int {\n\tbuf := make([]byte, 1<<22)\n\tn := runtime.Stack(buf, true)\n\treturn strings.Count(string(buf[:n]), \"(*Raft).processLogs(\")\n}\n\ntype rbResult struct {\n\treturned    bool\n\telapsed     time.Duration\n\terr         string\n\tapplied     int\n\tblockedDiff int\n}\n\nfunc rbStart(conf *Config, fsm *rbFSM, store *InmemCommitTrackingStore,\n\tsnaps SnapshotStore, addr ServerAddress, timeout time.Duration) rbResult {\n\tbase := rbBlockedProducers()\n\t_, trans := NewInmemTransport(addr)\n\tdone := make(chan error, 1)\n\tvar raft *Raft\n\tstart := time.Now()\n\tgo func() {\n\t\tvar err error\n\t\traft, err = NewRaft(conf, fsm, store, store, snaps, trans)\n\t\tdone <- err\n\t}()\n\tvar res rbResult\n\tselect {\n\tcase err := <-done:\n\t\tres.returned = true\n\t\tres.elapsed = time.Since(start)\n\t\tif err != nil {\n\t\t\tres.err = err.Error()\n\t\t} else {\n\t\t\tdefer func() { _ = raft.Shutdown().Error() }()\n\t\t}\n\tcase <-time.After(timeout):\n\t\tres.elapsed = time.Since(start)\n\t\tres.err = \"no return within observation window\"\n\t}\n\tres.applied = fsm.count()\n\tres.blockedDiff = rbBlockedProducers() - base\n\treturn res\n}\n\nfunc rbRun(t *testing.T, name string, entries uint64, timeout time.Duration) {\n\tstore := NewInmemCommitTrackingStore()\n\tlogs := make([]*Log, 0, entries)\n\tfor i := uint64(1); i <= entries; i++ {\n\t\tlogs = append(logs, &Log{Index: i, Term: 1, Type: LogCommand, Data: []byte(\"x\")})\n\t}\n\tif err := store.StoreLogs(logs); err != nil {\n\t\tt.Fatalf(\"seed logs: %v\", err)\n\t}\n\tif err := store.StageCommitIndex(entries); err != nil {\n\t\tt.Fatalf(\"stage commit index: %v\", err)\n\t}\n\tlastLog, err := store.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"last index: %v\", err)\n\t}\n\trbEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"rb_case_\" + name,\n\t\t\"case\":                   name,\n\t\t\"mode\":                   \"seeded_commit_tracking_store\",\n\t\t\"restore_committed_logs\": true,\n\t\t\"max_append_entries\":     1,\n\t\t\"fsm_batch_capacity\":     rbBatchCapacity,\n\t\t\"entries\":                entries,\n\t\t\"staged_commit_index\":    entries,\n\t\t\"last_log_index\":         lastLog,\n\t\t\"replay_entries\":         entries,\n\t\t\"replay_batches\":         entries,\n\t\t\"timeout_ms\":             int(timeout / time.Millisecond),\n\t})\n\tres := rbStart(rbConfig(\"node1\"), &rbFSM{}, store, NewInmemSnapshotStore(), \"node1\", timeout)\n\trbEmit(t, map[string]interface{}{\n\t\t\"event\":                          \"rb_result_\" + name,\n\t\t\"case\":                           name,\n\t\t\"returned\":                       res.returned,\n\t\t\"elapsed_ms\":                     int(res.elapsed / time.Millisecond),\n\t\t\"error\":                          res.err,\n\t\t\"fsm_applied_sampled\":            res.applied,\n\t\t\"new_goroutines_in_process_logs\": res.blockedDiff,\n\t})\n\tt.Logf(\"case=%s entries=%d returned=%v elapsed=%v err=%q\", name, entries, res.returned, res.elapsed, res.err)\n}\n\nfunc TestAssuranceRestoreBatchOne(t *testing.T) {\n\tt.Run(\"control_128_batches_at_1\", func(t *testing.T) {\n\t\trbRun(t, \"control_128_batches_at_1\", 128, 10*time.Second)\n\t})\n\tt.Run(\"trigger_129_batches_at_1\", func(t *testing.T) {\n\t\trbRun(t, \"trigger_129_batches_at_1\", 129, 5*time.Second)\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceRestoreBatchOne"
+      ],
+      "description": "",
+      "semantic_changes": [
+        "MaxAppendEntries is set to 1 rather than the default 64 or the previously exercised 1024, so the replay needs one batch per entry.",
+        "The seeded log sizes are 128 and 129 entries instead of 8192 and 8193, which keeps the control cheap enough to run beside the trigger.",
+        "The events keep the same field names as the earlier startup harness so the three configuration points can be compared directly."
+      ],
+      "prerequisites": [
+        {
+          "alias": "admit_control",
+          "event": "rb_case_control_128_batches_at_1",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_128_batches_at_1",
+              "reference": null
+            },
+            {
+              "field": "max_append_entries",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_trigger",
+          "event": "rb_case_trigger_129_batches_at_1",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "trigger_129_batches_at_1",
+              "reference": null
+            },
+            {
+              "field": "max_append_entries",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "replay_batches",
+              "op": "eq",
+              "value": 129,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "raft_process_logs",
+      "raft_batch_flush",
+      "fsm_consumer",
+      "api_start_goroutines",
+      "api_fsm_channel",
+      "cfg_defaults"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One node with RestoreCommittedLogs enabled and MaxAppendEntries set to 1, started from an in-memory commit-tracking log store seeded with either exactly 128 command entries or 129, with the staged commit index equal to the seeded entry count and no snapshot. The harness calls NewRaft on a separate goroutine and bounds the wait, because a caller that observes no return cannot call Shutdown: NewRaft has not handed back the *Raft. It records whether the constructor returned, how long it took, the error, how many entries the FSM had applied when the observation ended, and whether a new goroutine was left inside processLogs.",
+      "assumptions": [
+        "The seeded entries are ordinary command entries at term 1, which restoreFromCommittedLogs replays without needing a configuration entry.",
+        "One second of observation is ample for a replay of 128 entries: the control case returns in about a millisecond on the same machine.",
+        "A constructor that has not returned within the observation window is treated as having made no progress, which is what the harness measures rather than assumes."
+      ],
+      "excluded": [
+        "No real cluster, no snapshot and no configuration entry in the replayed range.",
+        "Only MaxAppendEntries=1; the batch sizes 64 and 1024 were measured by earlier receipts.",
+        "No attempt to shut down a node whose constructor never returned."
+      ],
+      "parameters": {
+        "max_append_entries": 1,
+        "fsm_batch_capacity": 128,
+        "control_entries": 128,
+        "trigger_entries": 129,
+        "timeouts_ms": "10000/5000"
+      }
+    },
+    "prefix": "The harness seeds an InmemCommitTrackingStore with N command entries at term 1, stages the commit index to N, and starts one raft with RestoreCommittedLogs enabled and MaxAppendEntries=1, whose local id is node1 and whose timeouts are 50 ms. It emits rb_case_<case> with the mode, the flag, the entries, the staged commit index, the last log index, the replay entry and batch counts and the observation timeout, then calls NewRaft on a goroutine and waits up to the timeout. On return it shuts the node down; on timeout it records that no return was observed and leaves the node alone, since the *Raft was never handed back. It emits rb_result_<case> with returned, elapsed_ms, error, the FSM's applied count sampled after the observation, and the change in the number of goroutines whose stack contains processLogs. The control case seeds 128 entries and allows ten seconds; the trigger seeds 129 entries and allows five.",
+    "requirement": null,
+    "responsibility": "Starting a node from already-committed entries is a startup path the library offers, and it must either complete or report an error. A constructor that blocks because it produced into a channel whose only consumer it has not started yet cannot do either: the caller never receives the node, so the caller has no way to start, serve or shut it down. The experiment measures the exact entry count at which that happens at the smallest legal batch size, which tests the stated product rather than a single configuration.",
+    "comparisons": [
+      {
+        "event": "rb_result_control_128_batches_at_1",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_control",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Exactly 128 batches, one entry each, is within the channel capacity and must let the constructor return."
+      },
+      {
+        "event": "rb_result_trigger_129_batches_at_1",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "One entry past the boundary must still let the constructor return; the harness records that it does not."
+      },
+      {
+        "event": "rb_result_trigger_129_batches_at_1",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "fsm_applied_sampled",
+          "op": "eq",
+          "value": 129,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A completed replay would leave all 129 replayed entries applied to the state machine."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "49133fbf233a47c287e4644facc4af06",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

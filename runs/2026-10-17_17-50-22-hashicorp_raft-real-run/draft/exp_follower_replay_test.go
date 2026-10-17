@@ -1,0 +1,185 @@
+package raft
+
+// Construction notes:
+//   * The startup-replay finding was measured with a single-node leader as the
+//     producing prefix. This harness uses the operational shape instead: a
+//     three-voter cluster commits the commands, a follower accumulates the
+//     committed prefix and stages its commit index through appendEntries, and
+//     that follower alone is shut down and restarted.
+//   * Each case builds its own cluster and shuts every raft down explicitly, so
+//     no cluster helper performs a second shutdown.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+	"testing"
+	"time"
+
+	hclog "github.com/hashicorp/go-hclog"
+)
+
+type frFSM struct {
+	mu sync.Mutex
+}
+
+func (f *frFSM) Apply(*Log) interface{}         { return nil }
+func (f *frFSM) Snapshot() (FSMSnapshot, error) { return &frSnapshot{}, nil }
+func (f *frFSM) Restore(io.ReadCloser) error    { return nil }
+
+type frSnapshot struct{}
+
+func (s *frSnapshot) Persist(SnapshotSink) error { return nil }
+func (s *frSnapshot) Release()                  {}
+
+func frEmit(t *testing.T, payload map[string]interface{}) {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	fmt.Println("CA_EVENT " + string(data))
+}
+
+type frResult struct {
+	returned   bool
+	elapsed    time.Duration
+	err        string
+	replay     uint64
+	batches    uint64
+	snapIndex  uint64
+	commitIdx  uint64
+	lastLogIdx uint64
+}
+
+func frRun(t *testing.T, name string, snapshotFollower bool) {
+	t.Helper()
+	conf := inmemConfig(t)
+	conf.Logger = hclog.NewNullLogger()
+	conf.CommitTimeout = 5 * time.Millisecond
+	conf.RestoreCommittedLogs = true
+	c, err := makeCluster(t, &MakeClusterOpts{Peers: 3, Bootstrap: true, Conf: conf, CommitTrackingLogs: true})
+	if err != nil {
+		t.Fatalf("cluster: %v", err)
+	}
+
+	leader := c.Leader()
+	if leader == nil {
+		t.Fatalf("no leader")
+	}
+	var follower *Raft
+	for _, r := range c.rafts {
+		if r != leader {
+			follower = r
+			break
+		}
+	}
+	if follower == nil {
+		t.Fatalf("no follower")
+	}
+	followerID := follower.localID
+
+	var last ApplyFuture
+	for i := 0; i < 8400; i++ {
+		last = leader.Apply([]byte("x"), 5*time.Second)
+	}
+	if err := last.Error(); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	store := follower.logs.(CommitTrackingLogStore)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		staged, err := store.GetCommitIndex()
+		if err != nil {
+			t.Fatalf("get commit index: %v", err)
+		}
+		if staged > 8200 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snapshotFollower {
+		if err := follower.Snapshot().Error(); err != nil {
+			t.Fatalf("follower snapshot: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	staged, _ := store.GetCommitIndex()
+	lastLog, _ := follower.logs.LastIndex()
+	lastSnap, _ := follower.getLastSnapshot()
+	confForRestart := follower.config()
+	logs, stable, snaps := follower.logs, follower.stable, follower.snapshots
+	addr := follower.localAddr
+	if err := follower.Shutdown().Error(); err != nil {
+		t.Fatalf("shutdown follower: %v", err)
+	}
+	for _, r := range c.rafts {
+		if r != follower {
+			_ = r.Shutdown().Error()
+		}
+	}
+
+	res := frResult{snapIndex: lastSnap, commitIdx: staged, lastLogIdx: lastLog}
+	if staged > lastSnap {
+		res.replay = staged - lastSnap
+	}
+	if res.replay > 0 {
+		res.batches = (res.replay + uint64(confForRestart.MaxAppendEntries) - 1) / uint64(confForRestart.MaxAppendEntries)
+	}
+	frEmit(t, map[string]interface{}{
+		"event":              "replay_case_" + name,
+		"case":               name,
+		"mode":               "three_voter_cluster_follower_restart",
+		"follower":           string(followerID),
+		"staged_commit":      staged,
+		"last_log_index":     lastLog,
+		"snapshot_index":     lastSnap,
+		"replay_entries":     res.replay,
+		"replay_batches":     res.batches,
+		"max_append_entries": confForRestart.MaxAppendEntries,
+		"follower_snapshot":  snapshotFollower,
+	})
+
+	_, trans := NewInmemTransport(addr)
+	confRestart := confForRestart
+	confRestart.Logger = hclog.NewNullLogger()
+	done := make(chan error, 1)
+	var restarted *Raft
+	start := time.Now()
+	go func() {
+		var err error
+		restarted, err = NewRaft(&confRestart, &frFSM{}, logs, stable, snaps, trans)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		res.returned = true
+		res.elapsed = time.Since(start)
+		if err != nil {
+			res.err = err.Error()
+		} else {
+			defer func() { _ = restarted.Shutdown().Error() }()
+		}
+	case <-time.After(5 * time.Second):
+		res.elapsed = time.Since(start)
+		res.err = "no return within observation window"
+	}
+	frEmit(t, map[string]interface{}{
+		"event":      "replay_result_" + name,
+		"case":       name,
+		"returned":   res.returned,
+		"elapsed_ms": int(res.elapsed / time.Millisecond),
+		"error":      res.err,
+	})
+}
+
+func TestAssuranceFollowerCommittedReplay(t *testing.T) {
+	t.Run("control_follower_with_snapshot", func(t *testing.T) {
+		frRun(t, "control_follower_with_snapshot", true)
+	})
+	t.Run("trigger_follower_no_snapshot", func(t *testing.T) {
+		frRun(t, "trigger_follower_no_snapshot", false)
+	})
+}

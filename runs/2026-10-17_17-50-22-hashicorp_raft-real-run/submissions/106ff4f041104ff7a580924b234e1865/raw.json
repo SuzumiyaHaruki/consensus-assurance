@@ -1,0 +1,183 @@
+{
+  "rationale": "Interpret receipt 14286fc183ac4bbc92a41f73a49a57d9, the third configuration point for the startup-replay boundary. With MaxAppendEntries set to its smallest legal value, 1, the product the account states predicts a boundary of 128 entries rather than 8192, and the receipt puts the boundary exactly there: 128 seeded entries returned in 1 ms and 129 entries did not return within 5004 ms, with nothing applied and one goroutine left inside processLogs. The account therefore keeps its conclusion and defect claim, states the boundary as measured at batch sizes 1, 64 and 1024, and replaces the limitation that named only two batch sizes. The knowledge entries gain the new receipt's executions for statements that do not change.",
+  "knowledge": [
+    {
+      "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+      "kind": "behavior",
+      "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+      "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+      "source_ids": [
+        "cfg_restore_option",
+        "api_restore_call",
+        "api_start_goroutines",
+        "api_restore_body",
+        "raft_process_logs",
+        "raft_batch_flush",
+        "fsm_consumer",
+        "store_commit_tracking"
+      ],
+      "executions": {
+        "d61420dbc49a4072937b040aac55a51c": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "87aea51bbd8a4b579f138f2c4986343a": [
+          0,
+          2,
+          4,
+          6,
+          8
+        ],
+        "f032fc49841048c9877653db9f877b27": [
+          0,
+          2
+        ],
+        "f8b98d790cc14664af8af17775d3cc48": [
+          0,
+          2,
+          4,
+          6,
+          8,
+          10,
+          12
+        ],
+        "14286fc183ac4bbc92a41f73a49a57d9": [
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+      "kind": "fact",
+      "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer outside a *Raft that NewRaft never returns).",
+      "conditions": "RestoreCommittedLogs=true, restart with staged commit index exceeding the last snapshot index by more than 128*MaxAppendEntries.",
+      "source_ids": [
+        "cfg_defaults",
+        "api_fsm_channel",
+        "raft_process_logs",
+        "fsm_consumer",
+        "api_shutdown"
+      ],
+      "executions": {
+        "d61420dbc49a4072937b040aac55a51c": [
+          1,
+          3,
+          5,
+          7
+        ],
+        "87aea51bbd8a4b579f138f2c4986343a": [
+          1,
+          3,
+          5,
+          7,
+          9
+        ],
+        "f032fc49841048c9877653db9f877b27": [
+          1,
+          3
+        ],
+        "f8b98d790cc14664af8af17775d3cc48": [
+          1,
+          3,
+          5,
+          7,
+          9,
+          11,
+          13
+        ],
+        "14286fc183ac4bbc92a41f73a49a57d9": [
+          1,
+          3
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "1255b78953904846987cdc19826340c8-question-0",
+      "experiment_id": "1255b78953904846987cdc19826340c8-experiment",
+      "source_ids": [
+        "cfg_restore_option",
+        "cfg_defaults",
+        "api_fsm_channel",
+        "api_restore_call",
+        "api_start_goroutines",
+        "api_restore_body",
+        "api_shutdown",
+        "raft_process_logs",
+        "raft_batch_flush",
+        "fsm_consumer",
+        "log_commit_tracking_iface",
+        "store_commit_tracking"
+      ],
+      "executions": {
+        "d61420dbc49a4072937b040aac55a51c": [
+          1,
+          3,
+          5,
+          7
+        ],
+        "87aea51bbd8a4b579f138f2c4986343a": [
+          1,
+          3,
+          5,
+          7,
+          9
+        ],
+        "f032fc49841048c9877653db9f877b27": [
+          1,
+          3
+        ],
+        "f8b98d790cc14664af8af17775d3cc48": [
+          1,
+          3,
+          5,
+          7,
+          9,
+          11,
+          13
+        ],
+        "14286fc183ac4bbc92a41f73a49a57d9": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Conclusion: violated. With RestoreCommittedLogs enabled, NewRaft does not complete a legal replay of already-committed log entries once the replay needs more than 128 FSM dispatch batches; the caller never receives the *Raft, so the node has no way to start, serve or shut down. This is a startup progress failure, not a decision-safety failure: no commit, vote or membership decision was observed to be wrong. Evidence. Receipt d61420dbc49a4072937b040aac55a51c (completed, tests_passed, exit 0): parsed index 1, seeded commit-tracking store with 8192 committed entries = exactly 128 batches at MaxAppendEntries=64, returned=true in 5 ms; parsed index 3, the retained state of a real single-node cluster that committed 8300 commands through the leader/commit/apply path and then snapshotted at index 8302 above the staged commit index, replay 0 batches, returned=true in 0 ms; parsed index 5, the same seeded store with 8193 entries = 129 batches, returned=false after 5000 ms with one newly blocked (*Raft).processLogs goroutine and one newly blocked (*Raft).restoreFromCommittedLogs goroutine; parsed index 7, the same real-cluster prefix without a snapshot, staged commit 8300 = 130 batches, returned=false after 5000 ms with the same two newly blocked goroutines. Successor receipt 87aea51bbd8a4b579f138f2c4986343a (completed, tests_passed, exit 0) reproduced all four outcomes (parsed indices 1, 3, 7, 9) and added parsed index 5: the identical 8193-entry store state that hangs at MaxAppendEntries=64, replayed as 9 batches with MaxAppendEntries=1024, returned=true in 2 ms. That comparison holds entry count, log content, staged commit index and snapshot state fixed and varies only the batch size, so the stall is attributable to the number of batches relative to the 128-slot channel rather than to log volume, snapshot handling, store state or the producing cluster; the goroutine match in both hanging cases localizes the block to processLogs invoked from restoreFromCommittedLogs. Mechanism from source: api.go:606 calls restoreFromCommittedLogs before any background goroutine exists; api.go:753 calls processLogs(commitIndex, nil); raft.go:1303-1313 sends each commitTuple batch into fsmMutateCh and selects only on that send and on r.shutdownCh; fsmMutateCh has capacity 128 (api.go:560); its only reader runFSM (fsm.go:241) is started at api.go:637 after NewRaft returns; api.go:1065 is the only closer of shutdownCh and is reachable only through a *Raft. After 128 successful sends the 129th send therefore has no producer and no possible closer, so the block is permanent rather than slow. Consequence under the exercised conditions: a node restarting with the documented RestoreCommittedLogs option and with more than 128*MaxAppendEntries committed entries beyond its last snapshot hangs inside NewRaft indefinitely while reporting no error. The operational restart path was measured separately in receipt f032fc49841048c9877653db9f877b27: a three-voter cluster committed 8400 commands, one follower accumulated them and staged its own commit index at 8400 with last log index 8402, and only that follower was restarted. With a snapshot taken on that follower at 8400 the replay was 0 batches and NewRaft returned in 0 ms (parsed index 1, comparison holds); without the snapshot the same follower needed 132 batches and NewRaft had not returned after 5000 ms (parsed index 3, comparison violated). The boundary therefore reproduces from the follower's own appendEntries-driven commit staging, not only from a feeding leader. The boundary was then checked at a second batch size: receipt f8b98d790cc14664af8af17775d3cc48 replays 131072 committed entries at MaxAppendEntries=1024, which is exactly 128 batches, and NewRaft returned in 45 ms (parsed index 7, comparison holds), while 131073 entries, one entry further and therefore 129 batches, did not return within 5000 ms (parsed index 9, comparison violated). The same capacity limit therefore governs a replay whose entry count is sixteen times larger, so the boundary follows the batch count rather than the default entry count. A third configuration point, receipt 14286fc183ac4bbc92a41f73a49a57d9 (completed, tests_passed, exit 0), moves the batch size to its smallest legal value: with MaxAppendEntries=1 the same product predicts a boundary of 128 entries. Parsed index 0 records replay_entries=128, replay_batches=128 and staged_commit_index=128; parsed index 1 records returned=true in 1 ms. Parsed index 2 records replay_entries=129 and replay_batches=129; parsed index 3 records returned=false after 5004 ms with the error 'no return within observation window', fsm_applied_sampled=0 and one new goroutine inside processLogs. The stated product 128*MaxAppendEntries therefore holds at 1, 64 and 1024, a span of 1024 in the entry count at which the block appears, and the smallest case shows the block needs no large volume of data, only one batch more than the channel can hold.",
+      "knowledge": [
+        {
+          "entry_id": "1255b78953904846987cdc19826340c8-knowledge-0",
+          "revision": 4,
+          "assertion": "NewRaft calls restoreFromCommittedLogs synchronously and processLogs flushes batches into fsmMutateCh while runFSM starts only after NewRaft returns."
+        },
+        {
+          "entry_id": "1255b78953904846987cdc19826340c8-knowledge-1",
+          "revision": 4,
+          "assertion": "The startup replay can enqueue at most 128 batches, so 128*MaxAppendEntries replayed entries is the boundary beyond which no progress path exists."
+        }
+      ],
+      "counterevidence": [
+        "RestoreCommittedLogs is not part of DefaultConfig (config.go:329-341 leaves it false), and with the option disabled restoreFromCommittedLogs returns immediately (api.go:725-727), so default-configured nodes cannot reach the blocked path.",
+        "A snapshot at or near the commit index removes the replay entirely: parsed index 3 in both receipts restarted the same 8300-commit real prefix with replay_batches=0 and returned NewRaft immediately, so snapshot cadence bounds exposure to this path.",
+        "A larger MaxAppendEntries moves the boundary: parsed index 5 of receipt 87aea51bbd8a4b579f138f2c4986343a completed the very state that hangs at the default batch size, so a deployment that raises MaxAppendEntries enough for 128*MaxAppendEntries to cover its snapshot lag does not encounter the block.",
+        "The trigger observations are bounded windows of 5000 ms, not infinite runs; permanence is claimed from the source-level absence of any consumer before NewRaft returns and from shutdownCh having no closer outside Shutdown on the returned *Raft, not from the timeout alone.",
+        "No incorrect commit, applied entry, vote or membership decision was observed in any case; the evidence contradicts only startup progress."
+      ],
+      "limitations": [
+        "The boundary is 128*MaxAppendEntries committed entries beyond the last snapshot, and it was exercised at three batch sizes: at 1 the boundary is 128 entries (129 blocked, 128 returned), at 64 it is 8192 entries (8193 blocked, 8192 returned) and at 1024 it is 131072 entries (131073 blocked, 131072 returned). Only three points were sampled, all with one entry per batch unit or a whole multiple of it, and the 128-slot fsmMutateCh capacity is not configurable, so no case varied it.",
+        "The seeded cases supply the commit-tracking store state directly. Three restarts rest on a real prefix: a single-node leader (staged commit 8300, last log 8302, because the leader stages the pre-dispatch commit index) and a three-voter cluster follower in both the snapshot and no-snapshot cases (staged commit 8400, last log 8402).",
+        "The with-snapshot control eliminated the replay rather than shortening it, so real-prefix restarts whose replay is between 1 and 128 batches were not exercised; that recovery region is bracketed only by the seeded 9-batch case and inferred from source for the real prefix.",
+        "fsm_applied_sampled is one sample at the end of each window and was 0 in every case, including the returning controls where runFSM had not yet applied anything, so it is not used as evidence of completion.",
+        "Out of scope here: whether the installSnapshot and restoreUserSnapshot sends to the same channel can block indefinitely on a running node, where runFSM is already active and would provide backpressure rather than a permanent block."
+      ],
+      "joint_history": "Receipt 87aea51bbd8a4b579f138f2c4986343a is the successor of 1255b78953904846987cdc19826340c8-experiment under the same investigation: it retains the four case names, admissions and assertions unchanged, adds one case, and changes only the recorded max_append_entries field and the new case. The four retained result events agree with the earlier receipt (both controls returned, both triggers did not), so they describe the same subject. Receipt f8b98d790cc14664af8af17775d3cc48 is the next revision of that experiment and adds the MaxAppendEntries=1024 pair; its four retained cases reproduce the earlier outcomes exactly. Receipt 14286fc183ac4bbc92a41f73a49a57d9 comes from a separate experiment identifier, 49133fbf233a47c287e4644facc4af06-experiment, built to sample the same product at MaxAppendEntries=1. It seeds the same kind of in-memory commit-tracking store, uses the same option and the same observation method, and records the same event field names, so its two cases are directly comparable with the earlier seeded cases; it differs only in the batch size and in the smaller entry counts that follow from it.",
+      "failure_attribution": null
+    }
+  ]
+}

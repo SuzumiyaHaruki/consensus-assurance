@@ -1,0 +1,223 @@
+{
+  "id": "3ba6c806449c483190a5cb2051f1ebc0-experiment",
+  "investigation_id": "1255b78953904846987cdc19826340c8-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * Each case runs a real single-node cluster that commits a first batch,\n//     takes a snapshot, then commits a second batch, and shuts down, so the\n//     restart replays only the tail after the snapshot.\n//   * Three tails are measured at the default MaxAppendEntries of 64: about\n//     fifty FSM batches, which is inside the range that earlier receipts only\n//     covered with a seeded store state; exactly one hundred and twenty eight\n//     batches, the channel capacity itself, measured on a large real tail so a\n//     slow replay cannot be mistaken for a capacity effect; and one entry past\n//     that, which the seeded boundary says must not return.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"runtime\"\n\t\"strings\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\ntype mbFSM struct {\n\tmu      sync.Mutex\n\tapplied int\n}\n\nfunc (f *mbFSM) Apply(*Log) interface{} {\n\tf.mu.Lock()\n\tf.applied++\n\tf.mu.Unlock()\n\treturn nil\n}\n\nfunc (f *mbFSM) Snapshot() (FSMSnapshot, error) { return &mbSnapshot{}, nil }\n\nfunc (f *mbFSM) Restore(io.ReadCloser) error {\n\tf.mu.Lock()\n\tf.applied = 0\n\tf.mu.Unlock()\n\treturn nil\n}\n\ntype mbSnapshot struct{}\n\nfunc (s *mbSnapshot) Persist(SnapshotSink) error { return nil }\nfunc (s *mbSnapshot) Release()                   {}\n\nfunc mbEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc mbConfig(id string) *Config {\n\tconf := DefaultConfig()\n\tconf.LocalID = ServerID(id)\n\tconf.Logger = hclog.NewNullLogger()\n\tconf.LogLevel = \"ERROR\"\n\tconf.HeartbeatTimeout = 50 * time.Millisecond\n\tconf.ElectionTimeout = 50 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 50 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.RestoreCommittedLogs = true\n\treturn conf\n}\n\nfunc mbBlocked() int {\n\tbuf := make([]byte, 1<<22)\n\tn := runtime.Stack(buf, true)\n\treturn strings.Count(string(buf[:n]), \"(*Raft).processLogs(\")\n}\n\nfunc TestAssuranceRestoreMidbandReplay(t *testing.T) {\n\tcases := []struct {\n\t\tname        string\n\t\tsecondBatch int\n\t\tevent       string\n\t}{\n\t\t{name: \"midband_replay\", secondBatch: 3200, event: \"mb_case_midband_replay\"},\n\t\t{name: \"capacity_replay\", secondBatch: 8194, event: \"mb_case_capacity_replay\"},\n\t\t{name: \"over_capacity_replay\", secondBatch: 8195, event: \"mb_case_over_capacity_replay\"},\n\t}\n\tfor _, tc := range cases {\n\t\ttc := tc\n\t\tt.Run(tc.name, func(t *testing.T) {\n\t\t\tmbRunCase(t, tc.name, tc.event, tc.secondBatch)\n\t\t})\n\t}\n}\n\nfunc mbRunCase(t *testing.T, name string, caseEvent string, secondBatch int) {\n\tt.Helper()\n\tconst firstBatch = 200\n\tconst window = 20 * time.Second\n\n\tstore := NewInmemCommitTrackingStore()\n\tsnaps := NewInmemSnapshotStore()\n\tconf := mbConfig(\"node1\")\n\t_, trans := NewInmemTransport(\"node1\")\n\tconfiguration := Configuration{Servers: []Server{{Suffrage: Voter, ID: \"node1\", Address: trans.LocalAddr()}}}\n\tif err := BootstrapCluster(conf, store, store, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tr, err := NewRaft(conf, &mbFSM{}, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"producing raft: %v\", err)\n\t}\n\tdeadline := time.Now().Add(10 * time.Second)\n\tfor r.Leader() == \"\" && time.Now().Before(deadline) {\n\t\ttime.Sleep(2 * time.Millisecond)\n\t}\n\tif r.Leader() == \"\" {\n\t\tt.Fatalf(\"no leader\")\n\t}\n\tapply := func(n int) {\n\t\tvar last ApplyFuture\n\t\tfor i := 0; i < n; i++ {\n\t\t\tlast = r.Apply([]byte(\"x\"), 5*time.Second)\n\t\t}\n\t\tif err := last.Error(); err != nil {\n\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t}\n\t}\n\tapply(firstBatch)\n\tif err := r.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tapply(secondBatch)\n\tsnapshotIndex := uint64(0)\n\tlisted, err := snaps.List()\n\tif err != nil {\n\t\tt.Fatalf(\"list snapshots: %v\", err)\n\t}\n\tif len(listed) > 0 {\n\t\tsnapshotIndex = listed[0].Index\n\t}\n\tif err := r.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\tstaged, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"staged commit: %v\", err)\n\t}\n\tlastLog, err := store.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"last log: %v\", err)\n\t}\n\treplay := uint64(0)\n\tif staged > snapshotIndex {\n\t\treplay = staged - snapshotIndex\n\t}\n\tbatches := (replay + 63) / 64\n\n\tmbEmit(t, map[string]interface{}{\n\t\t\"event\":                  caseEvent,\n\t\t\"case\":                   name,\n\t\t\"mode\":                   \"real_cluster_restart_with_snapshot_bound_tail\",\n\t\t\"restore_committed_logs\": true,\n\t\t\"first_batch\":            firstBatch,\n\t\t\"second_batch\":           secondBatch,\n\t\t\"snapshot_index\":         snapshotIndex,\n\t\t\"staged_commit_index\":    staged,\n\t\t\"last_log_index\":         lastLog,\n\t\t\"replay_entries\":         replay,\n\t\t\"replay_batches\":         batches,\n\t\t\"max_append_entries\":     64,\n\t\t\"window_ms\":              int(window / time.Millisecond),\n\t})\n\n\tbase := mbBlocked()\n\tstart := time.Now()\n\tdone := make(chan error, 1)\n\tvar restarted *Raft\n\tgo func() {\n\t\tvar rerr error\n\t\trestarted, rerr = NewRaft(mbConfig(\"node1\"), &mbFSM{}, store, store, snaps, trans)\n\t\tdone <- rerr\n\t}()\n\treturned := false\n\terrText := \"\"\n\tselect {\n\tcase err := <-done:\n\t\treturned = true\n\t\tif err != nil {\n\t\t\terrText = err.Error()\n\t\t} else {\n\t\t\tdefer func() { _ = restarted.Shutdown().Error() }()\n\t\t}\n\tcase <-time.After(window):\n\t\terrText = \"no return within observation window\"\n\t}\n\tmbEmit(t, map[string]interface{}{\n\t\t\"event\":               strings.Replace(caseEvent, \"mb_case_\", \"mb_result_\", 1),\n\t\t\"case\":                name,\n\t\t\"returned\":            returned,\n\t\t\"elapsed_ms\":          int(time.Since(start) / time.Millisecond),\n\t\t\"error\":               errText,\n\t\t\"new_blocked_process\": mbBlocked() - base,\n\t})\n\tt.Logf(\"case=%s replay=%d batches=%d returned=%v err=%q\", name, replay, batches, returned, errText)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceRestoreMidbandReplay"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_midband",
+          "event": "mb_case_midband_replay",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "midband_replay",
+              "reference": null
+            },
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "replay_batches",
+              "op": "eq",
+              "value": 50,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_capacity",
+          "event": "mb_case_capacity_replay",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "capacity_replay",
+              "reference": null
+            },
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "replay_batches",
+              "op": "eq",
+              "value": 128,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_over_capacity",
+          "event": "mb_case_over_capacity_replay",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "over_capacity_replay",
+              "reference": null
+            },
+            {
+              "field": "restore_committed_logs",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "replay_batches",
+              "op": "eq",
+              "value": 129,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "cfg_restore_option",
+      "cfg_defaults",
+      "api_fsm_channel",
+      "api_restore_call",
+      "api_start_goroutines",
+      "api_restore_body",
+      "raft_process_logs",
+      "raft_batch_flush",
+      "store_commit_interface"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three restarts of retained single-node cluster state with RestoreCommittedLogs enabled and MaxAppendEntries at its default of 64: a first batch of two hundred committed commands followed by a snapshot, then a second batch of 3200, 8194 or 8195 commands, so the restart replays only the tail after the snapshot and that tail is about fifty, exactly one hundred and twenty eight, or one hundred and twenty nine FSM batches.",
+      "assumptions": [
+        "The producing raft writes the same commit-tracking store, snapshot store and transport that the restart reads, so the replay state is produced through the normal leader, commit and apply path rather than seeded.",
+        "MaxAppendEntries stays at the DefaultConfig value of 64 and fsmMutateCh keeps its captured capacity, so the batch count is the only variable across the last pair.",
+        "NewRaft is invoked on its own goroutine and observed for a bounded window; a case that does not return is reported as returned=false rather than as a harness failure.",
+        "The snapshot produced by the first batch is at index 202, so the tail size is the second batch plus the two committed entries the first batch leaves beyond the snapshot."
+      ],
+      "excluded": [
+        "No assertions about commit safety, voting or membership; this probe addresses startup progress only.",
+        "No variation of the channel capacity, the batch size, or the store implementation; only the tail length changes.",
+        "The snapshot is always taken between the two batches; snapshots taken during a running second batch are not exercised."
+      ],
+      "parameters": {
+        "midband_replay": {
+          "second_batch": 3200,
+          "expected_replay_entries": 3198,
+          "expected_replay_batches": 50
+        },
+        "capacity_replay": {
+          "second_batch": 8194,
+          "expected_replay_entries": 8192,
+          "expected_replay_batches": 128
+        },
+        "over_capacity_replay": {
+          "second_batch": 8195,
+          "expected_replay_entries": 8194,
+          "expected_replay_batches": 129
+        },
+        "max_append_entries": 64,
+        "timeout_ms": 20000
+      }
+    },
+    "prefix": "Each case bootstraps a single-voter Configuration and starts a producing raft with RestoreCommittedLogs=true, InmemCommitTrackingStore as both log and stable store, an InmemSnapshotStore, an InmemTransport on the same address the restart will use, and an FSM that counts applied entries. The producing raft waits for leadership, applies the first batch of 200 commands through Apply futures, calls Snapshot(), applies the second batch, records the listed snapshot index, then Shutdown(). The case event emits the snapshot index, the store's staged commit index, the last log index, the derived replay entry count and batch count, the batch size and the observation window. The restart then constructs a fresh Config, FSM and transport over the retained stores on its own goroutine, records the number of goroutines parked inside processLogs before it starts, and waits up to the window for the constructor; the result event emits returned, elapsed_ms, error and the change in the parked-goroutine count.",
+    "requirement": null,
+    "responsibility": "The library chooses the batch size, creates fsmMutateCh with a fixed capacity, and decides the order in which NewRaft starts the FSM consumer, so a replay whose batch count exceeds that capacity blocks inside its own constructor. The documented RestoreCommittedLogs option promises to replay all known-committed logs before completing NewRaft, and the caller receives no handle to shut down until the constructor returns, so the replay must complete for any legal tail rather than only for tails shorter than the channel.",
+    "comparisons": [
+      {
+        "event": "mb_result_midband_replay",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_midband",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A real prefix whose snapshot leaves about fifty replay batches must let NewRaft complete; a false witness contradicts it."
+      },
+      {
+        "event": "mb_result_capacity_replay",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_capacity",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A real prefix replaying 8192 entries, exactly the 128 batches the channel holds, must let NewRaft complete; a false witness contradicts it."
+      },
+      {
+        "event": "mb_result_over_capacity_replay",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_over_capacity",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "One committed entry beyond the capacity, on the same real prefix shape, must still let NewRaft complete; a false witness contradicts it."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "1255b78953904846987cdc19826340c8-knowledge-0",
+        "revision": 7,
+        "assertion": "NewRaft calls restoreFromCommittedLogs synchronously, which sends commitTuple batches into fsmMutateCh from processLogs, while the only goroutine that reads that channel is started after the constructor returns."
+      },
+      {
+        "entry_id": "1255b78953904846987cdc19826340c8-knowledge-1",
+        "revision": 7,
+        "assertion": "The startup replay can enqueue at most 128 batches because fsmMutateCh holds 128 entries, so with the default MaxAppendEntries of 64 a replay of more than 8192 committed entries has no enabled progress path."
+      }
+    ]
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "3ba6c806449c483190a5cb2051f1ebc0",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

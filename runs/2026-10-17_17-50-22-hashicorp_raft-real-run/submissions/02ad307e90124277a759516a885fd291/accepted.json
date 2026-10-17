@@ -1,0 +1,136 @@
+{
+  "rationale": "Interpret receipt e7a4c652bb2b4273972d661adccd41e9, the clean-copy repeat of b5bd70f5750b4b45af3e925bd1748aaf-experiment. The shrink direction reproduced field for field (latest index ahead of the stored log, re-election alone, commit_index=4 with the peer at 2, restart re-leading and the peer catching up), and the four shrink receipts together cover both member assignments: the first and the repeat had one member leading with the other removed, the third and fourth had those roles swapped. The grow direction did not reproduce its earlier commit phase: the original leader stayed out of leadership for the whole window, the client command never committed, and both logs ended at index 3. That forces two corrections to the current record. First, reproducibility and the restart observation move from one run to two. Second, the stated reason no unsupported commit appears in the grow direction is wrong as written: a grown phantom configuration {A,B,C} admits the quorum {A,C}, which omits the committed voter B, so the bound came from the harness adding an unreachable third voter, not from the shape of the grown configuration. The conclusion and the asserted defect are unchanged; the boundary explanation and the grow-direction limitation are corrected.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "6491640ed49a4c7b8f5150438d350e36-knowledge-0",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "appendConfigurationEntry dispatches the configuration entry with dispatchLogs and then, regardless of whether the entry was stored, sets the latest configuration to the new configuration at the index the entry would have occupied, reconfigures the commitment map and restarts replication; dispatchLogs answers the futures with the store error and moves the node to follower, leaving the in-memory latest configuration ahead of the stored log.",
+      "conditions": "Leader applying a configuration change whose StoreLogs call fails.",
+      "source_ids": [
+        "raft_append_config",
+        "raft_dispatch_logs"
+      ],
+      "executions": {
+        "adbbb5d29a08477b9dbbd7da187f7f26": [
+          0,
+          1
+        ],
+        "99292afefb9d4308957a0e2d150bf11d": [
+          0,
+          3
+        ],
+        "e7a4c652bb2b4273972d661adccd41e9": [
+          0,
+          3
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": "6491640ed49a4c7b8f5150438d350e36-knowledge-1",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "quorumSize, electSelf and setupLeaderState all derive their voter set and quorum from the node's latest configuration, so a latest configuration that is not present in the log governs elections and commitment for that node.",
+      "conditions": "Any node whose configurations.latest refers to an unstored configuration entry.",
+      "source_ids": [
+        "raft_quorum_size2",
+        "raft_elect_self",
+        "raft_setup_leader_state"
+      ],
+      "executions": {
+        "adbbb5d29a08477b9dbbd7da187f7f26": [
+          1,
+          2
+        ],
+        "99292afefb9d4308957a0e2d150bf11d": [
+          1,
+          4
+        ],
+        "e7a4c652bb2b4273972d661adccd41e9": [
+          1
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "6491640ed49a4c7b8f5150438d350e36-question-0",
+      "experiment_id": "6491640ed49a4c7b8f5150438d350e36-experiment",
+      "source_ids": [
+        "raft_append_config",
+        "raft_dispatch_logs",
+        "raft_setup_leader_state",
+        "raft_quorum_size2",
+        "raft_elect_self",
+        "api_remove_server",
+        "cfg_next_configuration",
+        "membership_doc_defs"
+      ],
+      "executions": {
+        "0e6dd623c01e43a4b9e33cafc544ecf2": [
+          0,
+          1
+        ],
+        "adbbb5d29a08477b9dbbd7da187f7f26": [
+          1,
+          2
+        ],
+        "99292afefb9d4308957a0e2d150bf11d": [
+          1,
+          4
+        ],
+        "e7a4c652bb2b4273972d661adccd41e9": [
+          0,
+          1,
+          2,
+          4,
+          5
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Conclusion: violated, and the scoped defect is asserted. A configuration change whose log write fails is reported to the caller as failed, but the new configuration is nevertheless installed in the leader's in-memory latest configuration at the index the entry would have occupied. The node then treats that unstored configuration as authoritative: it re-elects itself with the shrunken voter set and reports a client command committed with only its own acknowledgement, while the other member of the committed configuration does not have that entry. Evidence from receipt 0e6dd623c01e43a4b9e33cafc544ecf2 (completed, tests_passed, exit 0). Parsed index 0, the case event: two voters were bootstrapped, the leader's store failed exactly the configuration write, and afterwards latest_index_after_fail=3 with last_log_index_after_fail=2, while phantom_servers records the shrunken configuration containing only the leader itself. Parsed index 1, the result: remove_failed=true with remove_error 'injected store failure', latest_index_exceeds_log=true, re_elected=true, apply_ok=true, commit_index=4, leader_last_index=4 and peer_last_index=2, so commit_without_peer=true. Under the committed two-voter configuration a quorum is both members, so the command the client was told had committed at index 4 never reached a quorum of that configuration. Mechanism from source: appendConfigurationEntry dispatches the configuration entry and then, unconditionally, calls setLatestConfiguration with the new configuration at the dispatched index, reconfigures the commitment map and restarts replication (raft.go:1204-1244), while dispatchLogs' store-error path only answers the futures with the error and moves the node to follower (raft.go:1245-1296). quorumSize, electSelf and setupLeaderState all read that latest configuration (raft.go:1087-1100, 1999-2071, 456-468), so the phantom configuration governs both the election the node wins alone and the quorum it uses to commit. Consequence under the exercised conditions: after a transient failure to store a configuration change, the leader can adopt a voter set that the rest of the cluster never accepted and serve client commits that no quorum of the committed configuration holds. The restart phase of receipt 76bdaf3e107643d4a3ed1247faa52460 is withdrawn as evidence: that harness created a fresh in-memory transport for the restarted node without connecting it to the other member's transport, so the restarted node could not reach the peer at all, and its restarted_as_leader=false and unchanged peer log index are explained by the missing wiring rather than by the target's recovery behaviour. The target's own membership document states the condition this violates: a new configuration 'will be in affect as soon as it is appended to the log' (membership.md:15). In the failed-write case nothing was appended, so the condition the document sets for a configuration to take effect was never met, yet the node used the new voter set for its election and for committing. A boundary control, receipt 99292afefb9d4308957a0e2d150bf11d, repeats the failed write in both directions: after a failed RemoveServer the phantom configuration contains only the leader and the later command commits with commit_without_peer=true (parsed index 1), while after a failed AddVoter the phantom configuration names the two real voters plus an unreachable third and the same command commits with commit_without_peer=false, the other real voter holding index 4 (parsed index 4). Clean-copy repeat: receipt e7a4c652bb2b4273972d661adccd41e9 re-executed the saved inputs of the fourth harness revision without reading the draft, and reproduced the shrink direction field for field with the same member assignment as the first receipt, the same member leading and the other voter removed. Parsed index 0 records latest_index_after_fail=3 against last_log_index_after_fail=2 with the phantom configuration reduced to the single remaining voter; parsed index 1 records remove_failed=true, latest_index_exceeds_log=true, re_elected=true, apply_ok=true, commit_index=4, leader_last_index=4 and peer_last_index=2, so commit_without_peer=true again; parsed index 2 records restart_ok=true, restarted_as_leader=true, lone_commit_retained=true, peer_last_index=5 and peer_caught_up=true, the same recovery shape as the third receipt. The third and fourth receipts swapped those roles, that member leading and the earlier leader removed, so the unsupported commit is not tied to which member led. The grow direction did not reproduce its earlier commit phase in that repeat: parsed index 3 again shows latest_index_exceeds_log=true with the grown phantom configuration {A,B,C}, but parsed index 4 records re_elected=false, apply_ok=false, commit_index=3 and both members' stores at index 3, and parsed index 5 records restarted_as_leader=false. Since the original leader did not regain leadership inside the ten-second window and the command never applied, commit_without_peer=false holds there because no commit occurred, not because a quorum held one; the harness records state and indices only, so which member served those index-3 writes is inferred rather than observed. Corrected boundary: the earlier reading, that a grown phantom quorum necessarily contains a majority of the committed voters, is wrong as a general statement. The grown configuration {A,B,C} admits the quorum {A,C}, which omits the committed voter B entirely; what kept every attainable grown quorum safe in these runs is that the harness's added third voter had no process and no transport, so {A,B} was the only quorum that could ever answer. The shrink direction needs no such condition, because a phantom single-voter configuration makes the leader's own acknowledgement a quorum, which is why the unsupported commit is expected there and appeared in every shrink run.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "6491640ed49a4c7b8f5150438d350e36-knowledge-0",
+          "revision": 2,
+          "assertion": "appendConfigurationEntry installs the new configuration in memory regardless of whether its log entry was stored."
+        },
+        {
+          "entry_id": "6491640ed49a4c7b8f5150438d350e36-knowledge-1",
+          "revision": 2,
+          "assertion": "quorumSize, electSelf and setupLeaderState derive voter sets from the latest configuration."
+        }
+      ],
+      "counterevidence": [
+        "The phantom state does not outlive a restart: in receipt adbbb5d29a08477b9dbbd7da187f7f26 and again in the clean-copy repeat e7a4c652bb2b4273972d661adccd41e9 the restarted node led again and the peer's log reached the same index, so the entry first committed alone later became a quorum commit of the committed configuration. The durability hazard is confined to the interval between that lone commit and a successful restart with the peer reachable.",
+        "The commit without a peer required the store to fail once and then succeed: the harness fails a single StoreLogs call, and a persistent write failure would also block the later client command, so the exercised trigger is a transient store error rather than a permanent one.",
+        "The other voter never accepted the phantom configuration and still holds the committed two-voter view, so its own elections fail while the phantom leader lives; the harness observed the leader's side only and did not measure how long the peer stays unable to win.",
+        "No data was corrupted: the client command was applied to the phantom leader's own state machine, and the failure mode is a commit reported without a quorum of the committed configuration.",
+        "The missing-quorum commit did not appear in either grow-direction run, so the consequence is bounded to failed changes that would remove a voter. That bound is a property of the harness rather than of grown configurations: the added third voter was unreachable, so the only attainable quorum of the grown phantom configuration was the two real voters. In receipt 99292afefb9d4308957a0e2d150bf11d the grow command committed with the other real voter holding the same index; in the repeat e7a4c652bb2b4273972d661adccd41e9 the grow command did not commit at all, the original leader stayed out of leadership for the full window and both stores ended at index 3."
+      ],
+      "limitations": [
+        "The shrink direction now has four receipts and reproduced identically, but the grow direction has two runs with different commit-phase outcomes: one where the phantom leader re-elected and committed with the other real voter holding the same index, one where no commit occurred and the apply failed. No three-member committed configuration, no non-voter in the committed configuration and no reachable added voter were exercised, so the phantom quorum that would omit a committed voter, such as {A,C}, remains untested.",
+        "The harness applies its command immediately after the node returns to Leader and does not test whether a later successful configuration change repairs or compounds the phantom view.",
+        "Recovery was measured twice, both in the shrink configuration with the peer reachable throughout: each time the node led again and the peer caught up. The case where the node never restarts, or restarts while the peer is unreachable, is the interval in which the lone commit stays unsupported and was not exercised.",
+        "The client-visible completion point was the Apply future returning nil; no read path through the FSM was exercised.",
+        "In the grow run of the repeat the ten-second leadership wait expired with re_elected=false and no recorded leader identity, so why the original leader did not re-elect under the grown phantom configuration, and which member wrote the index-3 entries both stores ended with, is unexplained by the recorded events."
+      ],
+      "joint_history": "Receipt adbbb5d29a08477b9dbbd7da187f7f26 is the third revision of 6491640ed49a4c7b8f5150438d350e36-experiment under this question and replaces the restart phase of the second revision, whose transport wiring was defective. The failed change, the phantom configuration and the lone commit are identical across the first and third receipts, so the events describe the same subject; the third adds a valid restart observation. Receipt 99292afefb9d4308957a0e2d150bf11d is the fourth revision of the same experiment and adds the grow-direction control; its shrink case reproduces the earlier receipt's outcome, and its grow case supplies the boundary that the earlier revisions lacked. Receipt e7a4c652bb2b4273972d661adccd41e9 is a clean-copy repeat of that fourth revision executed from the retained fixed inputs, with the same case suffixes and the same event shapes, so its events are compatible with the earlier receipts on the same subject: the shrink events match field for field, and the grow events diverge only in the commit phase, which makes the grow outcome run-dependent rather than harness-dependent.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

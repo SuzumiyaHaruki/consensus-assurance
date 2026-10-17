@@ -1,0 +1,216 @@
+{
+  "id": "94c20e41b2ad4cfba9d46911ecede913-experiment",
+  "investigation_id": "6491640ed49a4c7b8f5150438d350e36-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * Three real nodes run over in-memory transports. {A, B} are bootstrapped as\n//     the committed voter set; C runs with no configuration at all and is\n//     reachable, so the vote checks that are guarded by a non-empty server list\n//     do not apply to it and it will grant votes and accept entries.\n//   * The leader's log store fails exactly the write that would carry AddVoter(C),\n//     so the in-memory latest configuration becomes {leader, other voter, C}\n//     while the stored log never receives that entry.\n//   * The leader is then cut from the other committed voter. In the trigger C\n//     stays reachable, so the phantom quorum of two can be satisfied by the\n//     leader plus C; in the control C is cut too, so the phantom quorum has no\n//     attainable second voter.\n//   * The decisive observation is whether a client command commits with the\n//     committed voter absent, which no quorum of the committed two-voter\n//     configuration allows.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc pgEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\ntype pgFailStore struct {\n\t*InmemStore\n\tmu       sync.Mutex\n\tfailNext bool\n}\n\nfunc newPgFailStore() *pgFailStore { return &pgFailStore{InmemStore: NewInmemStore()} }\n\nfunc (f *pgFailStore) StoreLogs(logs []*Log) error {\n\tf.mu.Lock()\n\tfail := f.failNext\n\tf.failNext = false\n\tf.mu.Unlock()\n\tif fail {\n\t\treturn pgErr(\"injected store failure\")\n\t}\n\treturn f.InmemStore.StoreLogs(logs)\n}\n\ntype pgErr string\n\nfunc (e pgErr) Error() string { return string(e) }\n\ntype pgFSM struct{}\n\nfunc (f *pgFSM) Apply(*Log) interface{}         { return nil }\nfunc (f *pgFSM) Snapshot() (FSMSnapshot, error) { return &pgSnap{}, nil }\nfunc (f *pgFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype pgSnap struct{}\n\nfunc (s *pgSnap) Persist(SnapshotSink) error { return nil }\nfunc (s *pgSnap) Release()                   {}\n\nfunc pgRun(t *testing.T, caseName string, cutNew bool) {\n\tbase := inmemConfig(t)\n\tbase.HeartbeatTimeout = 300 * time.Millisecond\n\tbase.ElectionTimeout = 300 * time.Millisecond\n\tbase.LeaderLeaseTimeout = 300 * time.Millisecond\n\n\taddrA, transA := NewInmemTransport(\"A\")\n\taddrB, transB := NewInmemTransport(\"B\")\n\taddrC, transC := NewInmemTransport(\"C\")\n\ttransA.Connect(addrB, transB)\n\ttransA.Connect(addrC, transC)\n\ttransB.Connect(addrA, transA)\n\ttransB.Connect(addrC, transC)\n\ttransC.Connect(addrA, transA)\n\ttransC.Connect(addrB, transB)\n\n\tstoreA, storeB := newPgFailStore(), newPgFailStore()\n\tstoreC := NewInmemStore()\n\tsnapsA, snapsB, snapsC := NewInmemSnapshotStore(), NewInmemSnapshotStore(), NewInmemSnapshotStore()\n\tcommitted := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: addrA},\n\t\t{Suffrage: Voter, ID: \"B\", Address: addrB},\n\t}}\n\n\tconfA := *base\n\tconfA.LocalID = \"A\"\n\tconfB := *base\n\tconfB.LocalID = \"B\"\n\tconfC := *base\n\tconfC.LocalID = \"C\"\n\tif err := BootstrapCluster(&confA, storeA, storeA, snapsA, transA, committed); err != nil {\n\t\tt.Fatalf(\"bootstrap A: %v\", err)\n\t}\n\tif err := BootstrapCluster(&confB, storeB, storeB, snapsB, transB, committed); err != nil {\n\t\tt.Fatalf(\"bootstrap B: %v\", err)\n\t}\n\n\trA, err := NewRaft(&confA, &pgFSM{}, storeA, storeA, snapsA, transA)\n\tif err != nil {\n\t\tt.Fatalf(\"raft A: %v\", err)\n\t}\n\tdefer func() { _ = rA.Shutdown().Error() }()\n\trB, err := NewRaft(&confB, &pgFSM{}, storeB, storeB, snapsB, transB)\n\tif err != nil {\n\t\tt.Fatalf(\"raft B: %v\", err)\n\t}\n\tdefer func() { _ = rB.Shutdown().Error() }()\n\t// C has no configuration: it is the new server the failed AddVoter names.\n\trC, err := NewRaft(&confC, &pgFSM{}, storeC, storeC, snapsC, transC)\n\tif err != nil {\n\t\tt.Fatalf(\"raft C: %v\", err)\n\t}\n\tdefer func() { _ = rC.Shutdown().Error() }()\n\n\tdeadline := time.Now().Add(10 * time.Second)\n\tfor rA.Leader() == \"\" && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif rA.Leader() == \"\" {\n\t\tt.Fatalf(\"no leader formed in the two-voter committed configuration\")\n\t}\n\n\trL, rP := rA, rB\n\tstL, stP := storeA, storeB\n\ttransL, transP := transA, transB\n\taddrL, addrP := addrA, addrB\n\tpeerID := ServerID(\"B\")\n\tif rA.Leader() == \"B\" {\n\t\trL, rP = rB, rA\n\t\tstL, stP = storeB, storeA\n\t\ttransL, transP = transB, transA\n\t\taddrL, addrP = addrB, addrA\n\t\tpeerID = \"A\"\n\t}\n\t_ = rP\n\n\tstL.mu.Lock()\n\tstL.failNext = true\n\tstL.mu.Unlock()\n\terrAdd := rL.AddVoter(\"C\", addrC, 0, 5*time.Second).Error()\n\tlastLogL, _ := stL.LastIndex()\n\tlatestIndex := rL.configurations.latestIndex\n\tlatestServers := rL.getLatestConfiguration().Servers\n\tpgEmit(t, map[string]interface{}{\n\t\t\"event\":                     \"pg_case_\" + caseName,\n\t\t\"case\":                      caseName,\n\t\t\"members\":                   3,\n\t\t\"committed_voters\":          2,\n\t\t\"failure_injected\":          true,\n\t\t\"leader\":                    string(rL.localID),\n\t\t\"committed_peer\":            string(peerID),\n\t\t\"add_error\":                 fmt.Sprintf(\"%v\", errAdd),\n\t\t\"add_failed\":                errAdd != nil,\n\t\t\"latest_index_after_fail\":   latestIndex,\n\t\t\"last_log_index_after_fail\": lastLogL,\n\t\t\"phantom_voters\":            len(latestServers),\n\t\t\"phantom_servers\":           fmt.Sprintf(\"%v\", latestServers),\n\t})\n\n\t// Cut the leader from the other committed voter; optionally cut C as well.\n\ttransL.Disconnect(addrP)\n\ttransP.Disconnect(addrL)\n\tif cutNew {\n\t\ttransL.Disconnect(addrC)\n\t\ttransC.Disconnect(addrL)\n\t}\n\n\tdeadline = time.Now().Add(10 * time.Second)\n\tfor rL.State() != Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treElected := rL.State() == Leader\n\tapplyErr := rL.Apply([]byte(\"grown-phantom\"), 3*time.Second).Error()\n\tcommitL := rL.CommitIndex()\n\tlastL, _ := stL.LastIndex()\n\tlastP, _ := stP.LastIndex()\n\tlastC, _ := storeC.LastIndex()\n\tpgEmit(t, map[string]interface{}{\n\t\t\"event\":                         \"pg_result_\" + caseName,\n\t\t\"case\":                          caseName,\n\t\t\"cut_new_server\":                cutNew,\n\t\t\"latest_index_exceeds_log\":      latestIndex > lastLogL,\n\t\t\"re_elected\":                    reElected,\n\t\t\"apply_ok\":                      applyErr == nil,\n\t\t\"commit_index\":                  commitL,\n\t\t\"leader_last_index\":             lastL,\n\t\t\"committed_peer_last_index\":     lastP,\n\t\t\"new_server_last_index\":         lastC,\n\t\t\"committed_peer_has_entry\":      lastP >= commitL,\n\t\t\"new_server_has_entry\":          lastC >= commitL,\n\t\t\"commit_without_committed_voter\": applyErr == nil && lastP < commitL,\n\t})\n\tt.Logf(\"case=%v reElected=%v applyErr=%v commitL=%d lastL=%d lastP=%d lastC=%d\",\n\t\tcaseName, reElected, applyErr, commitL, lastL, lastP, lastC)\n}\n\nfunc TestAssurancePhantomGrownQuorum(t *testing.T) {\n\tt.Run(\"grow_reachable_new_server\", func(t *testing.T) {\n\t\tpgRun(t, \"grow_reachable_new_server\", false)\n\t})\n\tt.Run(\"grow_cut_new_server\", func(t *testing.T) {\n\t\tpgRun(t, \"grow_cut_new_server\", true)\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssurancePhantomGrownQuorum"
+      ],
+      "description": "",
+      "semantic_changes": [
+        "The cluster now has three running nodes instead of two, and the added server C is reachable and answers vote and append RPCs rather than being an unreachable name.",
+        "The harness partitions the leader from the other committed voter after the failed configuration write, and the control case additionally cuts C, so each case isolates the supporter set the phantom configuration admits.",
+        "Two cases replace the earlier shrink/grow pair, and the events report the phantom voter count, C's log index and whether the committed voter holds the committed index."
+      ],
+      "prerequisites": [
+        {
+          "alias": "admit_reachable",
+          "event": "pg_case_grow_reachable_new_server",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "grow_reachable_new_server",
+              "reference": null
+            },
+            {
+              "field": "failure_injected",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_cut",
+          "event": "pg_case_grow_cut_new_server",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "grow_cut_new_server",
+              "reference": null
+            },
+            {
+              "field": "failure_injected",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "raft_append_config",
+      "raft_dispatch_logs",
+      "raft_quorum_size2",
+      "raft_elect_self",
+      "raft_setup_leader_state",
+      "raft_start_stop_repl",
+      "raft_vote_nonvoter",
+      "membership_doc_defs"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three real nodes over in-memory transports with 300 ms heartbeat, election and lease timeouts. Nodes A and B are bootstrapped with the committed two-voter configuration {A,B}; node C is started with no configuration and no bootstrap, which is the state of a server named by an AddVoter call before that call is logged, and it is reachable from both committed voters. The leader's log store fails exactly the StoreLogs call carrying AddVoter(C), so the in-memory latest configuration becomes {leader, other committed voter, C} at an index the stored log never reaches. The harness then removes the leader's ability to reach the other committed voter in both directions and records whether the leader re-elects, whether a client command commits, and where each of the three logs ends. The trigger leaves C reachable; the control also removes the leader's ability to reach C.",
+      "assumptions": [
+        "All three nodes run the captured code; C is a genuine raft.Node with an empty log, an empty stable store and no bootstrap configuration, not a stub that merely answers RPCs.",
+        "The injected failure is a single StoreLogs call returning an error; the store accepts later writes.",
+        "Cutting a route with the in-memory transport's Disconnect models a network partition, not a process stop: the cut node keeps running and keeps its own view.",
+        "A command is treated as committed when its Apply future returns nil, the client-visible completion point.",
+        "The committed configuration remains {A,B} throughout, so any commit requires both committed voters, and a commit the other committed voter lacks is unsupported by that configuration."
+      ],
+      "excluded": [
+        "No restart, no snapshot and no repair of the phantom configuration after the observation.",
+        "No non-voter in the committed configuration and no concurrent client traffic.",
+        "The partition is applied after the failed configuration write, so a network failure that precedes or coincides with the write is not exercised."
+      ],
+      "parameters": {
+        "members": 3,
+        "committed_voters": 2,
+        "injected_failures": 1,
+        "timeouts_ms": 300,
+        "cases": 2
+      }
+    },
+    "prefix": "The harness creates three in-memory transports and connects every pair in both directions, bootstraps the two-voter configuration {A,B} on the stores of A and B, and starts three rafts: A and B from their bootstrapped stores, and C with an empty log, an empty stable store and no configuration, so every membership guard that tests a non-empty server list does not apply to it. It waits up to ten seconds for A or B to lead, records which member leads, arms that leader's log store to fail the next StoreLogs call, and calls AddVoter('C', address-of-C) with a five-second timeout. It emits pg_case_<case> with the returned error, the in-memory latest configuration index and servers, the last stored log index and the number of voters in the phantom configuration. It then disconnects the leader's transport from the other committed voter's address and that voter's transport from the leader's address, and in the control case also disconnects the leader from C and C from the leader. It waits up to ten seconds for the leader to be Leader again, applies one command with a three-second timeout, and emits pg_result_<case> with the re-election flag, the apply result, the leader's commit index, each of the three last log indices, whether the committed voter holds the committed index, whether C holds it, and commit_without_committed_voter, which is true only when the apply succeeded and the other committed voter's log ends below the leader's commit index.",
+    "requirement": null,
+    "responsibility": "The library owns both the durability of a configuration change and the supporter set used for elections and commitment. A configuration entry that was never stored cannot be the configuration under which a node counts votes or commits entries; adopting it anyway lets a server the committed configuration does not include supply the decisive acknowledgement for a commit, so a client is told a command is committed while the committed voters are split.",
+    "comparisons": [
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "add_failed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The failed configuration write must be reported as a failure in the reachable-new-server case."
+      },
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "latest_index_exceeds_log",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The in-memory latest configuration must not refer to an index beyond the stored log after the failed AddVoter."
+      },
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "commit_without_committed_voter",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A command committed while the leader cannot reach the other committed voter must not exist, because the committed two-voter configuration needs that voter."
+      },
+      {
+        "event": "pg_result_grow_reachable_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_reachable",
+        "assertion": {
+          "field": "committed_peer_has_entry",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The other committed voter must hold every committed index, whatever set of acknowledgements the leader counted."
+      },
+      {
+        "event": "pg_result_grow_cut_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_cut",
+        "assertion": {
+          "field": "re_elected",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: with both the committed voter and the new server cut, the phantom configuration of three voters has no attainable second vote, so the node must not regain leadership."
+      },
+      {
+        "event": "pg_result_grow_cut_new_server",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_cut",
+        "assertion": {
+          "field": "commit_without_committed_voter",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: no command may commit once the only remote voter available to the phantom configuration is also unreachable, which is what shows the trigger's commit depended on that server."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "94c20e41b2ad4cfba9d46911ecede913",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

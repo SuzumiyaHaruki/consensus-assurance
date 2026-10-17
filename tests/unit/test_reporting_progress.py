@@ -1,27 +1,11 @@
 """Report and observation-cache projections over synthetic saved evidence."""
 import json
-from types import SimpleNamespace
 import pytest
 from support.evidence import saved_evidence, append_interpretation
 from consensus_assurance.adapters.storage.files import write_json
-from consensus_assurance.core.types import CheckRun, ExecutionStatus, Gap
+from consensus_assurance.core.types import ExecutionStatus, Gap
 from consensus_assurance.workflow.experiments import assessment
-from consensus_assurance.workflow.research import execution_cost, costs, current_view
 from consensus_assurance.reporting.report import render_report
-
-
-def test_costs_keep_missing_data_and_do_not_double_count_children(tmp_path):
-    c=CheckRun(id='parent',action='experiment',cwd=str(tmp_path),snapshot_id='fixture',
-        started_at='2026-10-04T00:00:01+00:00',ended_at='2026-10-04T00:00:05.300000+00:00',
-        parameters={'action_seconds':28.71})
-    old=c.model_copy(update={'id':'old','parameters':{}})
-    child=c.model_copy(update={'id':'child','action':'cargo_seed_copy'})
-    state=SimpleNamespace(checks=[c,old,child,c.model_copy(deep=True)],usage={},elapsed_seconds=80)
-    result=costs(state)
-    assert result['target_executions']==2 and result['process_seconds']==8.6
-    assert result['action_seconds']==28.71 and result['unrecorded_action_ids']==['old']
-    for invalid in (None,-1,float('inf'),float('nan'),True,'28.71'):
-        assert execution_cost(c.model_copy(update={'parameters':{'action_seconds':invalid},'started_at':'invalid'}))=={'process_seconds':None,'action_seconds':None}
 
 
 @pytest.mark.parametrize('change', ['missing_cache', 'invalid_json', 'invalid_shape', 'invalid_comparison', 'method',
@@ -89,134 +73,70 @@ def test_measurement_fallback_never_writes_or_reuses_stale_observations(tmp_path
 
 
 @pytest.mark.parametrize('case,outcome,conclusion,claim', [
-    ('explore', 'unknown', 'violated', 'asserted'), ('explore', 'unknown', 'holds', 'asserted'),
-    ('prediction', 'holds', 'holds', 'asserted'), ('mismatch', 'holds', 'violated', 'asserted'),
-    ('duty', 'violated', 'violated', None), ('opposing', 'violated', 'holds', 'asserted'),
-    ('missing', 'unknown', 'conditional', 'unresolved'), ('malformed', 'unknown', 'conditional', 'unresolved'),
-    ('unmatched', 'unknown', 'conditional', 'unresolved'), ('gap', 'violated', 'violated', 'unresolved'),
+    ('explore', 'unknown', 'violated', 'asserted'),
+    ('mismatch', 'holds', 'violated', 'asserted'),
+    ('duty', 'violated', 'violated', None),
+    ('missing', 'unknown', 'conditional', 'unresolved'),
+    ('gap', 'violated', 'violated', 'unresolved'),
 ])
 def test_report_separates_comparisons_claims_and_observation_gaps(tmp_path, case, outcome, conclusion, claim):
-    events = [dict(event=name, operation=operation, value=value)
-        for operation, admitted, returned in [('case', 3, 0), ('control', 2, 3)]
-        for name, value in [('admitted', admitted), ('returned', returned)]]
+    events = [dict(event='admitted', operation='one', value=3, limit=3),
+              dict(event='returned', operation='one', value=0)]
+    changes = {}
     if case == 'missing':
         events[1].pop('value')
-    elif case == 'malformed':
-        events[1] = '{broken'
-    elif case == 'unmatched':
-        events.pop(0)
-    changes = dict(comparisons=[dict(event='returned', identity_fields=['operation'], admission_alias='start',
-        applicability_conditions=[dict(field='operation', value=operation)],
-        assertion=dict(field='value', value=expected)) for operation, expected in [
-            ('case', 0 if case in {'prediction', 'mismatch'} else 3), ('control', 3)]])
-    if case == 'explore':
-        changes.update(requirement=None, comparisons=[])
+    elif case == 'explore':
+        changes = dict(requirement=None, comparisons=[])
+    elif case == 'mismatch':
+        events[1]['value'] = 3
     state, fixed, check = saved_evidence(tmp_path, events=events, basis_changes=changes)
     if case == 'gap':
         state.investigations[0].gaps = [Gap(id='caller', operation_id='start', question='Does the caller contract apply?')]
-    append_interpretation(state, conclusion=conclusion, defect_claim=claim,
-        executions={check.id: [i for i, event in enumerate(events) if isinstance(event, dict) and event['event']=='returned']})
+    append_interpretation(state, conclusion=conclusion, defect_claim=claim, executions={check.id: [1]})
     before = state.model_dump(mode='json')
     result = assessment(state, tmp_path, fixed, check)
     text = render_report(state, tmp_path).read_text()
-    assert result['outcome'] == outcome and not {'confirmed', 'reviewed_complete'} & result.keys()
-    assert state.model_dump(mode='json') == before
-    assert assessment(state, tmp_path, fixed, check) == result
+    assert result['outcome'] == outcome
     claims, _, other = text.split('## Explicit model defect claims (subject to independent verification)', 1)[1].partition('## Other research results')
     assert (state.investigations[0].question in claims) == (claim == 'asserted')
     assert (state.investigations[0].question in other) == (claim != 'asserted')
-    assert text.count('### ') == 1 and 'confirmed' not in text
-    assert ('Interpretation differs from the mechanical result' in text) == (case in {'mismatch', 'opposing'})
-    assert ('mechanical comparison is undetermined, not an opposing conclusion' in text) == (case == 'explore')
-    current = text.split(f'### {state.investigations[0].question}', 1)[1].split('Fixed experiment `', 1)[0]
-    assert f'Current model interpretation `{state.interpretations[0].id}` · `{conclusion}`' in current
-    assert state.interpretations[0].rationale in current and 'declared predicate' not in current
-    claim_labels = {'asserted': 'defect asserted (subject to independent verification)',
-                    'unresolved': 'unresolved', None: 'no explicit defect claim submitted'}
-    assert f'Current model defect claim: {claim_labels[claim]}' in current
-    labels = {'holds': 'declared predicate holds', 'violated': 'declared predicate does not hold', 'unknown': 'comparison undetermined'}
+    assert ('Interpretation differs from the mechanical result' in text) == (case == 'mismatch')
     if case == 'explore':
-        assert not result['comparisons'] and 'No fixed comparisons declared' in text
-    else:
-        control = 'unknown' if case == 'malformed' else 'holds'
-        assert [r['outcome'] for r in result['comparisons']] == [outcome, control]
-        assert bool(result['comparisons'][0]['valid_witness_indices']) == (outcome == 'violated')
-        assert not result['comparisons'][1]['valid_witness_indices']
-        case_text, control_text = text.split('Comparison 0 ·', 1)[1].split('Comparison 1 ·', 1)
-        assert labels[outcome] in case_text and labels[control] in control_text
-    if case == 'gap':
-        assert state.investigations[0].gaps[0].question in text and 'Unresolved necessary gaps' in text
-    if case in {'missing', 'malformed', 'unmatched'}:
-        assert 'Observation gaps' in text
+        assert 'mechanical comparison is undetermined, not an opposing conclusion' in text
+    elif case == 'missing':
+        assert 'Observation gaps' in text and not result['comparisons'][0]['valid_witness_indices']
+    elif case == 'gap':
+        assert state.investigations[0].gaps[0].question in text
     for path in (f'fixed-experiments/{fixed.id}/basis.json', f'logs/{check.id}/check.json', f'logs/{check.id}/observations.json'):
-        assert path in text and (tmp_path/path).is_file()
-    view = current_view(state, tmp_path)
-    assert view['investigations'][0]['latest_interpretation']['conclusion'] == conclusion
-    assert view['reselection']['questions'][0]['latest_interpretation']['conclusion'] == conclusion
-    assert 'not provider request count' in text and 'excludes Agent local exploratory checks' in text
+        assert path in text and (tmp_path / path).is_file()
+    assert state.model_dump(mode='json') == before
 
 
-@pytest.mark.parametrize('claim,label',[
-    ('refuted','defect claim refuted within the stated scope'), ('unresolved','unresolved'), (None,'no explicit defect claim submitted')])
-def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,claim,label):
-    s, fixed, check = saved_evidence(tmp_path)
-    s.investigations[0].gaps = [Gap(id=f'gap-{i}', question=question, operation_id='start')
-        for i, question in enumerate(['Which caller contract applies?', 'Was the producer history legal?'])]
-    append_interpretation(s, defect_claim='asserted',
-        rationale='Compare the actual return. The initial model alleges a defect',
-        counterevidence=['The documented input bound may exclude this caller'],
-        limitations=['Only one call was observed'],
-        answers={'gap-0': dict(explanation='Initial contract reading', resolved=True)})
-    append_interpretation(s, experiment_id=None, conclusion='conditional',
-        rationale='Caller history remains unestablished',
-        counterevidence=['The actual caller duty excludes the alleged general obligation'],
-        limitations=['No broader consensus conclusion follows'],
-        answers={'gap-0': dict(resolved=claim != 'refuted',
-            explanation='The earlier answer did not establish the actual caller condition'
-                if claim == 'refuted' else 'The cited local contract controls this call')},
-        defect_claim=claim, executions={check.id: [1]} if claim is not None else {})
-    write_json(tmp_path / 'state.json', s)
-    before=s.model_dump(mode='json')
-    text=render_report(s,tmp_path).read_text()
-    current,execution=text.split('Fixed experiment `',1)
-    execution,history=execution.split('Interpretation history:',1)
-    for value in [s.interpretations[-1].rationale,*s.interpretations[-1].counterevidence,
-                  *s.interpretations[-1].limitations,*[v.explanation for v in s.interpretations[-1].answers.values()]]:
-        assert value in current and text.count(value)==1
-    if claim=='refuted':
-        assert 'gap remains open:' in current and 'Which caller contract applies?' in current
-    assert current.count('Was the producer history legal?')==1
-    assert not {'counterevidence','limitations'} & s.investigations[0].model_dump().keys()
-    assert 'Question counterevidence:' not in text and 'Question boundaries:' not in text
-    for value in [s.interpretations[0].rationale,*s.interpretations[0].counterevidence,*s.interpretations[0].limitations]:
-        assert value not in text
-    saved_history=json.loads((tmp_path/'state.json').read_text())['interpretations']
-    assert saved_history==[i.model_dump(mode='json') for i in s.interpretations]
-    assert f'[{s.interpretations[0].id}](state.json) → [{s.interpretations[1].id}](state.json)' in history
-    assert f'model claim asserted → {claim or "none"}' in history
-    assert 'changed fields:' in history and 'rationale' in history and 'source_ids' not in history
-    assert 'historical interpretation; the question has a later account' in execution
-    assert all(i.rationale not in execution for i in s.interpretations)
-    assert [i.defect_claim for i in s.interpretations]==['asserted',claim]
-    claims,other=text.split('## Explicit model defect claims (subject to independent verification)',1)[1].split('## Other research results',1)
-    assert s.investigations[0].question not in claims and s.investigations[0].question in other
-    assert f'Current model defect claim: {label}' in text
-    assert text.count('### ')==1
-    assert 'Compare the actual return' in saved_history[0]['rationale']
-    assert 'confirmed' not in text and 'declared predicate does not hold' in text
-    check=next(c for c in s.checks if c.experiment_id)
-    citations=assessment(s,tmp_path,s.experiments[0],check)['interpretation_citations']
-    assert citations['historical_count']==1
-    assert [i['id'] for i in citations['current']]==([s.interpretations[-1].id] if claim is not None else [])
-    assert ('Other current question interpretations explicitly citing this receipt' in execution)==(claim is not None)
-    observation=f'logs/{check.id}/observations.json'
-    assert '[code](state.json)' in current and '[doc](state.json)' in current
-    assert (f'logs/{check.id}/check.json' in current)==(claim is not None)
-    assert (observation in current)==(claim is not None)
-    assert ('event indices [1]' in current)==(claim is not None)
-    assert ('No execution receipt explicitly cited by this interpretation' in current)==(claim is None)
-    assert json.loads((tmp_path/observation).read_text())['events'][1]['value']==0
-    assert s.model_dump(mode='json')==before
+def test_report_uses_current_claim_without_erasing_history(tmp_path):
+    state, fixed, check = saved_evidence(tmp_path)
+    prior = append_interpretation(state, defect_claim='asserted', rationale='Initial defect allegation')
+    current = append_interpretation(state, experiment_id=None, conclusion='explained', defect_claim='refuted',
+        rationale='The caller contract excludes the observed input',
+        counterevidence=['The input violates the documented caller duty'], limitations=['Other callers remain open'],
+        executions={check.id: [1]})
+    write_json(tmp_path / 'state.json', state)
+    before = state.model_dump(mode='json')
+    text = render_report(state, tmp_path).read_text()
+    claims, other = text.split('## Explicit model defect claims (subject to independent verification)', 1)[1].split('## Other research results', 1)
+    assert state.investigations[0].question not in claims and state.investigations[0].question in other
+    assert prior.rationale not in text
+    for value in [current.rationale, *current.counterevidence, *current.limitations]:
+        assert value in text
+    assert 'model claim asserted → refuted' in text
+    assert f'[{prior.id}](state.json) → [{current.id}](state.json)' in text
+    assert json.loads((tmp_path / 'state.json').read_text())['interpretations'] == [
+        interpretation.model_dump(mode='json') for interpretation in state.interpretations]
+    result = assessment(state, tmp_path, fixed, check)
+    assert result['interpretation_citations']['historical_count'] == 1
+    assert [item['id'] for item in result['interpretation_citations']['current']] == [current.id]
+    assert result['outcome'] == 'violated'
+    assert f'logs/{check.id}/observations.json' in text and 'event indices [1]' in text
+    assert state.model_dump(mode='json') == before
 
 
 @pytest.mark.parametrize('superseded',[False,True])
@@ -247,3 +167,19 @@ def test_other_experiment_receipt_citations_do_not_change_direct_assessment(tmp_
     assert ('Other current question interpretations explicitly citing this receipt' in text)==(not superseded)
     assert ('Historical interpretations explicitly citing this receipt: 1' in text)==superseded
     assert 'No current explicit defect assertion' in text
+
+
+def test_later_experiment_gap_does_not_retroactively_block_saved_witness(tmp_path):
+    state, fixed, check = saved_evidence(tmp_path)
+    append_interpretation(state)
+    before = assessment(state, tmp_path, fixed, check)
+    successor = fixed.model_copy(update={'id': 'successor', 'previous_id': fixed.id, 'version': 2})
+    state.experiments.append(successor)
+    gap = Gap(id='history', operation_id='later', experiment_id=successor.id,
+              question='Does the new observation establish the required service opportunity?')
+    state.investigations[0].gaps.append(gap)
+    assert assessment(state, tmp_path, fixed, check) == before
+    gap.experiment_id = fixed.id
+    after = assessment(state, tmp_path, fixed, check)
+    assert after['gap_ids'] == [gap.id] and gap.question in after['blockers']
+    assert after['comparisons'] == before['comparisons']

@@ -1,0 +1,60 @@
+package raft
+
+import (
+	"testing"
+	"time"
+)
+
+func TestProbeVerifyLeaderNonvoter(t *testing.T) {
+	run := func(name string, alsoCutNonvoters bool) {
+		conf := inmemConfig(t)
+		conf.HeartbeatTimeout = time.Second
+		conf.ElectionTimeout = time.Second
+		conf.LeaderLeaseTimeout = time.Second
+		c := MakeClusterCustom(t, &MakeClusterOpts{Peers: 5, Bootstrap: true, Conf: conf})
+		defer c.Close()
+
+		leader := c.Leader()
+		if leader == nil {
+			t.Fatalf("no leader")
+		}
+		var others []*Raft
+		for _, r := range c.rafts {
+			if r != leader {
+				others = append(others, r)
+			}
+		}
+		// Demote two peers so the cluster has 3 voters and 2 non-voters.
+		for _, r := range others[:2] {
+			if err := leader.DemoteVoter(r.localID, 0, 5*time.Second).Error(); err != nil {
+				t.Fatalf("demote: %v", err)
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+
+		// Cut the leader from the two remaining voters.
+		leaderTrans := leader.trans.(*InmemTransport)
+		for _, r := range others[2:] {
+			leaderTrans.Disconnect(r.localAddr)
+			r.trans.(*InmemTransport).Disconnect(leader.localAddr)
+		}
+		if alsoCutNonvoters {
+			for _, r := range others[:2] {
+				leaderTrans.Disconnect(r.localAddr)
+				r.trans.(*InmemTransport).Disconnect(leader.localAddr)
+			}
+		}
+
+		fut := leader.VerifyLeader()
+		done := make(chan error, 1)
+		go func() { done <- fut.Error() }()
+		select {
+		case err := <-done:
+			t.Logf("%s: verify returned err=%v state=%v", name, err, leader.State())
+		case <-time.After(2 * time.Second):
+			t.Logf("%s: verify did NOT complete within window state=%v", name, leader.State())
+		}
+	}
+	t.Run("trigger_nonvoters_connected", func(t *testing.T) { run("trigger", false) })
+	t.Run("control_all_cut", func(t *testing.T) { run("control", true) })
+}

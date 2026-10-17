@@ -1,0 +1,204 @@
+package raft
+
+// Construction notes:
+//   * Two real members are bootstrapped as voters {A, B} over in-memory
+//     transports; the leading member's log store fails exactly the write that
+//     would carry the configuration entry removing the other member.
+//   * The harness then records whether the failed change left an in-memory
+//     configuration ahead of the stored log, and whether the leader can later
+//     commit a client command without the other member having it.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+	"testing"
+	"time"
+)
+
+func phEmit(t *testing.T, payload map[string]interface{}) {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	fmt.Println("CA_EVENT " + string(data))
+}
+
+type failStore struct {
+	*InmemStore
+	mu       sync.Mutex
+	failNext bool
+}
+
+func newFailStore() *failStore { return &failStore{InmemStore: NewInmemStore()} }
+
+func (f *failStore) StoreLogs(logs []*Log) error {
+	f.mu.Lock()
+	fail := f.failNext
+	f.failNext = false
+	f.mu.Unlock()
+	if fail {
+		return errInjected
+	}
+	return f.InmemStore.StoreLogs(logs)
+}
+
+type errType string
+
+func (e errType) Error() string { return string(e) }
+
+const errInjected = errType("injected store failure")
+
+type phFSM struct{}
+
+func (f *phFSM) Apply(*Log) interface{}         { return nil }
+func (f *phFSM) Snapshot() (FSMSnapshot, error) { return &phSnap{}, nil }
+func (f *phFSM) Restore(io.ReadCloser) error    { return nil }
+
+type phSnap struct{}
+
+func (s *phSnap) Persist(SnapshotSink) error { return nil }
+func (s *phSnap) Release()                   {}
+
+func TestAssurancePhantomConfiguration(t *testing.T) {
+	conf := inmemConfig(t)
+	conf.HeartbeatTimeout = 300 * time.Millisecond
+	conf.ElectionTimeout = 300 * time.Millisecond
+	conf.LeaderLeaseTimeout = 300 * time.Millisecond
+
+	addrA, transA := NewInmemTransport("A")
+	addrB, transB := NewInmemTransport("B")
+	transA.Connect(addrB, transB)
+	transB.Connect(addrA, transA)
+
+	storeA, storeB := newFailStore(), newFailStore()
+	snapsA, snapsB := NewInmemSnapshotStore(), NewInmemSnapshotStore()
+	cfg := Configuration{Servers: []Server{
+		{Suffrage: Voter, ID: "A", Address: addrA},
+		{Suffrage: Voter, ID: "B", Address: addrB},
+	}}
+	confA := *conf
+	confA.LocalID = "A"
+	confB := *conf
+	confB.LocalID = "B"
+	if err := BootstrapCluster(&confA, storeA, storeA, snapsA, transA, cfg); err != nil {
+		t.Fatalf("bootstrap A: %v", err)
+	}
+	if err := BootstrapCluster(&confB, storeB, storeB, snapsB, transB, cfg); err != nil {
+		t.Fatalf("bootstrap B: %v", err)
+	}
+	rA, err := NewRaft(&confA, &phFSM{}, storeA, storeA, snapsA, transA)
+	if err != nil {
+		t.Fatalf("raft A: %v", err)
+	}
+	defer func() { _ = rA.Shutdown().Error() }()
+	rB, err := NewRaft(&confB, &phFSM{}, storeB, storeB, snapsB, transB)
+	if err != nil {
+		t.Fatalf("raft B: %v", err)
+	}
+	defer func() { _ = rB.Shutdown().Error() }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for rA.Leader() == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	rL, rP := rA, rB
+	stL, stP := storeA, storeB
+	peerID := ServerID("B")
+	if rA.Leader() == "B" {
+		rL, rP = rB, rA
+		stL, stP = storeB, storeA
+		peerID = "A"
+	}
+	_ = rP
+	t.Logf("leader=%v follower-to-remove=%v", rL.Leader(), peerID)
+
+	stL.mu.Lock()
+	stL.failNext = true
+	stL.mu.Unlock()
+	errRemove := rL.RemoveServer(peerID, 0, 5*time.Second).Error()
+	lastLogL, _ := stL.LastIndex()
+	latestCfg := rL.getLatestConfiguration()
+	t.Logf("remove err=%v stateL=%v latestIndex=%d latestServers=%v lastLogL=%d",
+		errRemove, rL.State(), rL.configurations.latestIndex, latestCfg.Servers, lastLogL)
+
+	deadline = time.Now().Add(10 * time.Second)
+	for rL.State() != Leader && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	stateL := rL.State()
+	reElected := stateL == Leader
+	applyErr := rL.Apply([]byte("phantom"), 3*time.Second).Error()
+	commitL := rL.CommitIndex()
+	lastL, _ := stL.LastIndex()
+	lastP, _ := stP.LastIndex()
+	phantomServers := fmt.Sprintf("%v", latestCfg.Servers)
+	latestIndex := rL.configurations.latestIndex
+	phEmit(t, map[string]interface{}{
+		"event":                     "phantom_case",
+		"case":                      "failed_configuration_write",
+		"members":                   2,
+		"failure_injected":          true,
+		"removed_peer":              string(peerID),
+		"latest_index_after_fail":   latestIndex,
+		"last_log_index_after_fail": lastLogL,
+		"phantom_servers":           phantomServers,
+	})
+	phEmit(t, map[string]interface{}{
+		"event":                    "phantom_result",
+		"case":                     "failed_configuration_write",
+		"remove_error":             fmt.Sprintf("%v", errRemove),
+		"remove_failed":            errRemove != nil,
+		"latest_index_exceeds_log": latestIndex > lastLogL,
+		"re_elected":               reElected,
+		"apply_ok":                 applyErr == nil,
+		"commit_index":             commitL,
+		"leader_last_index":        lastL,
+		"peer_last_index":          lastP,
+		"commit_without_peer":      applyErr == nil && lastP < commitL,
+	})
+	t.Logf("stateL=%v applyErr=%v commitL=%d lastL=%d lastPeer=%d", stateL, applyErr, commitL, lastL, lastP)
+
+	// Restart the phantom leader from its own stores and see whether the lone
+	// commit is retained and whether the peer catches up under the log-derived
+	// configuration.
+	confRestart := rL.config()
+	confRestart.Logger = nil
+	restartAddr := rL.localAddr
+	logsRestart, stableRestart, snapsRestart := stL, stL, rL.snapshots
+	_ = rL.Shutdown()
+	_, transRestart := NewInmemTransport(restartAddr)
+	// Wire the restarted node back to the surviving peer: the peer's routing
+	// table still points at the previous transport object.
+	transRestart.Connect(rP.localAddr, rP.trans.(*InmemTransport))
+	rP.trans.(*InmemTransport).Disconnect(restartAddr)
+	rP.trans.(*InmemTransport).Connect(restartAddr, transRestart)
+	restarted, rerr := NewRaft(&confRestart, &phFSM{}, logsRestart, stableRestart, snapsRestart, transRestart)
+	restartOK := rerr == nil
+	becameLeader := false
+	if restartOK {
+		defer func() { _ = restarted.Shutdown().Error() }()
+		dl := time.Now().Add(10 * time.Second)
+		for time.Now().Before(dl) {
+			if restarted.State() == Leader {
+				becameLeader = true
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	lastPeerAfter, _ := stP.LastIndex()
+	lastLAfter, _ := stL.LastIndex()
+	phEmit(t, map[string]interface{}{
+		"event":                "phantom_restart",
+		"case":                 "failed_configuration_write",
+		"restart_ok":           restartOK,
+		"restarted_as_leader":  becameLeader,
+		"leader_last_index":    lastLAfter,
+		"peer_last_index":      lastPeerAfter,
+		"peer_caught_up":       lastPeerAfter >= commitL,
+		"lone_commit_retained": lastLAfter >= commitL,
+	})
+}

@@ -1,0 +1,1466 @@
+{
+  "input": {
+    "rationale": "Open a third, independent lead on the authority-transition axis after reading the transport contract: transports may invoke the heartbeat handler concurrently with the main thread, and appendEntries decides to raise the term with a read of currentTerm followed by a separate unconditional write, so a stale heartbeat's term write can land after a newer term observed by the main thread. Recording the sourced behavior and the discriminating experiment now; no execution is claimed.",
+    "sources": [
+      {
+        "id": "contract_heartbeat_handler",
+        "file": "transport.go",
+        "start_line": 58,
+        "end_line": 64,
+        "kind": "interface_statement"
+      },
+      {
+        "id": "api_set_heartbeat_handler",
+        "file": "api.go",
+        "start_line": 626,
+        "end_line": 632,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_process_heartbeat",
+        "file": "raft.go",
+        "start_line": 1436,
+        "end_line": 1457,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_append_term_handling",
+        "file": "raft.go",
+        "start_line": 1470,
+        "end_line": 1490,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_conflict_truncation",
+        "file": "raft.go",
+        "start_line": 1526,
+        "end_line": 1566,
+        "kind": "code_observation"
+      },
+      {
+        "id": "raft_set_current_term",
+        "file": "raft.go",
+        "start_line": 2164,
+        "end_line": 2172,
+        "kind": "code_observation"
+      },
+      {
+        "id": "net_heartbeat_dispatch",
+        "file": "net_transport.go",
+        "start_line": 298,
+        "end_line": 305,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_heartbeat_term_regression",
+        "question": "Can a heartbeat delivered through the concurrent fast-path lower the persisted current term after the main thread has observed a higher one, and can the node then truncate and apply an entry from a stale leader at an index it had already committed at the higher term?",
+        "source_ids": [
+          "contract_heartbeat_handler",
+          "api_set_heartbeat_handler",
+          "raft_process_heartbeat",
+          "raft_append_term_handling",
+          "raft_conflict_truncation",
+          "raft_set_current_term",
+          "net_heartbeat_dispatch"
+        ],
+        "hypothesis": "The Transport contract permits SetHeartbeatHandler callbacks to run outside the main RPC queue, and NetworkTransport dispatches heartbeats from its connection handler, so processHeartbeat can execute appendEntries concurrently with the main thread. appendEntries tests a.Term > r.getCurrentTerm() and then calls setCurrentTerm(a.Term), which unconditionally persists and stores the term, so a heartbeat carrying an older term that read the current term before the main thread adopted a higher one can write its older term afterwards. If the term then regresses, the AppendEntries older-term rejection no longer blocks the stale leader, whose conflicting entry at an already committed index is truncated and applied.",
+        "discriminator": "In a follower whose main thread is processing a higher-term request, deliver a heartbeat carrying the previously observed term through a transport that invokes the registered heartbeat handler concurrently, with a stable store that delays the heartbeat's term write until after the higher term is persisted. Record the persisted current term before and after, whether it decreased, and whether a stale leader's conflicting entry at the already committed index is truncated and applied. No regression, or a rejection of the stale entries, would refute the hypothesis.",
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_heartbeat_fastpath_concurrency",
+        "kind": "behavior",
+        "statement": "The Transport interface documents SetHeartbeatHandler as a fast-path that avoids head-of-line blocking and tells transports that do not support it to push heartbeats onto the Consumer channel instead; NetworkTransport stores the callback and its connection handler invokes it, while InmemTransport ignores the call entirely. NewRaft registers r.processHeartbeat, which forwards the request to appendEntries on whatever goroutine the transport used.",
+        "conditions": "Transport implementing the heartbeat fast-path (NetworkTransport); NewRaft has completed and registered the handler.",
+        "source_ids": [
+          "contract_heartbeat_handler",
+          "api_set_heartbeat_handler",
+          "raft_process_heartbeat",
+          "net_heartbeat_dispatch"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_term_raise_read_then_write",
+        "kind": "behavior",
+        "statement": "appendEntries raises the receiving term by first testing a.Term against r.getCurrentTerm() and later calling setCurrentTerm(a.Term), which writes the stable store and then the atomic term without comparing against the value it read, so the decision and the write are not a single atomic compare-and-set; the same function later deletes a conflicting log suffix from the first index whose term differs and appends the request's entries.",
+        "conditions": "Any appendEntries invocation, including one delivered concurrently through the heartbeat fast-path.",
+        "source_ids": [
+          "raft_append_term_handling",
+          "raft_set_current_term",
+          "raft_conflict_truncation"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "1255b78953904846987cdc19826340c8-question-0",
+        "version": 1,
+        "question": "When RestoreCommittedLogs replays committed entries inside NewRaft, can the replay fail to make progress because the FSM batch channel is produced into before its only consumer is started?",
+        "source_ids": [
+          "cfg_restore_option",
+          "api_fsm_channel",
+          "api_restore_call",
+          "api_start_goroutines",
+          "api_restore_body",
+          "raft_process_logs",
+          "raft_batch_flush",
+          "fsm_consumer",
+          "api_shutdown"
+        ],
+        "hypothesis": "processLogs enqueues ceil(replayed/MaxAppendEntries) commitTuple batches into fsmMutateCh (capacity 128) during NewRaft, while runFSM, the only consumer of that channel, is started only after NewRaft returns; a replay of more than 128*MaxAppendEntries committed entries beyond the last snapshot should therefore block NewRaft permanently on the channel send, since shutdownCh can only be closed by Shutdown() on a *Raft that NewRaft never returns.",
+        "discriminator": "Compare NewRaft return for replay sizes at and above the batch-capacity boundary, including a real cluster restart with and without a snapshot bounding the replay; a return in every case would refute the hypothesis.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1255b78953904846987cdc19826340c8"
+      },
+      {
+        "id": "f7da39e9771e40d29f8d7ec3d1c7d886-question-0",
+        "version": 1,
+        "question": "When an explicit LeadershipTransferToServer names a member that is a non-voter, does the transfer admit the request, and what does the returned future and the voters' terms show when the target cannot win any election?",
+        "source_ids": [
+          "api_transfer_doc",
+          "api_transfer_to_server_doc",
+          "api_initiate_transfer",
+          "raft_transfer_accept",
+          "raft_transfer_body",
+          "raft_pick_server",
+          "raft_timeout_now",
+          "raft_vote_nonvoter"
+        ],
+        "hypothesis": "leaderLoop accepts any id present in leaderState.replState, which startStopReplication creates for non-voters as well, so nothing checks suffrage for an explicit target; leadershipTransfer then replicates the non-voter up to the last index and sends TimeoutNow, timeoutNow makes the non-voter a transfer-candidate, and electSelf raises its term and asks every voter, whose requestVote handler raises its own term and steps down before rejecting the non-voter. The caller's future can then complete without error while leadership moved to an unrequested voter, contradicting the documented graceful failure for a follower that cannot be promoted.",
+        "discriminator": "A real cluster in which one member is demoted to non-voter, followed by an explicit transfer to that member: record the future's result, whether the named target ever becomes leader, the interval with no leader, and the voters' terms before and after. A future that reports an error, or a target that wins, would refute the hypothesis.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "f7da39e9771e40d29f8d7ec3d1c7d886"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+        "revision": 3,
+        "kind": "behavior",
+        "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+        "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+        "source_ids": [
+          "cfg_restore_option",
+          "api_restore_call",
+          "api_start_goroutines",
+          "api_restore_body",
+          "raft_process_logs",
+          "raft_batch_flush",
+          "fsm_consumer",
+          "store_commit_tracking"
+        ],
+        "executions": {
+          "d61420dbc49a4072937b040aac55a51c": [
+            0,
+            2,
+            4,
+            6
+          ],
+          "87aea51bbd8a4b579f138f2c4986343a": [
+            0,
+            2,
+            4,
+            6,
+            8
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+            "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+            "source_ids": [
+              "cfg_restore_option",
+              "api_restore_call",
+              "api_start_goroutines",
+              "api_restore_body",
+              "raft_process_logs",
+              "raft_batch_flush",
+              "fsm_consumer"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "1255b78953904846987cdc19826340c8",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+            "revision": 2,
+            "kind": "behavior",
+            "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+            "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+            "source_ids": [
+              "cfg_restore_option",
+              "api_restore_call",
+              "api_start_goroutines",
+              "api_restore_body",
+              "raft_process_logs",
+              "raft_batch_flush",
+              "fsm_consumer",
+              "store_commit_tracking"
+            ],
+            "executions": {
+              "d61420dbc49a4072937b040aac55a51c": [
+                0,
+                2,
+                4,
+                6
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "0b79bab611d549ad8afe771aae821fb1",
+            "correction": "",
+            "recorded_uses": [
+              "0b79bab611d549ad8afe771aae821fb1-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "c502aa0d94894cd1a70667cb56cf019f"
+      },
+      {
+        "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+        "revision": 3,
+        "kind": "fact",
+        "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer).",
+        "conditions": "RestoreCommittedLogs=true, DefaultConfig values, restart with staged commit index exceeding last snapshot index by more than 8192.",
+        "source_ids": [
+          "cfg_defaults",
+          "api_fsm_channel",
+          "raft_process_logs",
+          "fsm_consumer",
+          "api_shutdown"
+        ],
+        "executions": {
+          "d61420dbc49a4072937b040aac55a51c": [
+            1,
+            3,
+            5,
+            7
+          ],
+          "87aea51bbd8a4b579f138f2c4986343a": [
+            1,
+            3,
+            5,
+            7,
+            9
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+            "revision": 1,
+            "kind": "fact",
+            "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer).",
+            "conditions": "RestoreCommittedLogs=true, DefaultConfig values, restart with staged commit index exceeding last snapshot index by more than 8192.",
+            "source_ids": [
+              "cfg_defaults",
+              "api_fsm_channel",
+              "raft_process_logs",
+              "fsm_consumer",
+              "api_shutdown"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "1255b78953904846987cdc19826340c8",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+            "revision": 2,
+            "kind": "fact",
+            "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer).",
+            "conditions": "RestoreCommittedLogs=true, DefaultConfig values, restart with staged commit index exceeding last snapshot index by more than 8192.",
+            "source_ids": [
+              "cfg_defaults",
+              "api_fsm_channel",
+              "raft_process_logs",
+              "fsm_consumer",
+              "api_shutdown"
+            ],
+            "executions": {
+              "d61420dbc49a4072937b040aac55a51c": [
+                1,
+                3,
+                5,
+                7
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "0b79bab611d549ad8afe771aae821fb1",
+            "correction": "",
+            "recorded_uses": [
+              "0b79bab611d549ad8afe771aae821fb1-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "c502aa0d94894cd1a70667cb56cf019f"
+      },
+      {
+        "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+        "revision": 3,
+        "kind": "behavior",
+        "statement": "Automatic leadership transfer and explicit leadership transfer use different target checks: pickServer (used when no id is given) skips every server whose Suffrage is not Voter, while an explicit id is only looked up in leaderState.replState, which contains an entry for every configured server including non-voters, and a successful lookup proceeds to replicate and send TimeoutNow without consulting suffrage.",
+        "conditions": "Leader state with a committed latest configuration containing a non-voter; explicit LeadershipTransferToServer(id) for that member.",
+        "source_ids": [
+          "api_initiate_transfer",
+          "raft_transfer_accept",
+          "raft_pick_server",
+          "raft_transfer_body"
+        ],
+        "executions": {
+          "d436029b08c5425aa5aec577901cb8ba": [
+            0,
+            2
+          ],
+          "0726bba116ac415fa38b99b96a88290f": [
+            0,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "Automatic leadership transfer and explicit leadership transfer use different target checks: pickServer (used when no id is given) skips every server whose Suffrage is not Voter, while an explicit id is only looked up in leaderState.replState, which contains an entry for every configured server including non-voters, and a successful lookup proceeds to replicate and send TimeoutNow without consulting suffrage.",
+            "conditions": "Leader state with a committed latest configuration containing a non-voter; explicit LeadershipTransferToServer(id) for that member.",
+            "source_ids": [
+              "api_initiate_transfer",
+              "raft_transfer_accept",
+              "raft_pick_server",
+              "raft_transfer_body"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "f7da39e9771e40d29f8d7ec3d1c7d886",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+            "revision": 2,
+            "kind": "behavior",
+            "statement": "Automatic leadership transfer and explicit leadership transfer use different target checks: pickServer (used when no id is given) skips every server whose Suffrage is not Voter, while an explicit id is only looked up in leaderState.replState, which contains an entry for every configured server including non-voters, and a successful lookup proceeds to replicate and send TimeoutNow without consulting suffrage.",
+            "conditions": "Leader state with a committed latest configuration containing a non-voter; explicit LeadershipTransferToServer(id) for that member.",
+            "source_ids": [
+              "api_initiate_transfer",
+              "raft_transfer_accept",
+              "raft_pick_server",
+              "raft_transfer_body"
+            ],
+            "executions": {
+              "d436029b08c5425aa5aec577901cb8ba": [
+                0,
+                2
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "79cd26894cd2414a96c4667caf95c259",
+            "correction": "",
+            "recorded_uses": [
+              "79cd26894cd2414a96c4667caf95c259-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "0921e4be80e8414d887df81cec96b5c2"
+      },
+      {
+        "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+        "revision": 3,
+        "kind": "behavior",
+        "statement": "A voter that receives a RequestVote from a candidate absent from its latest configuration rejects it before any term handling, but a candidate that is present yet not a voter is handled later: the voter first adopts a higher term and steps down to follower, and only then rejects the vote because hasVote is false. timeoutNow performs no term, leader or membership check and immediately marks the receiver as a leadership-transfer candidate.",
+        "conditions": "Voter with a known latest configuration; RequestVote with LeadershipTransfer=true from a configured non-voter at a higher term.",
+        "source_ids": [
+          "raft_vote_nonvoter",
+          "raft_timeout_now"
+        ],
+        "executions": {
+          "d436029b08c5425aa5aec577901cb8ba": [
+            2,
+            3
+          ],
+          "0726bba116ac415fa38b99b96a88290f": [
+            2,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "A voter that receives a RequestVote from a candidate absent from its latest configuration rejects it before any term handling, but a candidate that is present yet not a voter is handled later: the voter first adopts a higher term and steps down to follower, and only then rejects the vote because hasVote is false. timeoutNow performs no term, leader or membership check and immediately marks the receiver as a leadership-transfer candidate.",
+            "conditions": "Voter with a known latest configuration; RequestVote with LeadershipTransfer=true from a configured non-voter at a higher term.",
+            "source_ids": [
+              "raft_vote_nonvoter",
+              "raft_timeout_now"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "f7da39e9771e40d29f8d7ec3d1c7d886",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+            "revision": 2,
+            "kind": "behavior",
+            "statement": "A voter that receives a RequestVote from a candidate absent from its latest configuration rejects it before any term handling, but a candidate that is present yet not a voter is handled later: the voter first adopts a higher term and steps down to follower, and only then rejects the vote because hasVote is false. timeoutNow performs no term, leader or membership check and immediately marks the receiver as a leadership-transfer candidate.",
+            "conditions": "Voter with a known latest configuration; RequestVote with LeadershipTransfer=true from a configured non-voter at a higher term.",
+            "source_ids": [
+              "raft_vote_nonvoter",
+              "raft_timeout_now"
+            ],
+            "executions": {
+              "d436029b08c5425aa5aec577901cb8ba": [
+                2,
+                3
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "79cd26894cd2414a96c4667caf95c259",
+            "correction": "",
+            "recorded_uses": [
+              "79cd26894cd2414a96c4667caf95c259-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "0921e4be80e8414d887df81cec96b5c2"
+      }
+    ],
+    "materials": [
+      {
+        "id": "cfg_restore_option",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "document_statement",
+        "text": "\t// RestoreCommittedLogs controls if the Raft server should use the restore committed logs\n\t// mechanism. Restore committed logs requires a LogStore implementation that\n\t// support commit tracking. When such a store is used and this config\n\t// enabled, raft nodes will replay all known-committed logs on disk\n\t// before completing `NewRaft` on startup. This is mainly useful where\n\t// the application allows relaxed-consistency reads from followers as it\n\t// will reduce how far behind the follower's FSM is when it starts. If all reads\n\t// are forwarded to the leader then there won't be observable benefit from this feature.\n\t//\n\t// Notice: If this is enabled, the log store MUST implement the CommitTrackingLogStore\n\t// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.\n\tRestoreCommittedLogs bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "cfg_defaults",
+        "file": "config.go",
+        "start_line": 329,
+        "end_line": 341,
+        "kind": "code_observation",
+        "text": "func DefaultConfig() *Config {\n\treturn &Config{\n\t\tProtocolVersion:    ProtocolVersionMax,\n\t\tHeartbeatTimeout:   1000 * time.Millisecond,\n\t\tElectionTimeout:    1000 * time.Millisecond,\n\t\tCommitTimeout:      50 * time.Millisecond,\n\t\tMaxAppendEntries:   64,\n\t\tShutdownOnRemove:   true,\n\t\tTrailingLogs:       10240,\n\t\tSnapshotInterval:   120 * time.Second,\n\t\tSnapshotThreshold:  8192,\n\t\tLeaderLeaseTimeout: 500 * time.Millisecond,\n\t\tLogLevel:           \"DEBUG\",",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "api_fsm_channel",
+        "file": "api.go",
+        "start_line": 556,
+        "end_line": 562,
+        "kind": "code_observation",
+        "text": "\tr := &Raft{\n\t\tprotocolVersion:       protocolVersion,\n\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),\n\t\tfsmSnapshotCh:         make(chan *reqSnapshotFuture),\n\t\tleaderCh:              make(chan bool, 1),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_call",
+        "file": "api.go",
+        "start_line": 600,
+        "end_line": 610,
+        "kind": "code_observation",
+        "text": "\n\t// Attempt to restore a snapshot if there are any.\n\tif err := r.restoreSnapshot(); err != nil {\n\t\treturn nil, err\n\t}\n\n\tif err := r.restoreFromCommittedLogs(); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Scan through the log for any configuration change entries.",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_start_goroutines",
+        "file": "api.go",
+        "start_line": 630,
+        "end_line": 640,
+        "kind": "code_observation",
+        "text": "\ttrans.SetHeartbeatHandler(r.processHeartbeat)\n\n\tif conf.skipStartup {\n\t\treturn r, nil\n\t}\n\t// Start the background work.\n\tr.goFunc(r.run)\n\tr.goFunc(r.runFSM)\n\tr.goFunc(r.runSnapshots)\n\treturn r, nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_body",
+        "file": "api.go",
+        "start_line": 723,
+        "end_line": 755,
+        "kind": "code_observation",
+        "text": "// restoreFromCommittedLogs recovers the Raft node from committed logs.\nfunc (r *Raft) restoreFromCommittedLogs() error {\n\tif !r.RestoreCommittedLogs {\n\t\treturn nil\n\t}\n\n\t// If the store implements CommitTrackingLogStore, we can read the commit index from the store.\n\t// This is useful when the store is able to track the commit index and we can avoid replaying logs.\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tr.logger.Warn(\"restore committed logs enabled but log store does not support it\", \"log_store\", fmt.Sprintf(\"%T\", r.logs))\n\t\treturn ErrIncompatibleLogStore\n\t}\n\n\tcommitIndex, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get commit index from store\", \"error\", err)\n\t\treturn err\n\t}\n\n\tlastIndex, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index from store\", \"error\", err)\n\t\treturn err\n\t}\n\tif commitIndex > lastIndex {\n\t\tcommitIndex = lastIndex\n\t}\n\n\tr.setCommitIndex(commitIndex)\n\tr.processLogs(commitIndex, nil)\n\treturn nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_shutdown",
+        "file": "api.go",
+        "start_line": 1060,
+        "end_line": 1072,
+        "kind": "code_observation",
+        "text": "func (r *Raft) Shutdown() Future {\n\tr.shutdownLock.Lock()\n\tdefer r.shutdownLock.Unlock()\n\n\tif !r.shutdown {\n\t\tclose(r.shutdownCh)\n\t\tr.shutdown = true\n\t\tr.setState(Shutdown)\n\t\treturn &shutdownFuture{r}\n\t}\n\n\t// avoid closing transport twice\n\treturn &shutdownFuture{nil}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "raft_process_logs",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1314,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_batch_flush",
+        "file": "raft.go",
+        "start_line": 1336,
+        "end_line": 1362,
+        "kind": "code_observation",
+        "text": "\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n\n\t// Update the lastApplied index and term\n\tr.setLastApplied(index)",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "fsm_consumer",
+        "file": "fsm.go",
+        "start_line": 236,
+        "end_line": 250,
+        "kind": "code_observation",
+        "text": "\n\tfor {\n\t\tsaturation.sleeping()\n\n\t\tselect {\n\t\tcase ptr := <-r.fsmMutateCh:\n\t\t\tsaturation.working()\n\n\t\t\tswitch req := ptr.(type) {\n\t\t\tcase []*commitTuple:\n\t\t\t\tapplyBatch(req)\n\n\t\t\tcase *restoreFuture:\n\t\t\t\trestore(req)\n",
+        "content_digest": "87043c532565c2027473e38fbe2089a0dcebba6f58d1b05262eb13a14e179df3"
+      },
+      {
+        "id": "log_commit_tracking_iface",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 220,
+        "kind": "interface_statement",
+        "text": "type CommitTrackingLogStore interface {\n\tLogStore\n\n\t// StageCommitIndex stages a new commit index to be persisted.\n\t// The staged commit index MUST only be persisted in a manner that is atomic\n\t// with the following StoreLogs call in the face of a crash.\n\t// This allows the Raft implementation to optimize commit index updates\n\t// without risking inconsistency between the commit index and the log entries.\n\t//\n\t// The implementation MUST NOT persist this value separately from the log entries.\n\t// Instead, it should stage the value to be written atomically with the next\n\t// StoreLogs call.\n\t//\n\t// GetCommitIndex MUST never return a value higher than the last index in the log,\n\t// even if a higher value has been staged with this method.\n\t//\n\t// idx is the new commit index to stage.\n\tStageCommitIndex(idx uint64) error\n\n\t// GetCommitIndex returns the latest persisted commit index from the latest log entry\n\t// in the store at startup.\n\t//\n\t// GetCommitIndex should not return a value higher than the last index in the log.\n\t// If that happens, the last index in the log will be used.\n\t//\n\t// When no commit index is found in the log store, return (0, nil).\n\tGetCommitIndex() (uint64, error)",
+        "content_digest": "7a890bd749cd6863faef212b586320b8c6d9574bb7158f56c4e022408abff0b4"
+      },
+      {
+        "id": "store_commit_tracking",
+        "file": "inmem_store.go",
+        "start_line": 138,
+        "end_line": 159,
+        "kind": "code_observation",
+        "text": "type InmemCommitTrackingStore struct {\n\tInmemStore\n\tcommitIndex atomic.Uint64\n}\n\n// NewInmemCommitTrackingStore returns a new in-memory backend that tracks the commit index. Do not ever\n// use for production. Only for testing.\nfunc NewInmemCommitTrackingStore() *InmemCommitTrackingStore {\n\ti := &InmemCommitTrackingStore{\n\t\tInmemStore: *NewInmemStore(),\n\t}\n\treturn i\n}\n\nfunc (i *InmemCommitTrackingStore) StageCommitIndex(index uint64) error {\n\ti.commitIndex.Store(index)\n\treturn nil\n}\n\nfunc (i *InmemCommitTrackingStore) GetCommitIndex() (uint64, error) {\n\treturn i.commitIndex.Load(), nil\n}",
+        "content_digest": "310fa3c0010caf76b4483bddd68db974ffd543330d4d462967d7918dcb818435"
+      },
+      {
+        "id": "api_transfer_doc",
+        "file": "api.go",
+        "start_line": 1296,
+        "end_line": 1310,
+        "kind": "document_statement",
+        "text": "\n// LeadershipTransfer will transfer leadership to a server in the cluster.\n// This can only be called from the leader, or it will fail. The leader will\n// stop accepting client requests, make sure the target server is up to date\n// and starts the transfer with a TimeoutNow message. This message has the same\n// effect as if the election timeout on the target server fires. Since\n// it is unlikely that another server is starting an election, it is very\n// likely that the target server is able to win the election.  Note that raft\n// protocol version 3 is not sufficient to use LeadershipTransfer. A recent\n// version of that library has to be used that includes this feature.  Using\n// transfer leadership is safe however in a cluster where not every node has\n// the latest version. If a follower cannot be promoted, it will fail\n// gracefully.\nfunc (r *Raft) LeadershipTransfer() Future {\n\tif r.protocolVersion < 3 {",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_transfer_to_server_doc",
+        "file": "api.go",
+        "start_line": 1312,
+        "end_line": 1330,
+        "kind": "document_statement",
+        "text": "\t}\n\n\treturn r.initiateLeadershipTransfer(nil, nil)\n}\n\n// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_initiate_transfer",
+        "file": "raft.go",
+        "start_line": 2210,
+        "end_line": 2230,
+        "kind": "code_observation",
+        "text": "func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) LeadershipTransferFuture {\n\tfuture := &leadershipTransferFuture{ID: id, Address: address}\n\tfuture.init()\n\n\tif id != nil && *id == r.localID {\n\t\terr := fmt.Errorf(\"cannot transfer leadership to itself\")\n\t\tr.logger.Info(err.Error())\n\t\tfuture.respond(err)\n\t\treturn future\n\t}\n\n\tselect {\n\tcase r.leadershipTransferCh <- future:\n\t\treturn future\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tdefault:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\t}\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_transfer_accept",
+        "file": "raft.go",
+        "start_line": 687,
+        "end_line": 742,
+        "kind": "code_observation",
+        "text": "\n\t\tcase <-r.leaderState.stepDown:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.setState(Follower)\n\n\t\tcase future := <-r.leadershipTransferCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tif r.getLeadershipTransferInProgress() {\n\t\t\t\tr.logger.Debug(ErrLeadershipTransferInProgress.Error())\n\t\t\t\tfuture.respond(ErrLeadershipTransferInProgress)\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tr.logger.Debug(\"starting leadership transfer\", \"id\", future.ID, \"address\", future.Address)\n\n\t\t\t// When we are leaving leaderLoop, we are no longer\n\t\t\t// leader, so we should stop transferring.\n\t\t\tleftLeaderLoop := make(chan struct{})\n\t\t\tdefer func() { close(leftLeaderLoop) }()\n\n\t\t\tstopCh := make(chan struct{})\n\t\t\tdoneCh := make(chan error, 1)\n\n\t\t\t// This is intentionally being setup outside of the\n\t\t\t// leadershipTransfer function. Because the TimeoutNow\n\t\t\t// call is blocking and there is no way to abort that\n\t\t\t// in case eg the timer expires.\n\t\t\t// The leadershipTransfer function is controlled with\n\t\t\t// the stopCh and doneCh.\n\t\t\t// No matter how this exits, have this function set\n\t\t\t// leadership transfer to false before we return\n\t\t\t//\n\t\t\t// Note that this leaves a window where callers of\n\t\t\t// LeadershipTransfer() and LeadershipTransferToServer()\n\t\t\t// may start executing after they get their future but before\n\t\t\t// this routine has set leadershipTransferInProgress back to false.\n\t\t\t// It may be safe to modify things such that setLeadershipTransferInProgress\n\t\t\t// is set to false before calling future.Respond, but that still needs\n\t\t\t// to be tested and this situation mirrors what callers already had to deal with.\n\t\t\tgo func() {\n\t\t\t\tdefer r.setLeadershipTransferInProgress(false)\n\t\t\t\tselect {\n\t\t\t\tcase <-time.After(r.config().ElectionTimeout):\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"leadership transfer timeout\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"lost leadership during transfer (expected)\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase err := <-doneCh:\n\t\t\t\t\tif err != nil {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_transfer_body",
+        "file": "raft.go",
+        "start_line": 991,
+        "end_line": 1023,
+        "kind": "code_observation",
+        "text": "func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {\n\t// make sure we are not already stopped\n\tselect {\n\tcase <-stopCh:\n\t\tdoneCh <- nil\n\t\treturn\n\tdefault:\n\t}\n\n\tfor atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex() {\n\t\terr := &deferError{}\n\t\terr.init()\n\t\trepl.triggerDeferErrorCh <- err\n\t\tselect {\n\t\tcase err := <-err.errCh:\n\t\t\tif err != nil {\n\t\t\t\tdoneCh <- err\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-stopCh:\n\t\t\tdoneCh <- nil\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_pick_server",
+        "file": "raft.go",
+        "start_line": 2186,
+        "end_line": 2206,
+        "kind": "code_observation",
+        "text": "func (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx\n\t\t\ttmp := server\n\t\t\tpick = &tmp\n\t\t}\n\t}\n\treturn pick\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_timeout_now",
+        "file": "raft.go",
+        "start_line": 2232,
+        "end_line": 2237,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_vote_nonvoter",
+        "file": "raft.go",
+        "start_line": 1696,
+        "end_line": 1707,
+        "kind": "code_observation",
+        "text": "\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "830b0f3ff5a14266b056ad4a6d0c877b",
+      "result": {
+        "submission": "update.json",
+        "summary": "Opened a third sourced lead on the authority-transition axis: transports may run the heartbeat handler concurrently with the main thread, and appendEntries raises the term with a read-then-unconditional-write, so a stale heartbeat could persist an older term after a higher one was adopted and then let a stale leader's conflicting entry be truncated and applied. Recorded the transport contract, dispatch, term handling and truncation behavior with a discriminating experiment design; no execution or defect claim yet."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-1255b78953904846987cdc19826340c8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-1255b78953904846987cdc19826340c8.json"
+      },
+      "submission-0b79bab611d549ad8afe771aae821fb1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-0b79bab611d549ad8afe771aae821fb1.json"
+      },
+      "submission-e4657d2965124cb68ea56ef73ec2149f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-e4657d2965124cb68ea56ef73ec2149f.json"
+      },
+      "submission-c502aa0d94894cd1a70667cb56cf019f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-c502aa0d94894cd1a70667cb56cf019f.json"
+      },
+      "submission-f7da39e9771e40d29f8d7ec3d1c7d886": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-f7da39e9771e40d29f8d7ec3d1c7d886.json"
+      },
+      "submission-411b98cd4fea40b6be94feeae6d72dce": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-411b98cd4fea40b6be94feeae6d72dce.json"
+      },
+      "submission-79cd26894cd2414a96c4667caf95c259": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-79cd26894cd2414a96c4667caf95c259.json"
+      },
+      "submission-15dbe6dd80174c69b563a513008e04dc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-15dbe6dd80174c69b563a513008e04dc.json"
+      },
+      "submission-0921e4be80e8414d887df81cec96b5c2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-0921e4be80e8414d887df81cec96b5c2.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "1255b78953904846987cdc19826340c8-question-0",
+        "version": 1,
+        "question": "When RestoreCommittedLogs replays committed entries inside NewRaft, can the replay fail to make progress because the FSM batch channel is produced into before its only consumer is started?",
+        "source_ids": [
+          "cfg_restore_option",
+          "api_fsm_channel",
+          "api_restore_call",
+          "api_start_goroutines",
+          "api_restore_body",
+          "raft_process_logs",
+          "raft_batch_flush",
+          "fsm_consumer",
+          "api_shutdown"
+        ],
+        "hypothesis": "processLogs enqueues ceil(replayed/MaxAppendEntries) commitTuple batches into fsmMutateCh (capacity 128) during NewRaft, while runFSM, the only consumer of that channel, is started only after NewRaft returns; a replay of more than 128*MaxAppendEntries committed entries beyond the last snapshot should therefore block NewRaft permanently on the channel send, since shutdownCh can only be closed by Shutdown() on a *Raft that NewRaft never returns.",
+        "discriminator": "Compare NewRaft return for replay sizes at and above the batch-capacity boundary, including a real cluster restart with and without a snapshot bounding the replay; a return in every case would refute the hypothesis.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "1255b78953904846987cdc19826340c8"
+      },
+      {
+        "id": "f7da39e9771e40d29f8d7ec3d1c7d886-question-0",
+        "version": 1,
+        "question": "When an explicit LeadershipTransferToServer names a member that is a non-voter, does the transfer admit the request, and what does the returned future and the voters' terms show when the target cannot win any election?",
+        "source_ids": [
+          "api_transfer_doc",
+          "api_transfer_to_server_doc",
+          "api_initiate_transfer",
+          "raft_transfer_accept",
+          "raft_transfer_body",
+          "raft_pick_server",
+          "raft_timeout_now",
+          "raft_vote_nonvoter"
+        ],
+        "hypothesis": "leaderLoop accepts any id present in leaderState.replState, which startStopReplication creates for non-voters as well, so nothing checks suffrage for an explicit target; leadershipTransfer then replicates the non-voter up to the last index and sends TimeoutNow, timeoutNow makes the non-voter a transfer-candidate, and electSelf raises its term and asks every voter, whose requestVote handler raises its own term and steps down before rejecting the non-voter. The caller's future can then complete without error while leadership moved to an unrequested voter, contradicting the documented graceful failure for a follower that cannot be promoted.",
+        "discriminator": "A real cluster in which one member is demoted to non-voter, followed by an explicit transfer to that member: record the future's result, whether the named target ever becomes leader, the interval with no leader, and the voters' terms before and after. A future that reports an error, or a target that wins, would refute the hypothesis.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "f7da39e9771e40d29f8d7ec3d1c7d886"
+      },
+      {
+        "id": "830b0f3ff5a14266b056ad4a6d0c877b-question-0",
+        "version": 1,
+        "question": "Can a heartbeat delivered through the concurrent fast-path lower the persisted current term after the main thread has observed a higher one, and can the node then truncate and apply an entry from a stale leader at an index it had already committed at the higher term?",
+        "source_ids": [
+          "contract_heartbeat_handler",
+          "api_set_heartbeat_handler",
+          "raft_process_heartbeat",
+          "raft_append_term_handling",
+          "raft_conflict_truncation",
+          "raft_set_current_term",
+          "net_heartbeat_dispatch"
+        ],
+        "hypothesis": "The Transport contract permits SetHeartbeatHandler callbacks to run outside the main RPC queue, and NetworkTransport dispatches heartbeats from its connection handler, so processHeartbeat can execute appendEntries concurrently with the main thread. appendEntries tests a.Term > r.getCurrentTerm() and then calls setCurrentTerm(a.Term), which unconditionally persists and stores the term, so a heartbeat carrying an older term that read the current term before the main thread adopted a higher one can write its older term afterwards. If the term then regresses, the AppendEntries older-term rejection no longer blocks the stale leader, whose conflicting entry at an already committed index is truncated and applied.",
+        "discriminator": "In a follower whose main thread is processing a higher-term request, deliver a heartbeat carrying the previously observed term through a transport that invokes the registered heartbeat handler concurrently, with a stable store that delays the heartbeat's term write until after the higher term is persisted. Record the persisted current term before and after, whether it decreased, and whether a stale leader's conflicting entry at the already committed index is truncated and applied. No regression, or a rejection of the stale entries, would refute the hypothesis.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "830b0f3ff5a14266b056ad4a6d0c877b"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+        "revision": 3,
+        "kind": "behavior",
+        "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+        "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+        "source_ids": [
+          "cfg_restore_option",
+          "api_restore_call",
+          "api_start_goroutines",
+          "api_restore_body",
+          "raft_process_logs",
+          "raft_batch_flush",
+          "fsm_consumer",
+          "store_commit_tracking"
+        ],
+        "executions": {
+          "d61420dbc49a4072937b040aac55a51c": [
+            0,
+            2,
+            4,
+            6
+          ],
+          "87aea51bbd8a4b579f138f2c4986343a": [
+            0,
+            2,
+            4,
+            6,
+            8
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+            "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+            "source_ids": [
+              "cfg_restore_option",
+              "api_restore_call",
+              "api_start_goroutines",
+              "api_restore_body",
+              "raft_process_logs",
+              "raft_batch_flush",
+              "fsm_consumer"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "1255b78953904846987cdc19826340c8",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-0",
+            "revision": 2,
+            "kind": "behavior",
+            "statement": "NewRaft() calls restoreFromCommittedLogs() synchronously, which clamps the store's staged commit index to the last log index, sets the commit index and calls processLogs(commitIndex, nil); processLogs flushes a commitTuple batch to r.fsmMutateCh every MaxAppendEntries entries and once more for the remainder, and the only goroutine that reads fsmMutateCh (runFSM) is started after NewRaft returns.",
+            "conditions": "RestoreCommittedLogs=true and a LogStore implementing CommitTrackingLogStore; no snapshot restored at or above the staged commit index.",
+            "source_ids": [
+              "cfg_restore_option",
+              "api_restore_call",
+              "api_start_goroutines",
+              "api_restore_body",
+              "raft_process_logs",
+              "raft_batch_flush",
+              "fsm_consumer",
+              "store_commit_tracking"
+            ],
+            "executions": {
+              "d61420dbc49a4072937b040aac55a51c": [
+                0,
+                2,
+                4,
+                6
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "0b79bab611d549ad8afe771aae821fb1",
+            "correction": "",
+            "recorded_uses": [
+              "0b79bab611d549ad8afe771aae821fb1-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "c502aa0d94894cd1a70667cb56cf019f"
+      },
+      {
+        "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+        "revision": 3,
+        "kind": "fact",
+        "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer).",
+        "conditions": "RestoreCommittedLogs=true, DefaultConfig values, restart with staged commit index exceeding last snapshot index by more than 8192.",
+        "source_ids": [
+          "cfg_defaults",
+          "api_fsm_channel",
+          "raft_process_logs",
+          "fsm_consumer",
+          "api_shutdown"
+        ],
+        "executions": {
+          "d61420dbc49a4072937b040aac55a51c": [
+            1,
+            3,
+            5,
+            7
+          ],
+          "87aea51bbd8a4b579f138f2c4986343a": [
+            1,
+            3,
+            5,
+            7,
+            9
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+            "revision": 1,
+            "kind": "fact",
+            "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer).",
+            "conditions": "RestoreCommittedLogs=true, DefaultConfig values, restart with staged commit index exceeding last snapshot index by more than 8192.",
+            "source_ids": [
+              "cfg_defaults",
+              "api_fsm_channel",
+              "raft_process_logs",
+              "fsm_consumer",
+              "api_shutdown"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "1255b78953904846987cdc19826340c8",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "1255b78953904846987cdc19826340c8-knowledge-1",
+            "revision": 2,
+            "kind": "fact",
+            "statement": "For the captured code, the startup replay can enqueue at most 128 batches because fsmMutateCh is created with capacity 128 and its send in processLogs selects only on that send and on r.shutdownCh; with DefaultConfig MaxAppendEntries=64 this allows at most 8192 committed entries beyond the last snapshot, so 8193 or more replayed entries have no enabled progress path (no consumer exists and shutdownCh has no closer).",
+            "conditions": "RestoreCommittedLogs=true, DefaultConfig values, restart with staged commit index exceeding last snapshot index by more than 8192.",
+            "source_ids": [
+              "cfg_defaults",
+              "api_fsm_channel",
+              "raft_process_logs",
+              "fsm_consumer",
+              "api_shutdown"
+            ],
+            "executions": {
+              "d61420dbc49a4072937b040aac55a51c": [
+                1,
+                3,
+                5,
+                7
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "0b79bab611d549ad8afe771aae821fb1",
+            "correction": "",
+            "recorded_uses": [
+              "0b79bab611d549ad8afe771aae821fb1-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "c502aa0d94894cd1a70667cb56cf019f"
+      },
+      {
+        "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+        "revision": 3,
+        "kind": "behavior",
+        "statement": "Automatic leadership transfer and explicit leadership transfer use different target checks: pickServer (used when no id is given) skips every server whose Suffrage is not Voter, while an explicit id is only looked up in leaderState.replState, which contains an entry for every configured server including non-voters, and a successful lookup proceeds to replicate and send TimeoutNow without consulting suffrage.",
+        "conditions": "Leader state with a committed latest configuration containing a non-voter; explicit LeadershipTransferToServer(id) for that member.",
+        "source_ids": [
+          "api_initiate_transfer",
+          "raft_transfer_accept",
+          "raft_pick_server",
+          "raft_transfer_body"
+        ],
+        "executions": {
+          "d436029b08c5425aa5aec577901cb8ba": [
+            0,
+            2
+          ],
+          "0726bba116ac415fa38b99b96a88290f": [
+            0,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "Automatic leadership transfer and explicit leadership transfer use different target checks: pickServer (used when no id is given) skips every server whose Suffrage is not Voter, while an explicit id is only looked up in leaderState.replState, which contains an entry for every configured server including non-voters, and a successful lookup proceeds to replicate and send TimeoutNow without consulting suffrage.",
+            "conditions": "Leader state with a committed latest configuration containing a non-voter; explicit LeadershipTransferToServer(id) for that member.",
+            "source_ids": [
+              "api_initiate_transfer",
+              "raft_transfer_accept",
+              "raft_pick_server",
+              "raft_transfer_body"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "f7da39e9771e40d29f8d7ec3d1c7d886",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+            "revision": 2,
+            "kind": "behavior",
+            "statement": "Automatic leadership transfer and explicit leadership transfer use different target checks: pickServer (used when no id is given) skips every server whose Suffrage is not Voter, while an explicit id is only looked up in leaderState.replState, which contains an entry for every configured server including non-voters, and a successful lookup proceeds to replicate and send TimeoutNow without consulting suffrage.",
+            "conditions": "Leader state with a committed latest configuration containing a non-voter; explicit LeadershipTransferToServer(id) for that member.",
+            "source_ids": [
+              "api_initiate_transfer",
+              "raft_transfer_accept",
+              "raft_pick_server",
+              "raft_transfer_body"
+            ],
+            "executions": {
+              "d436029b08c5425aa5aec577901cb8ba": [
+                0,
+                2
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "79cd26894cd2414a96c4667caf95c259",
+            "correction": "",
+            "recorded_uses": [
+              "79cd26894cd2414a96c4667caf95c259-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "0921e4be80e8414d887df81cec96b5c2"
+      },
+      {
+        "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+        "revision": 3,
+        "kind": "behavior",
+        "statement": "A voter that receives a RequestVote from a candidate absent from its latest configuration rejects it before any term handling, but a candidate that is present yet not a voter is handled later: the voter first adopts a higher term and steps down to follower, and only then rejects the vote because hasVote is false. timeoutNow performs no term, leader or membership check and immediately marks the receiver as a leadership-transfer candidate.",
+        "conditions": "Voter with a known latest configuration; RequestVote with LeadershipTransfer=true from a configured non-voter at a higher term.",
+        "source_ids": [
+          "raft_vote_nonvoter",
+          "raft_timeout_now"
+        ],
+        "executions": {
+          "d436029b08c5425aa5aec577901cb8ba": [
+            2,
+            3
+          ],
+          "0726bba116ac415fa38b99b96a88290f": [
+            2,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+            "revision": 1,
+            "kind": "behavior",
+            "statement": "A voter that receives a RequestVote from a candidate absent from its latest configuration rejects it before any term handling, but a candidate that is present yet not a voter is handled later: the voter first adopts a higher term and steps down to follower, and only then rejects the vote because hasVote is false. timeoutNow performs no term, leader or membership check and immediately marks the receiver as a leadership-transfer candidate.",
+            "conditions": "Voter with a known latest configuration; RequestVote with LeadershipTransfer=true from a configured non-voter at a higher term.",
+            "source_ids": [
+              "raft_vote_nonvoter",
+              "raft_timeout_now"
+            ],
+            "executions": {},
+            "knowledge": [],
+            "operation_id": "f7da39e9771e40d29f8d7ec3d1c7d886",
+            "correction": "",
+            "recorded_uses": [],
+            "affected_uses": []
+          },
+          {
+            "id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+            "revision": 2,
+            "kind": "behavior",
+            "statement": "A voter that receives a RequestVote from a candidate absent from its latest configuration rejects it before any term handling, but a candidate that is present yet not a voter is handled later: the voter first adopts a higher term and steps down to follower, and only then rejects the vote because hasVote is false. timeoutNow performs no term, leader or membership check and immediately marks the receiver as a leadership-transfer candidate.",
+            "conditions": "Voter with a known latest configuration; RequestVote with LeadershipTransfer=true from a configured non-voter at a higher term.",
+            "source_ids": [
+              "raft_vote_nonvoter",
+              "raft_timeout_now"
+            ],
+            "executions": {
+              "d436029b08c5425aa5aec577901cb8ba": [
+                2,
+                3
+              ]
+            },
+            "knowledge": [],
+            "operation_id": "79cd26894cd2414a96c4667caf95c259",
+            "correction": "",
+            "recorded_uses": [
+              "79cd26894cd2414a96c4667caf95c259-interpretation-0"
+            ],
+            "affected_uses": []
+          }
+        ],
+        "operation_id": "0921e4be80e8414d887df81cec96b5c2"
+      },
+      {
+        "id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The Transport interface documents SetHeartbeatHandler as a fast-path that avoids head-of-line blocking and tells transports that do not support it to push heartbeats onto the Consumer channel instead; NetworkTransport stores the callback and its connection handler invokes it, while InmemTransport ignores the call entirely. NewRaft registers r.processHeartbeat, which forwards the request to appendEntries on whatever goroutine the transport used.",
+        "conditions": "Transport implementing the heartbeat fast-path (NetworkTransport); NewRaft has completed and registered the handler.",
+        "source_ids": [
+          "contract_heartbeat_handler",
+          "api_set_heartbeat_handler",
+          "raft_process_heartbeat",
+          "net_heartbeat_dispatch"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "830b0f3ff5a14266b056ad4a6d0c877b"
+      },
+      {
+        "id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "appendEntries raises the receiving term by first testing a.Term against r.getCurrentTerm() and later calling setCurrentTerm(a.Term), which writes the stable store and then the atomic term without comparing against the value it read, so the decision and the write are not a single atomic compare-and-set; the same function later deletes a conflicting log suffix from the first index whose term differs and appends the request's entries.",
+        "conditions": "Any appendEntries invocation, including one delivered concurrently through the heartbeat fast-path.",
+        "source_ids": [
+          "raft_append_term_handling",
+          "raft_set_current_term",
+          "raft_conflict_truncation"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "830b0f3ff5a14266b056ad4a6d0c877b"
+      }
+    ],
+    "materials": [
+      {
+        "id": "cfg_restore_option",
+        "file": "config.go",
+        "start_line": 243,
+        "end_line": 254,
+        "kind": "document_statement",
+        "text": "\t// RestoreCommittedLogs controls if the Raft server should use the restore committed logs\n\t// mechanism. Restore committed logs requires a LogStore implementation that\n\t// support commit tracking. When such a store is used and this config\n\t// enabled, raft nodes will replay all known-committed logs on disk\n\t// before completing `NewRaft` on startup. This is mainly useful where\n\t// the application allows relaxed-consistency reads from followers as it\n\t// will reduce how far behind the follower's FSM is when it starts. If all reads\n\t// are forwarded to the leader then there won't be observable benefit from this feature.\n\t//\n\t// Notice: If this is enabled, the log store MUST implement the CommitTrackingLogStore\n\t// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.\n\tRestoreCommittedLogs bool",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "cfg_defaults",
+        "file": "config.go",
+        "start_line": 329,
+        "end_line": 341,
+        "kind": "code_observation",
+        "text": "func DefaultConfig() *Config {\n\treturn &Config{\n\t\tProtocolVersion:    ProtocolVersionMax,\n\t\tHeartbeatTimeout:   1000 * time.Millisecond,\n\t\tElectionTimeout:    1000 * time.Millisecond,\n\t\tCommitTimeout:      50 * time.Millisecond,\n\t\tMaxAppendEntries:   64,\n\t\tShutdownOnRemove:   true,\n\t\tTrailingLogs:       10240,\n\t\tSnapshotInterval:   120 * time.Second,\n\t\tSnapshotThreshold:  8192,\n\t\tLeaderLeaseTimeout: 500 * time.Millisecond,\n\t\tLogLevel:           \"DEBUG\",",
+        "content_digest": "baa36f7538d88c5228d282604b42e4d749e34ff557096b52b30850198b829806"
+      },
+      {
+        "id": "api_fsm_channel",
+        "file": "api.go",
+        "start_line": 556,
+        "end_line": 562,
+        "kind": "code_observation",
+        "text": "\tr := &Raft{\n\t\tprotocolVersion:       protocolVersion,\n\t\tapplyCh:               applyCh,\n\t\tfsm:                   fsm,\n\t\tfsmMutateCh:           make(chan interface{}, 128),\n\t\tfsmSnapshotCh:         make(chan *reqSnapshotFuture),\n\t\tleaderCh:              make(chan bool, 1),",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_call",
+        "file": "api.go",
+        "start_line": 600,
+        "end_line": 610,
+        "kind": "code_observation",
+        "text": "\n\t// Attempt to restore a snapshot if there are any.\n\tif err := r.restoreSnapshot(); err != nil {\n\t\treturn nil, err\n\t}\n\n\tif err := r.restoreFromCommittedLogs(); err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Scan through the log for any configuration change entries.",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_start_goroutines",
+        "file": "api.go",
+        "start_line": 630,
+        "end_line": 640,
+        "kind": "code_observation",
+        "text": "\ttrans.SetHeartbeatHandler(r.processHeartbeat)\n\n\tif conf.skipStartup {\n\t\treturn r, nil\n\t}\n\t// Start the background work.\n\tr.goFunc(r.run)\n\tr.goFunc(r.runFSM)\n\tr.goFunc(r.runSnapshots)\n\treturn r, nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_restore_body",
+        "file": "api.go",
+        "start_line": 723,
+        "end_line": 755,
+        "kind": "code_observation",
+        "text": "// restoreFromCommittedLogs recovers the Raft node from committed logs.\nfunc (r *Raft) restoreFromCommittedLogs() error {\n\tif !r.RestoreCommittedLogs {\n\t\treturn nil\n\t}\n\n\t// If the store implements CommitTrackingLogStore, we can read the commit index from the store.\n\t// This is useful when the store is able to track the commit index and we can avoid replaying logs.\n\tstore, ok := r.logs.(CommitTrackingLogStore)\n\tif !ok {\n\t\tr.logger.Warn(\"restore committed logs enabled but log store does not support it\", \"log_store\", fmt.Sprintf(\"%T\", r.logs))\n\t\treturn ErrIncompatibleLogStore\n\t}\n\n\tcommitIndex, err := store.GetCommitIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get commit index from store\", \"error\", err)\n\t\treturn err\n\t}\n\n\tlastIndex, err := r.logs.LastIndex()\n\tif err != nil {\n\t\tr.logger.Error(\"failed to get last log index from store\", \"error\", err)\n\t\treturn err\n\t}\n\tif commitIndex > lastIndex {\n\t\tcommitIndex = lastIndex\n\t}\n\n\tr.setCommitIndex(commitIndex)\n\tr.processLogs(commitIndex, nil)\n\treturn nil\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_shutdown",
+        "file": "api.go",
+        "start_line": 1060,
+        "end_line": 1072,
+        "kind": "code_observation",
+        "text": "func (r *Raft) Shutdown() Future {\n\tr.shutdownLock.Lock()\n\tdefer r.shutdownLock.Unlock()\n\n\tif !r.shutdown {\n\t\tclose(r.shutdownCh)\n\t\tr.shutdown = true\n\t\tr.setState(Shutdown)\n\t\treturn &shutdownFuture{r}\n\t}\n\n\t// avoid closing transport twice\n\treturn &shutdownFuture{nil}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "raft_process_logs",
+        "file": "raft.go",
+        "start_line": 1296,
+        "end_line": 1314,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {\n\t// Reject logs we've applied already\n\tlastApplied := r.getLastApplied()\n\tif index <= lastApplied {\n\t\tr.logger.Warn(\"skipping application of old log\", \"index\", index)\n\t\treturn\n\t}\n\n\tapplyBatch := func(batch []*commitTuple) {\n\t\tselect {\n\t\tcase r.fsmMutateCh <- batch:\n\t\tcase <-r.shutdownCh:\n\t\t\tfor _, cl := range batch {\n\t\t\t\tif cl.future != nil {\n\t\t\t\t\tcl.future.respond(ErrRaftShutdown)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_batch_flush",
+        "file": "raft.go",
+        "start_line": 1336,
+        "end_line": 1362,
+        "kind": "code_observation",
+        "text": "\t\t}\n\n\t\tswitch {\n\t\tcase preparedLog != nil:\n\t\t\t// If we have a log ready to send to the FSM add it to the batch.\n\t\t\t// The FSM thread will respond to the future.\n\t\t\tbatch = append(batch, preparedLog)\n\n\t\t\t// If we have filled up a batch, send it to the FSM\n\t\t\tif len(batch) >= maxAppendEntries {\n\t\t\t\tapplyBatch(batch)\n\t\t\t\tbatch = make([]*commitTuple, 0, maxAppendEntries)\n\t\t\t}\n\n\t\tcase futureOk:\n\t\t\t// Invoke the future if given.\n\t\t\tfuture.respond(nil)\n\t\t}\n\t}\n\n\t// If there are any remaining logs in the batch apply them\n\tif len(batch) != 0 {\n\t\tapplyBatch(batch)\n\t}\n\n\t// Update the lastApplied index and term\n\tr.setLastApplied(index)",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "fsm_consumer",
+        "file": "fsm.go",
+        "start_line": 236,
+        "end_line": 250,
+        "kind": "code_observation",
+        "text": "\n\tfor {\n\t\tsaturation.sleeping()\n\n\t\tselect {\n\t\tcase ptr := <-r.fsmMutateCh:\n\t\t\tsaturation.working()\n\n\t\t\tswitch req := ptr.(type) {\n\t\t\tcase []*commitTuple:\n\t\t\t\tapplyBatch(req)\n\n\t\t\tcase *restoreFuture:\n\t\t\t\trestore(req)\n",
+        "content_digest": "87043c532565c2027473e38fbe2089a0dcebba6f58d1b05262eb13a14e179df3"
+      },
+      {
+        "id": "log_commit_tracking_iface",
+        "file": "log.go",
+        "start_line": 194,
+        "end_line": 220,
+        "kind": "interface_statement",
+        "text": "type CommitTrackingLogStore interface {\n\tLogStore\n\n\t// StageCommitIndex stages a new commit index to be persisted.\n\t// The staged commit index MUST only be persisted in a manner that is atomic\n\t// with the following StoreLogs call in the face of a crash.\n\t// This allows the Raft implementation to optimize commit index updates\n\t// without risking inconsistency between the commit index and the log entries.\n\t//\n\t// The implementation MUST NOT persist this value separately from the log entries.\n\t// Instead, it should stage the value to be written atomically with the next\n\t// StoreLogs call.\n\t//\n\t// GetCommitIndex MUST never return a value higher than the last index in the log,\n\t// even if a higher value has been staged with this method.\n\t//\n\t// idx is the new commit index to stage.\n\tStageCommitIndex(idx uint64) error\n\n\t// GetCommitIndex returns the latest persisted commit index from the latest log entry\n\t// in the store at startup.\n\t//\n\t// GetCommitIndex should not return a value higher than the last index in the log.\n\t// If that happens, the last index in the log will be used.\n\t//\n\t// When no commit index is found in the log store, return (0, nil).\n\tGetCommitIndex() (uint64, error)",
+        "content_digest": "7a890bd749cd6863faef212b586320b8c6d9574bb7158f56c4e022408abff0b4"
+      },
+      {
+        "id": "store_commit_tracking",
+        "file": "inmem_store.go",
+        "start_line": 138,
+        "end_line": 159,
+        "kind": "code_observation",
+        "text": "type InmemCommitTrackingStore struct {\n\tInmemStore\n\tcommitIndex atomic.Uint64\n}\n\n// NewInmemCommitTrackingStore returns a new in-memory backend that tracks the commit index. Do not ever\n// use for production. Only for testing.\nfunc NewInmemCommitTrackingStore() *InmemCommitTrackingStore {\n\ti := &InmemCommitTrackingStore{\n\t\tInmemStore: *NewInmemStore(),\n\t}\n\treturn i\n}\n\nfunc (i *InmemCommitTrackingStore) StageCommitIndex(index uint64) error {\n\ti.commitIndex.Store(index)\n\treturn nil\n}\n\nfunc (i *InmemCommitTrackingStore) GetCommitIndex() (uint64, error) {\n\treturn i.commitIndex.Load(), nil\n}",
+        "content_digest": "310fa3c0010caf76b4483bddd68db974ffd543330d4d462967d7918dcb818435"
+      },
+      {
+        "id": "api_transfer_doc",
+        "file": "api.go",
+        "start_line": 1296,
+        "end_line": 1310,
+        "kind": "document_statement",
+        "text": "\n// LeadershipTransfer will transfer leadership to a server in the cluster.\n// This can only be called from the leader, or it will fail. The leader will\n// stop accepting client requests, make sure the target server is up to date\n// and starts the transfer with a TimeoutNow message. This message has the same\n// effect as if the election timeout on the target server fires. Since\n// it is unlikely that another server is starting an election, it is very\n// likely that the target server is able to win the election.  Note that raft\n// protocol version 3 is not sufficient to use LeadershipTransfer. A recent\n// version of that library has to be used that includes this feature.  Using\n// transfer leadership is safe however in a cluster where not every node has\n// the latest version. If a follower cannot be promoted, it will fail\n// gracefully.\nfunc (r *Raft) LeadershipTransfer() Future {\n\tif r.protocolVersion < 3 {",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_transfer_to_server_doc",
+        "file": "api.go",
+        "start_line": 1312,
+        "end_line": 1330,
+        "kind": "document_statement",
+        "text": "\t}\n\n\treturn r.initiateLeadershipTransfer(nil, nil)\n}\n\n// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "api_initiate_transfer",
+        "file": "raft.go",
+        "start_line": 2210,
+        "end_line": 2230,
+        "kind": "code_observation",
+        "text": "func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) LeadershipTransferFuture {\n\tfuture := &leadershipTransferFuture{ID: id, Address: address}\n\tfuture.init()\n\n\tif id != nil && *id == r.localID {\n\t\terr := fmt.Errorf(\"cannot transfer leadership to itself\")\n\t\tr.logger.Info(err.Error())\n\t\tfuture.respond(err)\n\t\treturn future\n\t}\n\n\tselect {\n\tcase r.leadershipTransferCh <- future:\n\t\treturn future\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tdefault:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\t}\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_transfer_accept",
+        "file": "raft.go",
+        "start_line": 687,
+        "end_line": 742,
+        "kind": "code_observation",
+        "text": "\n\t\tcase <-r.leaderState.stepDown:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.setState(Follower)\n\n\t\tcase future := <-r.leadershipTransferCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tif r.getLeadershipTransferInProgress() {\n\t\t\t\tr.logger.Debug(ErrLeadershipTransferInProgress.Error())\n\t\t\t\tfuture.respond(ErrLeadershipTransferInProgress)\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tr.logger.Debug(\"starting leadership transfer\", \"id\", future.ID, \"address\", future.Address)\n\n\t\t\t// When we are leaving leaderLoop, we are no longer\n\t\t\t// leader, so we should stop transferring.\n\t\t\tleftLeaderLoop := make(chan struct{})\n\t\t\tdefer func() { close(leftLeaderLoop) }()\n\n\t\t\tstopCh := make(chan struct{})\n\t\t\tdoneCh := make(chan error, 1)\n\n\t\t\t// This is intentionally being setup outside of the\n\t\t\t// leadershipTransfer function. Because the TimeoutNow\n\t\t\t// call is blocking and there is no way to abort that\n\t\t\t// in case eg the timer expires.\n\t\t\t// The leadershipTransfer function is controlled with\n\t\t\t// the stopCh and doneCh.\n\t\t\t// No matter how this exits, have this function set\n\t\t\t// leadership transfer to false before we return\n\t\t\t//\n\t\t\t// Note that this leaves a window where callers of\n\t\t\t// LeadershipTransfer() and LeadershipTransferToServer()\n\t\t\t// may start executing after they get their future but before\n\t\t\t// this routine has set leadershipTransferInProgress back to false.\n\t\t\t// It may be safe to modify things such that setLeadershipTransferInProgress\n\t\t\t// is set to false before calling future.Respond, but that still needs\n\t\t\t// to be tested and this situation mirrors what callers already had to deal with.\n\t\t\tgo func() {\n\t\t\t\tdefer r.setLeadershipTransferInProgress(false)\n\t\t\t\tselect {\n\t\t\t\tcase <-time.After(r.config().ElectionTimeout):\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"leadership transfer timeout\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"lost leadership during transfer (expected)\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase err := <-doneCh:\n\t\t\t\t\tif err != nil {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_transfer_body",
+        "file": "raft.go",
+        "start_line": 991,
+        "end_line": 1023,
+        "kind": "code_observation",
+        "text": "func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {\n\t// make sure we are not already stopped\n\tselect {\n\tcase <-stopCh:\n\t\tdoneCh <- nil\n\t\treturn\n\tdefault:\n\t}\n\n\tfor atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex() {\n\t\terr := &deferError{}\n\t\terr.init()\n\t\trepl.triggerDeferErrorCh <- err\n\t\tselect {\n\t\tcase err := <-err.errCh:\n\t\t\tif err != nil {\n\t\t\t\tdoneCh <- err\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-stopCh:\n\t\t\tdoneCh <- nil\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_pick_server",
+        "file": "raft.go",
+        "start_line": 2186,
+        "end_line": 2206,
+        "kind": "code_observation",
+        "text": "func (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx\n\t\t\ttmp := server\n\t\t\tpick = &tmp\n\t\t}\n\t}\n\treturn pick\n}\n",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_timeout_now",
+        "file": "raft.go",
+        "start_line": 2232,
+        "end_line": 2237,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_vote_nonvoter",
+        "file": "raft.go",
+        "start_line": 1696,
+        "end_line": 1707,
+        "kind": "code_observation",
+        "text": "\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "contract_heartbeat_handler",
+        "file": "transport.go",
+        "start_line": 58,
+        "end_line": 64,
+        "kind": "interface_statement",
+        "text": "\n\t// SetHeartbeatHandler is used to setup a heartbeat handler\n\t// as a fast-pass. This is to avoid head-of-line blocking from\n\t// disk IO. If a Transport does not support this, it can simply\n\t// ignore the call, and push the heartbeat onto the Consumer channel.\n\tSetHeartbeatHandler(cb func(rpc RPC))\n",
+        "content_digest": "3880ec16eb7121c92726b87f01514cd9e130d56603a4bf18656ce679c257af66"
+      },
+      {
+        "id": "api_set_heartbeat_handler",
+        "file": "api.go",
+        "start_line": 626,
+        "end_line": 632,
+        "kind": "code_observation",
+        "text": "\n\t// Setup a heartbeat fast-path to avoid head-of-line\n\t// blocking where possible. It MUST be safe for this\n\t// to be called concurrently with a blocking RPC.\n\ttrans.SetHeartbeatHandler(r.processHeartbeat)\n\n\tif conf.skipStartup {",
+        "content_digest": "98ea2895695e050fccc1c9693b5c670ddf75d11fdbe26677db310fca7e4e86cf"
+      },
+      {
+        "id": "raft_process_heartbeat",
+        "file": "raft.go",
+        "start_line": 1436,
+        "end_line": 1457,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processHeartbeat(rpc RPC) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"processHeartbeat\"}, time.Now())\n\n\t// Check if we are shutdown, just ignore the RPC\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn\n\tdefault:\n\t}\n\n\t// Ensure we are only handling a heartbeat\n\tswitch cmd := rpc.Command.(type) {\n\tcase *AppendEntriesRequest:\n\t\tr.appendEntries(rpc, cmd)\n\tdefault:\n\t\tr.logger.Error(\"expected heartbeat, got\", \"command\", hclog.Fmt(\"%#v\", rpc.Command))\n\t\trpc.Respond(nil, fmt.Errorf(\"unexpected command\"))\n\t}\n}\n\n// appendEntries is invoked when we get an append entries RPC call. This must\n// only be called from the main thread.",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_append_term_handling",
+        "file": "raft.go",
+        "start_line": 1470,
+        "end_line": 1490,
+        "kind": "code_observation",
+        "text": "\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term\n\t}\n\n\t// Save the current leader\n\tif len(a.Addr) > 0 {\n\t\tr.setLeader(r.trans.DecodePeer(a.Addr), ServerID(a.ID))\n\t} else {",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_conflict_truncation",
+        "file": "raft.go",
+        "start_line": 1526,
+        "end_line": 1566,
+        "kind": "code_observation",
+        "text": "\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Stage the future commit index if possible\n\t\t\tlastNewIndex := newEntries[len(newEntries)-1].Index\n\t\t\tcommitIndex := min(a.LeaderCommitIndex, lastNewIndex)\n\t\t\tr.tryStageCommitIndex(commitIndex)\n\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "raft_set_current_term",
+        "file": "raft.go",
+        "start_line": 2164,
+        "end_line": 2172,
+        "kind": "code_observation",
+        "text": "func (r *Raft) setCurrentTerm(t uint64) {\n\t// Persist to disk first\n\tif err := r.stable.SetUint64(keyCurrentTerm, t); err != nil {\n\t\tpanic(fmt.Errorf(\"failed to save current term: %v\", err))\n\t}\n\tr.raftState.setCurrentTerm(t)\n}\n\n// setState is used to update the current state. Any state",
+        "content_digest": "a7b9f4f414719149d9a94c54de7bd2a2f566b1f194a447999d41d57853b7ae38"
+      },
+      {
+        "id": "net_heartbeat_dispatch",
+        "file": "net_transport.go",
+        "start_line": 298,
+        "end_line": 305,
+        "kind": "code_observation",
+        "text": "// SetHeartbeatHandler is used to set up a heartbeat handler\n// as a fast-pass. This is to avoid head-of-line blocking from\n// disk IO.\nfunc (n *NetworkTransport) SetHeartbeatHandler(cb func(rpc RPC)) {\n\tn.heartbeatFnLock.Lock()\n\tdefer n.heartbeatFnLock.Unlock()\n\tn.heartbeatFn = cb\n}",
+        "content_digest": "f0b64c57ce7eb3ea4aa355a6084063f7c4bac5732f25714460b6fe1fe34b9293"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "830b0f3ff5a14266b056ad4a6d0c877b",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_heartbeat_fastpath_concurrency": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-0",
+        "@k_term_raise_read_then_write": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-1",
+        "@q_heartbeat_term_regression": "830b0f3ff5a14266b056ad4a6d0c877b-question-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "contract_heartbeat_handler"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "api_set_heartbeat_handler"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_process_heartbeat"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_append_term_handling"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_conflict_truncation"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "raft_set_current_term"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "net_heartbeat_dispatch"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_heartbeat_fastpath_concurrency"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@k_term_raise_read_then_write"
+        },
+        {
+          "object": "investigations",
+          "action": "create",
+          "target": "@q_heartbeat_term_regression"
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-1255b78953904846987cdc19826340c8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-1255b78953904846987cdc19826340c8.json"
+      },
+      "submission-0b79bab611d549ad8afe771aae821fb1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-0b79bab611d549ad8afe771aae821fb1.json"
+      },
+      "submission-e4657d2965124cb68ea56ef73ec2149f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-e4657d2965124cb68ea56ef73ec2149f.json"
+      },
+      "submission-c502aa0d94894cd1a70667cb56cf019f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-c502aa0d94894cd1a70667cb56cf019f.json"
+      },
+      "submission-f7da39e9771e40d29f8d7ec3d1c7d886": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-f7da39e9771e40d29f8d7ec3d1c7d886.json"
+      },
+      "submission-411b98cd4fea40b6be94feeae6d72dce": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-411b98cd4fea40b6be94feeae6d72dce.json"
+      },
+      "submission-79cd26894cd2414a96c4667caf95c259": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-79cd26894cd2414a96c4667caf95c259.json"
+      },
+      "submission-15dbe6dd80174c69b563a513008e04dc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-15dbe6dd80174c69b563a513008e04dc.json"
+      },
+      "submission-0921e4be80e8414d887df81cec96b5c2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-0921e4be80e8414d887df81cec96b5c2.json"
+      },
+      "submission-830b0f3ff5a14266b056ad4a6d0c877b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-17_17-50-22-hashicorp_raft-real-run/semantic-commits/submission-830b0f3ff5a14266b056ad4a6d0c877b.json"
+      }
+    }
+  }
+}

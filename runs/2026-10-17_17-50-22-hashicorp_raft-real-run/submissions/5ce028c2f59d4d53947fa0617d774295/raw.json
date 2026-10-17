@@ -1,0 +1,130 @@
+{
+  "rationale": "Interpret receipt fb14e70f60a3456eae7774eb6e005e69, a repeat of the end-to-end VerifyLeader experiment. The trigger verified itself immediately after the partition while its successor committed only about 2.4 seconds later, and the control with the non-voters also cut failed after about a second, so the account keeps its violated conclusion and asserted defect claim, records that the bound reproduces on a second run, and updates the timing numbers in its counterevidence and limitation.",
+  "knowledge": [
+    {
+      "id": "533b966489544f45b4fcf14f6edce57f-knowledge-0",
+      "kind": "behavior",
+      "statement": "VerifyLeader sizes its quorum with quorumSize (voters/2+1, voters only) but registers the verify future with every entry of leaderState.replState, which startStopReplication creates for every configured server including non-voters; a successful heartbeat or AppendEntries response calls notifyAll(true), which increments the verify future's vote count and completes the verification once the count reaches the voter-sized quorum.",
+      "conditions": "Leader with at least one non-voter replication stream and fewer reachable voters than the voter quorum.",
+      "source_ids": [
+        "raft_verify_leader",
+        "future_verify_vote",
+        "raft_start_stop_repl",
+        "raft_quorum_size"
+      ],
+      "executions": {
+        "7a54f3754b0b423aaf1ba6c0365367c0": [
+          1,
+          3
+        ],
+        "e49121154f514e39b6c1a37a2c353a4a": [
+          1,
+          2,
+          4,
+          5
+        ],
+        "13b7844febba4a6d80c7331818c943f6": [
+          1,
+          2,
+          4,
+          5
+        ],
+        "27d9e2e68fcf4e15b00b170ef9593714": [
+          1,
+          3
+        ],
+        "c211ca53de834d06a9b84e80fc18f1b7": [
+          1,
+          3
+        ],
+        "fb14e70f60a3456eae7774eb6e005e69": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "533b966489544f45b4fcf14f6edce57f-knowledge-1",
+      "kind": "behavior",
+      "statement": "checkLeaderLease, unlike VerifyLeader, iterates the latest configuration and counts only servers whose Suffrage is Voter towards the contacted quorum, so the lease check and the verification path use different supporter sets.",
+      "conditions": "Leader loop lease check with a configuration containing non-voters.",
+      "source_ids": [
+        "raft_leader_lease",
+        "raft_quorum_size"
+      ],
+      "executions": {
+        "e49121154f514e39b6c1a37a2c353a4a": [
+          2,
+          5
+        ],
+        "13b7844febba4a6d80c7331818c943f6": [
+          2,
+          5
+        ],
+        "27d9e2e68fcf4e15b00b170ef9593714": [
+          3
+        ],
+        "c211ca53de834d06a9b84e80fc18f1b7": [
+          3
+        ],
+        "fb14e70f60a3456eae7774eb6e005e69": [
+          3
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "533b966489544f45b4fcf14f6edce57f-question-0",
+      "experiment_id": "2fd5794c550141f7889f1530295d1294-experiment",
+      "source_ids": [
+        "api_verify_doc",
+        "raft_verify_leader",
+        "repl_notify_all",
+        "future_verify_vote",
+        "raft_start_stop_repl",
+        "raft_quorum_size",
+        "raft_leader_lease",
+        "membership_doc_nonvoter"
+      ],
+      "executions": {
+        "fb14e70f60a3456eae7774eb6e005e69": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Conclusion: violated, and the scoped defect is asserted. VerifyLeader reports success although the leader can reach fewer voters than the voter quorum it sized, because acknowledgements arriving on non-voter replication streams are counted as support. Evidence from receipt 7a54f3754b0b423aaf1ba6c0365367c0 (completed, tests_passed, exit 0). Parsed index 1, the trigger: five members were bootstrapped, two were demoted to non-voters, and the leader's transport was disconnected in both directions from the two remaining voters, so voters_reachable=1 against quorum_voters=2 while nonvoters_reachable=2; VerifyLeader completed with verify_ok=true and an empty error, and the node was still Leader. Parsed index 3, the control on an identically built cluster with the non-voters also disconnected (nonvoters_reachable=0): the same call completed with verify_ok=false and the error 'leadership lost while committing log', the node by then a Follower. The two cases differ only in whether the non-voters could answer, so the successful verification in the trigger is attributable to non-voter acknowledgements rather than to voter support. Mechanism from source: verifyLeader sets quorumSize with quorumSize(), which counts only voters (raft.go:1087-1100), but registers the verify future on every entry of leaderState.replState (raft.go:966-990), and startStopReplication creates a replication state for every configured server including non-voters (raft.go:583-600); any successful heartbeat or AppendEntries response calls notifyAll(true) (replication.go:100-112), which increments the verify future's vote count (future.go:274-293) and completes it at the voter-sized quorum. The library already uses the correct supporter set one function away: checkLeaderLease iterates the latest configuration and counts only voters (raft.go:1037-1050), so the two paths disagree about who can establish leadership. Consequence under the exercised conditions: a client that calls VerifyLeader to protect a read (api.go:927-931) is told the leader still holds a voter quorum while it can reach none of the other voters, so the guard against serving stale reads after leadership loss does not hold in a cluster that contains non-voters. A successor run, receipt e49121154f514e39b6c1a37a2c353a4a, repeated the call every 50 ms after the first verification and quantified the window: parsed index 1 again records verify_ok=true for the partitioned leader, and parsed index 2 records loop_successes=20 with ms_until_failure=1015 before the node became a Follower, so twenty separate verifications succeeded across about one second; the control at parsed index 4 recorded verify_ok=false and parsed index 5 recorded loop_successes=0 with failure at 0 ms. The false assurance therefore lasts for the leader lease interval (LeaderLeaseTimeout, one second in this harness), not for a single call. A clean-copy repeat of the same fixed experiment, receipt 13b7844febba4a6d80c7331818c943f6, reproduced the window: parsed index 1 verify_ok=true, parsed index 2 loop_successes=20 with ms_until_failure=1014, parsed index 4 verify_ok=false and parsed index 5 loop_successes=0. Both runs therefore agree on the count and on a window of about one second at this lease setting. End-to-end consequence, measured in receipt 27d9e2e68fcf4e15b00b170ef9593714 (completed, tests_passed, exit 0): five real nodes run as three voters and two non-voters with a recording state machine, the leader commits v1, is partitioned from the other two voters while the non-voters stay reachable, and is asked to verify itself immediately afterwards. Parsed index 0 records that state (voters_reachable=1, nonvoters_reachable=2, leader_value=v1); parsed index 1 records verify_after_partition_ok=true with ms_to_verify=0, so the false assurance is issued at once, but it also records ms_to_new_leader=2564 with new_leader_value=v2, verify_after_failover_ok=false and the error 'node is not the leader', old_value_before_heal=v1 against the successor's v2, and stale_verified_read=false. The old leader therefore stopped being able to verify itself before any successor had committed, so in this configuration the defect never became a verified stale read. Parsed index 3, the control with the non-voters also cut: verification failed after 1009 ms with 'leadership lost while committing log', and the successor committed v2 at 1476 ms, which shows the success in the trigger again depended on the non-voters while both cases ended with the old leader out of office. Second suffrage shape, receipt c211ca53de834d06a9b84e80fc18f1b7 (completed, tests_passed, exit 0): four members, one of them demoted, so the configuration has three voters and exactly one non-voter and the voter quorum is two. Parsed index 0 records voters_reachable=1, nonvoters_reachable=1, quorum_voters=2, demotion_converged=true and demotion_converge_ms=5, so the member whose acknowledgement is being counted had already applied its own demotion; parsed index 1 records verify_ok=true in 0 ms with the node still Leader, although it could reach only one of the two voters its sizing requires. Parsed index 3, the control with the single non-voter also cut: verify_ok=false after 50 ms with 'leadership lost while committing log', the node a Follower. One non-voter is therefore enough to supply the acknowledgement the voter quorum is missing, and the success ends as soon as that member is unreachable. Why the window closes is structural rather than lucky: this library rejects a configuration whose LeaderLeaseTimeout exceeds its HeartbeatTimeout, and requires HeartbeatTimeout <= ElectionTimeout, so a follower cannot begin an election before the old leader's lease has already run out, and the vote round trip only adds to that margin. The defect's practical reach is therefore a false leadership-health signal that lasts up to one lease interval, not a stale read after a failover. The membership document defines a non-voter as 'a server that receives log entries but is not considered for elections or commitment purposes' (membership.md:11-12), which supports treating a non-voter's acknowledgement as ineligible support for a leadership verification sized as a voter quorum.\n\nRepeat of the end-to-end experiment, receipt fb14e70f60a3456eae7774eb6e005e69 (completed, tests_passed, exit 0): the same fixed inputs were run again. Parsed index 0 records the trigger's state with one of three voters and both non-voters reachable, and parsed index 1 its result: the leader verified itself at 0 ms after the partition, the successor was elected and applied the new value at 2373 ms, the old leader's own value was still the initial one before the heal, its later verification failed with 'node is not the leader', and no stale verified read was recorded. Parsed index 2 records the control's state with the non-voters unreachable as well, and parsed index 3 its result: verification failed after 994 ms with 'leadership lost while committing log', the successor applied the new value at 1917 ms, and again no stale verified read. The bound the account claims therefore reproduces on a second execution with a successor about 190 ms faster than in the first run, so the false success remains confined to the interval between the partition and the lease-driven step-down rather than being an artifact of one run's timing.",
+      "counterevidence": [
+        "The verification returns before the lease check steps the leader down, so the false success is bounded by the leader lease interval rather than permanent; in the control that same step-down produced the error the trigger avoided. Receipt 27d9e2e68fcf4e15b00b170ef9593714 measures the bound directly: verification succeeded at 0 ms after the partition, the successor committed at 2564 ms, and the post-failover verification failed because the node was no longer the leader. The repeat, receipt fb14e70f60a3456eae7774eb6e005e69, measured the same shape: verification at 0 ms, the successor's commit at 2373 ms, and the later verification refused.",
+        "VerifyLeader returning nil installed no leader and returned no data; the harm needs a client that relies on it as the guard the documentation describes. The end-to-end case issued a state-machine read after a later verification, and that verification failed, so no read was served under a false assurance.",
+        "Non-voter reachability does show the leader is alive and connected, so a deployment that used VerifyLeader only as a liveness probe would not be affected; the code sizes a voter quorum, which makes quorum the stated intent.",
+        "The partition was modelled by removing in-memory transport routing in both directions between the leader and the voters, not by dropping packets or crashing members.",
+        "The election that removes the false leader is not slowed down: in the end-to-end case the successors were elected 1.5 s and 2.6 s after the cut, while the lease expired after about 1 s, so neither case approached an overlap between a successful verification and a stale state machine.",
+        "In both suffrage shapes the successful verification was issued while the non-voters were reachable and stopped once they were cut, so the result is about which acknowledgements the call accepts, not about the size of the cluster."
+      ],
+      "limitations": [
+        "Two suffrage shapes were exercised, both with three voters: five members with two non-voters and four members with one non-voter, each with the leader cut from the other voters. Larger clusters, configurations where non-voters outnumber voters, and a non-voter whose heartbeat is the only one in flight were not tested.",
+        "The exposure window was measured only at one lease setting: with LeaderLeaseTimeout of one second the partitioned leader returned twenty successful verifications over about 1,015 ms and, in a clean-copy repeat, twenty over about 1,014 ms before stepping down, so the window tracks the configured lease but was not varied.",
+        "The end-to-end case reads the state machine directly rather than through a client read protocol, and its timing bound is configuration-specific: with a one-second lease and staggered election timeouts of 1.1 s, 2 s and 3 s the successors were elected at 2.6 s and 1.5 s. The library validates LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout, so a lease longer than an election is not expressible and the window cannot be widened that way; a slower election would widen the false-verification interval without changing the fact that the successor arrives after the lease. The repeat recorded successor commits at 2373 ms in the trigger and 1917 ms in the control, so the bound moved by a few hundred milliseconds between runs without changing the order of events.",
+        "The demotions completed before the partition in the single-non-voter case, where the demoted member's own view was read back and had converged in 5 ms; in the five-member receipts the members' views of the new configuration were not read back before the transport was cut.",
+        "The stale-read case covers one partition shape and one partition timing, applied after the leader has committed and settled. A partition that begins while a verification is already in flight, or a leader whose lease contact comes from a voter that is about to be deposed, was not exercised."
+      ],
+      "joint_history": "Receipt e49121154f514e39b6c1a37a2c353a4a is the successor of 533b966489544f45b4fcf14f6edce57f-experiment under this question: identical cases, admissions and first-verification assertions, with an added repeat loop. The two receipts agree on the decisive outcomes (trigger succeeds, control fails), so they describe the same subject; the successor adds the exposure measurement the earlier receipt lacked. Receipt 13b7844febba4a6d80c7331818c943f6 is a clean-copy repeat of the successor with the same saved inputs; it adds reproducibility of the window measurement and introduces no different basis. Receipt 27d9e2e68fcf4e15b00b170ef9593714 comes from a separate experiment identifier, 2fd5794c550141f7889f1530295d1294-experiment, built to test the consequence the account had left inferred. It uses the same three-voter two-non-voter suffrage, the same bidirectional in-memory partition and the same one-second lease, but constructs the nodes directly so that applied values can be read, staggers the voters' election timeouts so the majority does not split its vote, and adds a second verification after a successor has committed. Receipt c211ca53de834d06a9b84e80fc18f1b7 comes from yet another identifier, f022aa8bf09f46fdb75241ad9ae583c8-experiment, which keeps the same demote-cut-verify sequence and the same two-second bound but reduces the cluster to four members so that exactly one non-voter remains; it also reads the demoted member's own configuration before cutting the routes. It intervenes on the same mechanism under the same question, and its pair of outcomes matches the five-member receipts, so the two shapes can be read together. Receipt fb14e70f60a3456eae7774eb6e005e69 is a repeat execution of 2fd5794c550141f7889f1530295d1294-experiment from its retained inputs, so it shares the case names, admissions and assertions of receipt 27d9e2e68fcf4e15b00b170ef9593714 and differs only in scheduler timing.",
+      "knowledge": [
+        {
+          "entry_id": "533b966489544f45b4fcf14f6edce57f-knowledge-0",
+          "revision": 5,
+          "assertion": "VerifyLeader sizes a voter quorum but registers the verification on every replication stream, including non-voters, whose acks increment its vote count."
+        },
+        {
+          "entry_id": "533b966489544f45b4fcf14f6edce57f-knowledge-1",
+          "revision": 5,
+          "assertion": "checkLeaderLease counts only voters, unlike VerifyLeader."
+        }
+      ]
+    }
+  ]
+}

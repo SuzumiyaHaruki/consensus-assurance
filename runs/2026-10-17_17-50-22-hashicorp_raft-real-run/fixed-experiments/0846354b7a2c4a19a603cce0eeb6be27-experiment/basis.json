@@ -1,0 +1,131 @@
+{
+  "id": "0846354b7a2c4a19a603cce0eeb6be27-experiment",
+  "investigation_id": "6491640ed49a4c7b8f5150438d350e36-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * Three real nodes over in-memory transports. A and B are bootstrapped as the\n//     committed voter set; C runs with no configuration and is reachable.\n//   * The leader's log store fails exactly the write that would carry AddVoter(C),\n//     so the in-memory latest configuration grows to include C while the stored\n//     log never receives that entry.\n//   * The leader is cut from the other committed voter but stays reachable to C,\n//     applies a command with the phantom quorum, and is then shut down.\n//   * A fresh Raft is started over the same stores and transport, and the probe\n//     records the configuration it loads and whether the stored log contains the\n//     entry that was committed under the phantom configuration.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc prEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\ntype prFailStore struct {\n\t*InmemStore\n\tmu       sync.Mutex\n\tfailNext bool\n}\n\nfunc newPrFailStore() *prFailStore { return &prFailStore{InmemStore: NewInmemStore()} }\n\nfunc (f *prFailStore) StoreLogs(logs []*Log) error {\n\tf.mu.Lock()\n\tfail := f.failNext\n\tf.failNext = false\n\tf.mu.Unlock()\n\tif fail {\n\t\treturn fmt.Errorf(\"injected store failure\")\n\t}\n\treturn f.InmemStore.StoreLogs(logs)\n}\n\ntype prFSM struct{ applied int }\n\nfunc (f *prFSM) Apply(*Log) interface{}         { f.applied++; return nil }\nfunc (f *prFSM) Snapshot() (FSMSnapshot, error) { return &prSnap{}, nil }\nfunc (f *prFSM) Restore(io.ReadCloser) error    { f.applied = 0; return nil }\n\ntype prSnap struct{}\n\nfunc (s *prSnap) Persist(SnapshotSink) error { return nil }\nfunc (s *prSnap) Release()                   {}\n\nfunc TestAssurancePhantomConfigRestart(t *testing.T) {\n\tbase := inmemConfig(t)\n\tbase.HeartbeatTimeout = 300 * time.Millisecond\n\tbase.ElectionTimeout = 300 * time.Millisecond\n\tbase.LeaderLeaseTimeout = 300 * time.Millisecond\n\n\taddrA, transA := NewInmemTransport(\"A\")\n\taddrB, transB := NewInmemTransport(\"B\")\n\taddrC, transC := NewInmemTransport(\"C\")\n\ttransA.Connect(addrB, transB)\n\ttransA.Connect(addrC, transC)\n\ttransB.Connect(addrA, transA)\n\ttransB.Connect(addrC, transC)\n\ttransC.Connect(addrA, transA)\n\ttransC.Connect(addrB, transB)\n\n\tstoreA, storeB := newPrFailStore(), newPrFailStore()\n\tstoreC := NewInmemStore()\n\tsnapsA, snapsB, snapsC := NewInmemSnapshotStore(), NewInmemSnapshotStore(), NewInmemSnapshotStore()\n\tcommitted := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: addrA},\n\t\t{Suffrage: Voter, ID: \"B\", Address: addrB},\n\t}}\n\n\tconfA := *base\n\tconfA.LocalID = \"A\"\n\tconfB := *base\n\tconfB.LocalID = \"B\"\n\tconfC := *base\n\tconfC.LocalID = \"C\"\n\tif err := BootstrapCluster(&confA, storeA, storeA, snapsA, transA, committed); err != nil {\n\t\tt.Fatalf(\"bootstrap A: %v\", err)\n\t}\n\tif err := BootstrapCluster(&confB, storeB, storeB, snapsB, transB, committed); err != nil {\n\t\tt.Fatalf(\"bootstrap B: %v\", err)\n\t}\n\n\trA, err := NewRaft(&confA, &prFSM{}, storeA, storeA, snapsA, transA)\n\tif err != nil {\n\t\tt.Fatalf(\"raft A: %v\", err)\n\t}\n\trB, err := NewRaft(&confB, &prFSM{}, storeB, storeB, snapsB, transB)\n\tif err != nil {\n\t\t_ = rA.Shutdown().Error()\n\t\tt.Fatalf(\"raft B: %v\", err)\n\t}\n\tdefer func() { _ = rB.Shutdown().Error() }()\n\trC, err := NewRaft(&confC, &prFSM{}, storeC, storeC, snapsC, transC)\n\tif err != nil {\n\t\t_ = rA.Shutdown().Error()\n\t\tt.Fatalf(\"raft C: %v\", err)\n\t}\n\tdefer func() { _ = rC.Shutdown().Error() }()\n\n\tdeadline := time.Now().Add(10 * time.Second)\n\tfor rA.Leader() == \"\" && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif rA.Leader() == \"\" {\n\t\tt.Fatalf(\"no leader formed in the two-voter committed configuration\")\n\t}\n\n\trL, rP := rA, rB\n\tstL := storeA\n\tconfL := &confA\n\tsnapsL := snapsA\n\ttransL, transP := transA, transB\n\taddrL, addrP := addrA, addrB\n\tif rA.Leader() == \"B\" {\n\t\trL, rP = rB, rA\n\t\tstL = storeB\n\t\tconfL = &confB\n\t\tsnapsL = snapsB\n\t\ttransL, transP = transB, transA\n\t\taddrL, addrP = addrB, addrA\n\t}\n\t_ = rP\n\n\tstL.mu.Lock()\n\tstL.failNext = true\n\tstL.mu.Unlock()\n\terrAdd := rL.AddVoter(\"C\", addrC, 0, 5*time.Second).Error()\n\tlastLogL, _ := stL.LastIndex()\n\tlatestIndex := rL.configurations.latestIndex\n\tlatestServers := rL.getLatestConfiguration().Servers\n\n\ttransL.Disconnect(addrP)\n\ttransP.Disconnect(addrL)\n\tdeadline = time.Now().Add(10 * time.Second)\n\tfor rL.State() != Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tapplyErr := rL.Apply([]byte(\"phantom-restart\"), 3*time.Second).Error()\n\tcommitL := rL.CommitIndex()\n\tlastL, _ := stL.LastIndex()\n\tlastP, _ := storeB.LastIndex()\n\tif rL.localID == \"B\" {\n\t\tlastP, _ = storeA.LastIndex()\n\t}\n\tprEmit(t, map[string]interface{}{\n\t\t\"event\":                     \"pr_case_phantom_commit\",\n\t\t\"case\":                      \"phantom_commit\",\n\t\t\"add_failed\":                errAdd != nil,\n\t\t\"latest_index_after_fail\":   latestIndex,\n\t\t\"last_log_index_after_fail\": lastLogL,\n\t\t\"phantom_voters\":            len(latestServers),\n\t\t\"apply_ok\":                  applyErr == nil,\n\t\t\"commit_index\":              commitL,\n\t\t\"leader_last_index\":         lastL,\n\t\t\"committed_peer_last_index\": lastP,\n\t\t\"committed_peer_has_entry\":  lastP >= commitL,\n\t})\n\n\tif err := rL.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown leader: %v\", err)\n\t}\n\n\trestarted, err := NewRaft(confL, &prFSM{}, stL, stL, snapsL, transL)\n\tif err != nil {\n\t\tt.Fatalf(\"restart leader raft: %v\", err)\n\t}\n\tdefer func() { _ = restarted.Shutdown().Error() }()\n\tvar loaded Configuration\n\tcfgErr := restarted.GetConfiguration().Error()\n\tif cfgErr == nil {\n\t\tloaded = restarted.GetConfiguration().Configuration()\n\t}\n\tloadedIDs := []string{}\n\tloadedHasC := false\n\tloadedVoters := 0\n\tfor _, srv := range loaded.Servers {\n\t\tloadedIDs = append(loadedIDs, string(srv.ID))\n\t\tif srv.ID == \"C\" {\n\t\t\tloadedHasC = true\n\t\t}\n\t\tif srv.Suffrage == Voter {\n\t\t\tloadedVoters++\n\t\t}\n\t}\n\trestartLast, _ := stL.LastIndex()\n\trestartCommit := uint64(0)\n\tprEmit(t, map[string]interface{}{\n\t\t\"event\":                          \"pr_result_phantom_restart\",\n\t\t\"case\":                           \"phantom_restart\",\n\t\t\"config_error\":                   fmt.Sprintf(\"%v\", cfgErr),\n\t\t\"restarted_servers\":              fmt.Sprintf(\"%v\", loadedIDs),\n\t\t\"restarted_has_new_server\":       loadedHasC,\n\t\t\"restarted_voters\":               loadedVoters,\n\t\t\"restart_last_log_index\":         restartLast,\n\t\t\"restart_commit_index\":           restartCommit,\n\t\t\"phantom_commit_index\":           commitL,\n\t\t\"stored_log_has_committed_entry\": restartLast >= commitL,\n\t\t\"phantom_survived_restart\":       loadedHasC,\n\t})\n\tt.Logf(\"add_failed=%v applyErr=%v commit=%d lastL=%d lastP=%d restartLast=%d hasC=%v servers=%v\",\n\t\terrAdd != nil, applyErr, commitL, lastL, lastP, restartLast, loadedHasC, loadedIDs)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssurancePhantomConfigRestart"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_phantom_commit",
+          "event": "pr_case_phantom_commit",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "phantom_commit",
+              "reference": null
+            },
+            {
+              "field": "add_failed",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "phantom_voters",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "apply_ok",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "raft_append_config",
+      "cfg_next_configuration",
+      "raft_setup_leader_state"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One three-node in-memory cluster in which A and B are the committed voters and C has no configuration; the leader injects a store failure on the AddVoter(C) write, loses contact with the other committed voter, commits a client command with the phantom quorum, is shut down, and is replaced by a fresh Raft over the same stores.",
+      "assumptions": [
+        "The failure is injected for exactly the next StoreLogs call, so only the configuration entry is lost.",
+        "C stays reachable while the other committed voter is cut, which is what allows the phantom quorum of two to be satisfied.",
+        "The restart uses the leader's own store, snapshot store, transport and configuration, so it re-reads exactly what that node persisted.",
+        "The commit index is read from the restarted node's store only as an observation; the store used here does not persist a commit index."
+      ],
+      "excluded": [
+        "No variation of the number of restarts or of the cluster size.",
+        "No assertion about what happens if the retained entry is later replicated to the committed peer; that path is not exercised here.",
+        "No snapshot is taken before the restart, so the replay is over the full stored log."
+      ],
+      "parameters": {
+        "members": 3,
+        "committed_voters": 2,
+        "phantom_voters": 3,
+        "apply_timeout_ms": 3000,
+        "leader_wait_ms": 10000
+      }
+    },
+    "prefix": "The harness bootstraps A and B with the two-voter configuration, starts C with no configuration, waits for a leader among A and B, marks the leader's store to fail the next StoreLogs call, and calls AddVoter(C). It then disconnects the leader from the other committed voter, waits for the leader to remain leader, applies one command and records the commit index together with the committed peer's last index. A case event records the add error, the latest configuration index, the last stored index, the phantom voter count and the apply result. The leader is shut down, a fresh Raft is created over the same store, snapshot store and transport, and a result event records the configuration error, the loaded server list and voter count, whether the new server is present, the last stored index and the stored commit index.",
+    "requirement": null,
+    "responsibility": "The library decides whether a configuration entry is installed in memory and what it reports to the caller, and it also decides which configuration a node adopts when it starts. A configuration whose write failed was never given a place in the log, so a restart must reconstruct authority from the log alone; a node that kept the phantom configuration across a restart would be treating an unwritten record as durable.",
+    "comparisons": [
+      {
+        "event": "pr_result_phantom_restart",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_phantom_commit",
+        "assertion": {
+          "field": "restarted_has_new_server",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A configuration entry whose write failed was never stored, so the restarted node must not load it; a true witness would make the defect durable rather than process-local."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "6491640ed49a4c7b8f5150438d350e36-knowledge-0",
+        "revision": 5,
+        "assertion": "appendConfigurationEntry installs the latest configuration at the attempted index whether or not the entry was stored, and dispatchLogs answers the futures with the store error and steps the node down."
+      },
+      {
+        "entry_id": "6491640ed49a4c7b8f5150438d350e36-knowledge-1",
+        "revision": 5,
+        "assertion": "quorumSize, electSelf and setupLeaderState derive their voter set from the latest configuration, so an unstored configuration governs elections and commitment."
+      }
+    ]
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "0846354b7a2c4a19a603cce0eeb6be27",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

@@ -1,0 +1,290 @@
+package raft
+
+// Construction notes:
+//   * NewRaft() with RestoreCommittedLogs enabled replays committed log entries
+//     by pushing commitTuple batches into r.fsmMutateCh, which is only drained
+//     by runFSM. runFSM is started after NewRaft returns, so a replay that
+//     produces more batches than the channel capacity cannot make progress.
+//   * Cases below measure that boundary with (a) a log store seeded exactly at
+//     and one entry past the boundary and (b) a real single-node cluster that
+//     committed commands through the normal leader/commit/apply path before
+//     shutdown, with and without a snapshot bounding the replay.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	hclog "github.com/hashicorp/go-hclog"
+)
+
+const (
+	// Values taken from DefaultConfig(); records them in every case event so the
+	// boundary arithmetic is inspectable.
+	caMaxAppendEntries = 64
+	caFSMBatchCapacity = 128
+	caCommands         = 8300
+)
+
+type assuranceFSM struct {
+	mu      sync.Mutex
+	applied int
+}
+
+func (f *assuranceFSM) Apply(*Log) interface{} {
+	f.mu.Lock()
+	f.applied++
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *assuranceFSM) Snapshot() (FSMSnapshot, error) { return &assuranceSnapshot{}, nil }
+
+func (f *assuranceFSM) Restore(io.ReadCloser) error {
+	f.mu.Lock()
+	f.applied = 0
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *assuranceFSM) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.applied
+}
+
+type assuranceSnapshot struct{}
+
+func (s *assuranceSnapshot) Persist(SnapshotSink) error { return nil }
+func (s *assuranceSnapshot) Release()                  {}
+
+func caEmit(t *testing.T, payload map[string]interface{}) {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	// Direct stdout keeps every event in one stream; t.Log is only surfaced for
+	// failing tests under go test -json without -v.
+	fmt.Println("CA_EVENT " + string(data))
+}
+
+func caConfig(id string) *Config {
+	conf := DefaultConfig()
+	conf.LocalID = ServerID(id)
+	conf.Logger = hclog.NewNullLogger()
+	conf.LogLevel = "ERROR"
+	conf.HeartbeatTimeout = 50 * time.Millisecond
+	conf.ElectionTimeout = 50 * time.Millisecond
+	conf.LeaderLeaseTimeout = 50 * time.Millisecond
+	conf.CommitTimeout = 5 * time.Millisecond
+	// Required in the producing run as well: the commit index is only staged in
+	// the log store while this option is enabled.
+	conf.RestoreCommittedLogs = true
+	return conf
+}
+
+func caStackMatches() (processLogs int, restoreCommitted int) {
+	buf := make([]byte, 1<<22)
+	n := runtime.Stack(buf, true)
+	text := string(buf[:n])
+	return strings.Count(text, "(*Raft).processLogs("), strings.Count(text, "(*Raft).restoreFromCommittedLogs(")
+}
+
+type caStartResult struct {
+	returned             bool
+	elapsed              time.Duration
+	err                  string
+	fsmApplied           int
+	newBlockedProcess    int
+	newBlockedRestoreLog int
+}
+
+// caStartup calls NewRaft in a separate goroutine and bounds the wait. A caller
+// that observes no return cannot call Shutdown: NewRaft has not handed back the
+// *Raft, which is the only owner of shutdownCh.
+func caStartup(conf *Config, fsm *assuranceFSM, store *InmemCommitTrackingStore,
+	snaps SnapshotStore, addr ServerAddress, timeout time.Duration) caStartResult {
+	baseLogs, baseRestore := caStackMatches()
+	_, trans := NewInmemTransport(addr)
+	done := make(chan error, 1)
+	var raft *Raft
+	start := time.Now()
+	go func() {
+		var err error
+		raft, err = NewRaft(conf, fsm, store, store, snaps, trans)
+		done <- err
+	}()
+	var result caStartResult
+	select {
+	case err := <-done:
+		result.returned = true
+		result.elapsed = time.Since(start)
+		if err != nil {
+			result.err = err.Error()
+		} else {
+			defer func() { _ = raft.Shutdown().Error() }()
+		}
+	case <-time.After(timeout):
+		result.elapsed = time.Since(start)
+		result.err = "no return within observation window"
+	}
+	result.fsmApplied = fsm.count()
+	logs, restore := caStackMatches()
+	result.newBlockedProcess = logs - baseLogs
+	result.newBlockedRestoreLog = restore - baseRestore
+	return result
+}
+
+func caEmitCase(t *testing.T, name, mode string, timeout time.Duration,
+	entries, stagedCommit, lastLog, snapshotIndex uint64) {
+	replay := uint64(0)
+	if stagedCommit > snapshotIndex {
+		replay = stagedCommit - snapshotIndex
+	}
+	caEmit(t, map[string]interface{}{
+		"event":                  "startup_case_" + name,
+		"case":                   name,
+		"mode":                   mode,
+		"restore_committed_logs": true,
+		"max_append_entries":     caMaxAppendEntries,
+		"fsm_batch_capacity":     caFSMBatchCapacity,
+		"entries":                entries,
+		"staged_commit_index":    stagedCommit,
+		"last_log_index":         lastLog,
+		"snapshot_index":         snapshotIndex,
+		"replay_entries":         replay,
+		"replay_batches":         (replay + caMaxAppendEntries - 1) / caMaxAppendEntries,
+		"timeout_ms":             int(timeout / time.Millisecond),
+	})
+}
+
+func caEmitResult(t *testing.T, name string, res caStartResult) {
+	caEmit(t, map[string]interface{}{
+		"event":                            "startup_result_" + name,
+		"case":                             name,
+		"returned":                         res.returned,
+		"elapsed_ms":                       int(res.elapsed / time.Millisecond),
+		"error":                            res.err,
+		"fsm_applied_sampled":              res.fsmApplied,
+		"new_goroutines_in_process_logs":   res.newBlockedProcess,
+		"new_goroutines_in_restore_replay": res.newBlockedRestoreLog,
+	})
+}
+
+func caSeededCase(t *testing.T, name string, entries uint64, timeout time.Duration) {
+	store := NewInmemCommitTrackingStore()
+	logs := make([]*Log, 0, entries)
+	for i := uint64(1); i <= entries; i++ {
+		logs = append(logs, &Log{Index: i, Term: 1, Type: LogCommand, Data: []byte("x")})
+	}
+	if err := store.StoreLogs(logs); err != nil {
+		t.Fatalf("seed logs: %v", err)
+	}
+	if err := store.StageCommitIndex(entries); err != nil {
+		t.Fatalf("stage commit index: %v", err)
+	}
+	lastLog, err := store.LastIndex()
+	if err != nil {
+		t.Fatalf("last index: %v", err)
+	}
+	caEmitCase(t, name, "seeded_commit_tracking_store", timeout, entries, entries, lastLog, 0)
+	conf := caConfig("node1")
+	res := caStartup(conf, &assuranceFSM{}, store, NewInmemSnapshotStore(), "node1", timeout)
+	caEmitResult(t, name, res)
+}
+
+type caPrefix struct {
+	store         *InmemCommitTrackingStore
+	snaps         *InmemSnapshotStore
+	stagedCommit  uint64
+	lastLog       uint64
+	snapshotIndex uint64
+}
+
+// caRealPrefix produces committed entries through a real single-node cluster and
+// shuts it down, returning the retained stores.
+func caRealPrefix(t *testing.T, commands int, takeSnapshot bool) caPrefix {
+	store := NewInmemCommitTrackingStore()
+	snaps := NewInmemSnapshotStore()
+	conf := caConfig("node1")
+	_, trans := NewInmemTransport("node1")
+	configuration := Configuration{Servers: []Server{{Suffrage: Voter, ID: "node1", Address: trans.LocalAddr()}}}
+	if err := BootstrapCluster(conf, store, store, snaps, trans, configuration); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	r, err := NewRaft(conf, &assuranceFSM{}, store, store, snaps, trans)
+	if err != nil {
+		t.Fatalf("create producing raft: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for r.Leader() == "" && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if r.Leader() == "" {
+		t.Fatalf("producing raft did not elect a leader")
+	}
+	var last ApplyFuture
+	for i := 0; i < commands; i++ {
+		last = r.Apply([]byte("x"), 5*time.Second)
+	}
+	if err := last.Error(); err != nil {
+		t.Fatalf("apply through leader: %v", err)
+	}
+	if takeSnapshot {
+		if err := r.Snapshot().Error(); err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+	}
+	snapshotIndex := uint64(0)
+	listed, err := snaps.List()
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	if len(listed) > 0 {
+		snapshotIndex = listed[0].Index
+	}
+	if err := r.Shutdown().Error(); err != nil {
+		t.Fatalf("shutdown producing raft: %v", err)
+	}
+	staged, err := store.GetCommitIndex()
+	if err != nil {
+		t.Fatalf("read staged commit index: %v", err)
+	}
+	lastLog, err := store.LastIndex()
+	if err != nil {
+		t.Fatalf("read last log index: %v", err)
+	}
+	return caPrefix{store: store, snaps: snaps, stagedCommit: staged, lastLog: lastLog, snapshotIndex: snapshotIndex}
+}
+
+func TestAssuranceRestoreCommittedLogsStartupReplay(t *testing.T) {
+	// Controls run first so each trigger case reports newly blocked goroutines.
+	t.Run("control_128_batches", func(t *testing.T) {
+		caSeededCase(t, "control_128_batches", 8192, 20*time.Second)
+	})
+	t.Run("control_real_prefix_with_snapshot", func(t *testing.T) {
+		prefix := caRealPrefix(t, caCommands, true)
+		caEmitCase(t, "control_real_prefix_with_snapshot", "real_cluster_restart", 20*time.Second,
+			caCommands, prefix.stagedCommit, prefix.lastLog, prefix.snapshotIndex)
+		conf := caConfig("node1")
+		res := caStartup(conf, &assuranceFSM{}, prefix.store, prefix.snaps, "node1", 20*time.Second)
+		caEmitResult(t, "control_real_prefix_with_snapshot", res)
+	})
+	t.Run("trigger_129_batches", func(t *testing.T) {
+		caSeededCase(t, "trigger_129_batches", 8193, 5*time.Second)
+	})
+	t.Run("trigger_real_prefix_no_snapshot", func(t *testing.T) {
+		prefix := caRealPrefix(t, caCommands, false)
+		caEmitCase(t, "trigger_real_prefix_no_snapshot", "real_cluster_restart", 5*time.Second,
+			caCommands, prefix.stagedCommit, prefix.lastLog, prefix.snapshotIndex)
+		conf := caConfig("node1")
+		res := caStartup(conf, &assuranceFSM{}, prefix.store, prefix.snaps, "node1", 5*time.Second)
+		caEmitResult(t, "trigger_real_prefix_no_snapshot", res)
+	})
+}

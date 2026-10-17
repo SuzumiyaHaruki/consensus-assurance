@@ -1,0 +1,165 @@
+{
+  "rationale": "The VerifyLeader account currently stops at the verification result: it shows success with one of three voters reachable, and its limitations say the end-to-end consequence was never aligned. This experiment measures the consequence. Five real nodes run as three voters and two non-voters with a recording state machine; the leader commits v1, is partitioned from the other two voters, and keeps the non-voters reachable. Immediately after the partition the leader is asked to verify itself, then the two remaining voters elect a new leader and commit v2, and the old leader is asked to verify again and its state machine is read. If verification can still succeed after the majority has moved on, a caller that verifies before a local read would serve stale data; if the lease ends the old leadership before a successor exists, the defect is a false health signal confined to that window. A local probe produced the second outcome: verification succeeded in 0 ms, the new leader was elected and committed v2 after about 2 s, and by then the old leader had stepped down and verification failed with 'node is not the leader'. The control, which also cuts the non-voters, failed verification at lease expiry with none of the trigger's success. The formal run is requested so the bound rests on a retained receipt.",
+  "experiment": {
+    "investigation_id": "533b966489544f45b4fcf14f6edce57f-question-0",
+    "harness_path": "exp_verify_stale_read_test.go",
+    "source_ids": [
+      "raft_verify_leader",
+      "future_verify_vote",
+      "raft_leader_lease",
+      "raft_quorum_size2",
+      "raft_start_stop_repl",
+      "membership_doc_nonvoter"
+    ],
+    "test_names": [
+      "TestAssuranceVerifyStaleRead"
+    ],
+    "scope": {
+      "description": "Five real nodes over fully connected in-memory transports, bootstrapped from one configuration containing voters A, B and C and non-voters D and E. All nodes share a one-second heartbeat and leader lease; the voters' election timeouts are staggered (A 1.1 s, B 2 s, C and the non-voters 3 s) so that after a partition the two remaining voters do not campaign in lockstep and split the vote. The leader commits 'v1' through a recording FSM, is then disconnected from the other two voters in both directions, and keeps the non-voters reachable in the trigger and loses them in the control. Immediately after the cut the old leader is asked to verify itself; then the harness waits up to twelve seconds for one of the other voters to lead, applies 'v2' there, and asks the old leader to verify itself again before reading its state machine.",
+      "assumptions": [
+        "A caller that verifies the leader before answering a read is the harm model: the experiment measures whether the verification can succeed after the cluster has a different leader.",
+        "The injected partition is a bidirectional route removal on the in-memory transports; both sides keep running.",
+        "The old leader's lease, not the harness, decides when it stops being leader; the harness only records how that timing compares with the election of a successor.",
+        "Both FSM values are read after the successor has applied 'v2', so a value difference means the two state machines disagreed at that moment."
+      ],
+      "excluded": [
+        "No restart, no snapshot and no client read protocol; the read is the FSM value a caller would have served.",
+        "No asymmetric or intermittent partition, and no disk-backed store.",
+        "No write attempt on the old leader: earlier work established that a commit needs a voter quorum even when verification counts non-voter acknowledgements."
+      ],
+      "parameters": {
+        "members": 5,
+        "voters": 3,
+        "nonvoters": 2,
+        "heartbeat_ms": 1000,
+        "lease_ms": 1000,
+        "election_timeouts_ms": "1100/2000/3000",
+        "cases": 2
+      }
+    },
+    "prefix": "The harness creates five in-memory transports and connects every pair in both directions, bootstraps the same configuration (voters A, B, C; non-voters D, E) on all five stores, and starts five rafts each with its own recording FSM. It waits up to ten seconds for a leader, applies 'v1' with a three-second timeout, and sleeps 300 ms so the value is applied everywhere. It then disconnects the leader's transport from the other voters' addresses and theirs from the leader's, and in the control case does the same for the non-voters. It emits sr_case_<case> with the leader identity, the reachable voter and non-voter counts, the initial value and the leader's FSM value, records the cut time, calls VerifyLeader with a two-second bound and records whether it completed, whether it succeeded, its error and the milliseconds since the cut. It waits up to twelve seconds for a voter other than the old leader to report Leader, applies 'v2' there with a three-second timeout, sleeps 300 ms, and records the successor's identity, apply result, FSM value and the milliseconds since the cut. It then calls VerifyLeader on the old leader again with a two-second bound and reads the old leader's FSM value before healing the partition. It emits sr_result_<case> with all of those fields plus stale_verified_read, which is true only when the post-failover verification succeeded and the old leader's value differs from the successor's committed value.",
+    "requirement": null,
+    "responsibility": "VerifyLeader is the licence a caller uses before serving a local read: success tells the caller this node is still the leader that a fresh read requires. If that licence can be issued while fewer voters than the voter quorum can answer, the licence is issued on support the configuration does not count, and the caller's read is only as fresh as the moment the real quorum moved on. The experiment measures whether that window exists in practice and how it compares with the time a successor needs.",
+    "semantic_changes": [
+      "The cluster keeps the same five members and suffrage as the earlier verify harness but is built directly from in-memory transports and a recording FSM rather than the cluster helper, so applied values can be read.",
+      "The harness adds a second verification after a successor has committed a different value, and records the elapsed time from the partition to each event.",
+      "The events report the old leader's and the successor's FSM values rather than only the verification outcome."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit_trigger",
+        "event": "sr_case_trigger_nonvoters_connected",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "trigger_nonvoters_connected",
+            "reference": null
+          },
+          {
+            "field": "voters_reachable",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "nonvoters_reachable",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admit_control",
+        "event": "sr_case_control_all_cut",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "control_all_cut",
+            "reference": null
+          },
+          {
+            "field": "voters_reachable",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "nonvoters_reachable",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "sr_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "verify_after_partition_ok",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Trigger: with one of three voters reachable and both non-voters reachable, the leader is expected to report a successful verification."
+      },
+      {
+        "event": "sr_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "verify_after_failover_ok",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Once a successor has committed a different value, the old leader should no longer be able to verify itself, which is the bound this experiment measures."
+      },
+      {
+        "event": "sr_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "stale_verified_read",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A verified read served by the old leader after the successor's commit would be stale data; the harness records whether that combination occurred."
+      },
+      {
+        "event": "sr_result_control_all_cut",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_control",
+        "assertion": {
+          "field": "verify_after_partition_ok",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: with the non-voters unreachable as well, the leader has no possible supporter and must not report a successful verification."
+      }
+    ]
+  }
+}

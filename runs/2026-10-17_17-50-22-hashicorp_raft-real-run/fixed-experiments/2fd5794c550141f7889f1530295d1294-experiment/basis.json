@@ -1,0 +1,195 @@
+{
+  "id": "2fd5794c550141f7889f1530295d1294-experiment",
+  "investigation_id": "533b966489544f45b4fcf14f6edce57f-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * Five real nodes over in-memory transports: voters A, B, C and non-voters\n//     D, E, all bootstrapped with the same configuration and a recording FSM.\n//   * The leader writes \"v1\" and every node applies it. The leader is then\n//     partitioned from the two other voters and keeps only the non-voters\n//     reachable, so the committed voter quorum cannot answer it.\n//   * Immediately after the partition the old leader is asked to verify itself,\n//     which is the check a caller performs before serving a read. The trigger\n//     keeps the non-voters reachable; the control also cuts them, leaving the old\n//     leader with no possible supporter.\n//   * The two remaining voters then elect a new leader and commit \"v2\". Once that\n//     has happened the old leader is asked to verify itself again and its state\n//     machine is read.\n//   * The decisive observation is whether verification can still succeed after\n//     the majority has moved on, which is what a stale verified read needs.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc srEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\ntype srFSM struct {\n\tmu   sync.Mutex\n\tvals []string\n}\n\nfunc (f *srFSM) Apply(l *Log) interface{} {\n\tf.mu.Lock()\n\tf.vals = append(f.vals, string(l.Data))\n\tf.mu.Unlock()\n\treturn nil\n}\n\nfunc (f *srFSM) last() string {\n\tf.mu.Lock()\n\tdefer f.mu.Unlock()\n\tif len(f.vals) == 0 {\n\t\treturn \"\"\n\t}\n\treturn f.vals[len(f.vals)-1]\n}\n\nfunc (f *srFSM) Snapshot() (FSMSnapshot, error) { return &srSnap{}, nil }\nfunc (f *srFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype srSnap struct{}\n\nfunc (s *srSnap) Persist(SnapshotSink) error { return nil }\nfunc (s *srSnap) Release()                   {}\n\nfunc srWaitLeader(t *testing.T, nodes []*Raft, want *Raft, timeout time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(timeout)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range nodes {\n\t\t\tif r == want {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif st := r.State(); st == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\treturn nil\n}\n\nfunc srVerify(r *Raft, timeout time.Duration) (bool, string, bool) {\n\tdone := make(chan error, 1)\n\tgo func() { done <- r.VerifyLeader().Error() }()\n\tselect {\n\tcase err := <-done:\n\t\tif err != nil {\n\t\t\treturn false, err.Error(), true\n\t\t}\n\t\treturn true, \"\", true\n\tcase <-time.After(timeout):\n\t\treturn false, \"no completion\", false\n\t}\n}\n\nfunc srRun(t *testing.T, caseName string, cutNonvoters bool) {\n\tbase := inmemConfig(t)\n\t// The lease may not exceed the heartbeat timeout. All members share a\n\t// one-second heartbeat and lease; the voters' election timeouts are staggered\n\t// so that, whichever member leads, the two remaining voters do not campaign in\n\t// lockstep and split the vote after the partition.\n\tbase.HeartbeatTimeout = time.Second\n\tbase.LeaderLeaseTimeout = time.Second\n\telectionTimeouts := map[string]time.Duration{\n\t\t\"A\": 1100 * time.Millisecond,\n\t\t\"B\": 2 * time.Second,\n\t\t\"C\": 3 * time.Second,\n\t\t\"D\": 3 * time.Second,\n\t\t\"E\": 3 * time.Second,\n\t}\n\n\tids := []string{\"A\", \"B\", \"C\", \"D\", \"E\"}\n\taddrs := make(map[string]ServerAddress, len(ids))\n\ttrans := make(map[string]*InmemTransport, len(ids))\n\tfor _, id := range ids {\n\t\ta, tr := NewInmemTransport(ServerAddress(id))\n\t\taddrs[id] = a\n\t\ttrans[id] = tr\n\t}\n\tfor _, i := range ids {\n\t\tfor _, j := range ids {\n\t\t\tif i != j {\n\t\t\t\ttrans[i].Connect(addrs[j], trans[j])\n\t\t\t}\n\t\t}\n\t}\n\n\tservers := []Server{\n\t\t{Suffrage: Voter, ID: \"A\", Address: addrs[\"A\"]},\n\t\t{Suffrage: Voter, ID: \"B\", Address: addrs[\"B\"]},\n\t\t{Suffrage: Voter, ID: \"C\", Address: addrs[\"C\"]},\n\t\t{Suffrage: Nonvoter, ID: \"D\", Address: addrs[\"D\"]},\n\t\t{Suffrage: Nonvoter, ID: \"E\", Address: addrs[\"E\"]},\n\t}\n\tcfg := Configuration{Servers: servers}\n\n\tnodes := make(map[string]*Raft, len(ids))\n\tfsms := make(map[string]*srFSM, len(ids))\n\tstores := make(map[string]*InmemStore, len(ids))\n\tsnaps := make(map[string]*InmemSnapshotStore, len(ids))\n\tfor _, id := range ids {\n\t\tconf := *base\n\t\tconf.LocalID = ServerID(id)\n\t\tconf.ElectionTimeout = electionTimeouts[id]\n\t\tstore := NewInmemStore()\n\t\tsnap := NewInmemSnapshotStore()\n\t\tif err := BootstrapCluster(&conf, store, store, snap, trans[id], cfg); err != nil {\n\t\t\tt.Fatalf(\"bootstrap %s: %v\", id, err)\n\t\t}\n\t\tfsm := &srFSM{}\n\t\tr, err := NewRaft(&conf, fsm, store, store, snap, trans[id])\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"raft %s: %v\", id, err)\n\t\t}\n\t\tdefer func(r *Raft) { _ = r.Shutdown().Error() }(r)\n\t\tnodes[id] = r\n\t\tfsms[id] = fsm\n\t\tstores[id] = store\n\t\tsnaps[id] = snap\n\t}\n\n\tall := []*Raft{nodes[\"A\"], nodes[\"B\"], nodes[\"C\"], nodes[\"D\"], nodes[\"E\"]}\n\tleader := srWaitLeader(t, all, nil, 10*time.Second)\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader formed\")\n\t}\n\tleaderID := string(leader.localID)\n\n\tif err := leader.Apply([]byte(\"v1\"), 3*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"initial apply: %v\", err)\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\t// Partition the leader from the other two voters, and optionally from the\n\t// non-voters as well.\n\tleaderTrans := trans[leaderID]\n\tfor _, id := range ids {\n\t\tif id == leaderID {\n\t\t\tcontinue\n\t\t}\n\t\tisVoter := id == \"A\" || id == \"B\" || id == \"C\"\n\t\t// Always cut the other voters; in the control, cut the non-voters too.\n\t\tif isVoter || cutNonvoters {\n\t\t\tleaderTrans.Disconnect(addrs[id])\n\t\t\ttrans[id].Disconnect(addrs[leaderID])\n\t\t}\n\t}\n\n\tsrEmit(t, map[string]interface{}{\n\t\t\"event\":               \"sr_case_\" + caseName,\n\t\t\"case\":                caseName,\n\t\t\"members\":             5,\n\t\t\"voters\":              3,\n\t\t\"nonvoters\":           2,\n\t\t\"leader\":              leaderID,\n\t\t\"voters_reachable\":    1,\n\t\t\"nonvoters_reachable\": map[bool]int{true: 0, false: 2}[cutNonvoters],\n\t\t\"initial_value\":       \"v1\",\n\t\t\"leader_value\":        fsms[leaderID].last(),\n\t})\n\n\t// While the old leader still believes it leads: verify, then write.\n\tcutAt := time.Now()\n\tverifyOK, verifyErr, verifyCompleted := srVerify(leader, 2*time.Second)\n\tmsToVerify := int(time.Since(cutAt) / time.Millisecond)\n\n\t// The majority side elects a new leader and commits a different value.\n\tnewLeader := srWaitLeader(t, all, leader, 12*time.Second)\n\tnewLeaderID := \"\"\n\tnewApplyOK := false\n\tnewValue := \"\"\n\tif newLeader != nil {\n\t\tnewLeaderID = string(newLeader.localID)\n\t\tnewApplyOK = newLeader.Apply([]byte(\"v2\"), 3*time.Second).Error() == nil\n\t\ttime.Sleep(300 * time.Millisecond)\n\t\tnewValue = fsms[newLeaderID].last()\n\t}\n\tmsToNewLeader := -1\n\tif newLeaderID != \"\" {\n\t\tmsToNewLeader = int(time.Since(cutAt) / time.Millisecond)\n\t}\n\n\t// Can the old leader still verify itself now that the majority has a leader?\n\tverifyAfterOK, verifyAfterErr, _ := srVerify(leader, 2*time.Second)\n\toldValueBeforeHeal := fsms[leaderID].last()\n\n\t// Heal the partition and let the new leader's log reach the old one.\n\tfor _, id := range ids {\n\t\tif id == leaderID {\n\t\t\tcontinue\n\t\t}\n\t\tleaderTrans.Connect(addrs[id], trans[id])\n\t\ttrans[id].Connect(addrs[leaderID], leaderTrans)\n\t}\n\ttime.Sleep(1500 * time.Millisecond)\n\n\toldValue := fsms[leaderID].last()\n\tsrEmit(t, map[string]interface{}{\n\t\t\"event\":             \"sr_result_\" + caseName,\n\t\t\"case\":              caseName,\n\t\t\"old_leader\":        leaderID,\n\t\t\"old_leader_state\":  leader.State().String(),\n\t\t\"verify_completed\":  verifyCompleted,\n\t\t\"verify_after_partition_ok\": verifyOK,\n\t\t\"verify_error\":      verifyErr,\n\t\t\"ms_to_verify\":      msToVerify,\n\t\t\"new_leader\":        newLeaderID,\n\t\t\"new_apply_ok\":      newApplyOK,\n\t\t\"ms_to_new_leader\":  msToNewLeader,\n\t\t\"new_leader_value\":  newValue,\n\t\t\"verify_after_failover_ok\": verifyAfterOK,\n\t\t\"verify_after_failover_error\": verifyAfterErr,\n\t\t\"old_value_before_heal\": oldValueBeforeHeal,\n\t\t\"old_leader_value\":  oldValue,\n\t\t\"stale_verified_read\": verifyAfterOK && newValue != \"\" && oldValueBeforeHeal != newValue,\n\t})\n\tt.Logf(\"case=%v old=%v verifyBefore=%v ms=%d newLeader=%v msNew=%d verifyAfter=%v errAfter=%q oldBeforeHeal=%q newValue=%q\",\n\t\tcaseName, leaderID, verifyOK, msToVerify, newLeaderID, msToNewLeader, verifyAfterOK, verifyAfterErr, oldValueBeforeHeal, newValue)\n}\n\nfunc TestAssuranceVerifyStaleRead(t *testing.T) {\n\tt.Run(\"trigger_nonvoters_connected\", func(t *testing.T) {\n\t\tsrRun(t, \"trigger_nonvoters_connected\", false)\n\t})\n\tt.Run(\"control_all_cut\", func(t *testing.T) {\n\t\tsrRun(t, \"control_all_cut\", true)\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceVerifyStaleRead"
+      ],
+      "description": "",
+      "semantic_changes": [
+        "The cluster keeps the same five members and suffrage as the earlier verify harness but is built directly from in-memory transports and a recording FSM rather than the cluster helper, so applied values can be read.",
+        "The harness adds a second verification after a successor has committed a different value, and records the elapsed time from the partition to each event.",
+        "The events report the old leader's and the successor's FSM values rather than only the verification outcome."
+      ],
+      "prerequisites": [
+        {
+          "alias": "admit_trigger",
+          "event": "sr_case_trigger_nonvoters_connected",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "trigger_nonvoters_connected",
+              "reference": null
+            },
+            {
+              "field": "voters_reachable",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "nonvoters_reachable",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_control",
+          "event": "sr_case_control_all_cut",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_all_cut",
+              "reference": null
+            },
+            {
+              "field": "voters_reachable",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "nonvoters_reachable",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "raft_verify_leader",
+      "future_verify_vote",
+      "raft_leader_lease",
+      "raft_quorum_size2",
+      "raft_start_stop_repl",
+      "membership_doc_nonvoter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Five real nodes over fully connected in-memory transports, bootstrapped from one configuration containing voters A, B and C and non-voters D and E. All nodes share a one-second heartbeat and leader lease; the voters' election timeouts are staggered (A 1.1 s, B 2 s, C and the non-voters 3 s) so that after a partition the two remaining voters do not campaign in lockstep and split the vote. The leader commits 'v1' through a recording FSM, is then disconnected from the other two voters in both directions, and keeps the non-voters reachable in the trigger and loses them in the control. Immediately after the cut the old leader is asked to verify itself; then the harness waits up to twelve seconds for one of the other voters to lead, applies 'v2' there, and asks the old leader to verify itself again before reading its state machine.",
+      "assumptions": [
+        "A caller that verifies the leader before answering a read is the harm model: the experiment measures whether the verification can succeed after the cluster has a different leader.",
+        "The injected partition is a bidirectional route removal on the in-memory transports; both sides keep running.",
+        "The old leader's lease, not the harness, decides when it stops being leader; the harness only records how that timing compares with the election of a successor.",
+        "Both FSM values are read after the successor has applied 'v2', so a value difference means the two state machines disagreed at that moment."
+      ],
+      "excluded": [
+        "No restart, no snapshot and no client read protocol; the read is the FSM value a caller would have served.",
+        "No asymmetric or intermittent partition, and no disk-backed store.",
+        "No write attempt on the old leader: earlier work established that a commit needs a voter quorum even when verification counts non-voter acknowledgements."
+      ],
+      "parameters": {
+        "members": 5,
+        "voters": 3,
+        "nonvoters": 2,
+        "heartbeat_ms": 1000,
+        "lease_ms": 1000,
+        "election_timeouts_ms": "1100/2000/3000",
+        "cases": 2
+      }
+    },
+    "prefix": "The harness creates five in-memory transports and connects every pair in both directions, bootstraps the same configuration (voters A, B, C; non-voters D, E) on all five stores, and starts five rafts each with its own recording FSM. It waits up to ten seconds for a leader, applies 'v1' with a three-second timeout, and sleeps 300 ms so the value is applied everywhere. It then disconnects the leader's transport from the other voters' addresses and theirs from the leader's, and in the control case does the same for the non-voters. It emits sr_case_<case> with the leader identity, the reachable voter and non-voter counts, the initial value and the leader's FSM value, records the cut time, calls VerifyLeader with a two-second bound and records whether it completed, whether it succeeded, its error and the milliseconds since the cut. It waits up to twelve seconds for a voter other than the old leader to report Leader, applies 'v2' there with a three-second timeout, sleeps 300 ms, and records the successor's identity, apply result, FSM value and the milliseconds since the cut. It then calls VerifyLeader on the old leader again with a two-second bound and reads the old leader's FSM value before healing the partition. It emits sr_result_<case> with all of those fields plus stale_verified_read, which is true only when the post-failover verification succeeded and the old leader's value differs from the successor's committed value.",
+    "requirement": null,
+    "responsibility": "VerifyLeader is the licence a caller uses before serving a local read: success tells the caller this node is still the leader that a fresh read requires. If that licence can be issued while fewer voters than the voter quorum can answer, the licence is issued on support the configuration does not count, and the caller's read is only as fresh as the moment the real quorum moved on. The experiment measures whether that window exists in practice and how it compares with the time a successor needs.",
+    "comparisons": [
+      {
+        "event": "sr_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "verify_after_partition_ok",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Trigger: with one of three voters reachable and both non-voters reachable, the leader is expected to report a successful verification."
+      },
+      {
+        "event": "sr_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "verify_after_failover_ok",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Once a successor has committed a different value, the old leader should no longer be able to verify itself, which is the bound this experiment measures."
+      },
+      {
+        "event": "sr_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "stale_verified_read",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A verified read served by the old leader after the successor's commit would be stale data; the harness records whether that combination occurred."
+      },
+      {
+        "event": "sr_result_control_all_cut",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_control",
+        "assertion": {
+          "field": "verify_after_partition_ok",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: with the non-voters unreachable as well, the leader has no possible supporter and must not report a successful verification."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "2fd5794c550141f7889f1530295d1294",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

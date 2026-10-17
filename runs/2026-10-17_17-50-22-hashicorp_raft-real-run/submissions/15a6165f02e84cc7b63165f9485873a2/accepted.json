@@ -1,0 +1,96 @@
+{
+  "rationale": "Fold the frequency receipt into the heartbeat account: with no added store latency 200 attempts produced no inversion, while 0-2 ms write jitter produced 90 of 200. That replaces the earlier single-forced-sequence limitation and the counterevidence that framed the defect as merely reachable, and it characterises the trigger as store-write latency rather than a harness-forced order. The consequence receipt is retained as the separate witness for what follows a regression.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-1",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "appendEntries raises the receiving term by first testing a.Term against r.getCurrentTerm() and later calling setCurrentTerm(a.Term), which writes the stable store and then the atomic term without comparing against the value it read, so the decision and the write are not a single atomic compare-and-set; the same function later deletes a conflicting log suffix from the first index whose term differs and appends the request's entries. Because the leader's heartbeat request carries only a header, a term and a leader address, its concurrent execution skips the previous-log check, stores no entries and never advances the commit index, so the term and leader updates are its only state effects.",
+      "conditions": "Any appendEntries invocation, including one delivered concurrently through the heartbeat fast-path; the heartbeat case has PrevLogEntry 0, no entries and LeaderCommitIndex 0.",
+      "source_ids": [
+        "raft_append_term_handling",
+        "raft_set_current_term",
+        "raft_conflict_truncation",
+        "repl_heartbeat_request",
+        "raft_append_skip_paths"
+      ],
+      "executions": {
+        "cabc782e68fb4c98a4f82a9d4e62e07b": [
+          1,
+          3
+        ],
+        "14a6432138534293b361a796cd32bda8": [
+          1,
+          3
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "830b0f3ff5a14266b056ad4a6d0c877b-question-0",
+      "experiment_id": "837719d9805545fd8a3a484cb274338a-experiment",
+      "source_ids": [
+        "contract_heartbeat_handler",
+        "api_set_heartbeat_handler",
+        "raft_process_heartbeat",
+        "raft_append_term_handling",
+        "raft_conflict_truncation",
+        "raft_set_current_term",
+        "net_heartbeat_dispatch",
+        "repl_heartbeat_request",
+        "net_heartbeat_classify",
+        "net_heartbeat_direct_call"
+      ],
+      "executions": {
+        "cabc782e68fb4c98a4f82a9d4e62e07b": [
+          1,
+          3
+        ],
+        "14a6432138534293b361a796cd32bda8": [
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Conclusion: violated, and the scoped defect is asserted. A heartbeat executed on a goroutine other than the main RPC loop, as the fast-path contract permits, races the node's term update: when the stable-store write it performs takes long enough, the term it decided to persist can land after a higher term already persisted by the main thread, leaving the node below a term it had adopted. Once the term is below the current leader's term, the node stops rejecting an older leader's messages and replaces an entry it had already applied at the higher term with that leader's entry. Evidence. Consequence, receipt cabc782e68fb4c98a4f82a9d4e62e07b: parsed index 1 records after_newer_term=4, after_stale_term=3, persisted_term=3 and the write sequence [1 1 2 4 3] (term_decreased=true); parsed index 3 records the stale term-3 request being accepted (stale_request_accepted=true), the log at index 4 becoming \"stale4\" while the FSM still holds \"new4\", index 5 applied from the stale history as \"stale5\", and both applied and commit indexes at 5 (applied_entry_replaced=true). Frequency, receipt 14a6432138534293b361a796cd32bda8: with no added store latency, 200 concurrent attempts produced inversion_count=0 (parsed index 1, comparison holds), while the same 200 attempts with a uniform 0-2 ms delay added to every current-term write produced inversion_count=90 (parsed index 3, comparison violated). The two cases differ only in that delay, so the inversion is a store-write-latency-sensitive race rather than an artifact of a forced order. Mechanism from source: Transport documents the heartbeat handler as a fast-path (transport.go:58-64); NetworkTransport classifies an AppendEntries as a heartbeat exactly when the term is non-zero, a leader address is present, both previous-log fields are zero, no entries are carried and LeaderCommitIndex is zero - the shape the leader's heartbeat request builds (net_transport.go:660-690, replication.go:388-397) - and for that shape calls the registered handler directly on the connection-handler goroutine, skipping the consumer channel (net_transport.go:718-736), with NewRaft registering r.processHeartbeat (api.go:626-632). appendEntries tests a.Term above r.getCurrentTerm(), then calls setCurrentTerm(a.Term), which writes the stable store and afterwards stores the same value atomically without re-checking (raft.go:1470-1490, 2164-2172); the gap between the store write and the atomic store is where a concurrent higher-term writer can be overtaken. The subsequent acceptance and truncation run on the entry path that trusts the current term (raft.go:1526-1566). Consequence under the exercised conditions: a follower whose stable-store term write is delayed can finish below an already adopted term and then accept and apply a stale leader's conflicting entries, leaving its log and FSM describing different histories.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-0",
+          "revision": 2,
+          "assertion": "The transport contract permits the registered heartbeat handler to run outside the main RPC queue, and NetworkTransport dispatches heartbeats that way."
+        },
+        {
+          "entry_id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-1",
+          "revision": 4,
+          "assertion": "appendEntries decides to raise the term, then writes it unconditionally, and a heartbeat's concurrent execution affects only the term and leader."
+        }
+      ],
+      "counterevidence": [
+        "In the retained frequency run the zero-latency case produced no inversion in 200 attempts, so the trigger is latency rather than concurrency alone; a rate below one in two hundred would not have been detected, and this run does not bound the zero-latency rate.",
+        "The stale term-3 and newer term-4 requests are crafted AppendEntries whose leader commit indexes are asserted by the request, not produced by a quorum of live peers; only one real node ran in either receipt. The claim therefore rests on the follower's own duties (term monotonicity and not replacing an applied entry); divergence from a real committed cluster state is conditional on the term-4 entry having been committed elsewhere.",
+        "The applied FSM entry at index 4 was not re-applied because lastApplied already covered that index, so the immediate FSM divergence appeared at index 5; the disagreement at index 4 exists between the log and the FSM and would surface on a restart replay.",
+        "The probe delivered the heartbeat by calling the registered handler on a separate goroutine rather than through a live NetworkTransport, so framing, connection reuse, timeouts and the response path were not exercised, even though the classified request shape and the direct handler invocation match that transport's source.",
+        "The delayed store is a generic hook that sleeps before persisting; no disk-backed store implementation was measured, so nothing is claimed about how often a real stable store's write latency exceeds the interleaving window."
+      ],
+      "limitations": [
+        "Two timing modes, 200 attempts each, one process and one platform; the observed 90 of 200 is a property of this harness's delay distribution, not a field rate.",
+        "The two competing leaders were modelled by crafted requests over the real consumer path; the obsolete leader's partition, its continued heartbeating and the newer leader's quorum were not produced by real nodes, and repeated attempts reuse one node's log.",
+        "Only the term and leader writes of the fast-path were exercised; whether other concurrent fast-path effects interact with snapshot installation or configuration updates was not tested.",
+        "The fix boundary is unexamined: a compare-and-set term update would close this interleaving, but no protective mechanism in the captured code was tested against it."
+      ],
+      "joint_history": "Both receipts belong to this investigation and run the same follower-side setup on the same snapshot; they answer different parts of the question. Receipt cabc782e68fb4c98a4f82a9d4e62e07b forces one interleaving with a held term write and measures what happens afterwards, while receipt 14a6432138534293b361a796cd32bda8 repeats the race 200 times per timing mode without a hook and measures only the inversion count. Neither receipt's events establish the other's claim, and together they support one account because the mechanism, node configuration and request shapes are identical.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

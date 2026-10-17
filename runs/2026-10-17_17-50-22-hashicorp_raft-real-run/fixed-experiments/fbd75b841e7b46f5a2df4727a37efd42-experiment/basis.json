@@ -1,0 +1,152 @@
+{
+  "id": "fbd75b841e7b46f5a2df4727a37efd42-experiment",
+  "investigation_id": "1255b78953904846987cdc19826340c8-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * The startup-replay finding was measured with a single-node leader as the\n//     producing prefix. This harness uses the operational shape instead: a\n//     three-voter cluster commits the commands, a follower accumulates the\n//     committed prefix and stages its commit index through appendEntries, and\n//     that follower alone is shut down and restarted.\n//   * Each case builds its own cluster and shuts every raft down explicitly, so\n//     no cluster helper performs a second shutdown.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n\n\thclog \"github.com/hashicorp/go-hclog\"\n)\n\ntype frFSM struct {\n\tmu sync.Mutex\n}\n\nfunc (f *frFSM) Apply(*Log) interface{}         { return nil }\nfunc (f *frFSM) Snapshot() (FSMSnapshot, error) { return &frSnapshot{}, nil }\nfunc (f *frFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype frSnapshot struct{}\n\nfunc (s *frSnapshot) Persist(SnapshotSink) error { return nil }\nfunc (s *frSnapshot) Release()                  {}\n\nfunc frEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\ntype frResult struct {\n\treturned   bool\n\telapsed    time.Duration\n\terr        string\n\treplay     uint64\n\tbatches    uint64\n\tsnapIndex  uint64\n\tcommitIdx  uint64\n\tlastLogIdx uint64\n}\n\nfunc frRun(t *testing.T, name string, snapshotFollower bool) {\n\tt.Helper()\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.NewNullLogger()\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.RestoreCommittedLogs = true\n\tc, err := makeCluster(t, &MakeClusterOpts{Peers: 3, Bootstrap: true, Conf: conf, CommitTrackingLogs: true})\n\tif err != nil {\n\t\tt.Fatalf(\"cluster: %v\", err)\n\t}\n\n\tleader := c.Leader()\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader\")\n\t}\n\tvar follower *Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader {\n\t\t\tfollower = r\n\t\t\tbreak\n\t\t}\n\t}\n\tif follower == nil {\n\t\tt.Fatalf(\"no follower\")\n\t}\n\tfollowerID := follower.localID\n\n\tvar last ApplyFuture\n\tfor i := 0; i < 8400; i++ {\n\t\tlast = leader.Apply([]byte(\"x\"), 5*time.Second)\n\t}\n\tif err := last.Error(); err != nil {\n\t\tt.Fatalf(\"apply: %v\", err)\n\t}\n\tstore := follower.logs.(CommitTrackingLogStore)\n\tdeadline := time.Now().Add(10 * time.Second)\n\tfor {\n\t\tstaged, err := store.GetCommitIndex()\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"get commit index: %v\", err)\n\t\t}\n\t\tif staged > 8200 || time.Now().After(deadline) {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif snapshotFollower {\n\t\tif err := follower.Snapshot().Error(); err != nil {\n\t\t\tt.Fatalf(\"follower snapshot: %v\", err)\n\t\t}\n\t\ttime.Sleep(100 * time.Millisecond)\n\t}\n\n\tstaged, _ := store.GetCommitIndex()\n\tlastLog, _ := follower.logs.LastIndex()\n\tlastSnap, _ := follower.getLastSnapshot()\n\tconfForRestart := follower.config()\n\tlogs, stable, snaps := follower.logs, follower.stable, follower.snapshots\n\taddr := follower.localAddr\n\tif err := follower.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown follower: %v\", err)\n\t}\n\tfor _, r := range c.rafts {\n\t\tif r != follower {\n\t\t\t_ = r.Shutdown().Error()\n\t\t}\n\t}\n\n\tres := frResult{snapIndex: lastSnap, commitIdx: staged, lastLogIdx: lastLog}\n\tif staged > lastSnap {\n\t\tres.replay = staged - lastSnap\n\t}\n\tif res.replay > 0 {\n\t\tres.batches = (res.replay + uint64(confForRestart.MaxAppendEntries) - 1) / uint64(confForRestart.MaxAppendEntries)\n\t}\n\tfrEmit(t, map[string]interface{}{\n\t\t\"event\":              \"replay_case_\" + name,\n\t\t\"case\":               name,\n\t\t\"mode\":               \"three_voter_cluster_follower_restart\",\n\t\t\"follower\":           string(followerID),\n\t\t\"staged_commit\":      staged,\n\t\t\"last_log_index\":     lastLog,\n\t\t\"snapshot_index\":     lastSnap,\n\t\t\"replay_entries\":     res.replay,\n\t\t\"replay_batches\":     res.batches,\n\t\t\"max_append_entries\": confForRestart.MaxAppendEntries,\n\t\t\"follower_snapshot\":  snapshotFollower,\n\t})\n\n\t_, trans := NewInmemTransport(addr)\n\tconfRestart := confForRestart\n\tconfRestart.Logger = hclog.NewNullLogger()\n\tdone := make(chan error, 1)\n\tvar restarted *Raft\n\tstart := time.Now()\n\tgo func() {\n\t\tvar err error\n\t\trestarted, err = NewRaft(&confRestart, &frFSM{}, logs, stable, snaps, trans)\n\t\tdone <- err\n\t}()\n\tselect {\n\tcase err := <-done:\n\t\tres.returned = true\n\t\tres.elapsed = time.Since(start)\n\t\tif err != nil {\n\t\t\tres.err = err.Error()\n\t\t} else {\n\t\t\tdefer func() { _ = restarted.Shutdown().Error() }()\n\t\t}\n\tcase <-time.After(5 * time.Second):\n\t\tres.elapsed = time.Since(start)\n\t\tres.err = \"no return within observation window\"\n\t}\n\tfrEmit(t, map[string]interface{}{\n\t\t\"event\":      \"replay_result_\" + name,\n\t\t\"case\":       name,\n\t\t\"returned\":   res.returned,\n\t\t\"elapsed_ms\": int(res.elapsed / time.Millisecond),\n\t\t\"error\":      res.err,\n\t})\n}\n\nfunc TestAssuranceFollowerCommittedReplay(t *testing.T) {\n\tt.Run(\"control_follower_with_snapshot\", func(t *testing.T) {\n\t\tfrRun(t, \"control_follower_with_snapshot\", true)\n\t})\n\tt.Run(\"trigger_follower_no_snapshot\", func(t *testing.T) {\n\t\tfrRun(t, \"trigger_follower_no_snapshot\", false)\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceFollowerCommittedReplay"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_follower_snapshot",
+          "event": "replay_case_control_follower_with_snapshot",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_follower_with_snapshot",
+              "reference": null
+            },
+            {
+              "field": "follower_snapshot",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_follower_no_snapshot",
+          "event": "replay_case_trigger_follower_no_snapshot",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "trigger_follower_no_snapshot",
+              "reference": null
+            },
+            {
+              "field": "follower_snapshot",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "max_append_entries",
+              "op": "eq",
+              "value": 64,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "cfg_restore_option",
+      "api_fsm_channel",
+      "api_restore_body",
+      "raft_process_logs",
+      "raft_batch_flush",
+      "fsm_consumer",
+      "store_commit_tracking",
+      "api_start_goroutines"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two restarts of a follower from a real three-voter in-memory cluster with commit-tracking and RestoreCommittedLogs enabled. The leader commits 8400 commands; the chosen follower accumulates them and its own staged commit index is polled until it exceeds 8200. In the control case that follower additionally takes a snapshot before shutdown; in the trigger case it does not. The cluster is then stopped and only the follower is restarted from its retained stores with a fresh transport, bounded by a five-second observation.",
+      "assumptions": [
+        "All three members run the captured code with inmemConfig timeouts and the in-memory commit-tracking store.",
+        "The follower's staged commit index is read from its own log store and is therefore what restoreFromCommittedLogs would consume on restart.",
+        "The control's snapshot is taken through the follower's own Snapshot future, so the replay it removes is bounded by that follower's applied state.",
+        "NewRaft is invoked on its own goroutine; a case that does not return within five seconds is reported as returned=false rather than failing the harness."
+      ],
+      "excluded": [
+        "No leader restart, no snapshot shipped from another node, and no client traffic during the restart.",
+        "No claim about the exact snapshot index chosen by the follower's snapshot machinery beyond what the case event records."
+      ],
+      "parameters": {
+        "peers": 3,
+        "commands": 8400,
+        "staged_commit_floor": 8200,
+        "max_append_entries": 64,
+        "observation_ms": 5000
+      }
+    },
+    "prefix": "Each case builds a three-voter cluster through makeCluster with CommitTrackingLogs and RestoreCommittedLogs, waits for a leader, applies 8400 commands through the leader, and polls the chosen follower's own commit index until it exceeds 8200. In the control it then takes a snapshot on that follower; both cases read the follower's last snapshot index, staged commit index and last log index, shut down the follower and the remaining members, and emit a case event with those values plus the derived replay entries and batches. The harness then calls NewRaft on the follower's retained log, stable and snapshot stores with a fresh transport and a logger-free copy of its config, bounded by five seconds, and emits the returned flag, elapsed time and error.",
+    "requirement": null,
+    "responsibility": "The library owns the size and lifetime of its FSM dispatch channel and the order in which NewRaft starts the FSM consumer. The documented RestoreCommittedLogs option promises to replay all known-committed logs on disk before completing NewRaft, so a follower restarting with a legal committed prefix must complete.",
+    "comparisons": [
+      {
+        "event": "replay_result_control_follower_with_snapshot",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_follower_snapshot",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A follower restart whose snapshot bounds the replay must let NewRaft complete."
+      },
+      {
+        "event": "replay_result_trigger_follower_no_snapshot",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_follower_no_snapshot",
+        "assertion": {
+          "field": "returned",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "A follower restart replaying its own committed prefix without a snapshot must let NewRaft complete; a false witness contradicts it."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "fbd75b841e7b46f5a2df4727a37efd42",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

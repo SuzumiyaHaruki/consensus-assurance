@@ -236,7 +236,8 @@ class Codex:
             tool_roots = [Path(discovered.stdout.strip()).resolve()]
             cache = Path(self.config.go_mod_cache_dir) if self.config.go_mod_cache_dir else scratch / 'go-mod'
             self.tool_environment.update(GoModuleBackend().environment(self.work))
-            self.tool_environment.update(GOCACHE=str(scratch/'go-build'), GOMODCACHE=str(cache))
+            self.tool_environment.update(GOCACHE=str(scratch/'go-build'), GOMODCACHE=str(cache),
+                                         GOFLAGS='-mod=readonly -count=1')
             for name in ('go-build', 'go-mod'):(scratch/name).mkdir(exist_ok=True)
             commands = {'go': ['go', 'version'], 'go_environment':
                 ['go', 'env', 'GOOS', 'GOARCH', 'GOVERSION', 'GOROOT', 'GOMODCACHE', 'GOCACHE', 'GOFLAGS', 'GOWORK']}

@@ -56,11 +56,35 @@ def test_duplicate_and_secret_config_errors(tmp_path, capsys):
 def test_no_paid_call_without_authorization(tmp_path, monkeypatch):
     c = configuration(tmp_path)
     path = tmp_path / "local.yaml"
-    path.write_text(yaml.safe_dump(c.model_dump()))
     monkeypatch.setattr(runner, "run", lambda *a, **k: pytest.fail("Must not start model run"))
     c.allow_experiments = False
     path.write_text(yaml.safe_dump(c.model_dump()))
     assert main(["run", "--config", str(path)]) == 2
+
+
+@pytest.mark.parametrize('custom', [False, True])
+def test_client_authentication_keeps_credentials_out_of_tool_environment(tmp_path, monkeypatch, custom):
+    config = configuration(tmp_path)
+    if not custom:
+        config.codex_provider = None
+        config.api_key_env = 'BASELINE_NATIVE_TEST_KEY'
+    monkeypatch.setattr(codex.shutil, 'which', lambda _: sys.executable)
+    monkeypatch.setenv('HTTPS_PROXY', 'http://proxy.example.invalid:7890')
+    monkeypatch.setenv('UNRELATED_SECRET', 'private')
+    monkeypatch.delenv(config.credential_name, raising=False)
+    client = codex.Codex(config, tmp_path/'client', {}, time.monotonic()+10)
+    try:
+        assert 'HTTPS_PROXY' in client.environment and 'UNRELATED_SECRET' not in client.environment
+        with pytest.raises(ValueError, match='Missing credential'):
+            client.authenticate()
+        monkeypatch.setenv(config.credential_name, 'credential-canary')
+        client.authenticate()
+        key = config.credential_name if custom else 'CODEX_API_KEY'
+        assert client.environment[key] == 'credential-canary'
+        assert not {'HTTPS_PROXY', key, 'UNRELATED_SECRET'} & client.tool_environment.keys()
+        assert 'credential-canary' not in json.dumps(client.settings)
+    finally:
+        client.close()
 
 
 def test_source_capture_commit_cleanliness_and_links(tmp_path):
@@ -385,6 +409,17 @@ def test_tool_arguments_and_directory_boundary(tmp_path):
     assert local_exec.validate_directory(work,'.') == work
     for relative in ('..',str(work),'outside','missing'):
         with pytest.raises((ValueError, OSError)):local_exec.validate_directory(work,relative)
+
+
+def test_cargo_compiled_seed_is_not_a_dependency_cache(tmp_path, monkeypatch):
+    (tmp_path/'manifest.json').write_text('{}')
+    client = object.__new__(codex.Codex)
+    client.work, client.target = tmp_path, {'execution_backend': 'cargo'}
+    client.config = SimpleNamespace(cargo_dependency_cache_dir=str(tmp_path))
+    client.local = lambda *args: ({'status': 'completed', 'exit_code': 0}, 'codex fixture')
+    monkeypatch.setattr(codex, 'cargo_tool', lambda: Path('/synthetic/tool/bin/cargo'))
+    with pytest.raises(ValueError, match='compiled seed directory is not a dependency cache'):
+        client.prepare()
 
 
 @pytest.mark.parametrize('basis,value', [('requested',1),('action_timeout',2),('total_seconds',4),('total_seconds',-1)])

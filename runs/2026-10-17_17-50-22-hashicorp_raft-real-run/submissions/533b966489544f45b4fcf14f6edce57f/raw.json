@@ -1,0 +1,207 @@
+{
+  "rationale": "Open and execute an independent client-contract question on the decision-support axis: VerifyLeader is documented as protecting against stale reads after lost leadership, and the code counts acknowledgements from every replication stream while sizing the quorum from voters only. A five-member cluster with two demoted non-voters lets the trigger cut the leader from both other voters while the non-voters stay reachable, with a control that also cuts the non-voters.",
+  "sources": [
+    {
+      "id": "api_verify_doc",
+      "file": "api.go",
+      "start_line": 927,
+      "end_line": 931,
+      "kind": "document_statement"
+    },
+    {
+      "id": "raft_verify_leader",
+      "file": "raft.go",
+      "start_line": 966,
+      "end_line": 990,
+      "kind": "code_observation"
+    },
+    {
+      "id": "repl_notify_all",
+      "file": "replication.go",
+      "start_line": 100,
+      "end_line": 112,
+      "kind": "code_observation"
+    },
+    {
+      "id": "future_verify_vote",
+      "file": "future.go",
+      "start_line": 274,
+      "end_line": 293,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_start_stop_repl",
+      "file": "raft.go",
+      "start_line": 583,
+      "end_line": 600,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_quorum_size",
+      "file": "raft.go",
+      "start_line": 1087,
+      "end_line": 1100,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_leader_lease",
+      "file": "raft.go",
+      "start_line": 1037,
+      "end_line": 1050,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_verify_nonvoter",
+      "question": "Can VerifyLeader report success while the leader can reach fewer voters than its voter quorum, because acknowledgements from non-voter replication streams are counted toward that quorum?",
+      "source_ids": [
+        "api_verify_doc",
+        "raft_verify_leader",
+        "repl_notify_all",
+        "future_verify_vote",
+        "raft_start_stop_repl",
+        "raft_quorum_size",
+        "raft_leader_lease"
+      ],
+      "hypothesis": "verifyLeader sizes the quorum with quorumSize, which counts voters only, but registers the verify future on every followerReplication in leaderState.replState, and startStopReplication creates one for every configured server including non-voters; a successful heartbeat from a non-voter calls notifyAll(true) and increments the verify future's vote count, so a leader that can reach only itself among voters can still reach the voter-sized quorum with non-voter acknowledgements and report success.",
+      "discriminator": "Boot five members, demote two to non-voters, cut the leader from the two remaining voters but leave the non-voters reachable, and ask the leader to verify itself with a bounded wait; compare against the same cluster with the non-voters also cut. A success in the trigger and a failure in the control establishes that non-voter acknowledgements substitute for voter support."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_verify_counts_every_stream",
+      "kind": "behavior",
+      "statement": "VerifyLeader sizes its quorum with quorumSize (voters/2+1, voters only) but registers the verify future with every entry of leaderState.replState, which startStopReplication creates for every configured server including non-voters; a successful heartbeat or AppendEntries response calls notifyAll(true), which increments the verify future's vote count and completes the verification once the count reaches the voter-sized quorum.",
+      "conditions": "Leader with at least one non-voter replication stream and fewer reachable voters than the voter quorum.",
+      "source_ids": [
+        "raft_verify_leader",
+        "repl_notify_all",
+        "future_verify_vote",
+        "raft_start_stop_repl",
+        "raft_quorum_size"
+      ]
+    },
+    {
+      "ref": "@k_lease_counts_voters_only",
+      "kind": "behavior",
+      "statement": "checkLeaderLease, unlike VerifyLeader, iterates the latest configuration and counts only servers whose Suffrage is Voter towards the contacted quorum, so the lease check and the verification path use different supporter sets.",
+      "conditions": "Leader loop lease check with a configuration containing non-voters.",
+      "source_ids": [
+        "raft_leader_lease",
+        "raft_quorum_size"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q_verify_nonvoter",
+    "harness_path": "exp_verify_leader_test.go",
+    "files": {},
+    "execution_package": ".",
+    "test_names": [
+      "TestAssuranceVerifyLeaderSupporters"
+    ],
+    "source_ids": [
+      "api_verify_doc",
+      "raft_verify_leader",
+      "repl_notify_all",
+      "future_verify_vote",
+      "raft_start_stop_repl",
+      "raft_quorum_size",
+      "raft_leader_lease"
+    ],
+    "scope": {
+      "description": "Two VerifyLeader invocations on real five-member in-memory clusters. Both bootstrap five voters, demote two non-leader members to non-voters, and disconnect the leader's transport from the two remaining voters in both directions. The trigger leaves the two non-voters reachable; the control also disconnects them. Each case records the reachable member counts, the voter quorum, whether the verification completed and with what error, and the leader state afterwards.",
+      "assumptions": [
+        "All members run the captured code on the in-memory transport with one-second heartbeat, election and lease timeouts so the leader is not stepped down by the lease check during the short window.",
+        "Disconnect removes routing in both directions, modelling a partition that isolates the leader from those members only.",
+        "The verification is bounded by a two-second wait; a verification that never completes is reported as completed=false rather than failing the harness.",
+        "The demotions are committed through the leader before the partition; the harness does not separately assert each member's view of the new configuration."
+      ],
+      "excluded": [
+        "No claim about read serializability beyond what VerifyLeader itself promises; the harness does not issue reads.",
+        "No transfer or configuration change during the partition, and no client traffic."
+      ],
+      "parameters": {
+        "members": 5,
+        "voters_after_demotion": 3,
+        "nonvoters": 2,
+        "voters_reachable_in_both_cases": 1,
+        "quorum_voters": 2,
+        "window_ms": 2000
+      }
+    },
+    "prefix": "Each case builds a five-voter in-memory cluster through MakeClusterCustom with one-second heartbeat, election and lease timeouts, waits for a leader, demotes two non-leader members with DemoteVoter, and sleeps 300 ms. It then disconnects the leader's transport from the two remaining voters in both directions and, in the control only, from the two non-voters as well. The case event records member counts and the voter quorum; the harness calls leader.VerifyLeader(), waits up to two seconds for the future, and emits whether it completed, whether it returned nil, its error text and the leader's state afterwards.",
+    "responsibility": "VerifyLeader is documented as protecting against stale reads after leadership has been lost, so the library owns the definition of the support that satisfies it. The quorum it sizes is a voter quorum, and the messages it counts must therefore be voter acknowledgements; a non-voter cannot contribute to leadership legitimacy.",
+    "prerequisites": [
+      {
+        "alias": "admit_trigger_nonvoter_support",
+        "event": "verify_case_trigger_nonvoters_connected",
+        "conditions": [
+          {
+            "field": "case",
+            "value": "trigger_nonvoters_connected"
+          },
+          {
+            "field": "voters_reachable",
+            "value": 1
+          },
+          {
+            "field": "nonvoters_reachable",
+            "value": 2
+          },
+          {
+            "field": "quorum_voters",
+            "value": 2
+          }
+        ]
+      },
+      {
+        "alias": "admit_control_no_support",
+        "event": "verify_case_control_all_cut",
+        "conditions": [
+          {
+            "field": "case",
+            "value": "control_all_cut"
+          },
+          {
+            "field": "voters_reachable",
+            "value": 1
+          },
+          {
+            "field": "nonvoters_reachable",
+            "value": 0
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "verify_result_control_all_cut",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_control_no_support",
+        "assertion": {
+          "field": "verify_ok",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Control: with no reachable supporter the verification must not report success."
+      },
+      {
+        "event": "verify_result_trigger_nonvoters_connected",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger_nonvoter_support",
+        "assertion": {
+          "field": "verify_ok",
+          "op": "eq",
+          "value": false
+        },
+        "description": "With only one of three voters reachable against a quorum of two, the verification must not report success; a true value contradicts it."
+      }
+    ]
+  }
+}

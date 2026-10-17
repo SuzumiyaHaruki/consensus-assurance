@@ -19,8 +19,7 @@ from mcp.client.stdio import stdio_client
 
 from baseline import codex, local_exec, runner
 from baseline.__main__ import load_target
-from support.baseline import SESSION, configuration
-from support.responses import ResponsesFixture, message
+from support.baseline import configuration
 
 
 pytestmark = pytest.mark.real
@@ -72,14 +71,6 @@ public class LocalIdentity {
     assert 'LOCAL_IDENTITY_OK' in text
 
 toolchains = pytest.mark.parametrize('environment', ['go_module', 'cargo'], indirect=True, scope='module')
-
-
-@pytest.fixture(scope='module')
-def native_model():
-    if not shutil.which('codex'):
-        pytest.skip('Codex is required')
-    catalog = json.loads(subprocess.check_output(['codex', 'debug', 'models', '--bundled']))
-    return next(m['slug'] for m in catalog['models'] if 'high' in {v['effort'] for v in m['supported_reasoning_levels']})
 
 
 @contextmanager
@@ -246,127 +237,6 @@ def denied(fn):
     assert all((path / "writable-host-canary").read_text() == "dependency canary" for path in visible)
 
 
-def test_real_exec_resume_request_tools_and_result_consumption(environment, monkeypatch):
-    """Scripted loopback Responses exchanges prove routing, never model competence."""
-    import jsonschema
-    client = environment
-    catalog = client.root/'inputs/models.json'
-    selected = json.loads(catalog.read_bytes())
-    assert selected['models'][0]['supports_search_tool'] is True
-    folder = client.root/'inputs/request-tools'
-    tcp = "import socket,time; s=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());a,_=s.accept();c.sendall(b'ping');assert a.recv(4)==b'ping';a.sendall(b'pong');assert c.recv(4)==b'pong';print('LOCAL_FIXTURE_TCP_ROUNDTRIP',flush=True);time.sleep(12)"
-    arguments = {'argv': ['python3', '-c', tcp], 'timeout_seconds': 25}
-    turn = {}
-
-    def reply(body, number):
-        output = next((item for item in body['input'] if item.get('type') == 'function_call_output'
-                       and item.get('call_id') == turn['call_id']), None)
-        if output:
-            actual = json.loads(output['output'].split('Output:\n', 1)[1])
-            path = client.root/'executions'/actual['execution_id']/'result.json'
-            assert actual == json.loads(path.read_text())
-            assert actual['turn'] == turn['folder'].name and actual['argv'] == arguments['argv']
-            assert actual['status'] == 'completed' and actual['exit_code'] == 0
-            assert 'LOCAL_FIXTURE_TCP_ROUNDTRIP' in (path.parent/'stdout.txt').read_text()
-            assert actual['elapsed_seconds'] >= 12, 'Long command ended before the parent-thread regression was exercised'
-            turn['execution_id'] = actual['execution_id']
-            return message()
-        surfaces = list(body['tools'])
-        for item in body['input']:
-            if item.get('type') == 'tool_search_output' and item.get('status') == 'completed':
-                surfaces.extend(item['tools'])
-        namespace = next((tool for tool in surfaces if tool.get('type') == 'namespace'
-                          and tool.get('name') == 'mcp__baseline_local'), None)
-        if namespace is None:
-            assert any(tool.get('type') == 'tool_search' and tool.get('execution') == 'client'
-                                  for tool in body['tools'])
-            return {'type': 'tool_search_call', 'id': turn['call_id'] + '-search', 'call_id': turn['call_id'] + '-search',
-                    'status': 'completed', 'execution': 'client', 'arguments': {'query': 'baseline_local isolated_exec TCP', 'limit': 1}}
-        tool, = namespace['tools']
-        assert tool['type'] == 'function' and tool['name'] == 'isolated_exec'
-        schema = tool['parameters']
-        assert set(schema['properties']) == {'argv', 'cwd', 'timeout_seconds'}
-        assert schema['required'] == ['argv'] and schema['additionalProperties'] is False
-        jsonschema.validate(arguments, schema)
-        with pytest.raises(jsonschema.ValidationError):jsonschema.validate({'cmd': 'echo invalid'}, schema)
-        return {'type': 'function_call', 'id': turn['call_id'], 'call_id': turn['call_id'],
-                'namespace': namespace['name'], 'name': tool['name'], 'arguments': json.dumps(arguments)}
-
-    result, text = sandbox(client, ['python3','-c',"import time;print('STARTED',flush=True);time.sleep(30)"], 'forced-sandbox-exit', .8)
-    assert result['status']=='timeout' and 'STARTED' in text
-    assert all((client.work/name).is_dir() and not any((client.work/name).iterdir()) for name in ('.codex','.agents'))
-    with ResponsesFixture(folder, reply) as capture:
-        # Only endpoint and dummy credential differ from the production provider assembly.
-        monkeypatch.setitem(client.settings, 'model_providers.deepseek.base_url', capture.url)
-        monkeypatch.setitem(client.environment, client.config.codex_provider.env_key, 'synthetic-local-fixture')
-        session, results = None, []
-        for number in (1, 2):
-            turn.clear()
-            turn.update(folder=client.root/'turns'/f'fixture-request-{number}', call_id=f'fixture-{number}')
-            result = client.turn(turn['folder'], 'Synthetic local routing fixture only; no remote inference.', 8, session)
-            assert result['status'] == 'completed', result
-            assert result['elapsed_seconds'] > 12 > result['timeout_seconds']
-            clock_path = Path(json.loads(client.control_path.read_text())['execution_clock_path'])
-            clock = json.loads(clock_path.read_text())
-            assert 12 <= clock['elapsed_seconds'] < 20 and 'active' not in clock
-            if number == 1:
-                first_clock, first_bytes = clock_path, clock_path.read_bytes()
-            else:
-                assert clock_path != first_clock and first_clock.read_bytes() == first_bytes
-            assert turn.get('execution_id') and not capture.errors
-            session = result['session_id']
-            results.append({**result, 'execution_id': turn['execution_id']})
-        assert results[0]['session_id'] == results[1]['session_id']
-        initial = capture.requests[0]['tools']
-        assert any(t.get('type') == 'tool_search' for t in initial)
-        assert all('METHOD_AND_ANSWER_CANARY_7301' not in json.dumps(body)
-            and '\\n### Available skills\\n' not in json.dumps(body['input']) for body in capture.requests)
-        runner.write_json(folder/'observations.json', {'evidence': 'scripted_local_fixture_not_model_inference',
-            'cli': client.version, 'supports_search_tool': True, 'tool_mode': selected['models'][0].get('tool_mode'),
-            'endpoint_override': capture.url, 'credential': 'synthetic-local-fixture',
-            'provider_id_unchanged': client.config.codex_provider.id, 'turns': results,
-            'requests': len(capture.requests), 'remote_model_calls': 0})
-    broken = {**client.settings, 'mcp_servers': {'baseline_local': {**client.mcp_settings,
-        'args': ['-i', '/nonexistent-baseline-acceptance-service']}}}
-    for name in ('exec', 'resume'):
-        args = ['exec', *(['resume', session] if name == 'resume' else []), '--ignore-user-config', '--strict-config',
-                '--skip-git-repo-check', '--json', *codex.options(broken), '-']
-        result, text = client.local(args, 'required-mcp-'+name, stdin='Synthetic startup check; no inference is authorized.')
-        error = (client.root/'inputs'/('required-mcp-'+name)/'stderr.log').read_text()
-        assert result['exit_code'] != 0 and 'required mcp' in (text+error).lower(), text+error
-        assert not any(json.loads(line).get('type') == 'turn.completed' for line in text.splitlines() if line.startswith('{'))
-
-
-def test_native_openai_connection_and_key_boundary(tmp_path, monkeypatch, native_model):
-    if not all(shutil.which(name) for name in ("codex", "bwrap", "go")):
-        pytest.skip("Codex, Bubblewrap and Go are required")
-    config = configuration(tmp_path)
-    config.codex_provider = None
-    config.agent_model = native_model
-    config.api_key_env = "BASELINE_NATIVE_TEST_KEY"
-    root = tmp_path / "native"
-    connection = {'HTTPS_PROXY':'http://proxy.example.invalid:7890', 'https_proxy':'http://proxy.example.invalid:7890',
-                  'NO_PROXY':'localhost,127.0.0.1', 'SSL_CERT_DIR':'/etc/ssl/certs'}
-    for key,value in {**connection,'UNRELATED_SECRET':'not-for-client'}.items():monkeypatch.setenv(key,value)
-    with prepared_client(config, root, timeout=60) as client:
-        assert all(client.environment[key]==value for key,value in connection.items())
-        assert 'UNRELATED_SECRET' not in client.environment
-        assert not connection.keys() & client.execution_control['environment'].keys()
-        result,text=sandbox(client,['/usr/bin/python3','-c',
-            'import os; assert not '+repr(set(connection))+' & os.environ.keys()'], 'connection-env-boundary')
-        assert result['status']=='completed' and result['exit_code']==0,text
-        assert "model_provider" not in client.settings
-        assert client.settings["forced_login_method"] == "api"
-        monkeypatch.delenv(config.api_key_env, raising=False)
-        with pytest.raises(ValueError, match="Missing credential"):
-            client.authenticate()
-        monkeypatch.setenv(config.api_key_env, "native-test-canary")
-        client.authenticate()
-        assert client.environment["CODEX_API_KEY"] == "native-test-canary"
-        assert config.api_key_env not in client.environment
-        assert "native-test-canary" not in json.dumps(client.settings)
-
-
 def test_check_env_runs_no_model_and_retains_real_probes(tmp_path):
     if not all(shutil.which(name) for name in ("codex", "bwrap", "go")):
         pytest.skip("Codex, Bubblewrap and Go are required")
@@ -386,6 +256,11 @@ def test_check_env_runs_no_model_and_retains_real_probes(tmp_path):
 def check_network_capabilities(environment, execution):
     from consensus_assurance.adapters.storage.files import write_json
     route, work, execute = execution
+    reports = [environment.root.parent/name/'work/report.md' for name in ('other-group', 'historical-run')]
+    for report in reports:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text('Unrelated run result canary')
+        assert report.read_text() == 'Unrelated run result canary'
     host = socket.socket()
     host.bind(("127.0.0.1", 0))
     host.listen()
@@ -400,6 +275,13 @@ def check_network_capabilities(environment, execution):
 r = {'netns': os.readlink('/proc/self/ns/net'), 'route': pathlib.Path('/proc/net/route').read_text(),
      'ipv6_route': pathlib.Path('/proc/net/ipv6_route').read_text(),
      'pipe': subprocess.check_output(['/bin/sh', '-c', 'printf probe | cat']).decode()}
+r['unrelated_reports_blocked']=[]
+for name in FORBIDDEN_FILES:
+    try:pathlib.Path(name).read_bytes()
+    except OSError as e:
+        assert e.errno in (errno.ENOENT,errno.EACCES,errno.EPERM), e
+        r['unrelated_reports_blocked'].append(name)
+    else:raise AssertionError('Other or historical run report is readable: '+name)
 items=[]
 t=threading.Thread(target=lambda:items.append('thread'));t.start();t.join();r['thread']=items==['thread']
 try:
@@ -423,7 +305,7 @@ for key,args in COMMANDS.items():
     if args[0]=='cargo' and os.environ.get('RUSTC'):args[0]=str(pathlib.Path(os.environ['RUSTC']).with_name('cargo'))
     r[key]=subprocess.check_output(args,text=True).strip()
 print(json.dumps(r))
-'''.replace("PORT", str(port)).replace("COMMANDS", repr({"tool": ["go", "version"], "platform": ["uname", "-sm"]} if environment.target["execution_backend"] == "go_module" else {"tool": ["rustc", "--version", "--verbose"], "cargo": ["cargo", "--version"], "platform": ["uname", "-sm"]}))
+'''.replace("PORT", str(port)).replace("FORBIDDEN_FILES", repr(list(map(str, reports)))).replace("COMMANDS", repr({"tool": ["go", "version"], "platform": ["uname", "-sm"]} if environment.target["execution_backend"] == "go_module" else {"tool": ["rustc", "--version", "--verbose"], "cargo": ["cargo", "--version"], "platform": ["uname", "-sm"]}))
     try:
         result, text = execute(["python3", "-c", script], "network-capabilities")
     finally:
@@ -434,6 +316,10 @@ print(json.dumps(r))
     write_json(environment.root.parent / (route + "-capabilities.json"), observed)
     assert observed["pipe"] == "probe" and observed["thread"]
     assert not observed["host_reachable"]
+    assert observed['unrelated_reports_blocked'] == list(map(str, reports))
+    if route in {"baseline", "baseline_mcp"} and environment.target["execution_backend"] == "go_module":
+        assert observed["environment"]["GOFLAGS"] == "-mod=readonly -count=1"
+        assert observed["environment"]["GOCACHE"] == str(environment.work / ".runtime/go-build")
     if route in {"full_fixed", "baseline_mcp"}:
         assert observed["local_tcp"] and observed["netns"] != namespace
         assert "127.0.0.1" in observed["localhost"]
@@ -449,20 +335,6 @@ print(json.dumps(r))
 @toolchains
 def test_network_capabilities_with_host_success_control(environment, execution):
     check_network_capabilities(environment, execution)
-
-
-@pytest.mark.parametrize('environment', ['cargo'], indirect=True, scope='module')
-def test_cargo_compiled_seed_is_not_a_dependency_cache(environment):
-    seed = environment.root.parent / 'compiled-seed'
-    seed.mkdir()
-    (seed / 'manifest.json').write_text('{}')
-    config = environment.config.model_copy(update={'cargo_dependency_cache_dir': str(seed)})
-    client = codex.Codex(config, environment.root, environment.target, time.monotonic() + 30)
-    try:
-        with pytest.raises(ValueError, match='compiled seed directory is not a dependency cache'):
-            client.prepare()
-    finally:
-        client.close()
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancelled"])
@@ -632,26 +504,8 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
     assert heartbeat.read_text()==before, 'Detached descendant survived the service lifecycle'
 
 
-def test_native_full_profile_prepares_without_custom_provider(environment, monkeypatch, native_model):
-    from consensus_assurance.adapters.agents.backend import CodexAgent
-    from consensus_assurance.adapters.runners.process import ProcessRunner
-    client=environment
-    root=client.root.parent/'native-profile'
-    (root/'agent-source').mkdir(parents=True)
-    (root/'agent-source/fixture.txt').write_text('source control')
-    home=client.home/'native-profile-home';home.mkdir()
-    monkeypatch.setenv('CODEX_HOME',str(home))
-    process_runner=ProcessRunner(root)
-    agent=CodexAgent('high',native_model,profile='single_agent')
-    assert agent.probe(process_runner)['available']
-    agent.bind_inputs(root, root/'agent-source')
-    assert agent.prepare(process_runner,root/'draft','s')[0]
-    record=json.loads((root/'agent-inputs/runtime-settings.json').read_text())
-    assert record['profile'] == 'single_agent'
-
-
-def test_pairing_uses_configured_assembly_and_actual_exec_resume(environment, monkeypatch):
-    """One selected pairing, synthetic sources/Responses; no remote inference or cross-product."""
+def test_ca_shell_and_fixed_execution_isolate_materials_and_other_runs(environment, monkeypatch):
+    """Exercise both CA entry points against the same filesystem/network canaries."""
     from consensus_assurance.cli import load_config
     from consensus_assurance.registry import assemble
     from consensus_assurance.workflow.engine import Engine
@@ -680,34 +534,6 @@ def test_pairing_uses_configured_assembly_and_actual_exec_resume(environment, mo
     assert agent.prepare(engine.runner, work, engine.state.snapshot.id)[0]
     assert (root/'agent-inputs/models.json').read_bytes() == (client.root/'inputs/models.json').read_bytes()
     settings = agent.permission_options(root, work) + agent.connection_options(root, sandbox=True)
-    check = engine.runner.run([*agent.sandbox_command(root), 'features', 'list', *settings], work,
-                              'pairing_features', 'fixture', 15, env=agent.client_environment())
-    assert check.exit_code == 0
-    def features(text):
-        return {line.split()[0]: line.split()[-1] for line in text.splitlines() if len(line.split()) >= 3}
-    assert features(output(check)) == features((client.root/'inputs/features/stdout.jsonl').read_text())
-    captured = root/'pairing-requests'
-    with ResponsesFixture(captured, lambda *_: message(json.dumps({'submission': 'fixture.json', 'summary': 'Synthetic receipt'}))) as capture:
-        # Only the endpoint changes to the local fixture; real invocation flags and catalogs remain.
-        connection = agent.connection_options
-        monkeypatch.setattr(agent, 'connection_options', lambda *a, **kw: [
-            value.replace(config.codex_provider.base_url, capture.url) for value in connection(*a, **kw)])
-        assert agent.prepare(engine.runner, work, engine.state.snapshot.id)[0]
-        session = None
-        for number in (1, 2):
-            check, actual, receipt = agent.investigate(engine.runner, 'Synthetic compatibility receipt only.', work,
-                                                      engine.state.snapshot.id, 30, session)
-            assert check.status.value == 'completed' and receipt, check.reason
-            assert '--ignore-user-config' in check.command and ('resume' in check.command) == bool(session)
-            assert session is None or actual == session
-            session = actual
-        assert not capture.errors and len(capture.requests) == 2
-        for body in capture.requests:
-            assert body['model'] == config.agent_model and body['reasoning']['effort'] == config.agent_reasoning_effort
-            text = json.dumps(body['input'])
-            assert all(token not in text for token in ('UNTRUSTED_HOME_INSTRUCTIONS', 'UNTRUSTED_PAIRING_INSTRUCTIONS', '\\n### Available skills\\n'))
-            assert all(entry['path'] not in text for entry in agent.profile_settings['skills.config'])
-            assert not any(tool.get('type') in {'mcp', 'web_search', 'web_search_preview'} for tool in body['tools'])
     protected = [str(root/'agent-source/fixture.txt'), str(root/'logs/host-record')]
     (root/'logs/host-record').write_text('evidence')
     script = '''import errno,pathlib

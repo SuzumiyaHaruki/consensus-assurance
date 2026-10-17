@@ -26,7 +26,7 @@ def clean_environment(workspace, adapter=None):
     return result
 
 
-def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None):
+def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None, writable_roots=()):
     if mode == "workspace":
         return command
     executable = shutil.which("bwrap")
@@ -47,6 +47,8 @@ def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None
     for cache in read_only_roots:
         if cache.is_dir():
             args += ["--ro-bind", str(cache), str(cache)]
+    for cache in writable_roots:
+        args += ["--bind", str(cache), str(cache)]
     exe = Path(shutil.which(command[0]) or command[0]).resolve()
     if str(exe).startswith(str(Path.home())):
         tool_root = exe.parent.parent
@@ -85,7 +87,7 @@ def install_harness(workspace, filename, harness, target_files, *, write=True):
     return [str(workspace / name) for name in files]
 
 
-def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action="experiment", adapter=None, *, prepared=False, view_path=None):
+def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action="experiment", adapter=None, *, prepared=False, view_path=None, writable_roots=(), env_overrides=None):
     if not prepared and hasattr(adapter,'execute'):
         return adapter.execute(runner,command,workspace,snapshot_id,timeout,mode,action)
     source=workspace.parent.parent.parent/'source'
@@ -94,11 +96,12 @@ def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, actio
         from consensus_assurance.adapters.storage.workspace_delta import save_delta
         input_manifest=save_delta(source,workspace,snapshot_id)
     try:
-        argv = sandbox_command(command, workspace, mode, adapter.read_only_roots() if adapter else (),view_path)
+        argv = sandbox_command(command, workspace, mode, adapter.read_only_roots() if adapter else (),view_path,writable_roots)
     except FileNotFoundError as exc:
         return CheckRun(action=action, cwd=str(workspace), snapshot_id=snapshot_id,
             status=ExecutionStatus.TOOL_MISSING, reason=str(exc),artifacts=[str(input_manifest)] if input_manifest else [])
     env=clean_environment(workspace, adapter)
+    env.update(env_overrides or {})
     if view_path:
         env={k:v.replace(str(workspace),str(view_path)) for k,v in env.items()}
     check = runner.run(argv, workspace, action, snapshot_id, timeout, env=env)

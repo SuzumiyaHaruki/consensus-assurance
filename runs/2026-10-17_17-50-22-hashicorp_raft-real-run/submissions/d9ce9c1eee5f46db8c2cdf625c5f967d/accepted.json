@@ -1,0 +1,124 @@
+{
+  "rationale": "Correct two citation and premise problems: the transfer account relied on a target-role sample that the harness took before DemoteVoter was issued, so that premise is withdrawn and the limit states what remains unmeasured; the heartbeat account now cites the zero-latency control event whose comparison it reports.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "f7da39e9771e40d29f8d7ec3d1c7d886-question-0",
+      "experiment_id": "411b98cd4fea40b6be94feeae6d72dce-experiment",
+      "source_ids": [
+        "api_transfer_doc",
+        "api_transfer_to_server_doc",
+        "api_initiate_transfer",
+        "raft_transfer_accept",
+        "raft_transfer_body",
+        "raft_pick_server",
+        "raft_timeout_now",
+        "raft_vote_nonvoter"
+      ],
+      "executions": {
+        "d436029b08c5425aa5aec577901cb8ba": [
+          1,
+          3
+        ],
+        "0726bba116ac415fa38b99b96a88290f": [
+          1,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Conclusion: violated, and the scoped defect is asserted. A leadership transfer that explicitly names a member the configuration marks as a non-voter is admitted, completes its future without error, and does not install that member as leader; the attempt instead forces an election round in which every member's term advances, leadership lands on a member the caller did not name, and leadership is absent for a measurable interval. Evidence, two receipts of the same experiment lineage. Parsed index 1 of receipt d436029b08c5425aa5aec577901cb8ba and of successor receipt 0726bba116ac415fa38b99b96a88290f, the control where the explicit target is an ordinary voter: target_ever_leader=true, final_leader_is_target=true, future_ok=true, target_term_after=3 with other_member_term_max_after=3, so the mechanism installs the named target with a single term advance. Parsed index 3 of both receipts, the trigger where one non-leader member was demoted with DemoteVoter before the transfer: future_ok=true with an empty future_error, target_ever_leader=false, final_leader_is_target=false, target_term_after=4 and other_member_term_max_after=4, while the case event (parsed index 2) records target_demoted=true and transfer_target_role=nonvoter. The successor adds two measurements, one of which corrects an earlier reading: the case event's target_role_in_own_config value was sampled before DemoteVoter was issued, so it describes the target's pre-demotion view and says nothing about what the target knew when it campaigned, which remains unmeasured; the voters nonetheless rejected the target, and the trigger produced 8 candidate samples with 8 leaderless samples (about 80 ms with no member reporting Leader) out of 470 samples at roughly 10 ms spacing, against 0 candidate and 0 leaderless samples out of 471 in the control. The two cases differ only in the target's suffrage, so the outcome difference is attributable to eligibility, not to the transfer path, harness or transport timing. Mechanism from source: leaderLoop resolves an explicit id only through leaderState.replState (raft.go:687-742), which startStopReplication populates for every configured server including non-voters, whereas the automatic path's pickServer skips non-voters outright (raft.go:2186-2206); leadershipTransfer replicates the target and sends TimeoutNow (raft.go:991-1023), and timeoutNow (raft.go:2232-2237) marks the receiver as a leadership-transfer candidate with no suffrage, term, leader or membership check; electSelf raises the target's term and asks every voter, whose requestVote handler adopts the higher term and steps down before rejecting the non-voter (raft.go:1696-1707). The trigger's term pattern (target and all other members at 4, one step beyond the rejected round) and its leaderless interval match exactly that path, while the control's single-step advance to 3 matches a successful transfer. Consequence under the exercised conditions: a caller that names a serving but non-voting member receives a completed transfer with no error, no transfer of authority, an extra election round that raises every member's term, and a leaderless interval whose length follows the configured election timeout.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+          "revision": 3,
+          "assertion": "An explicit transfer target is resolved only through leaderState.replState, which includes non-voters, while pickServer skips non-voters."
+        },
+        {
+          "entry_id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+          "revision": 3,
+          "assertion": "A voter adopts a higher term and steps down before rejecting a configured non-voter candidate, and timeoutNow forces candidacy without checking suffrage or term."
+        }
+      ],
+      "counterevidence": [
+        "The documentation's promise is soft rather than a guarantee: it says it is 'very likely' the target wins and that a follower which cannot be promoted 'will fail gracefully' (api.go:1296-1330), and the leaderLoop code deliberately reports nil with the message 'lost leadership during transfer (expected)', which can be read as the future reporting only that leadership was relinquished. The claim therefore rests on the admission of an ineligible target and on the observed outcome, not on the future's wording alone.",
+        "The control case shows the same mechanism transfers leadership correctly to a voter, so the defect is specific to the eligibility of an explicitly named target, not to leadership transfer in general.",
+        "The measured disruption is small in absolute terms because the cluster ran with inmemConfig timeouts (Heartbeat/Election/Lease 50 ms): 8 samples and about 80 ms without a leader, one extra election round. The interval follows the configured election timeout, so a production configuration of about 1 s would scale it accordingly; the 80 ms figure is not a bound for other settings.",
+        "No committed entry was lost, no vote was counted for an ineligible candidate, and no decision-safety property was contradicted in either case; what is contradicted is the completion signal and the authority outcome of the explicit transfer."
+      ],
+      "limitations": [
+        "Both runs exercised one cluster size (four members, three voters after the demotion) and one relationship: a leader transferring to a non-leader member. Transfer initiated while the leader later regains leadership, and clusters whose only non-voter is the sole reachable member, were not tested.",
+        "Leaderless counts are sampled every ~10 ms over roughly 4.7 s of the 5 s window (470 samples); a gap shorter than the sample spacing would be missed, so 80 ms is a lower bound for the trigger and the control's zero does not prove uninterrupted leadership.",
+        "The suffrage value recorded in the case events (target_role_in_own_config) was read before DemoteVoter was issued because of harness ordering, so it does not describe the target's view at transfer time; whether the campaigning target still believed it was a voter, or already knew it was a non-voter, was not measured, and the exercised case may be either.",
+        "That the voter members had committed the demotion before the transfer is inferred from their rejection and term adoption, not from reading each voter's configuration.",
+        "Out of scope: whether an unprivileged or misconfigured peer could send TimeoutNow directly, even though timeoutNow performs no term, leader or membership check (raft.go:2232-2237); that path was not exercised here."
+      ],
+      "joint_history": "Receipt 0726bba116ac415fa38b99b96a88290f is the successor of the same fixed experiment lineage under this investigation: identical case names, admissions, assertions and cluster construction, with two added measurements (the target's own configuration view before the transfer, and per-sample candidate/leaderless counts read from each member's State()). The two receipts agree on the decisive outcome of all four comparisons, so their events describe the same subject and can be read together; the successor replaces the earlier receipt only for the two quantities the earlier run left unmeasured.",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "830b0f3ff5a14266b056ad4a6d0c877b-question-0",
+      "experiment_id": "837719d9805545fd8a3a484cb274338a-experiment",
+      "source_ids": [
+        "contract_heartbeat_handler",
+        "api_set_heartbeat_handler",
+        "raft_process_heartbeat",
+        "raft_append_term_handling",
+        "raft_conflict_truncation",
+        "raft_set_current_term",
+        "net_heartbeat_dispatch",
+        "repl_heartbeat_request",
+        "net_heartbeat_classify",
+        "net_heartbeat_direct_call"
+      ],
+      "executions": {
+        "cabc782e68fb4c98a4f82a9d4e62e07b": [
+          1,
+          3
+        ],
+        "14a6432138534293b361a796cd32bda8": [
+          1,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Conclusion: violated, and the scoped defect is asserted. A heartbeat executed on a goroutine other than the main RPC loop, as the fast-path contract permits, races the node's term update: when the stable-store write it performs takes long enough, the term it decided to persist can land after a higher term already persisted by the main thread, leaving the node below a term it had adopted. Once the term is below the current leader's term, the node stops rejecting an older leader's messages and replaces an entry it had already applied at the higher term with that leader's entry. Evidence. Consequence, receipt cabc782e68fb4c98a4f82a9d4e62e07b: parsed index 1 records after_newer_term=4, after_stale_term=3, persisted_term=3 and the write sequence [1 1 2 4 3] (term_decreased=true); parsed index 3 records the stale term-3 request being accepted (stale_request_accepted=true), the log at index 4 becoming \"stale4\" while the FSM still holds \"new4\", index 5 applied from the stale history as \"stale5\", and both applied and commit indexes at 5 (applied_entry_replaced=true). Frequency, receipt 14a6432138534293b361a796cd32bda8: with no added store latency, 200 concurrent attempts produced inversion_count=0 (parsed index 1, comparison holds), while the same 200 attempts with a uniform 0-2 ms delay added to every current-term write produced inversion_count=90 (parsed index 3, comparison violated). The two cases differ only in that delay, so the inversion is a store-write-latency-sensitive race rather than an artifact of a forced order. Mechanism from source: Transport documents the heartbeat handler as a fast-path (transport.go:58-64); NetworkTransport classifies an AppendEntries as a heartbeat exactly when the term is non-zero, a leader address is present, both previous-log fields are zero, no entries are carried and LeaderCommitIndex is zero - the shape the leader's heartbeat request builds (net_transport.go:660-690, replication.go:388-397) - and for that shape calls the registered handler directly on the connection-handler goroutine, skipping the consumer channel (net_transport.go:718-736), with NewRaft registering r.processHeartbeat (api.go:626-632). appendEntries tests a.Term above r.getCurrentTerm(), then calls setCurrentTerm(a.Term), which writes the stable store and afterwards stores the same value atomically without re-checking (raft.go:1470-1490, 2164-2172); the gap between the store write and the atomic store is where a concurrent higher-term writer can be overtaken. The subsequent acceptance and truncation run on the entry path that trusts the current term (raft.go:1526-1566). Consequence under the exercised conditions: a follower whose stable-store term write is delayed can finish below an already adopted term and then accept and apply a stale leader's conflicting entries, leaving its log and FSM describing different histories.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-0",
+          "revision": 2,
+          "assertion": "The transport contract permits the registered heartbeat handler to run outside the main RPC queue, and NetworkTransport dispatches heartbeats that way."
+        },
+        {
+          "entry_id": "830b0f3ff5a14266b056ad4a6d0c877b-knowledge-1",
+          "revision": 4,
+          "assertion": "appendEntries decides to raise the term, then writes it unconditionally, and a heartbeat's concurrent execution affects only the term and leader."
+        }
+      ],
+      "counterevidence": [
+        "In the retained frequency run the zero-latency case produced no inversion in 200 attempts, so the trigger is latency rather than concurrency alone; a rate below one in two hundred would not have been detected, and this run does not bound the zero-latency rate.",
+        "The stale term-3 and newer term-4 requests are crafted AppendEntries whose leader commit indexes are asserted by the request, not produced by a quorum of live peers; only one real node ran in either receipt. The claim therefore rests on the follower's own duties (term monotonicity and not replacing an applied entry); divergence from a real committed cluster state is conditional on the term-4 entry having been committed elsewhere.",
+        "The applied FSM entry at index 4 was not re-applied because lastApplied already covered that index, so the immediate FSM divergence appeared at index 5; the disagreement at index 4 exists between the log and the FSM and would surface on a restart replay.",
+        "The probe delivered the heartbeat by calling the registered handler on a separate goroutine rather than through a live NetworkTransport, so framing, connection reuse, timeouts and the response path were not exercised, even though the classified request shape and the direct handler invocation match that transport's source.",
+        "The delayed store is a generic hook that sleeps before persisting; no disk-backed store implementation was measured, so nothing is claimed about how often a real stable store's write latency exceeds the interleaving window."
+      ],
+      "limitations": [
+        "Two timing modes, 200 attempts each, one process and one platform; the observed 90 of 200 is a property of this harness's delay distribution, not a field rate.",
+        "The two competing leaders were modelled by crafted requests over the real consumer path; the obsolete leader's partition, its continued heartbeating and the newer leader's quorum were not produced by real nodes, and repeated attempts reuse one node's log.",
+        "Only the term and leader writes of the fast-path were exercised; whether other concurrent fast-path effects interact with snapshot installation or configuration updates was not tested.",
+        "The fix boundary is unexamined: a compare-and-set term update would close this interleaving, but no protective mechanism in the captured code was tested against it."
+      ],
+      "joint_history": "Both receipts belong to this investigation and run the same follower-side setup on the same snapshot; they answer different parts of the question. Receipt cabc782e68fb4c98a4f82a9d4e62e07b forces one interleaving with a held term write and measures what happens afterwards, while receipt 14a6432138534293b361a796cd32bda8 repeats the race 200 times per timing mode without a hook and measures only the inversion count. Neither receipt's events establish the other's claim, and together they support one account because the mechanism, node configuration and request shapes are identical.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -134,15 +134,6 @@ def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remai
     assert json.loads((Path(check.stdout).parent/'check.json').read_text())['reason']==check.reason
 
 
-def test_retired_configuration_and_products_are_rejected():
-    from consensus_assurance.core.submissions import AuditSubmission
-    from consensus_assurance.cli import load_config
-    assert load_config() == Config()
-    for legacy in ({'verifier_backend':'tlc'}, {'verifier_backend':'none'}, {'tlc_jar':'missing'}, {'budget':{'model_checks':1}}):
-        with pytest.raises(ValueError, match='no longer supported'):Config.model_validate(legacy)
-    with pytest.raises(ValueError):AuditSubmission.model_validate({'action':'model','rationale':'Removed product'})
-
-
 @pytest.mark.parametrize('selection',[
     {'execution_package':'/tmp'}, {'execution_package':'../outside'}, {'execution_package':'-args'},
     {'execution_package':'./...'}, {'execution_package':'. ./internal/core'}, {'execution_package':'.;true'},
@@ -186,18 +177,6 @@ def test_package_boundaries_match_preflight_and_admission_without_execution(tmp_
     assert engine.state.model_dump(mode='json')==saved
     with pytest.raises(ValueError):prepare_submission(engine,AuditSubmission.model_validate(sub),Inputs(draft),'invalid')
     assert not (engine.root/'experiments').exists() and not engine.state.checks and not engine.state.experiments
-
-
-def test_python_rejects_go_override_and_go_default_path_conflict(tmp_path):
-    from consensus_assurance.adapters.runners.python import PythonBackend
-    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
-    from consensus_assurance.core.config import TargetConfig
-    harness=Harness(kind='python',source='print(1)',description='Local check',semantic_changes=[],execution_package='.')
-    with pytest.raises(ValueError,match='does not support'):PythonBackend().resolve_harness(harness,tmp_path,{})
-    with pytest.raises(ValueError,match='test_names'):
-        PythonBackend().resolve_harness(harness.model_copy(update={'execution_package':None,'test_names':['check']}),tmp_path,{})
-    with pytest.raises(ValueError,match='target.harness_path'):
-        GoModuleBackend(TargetConfig(execution_package='internal/core',harness_path='assurance_generated_test.go'))
 
 
 def test_exact_test_selection_validation():

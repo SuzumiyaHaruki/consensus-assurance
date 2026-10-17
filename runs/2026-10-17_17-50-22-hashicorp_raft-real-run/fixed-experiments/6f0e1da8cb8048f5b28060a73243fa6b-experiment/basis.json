@@ -1,0 +1,181 @@
+{
+  "id": "6f0e1da8cb8048f5b28060a73243fa6b-experiment",
+  "investigation_id": "f7da39e9771e40d29f8d7ec3d1c7d886-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Construction notes:\n//   * One real four-member cluster is bootstrapped, one non-leader member is\n//     demoted with DemoteVoter, and the harness waits until that member's own\n//     configuration view reports the non-voter role.\n//   * The control then calls LeadershipTransfer(), the automatic form that has no\n//     target, and records whether a leader exists afterwards and whether it is a\n//     voter.\n//   * The trigger calls LeadershipTransferToServer for the demoted member and\n//     records the future result, whether that member ever reports Leader, and the\n//     sampled interval without a leader.\n//   * The point of the pair is the asymmetry between the two entry points on the\n//     same cluster state.\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc xgEmit(t *testing.T, payload map[string]interface{}) {\n\tt.Helper()\n\tdata, err := json.Marshal(payload)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc xgRun(t *testing.T, name string, explicit bool) {\n\tt.Helper()\n\tconst sampleEvery = 10 * time.Millisecond\n\tconst watchWindow = 3 * time.Second\n\n\tconf := inmemConfig(t)\n\tc := MakeClusterCustom(t, &MakeClusterOpts{Peers: 4, Bootstrap: true, Conf: conf})\n\tdefer c.Close()\n\n\t// Choose the member to demote at the moment of the demotion, so the target is\n\t// definitely a follower then: demoting the sitting leader starts a transfer of\n\t// its own and would contaminate the case.\n\tleader := c.Leader()\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader\")\n\t}\n\tvar target *Raft\n\tfor _, r := range c.rafts {\n\t\tif r.localID != leader.localID {\n\t\t\ttarget = r\n\t\t\tbreak\n\t\t}\n\t}\n\tif target == nil {\n\t\tt.Fatalf(\"no non-leader peer\")\n\t}\n\ttargetID := target.localID\n\tdemotedWasLeader := leader.localID == targetID\n\n\tif err := leader.DemoteVoter(targetID, 0, 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"demote: %v\", err)\n\t}\n\troleOf := func() string {\n\t\tfut := target.GetConfiguration()\n\t\tif err := fut.Error(); err != nil {\n\t\t\treturn \"unknown\"\n\t\t}\n\t\tfor _, srv := range fut.Configuration().Servers {\n\t\t\tif srv.ID == targetID {\n\t\t\t\tif srv.Suffrage == Voter {\n\t\t\t\t\treturn \"voter\"\n\t\t\t\t}\n\t\t\t\treturn \"nonvoter\"\n\t\t\t}\n\t\t}\n\t\treturn \"absent\"\n\t}\n\tconvergeStart := time.Now()\n\tconverged := false\n\tfor time.Since(convergeStart) < 2*time.Second {\n\t\tif roleOf() == \"nonvoter\" {\n\t\t\tconverged = true\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tconvergeMS := int(time.Since(convergeStart) / time.Millisecond)\n\n\tmode := \"automatic\"\n\tif explicit {\n\t\tmode = \"explicit_to_demoted_member\"\n\t}\n\txgEmit(t, map[string]interface{}{\n\t\t\"event\":              \"xg_case_\" + name,\n\t\t\"case\":               name,\n\t\t\"mode\":               mode,\n\t\t\"members\":            4,\n\t\t\"voters\":             3,\n\t\t\"nonvoters\":          1,\n\t\t\"demoted_member\":     string(targetID),\n\t\t\"role_view\":          roleOf(),\n\t\t\"converged\":          converged,\n\t\t\"converge_ms\":        convergeMS,\n\t\t\"leader_before\":      string(leader.localID),\n\t\t\"demoted_was_leader\": demotedWasLeader,\n\t})\n\n\tfutureOK := false\n\tfutureErr := \"\"\n\tfutureDone := false\n\tattempts := 0\n\tstart := time.Now()\n\tattemptErrors := []string{}\n\tfirstAttemptOK := false\n\tfirstAttemptErr := \"\"\n\tfor attempts < 5 {\n\t\ttransferLeader := c.Leader()\n\t\tif transferLeader == nil {\n\t\t\tfutureErr = \"no leader at transfer time\"\n\t\t\tattemptErrors = append(attemptErrors, futureErr)\n\t\t\tbreak\n\t\t}\n\t\tfut := transferLeader.LeadershipTransfer()\n\t\tif explicit {\n\t\t\tfut = transferLeader.LeadershipTransferToServer(targetID, target.localAddr)\n\t\t}\n\t\tattempts++\n\t\tdone := make(chan error, 1)\n\t\tgo func() { done <- fut.Error() }()\n\t\tvar err error\n\t\tselect {\n\t\tcase err = <-done:\n\t\t\tfutureDone = true\n\t\tcase <-time.After(5 * time.Second):\n\t\t\terr = fmt.Errorf(\"no completion within five seconds\")\n\t\t}\n\t\tattemptErrText := \"\"\n\t\tif err != nil {\n\t\t\tattemptErrText = err.Error()\n\t\t}\n\t\tattemptErrors = append(attemptErrors, attemptErrText)\n\t\tif attempts == 1 {\n\t\t\tfirstAttemptOK = err == nil\n\t\t\tfirstAttemptErr = attemptErrText\n\t\t}\n\t\tif err == nil {\n\t\t\tfutureOK = true\n\t\t\tfutureErr = \"\"\n\t\t\tbreak\n\t\t}\n\t\tfutureErr = err.Error()\n\t\tif !strings.Contains(futureErr, \"in progress\") {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(100 * time.Millisecond)\n\t}\n\tfutureMS := int(time.Since(start) / time.Millisecond)\n\n\tsamples := 0\n\tleaderless := 0\n\ttargetEverLeader := false\n\twatchStart := time.Now()\n\tfor time.Since(watchStart) < watchWindow {\n\t\tl := c.Leader()\n\t\tsamples++\n\t\tif l == nil {\n\t\t\tleaderless++\n\t\t} else if l.localID == targetID {\n\t\t\ttargetEverLeader = true\n\t\t}\n\t\ttime.Sleep(sampleEvery)\n\t}\n\tfinalLeader := \"\"\n\tfinalIsTarget := false\n\tif l := c.Leader(); l != nil {\n\t\tfinalLeader = string(l.localID)\n\t\tfinalIsTarget = l.localID == targetID\n\t}\n\n\t// Whatever the transfer did to the leader's transfer state, a client write\n\t// submitted afterwards shows whether the leader still serves requests.\n\tapplyErr := \"\"\n\tapplyMs := 0\n\tconfigErr := \"\"\n\tif l := c.Leader(); l == nil {\n\t\tapplyErr = \"no leader\"\n\t\tconfigErr = \"no leader\"\n\t} else {\n\t\tapplyStart := time.Now()\n\t\tif err := l.Apply([]byte(\"post-transfer\"), 2*time.Second).Error(); err != nil {\n\t\t\tapplyErr = err.Error()\n\t\t}\n\t\tapplyMs = int(time.Since(applyStart) / time.Millisecond)\n\t\tif err := l.GetConfiguration().Error(); err != nil {\n\t\t\tconfigErr = err.Error()\n\t\t}\n\t}\n\n\txgEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"xg_result_\" + name,\n\t\t\"case\":                   name,\n\t\t\"mode\":                   mode,\n\t\t\"future_done\":            futureDone,\n\t\t\"future_ok\":              futureOK,\n\t\t\"future_error\":           futureErr,\n\t\t\"future_ms\":              futureMS,\n\t\t\"attempts\":               attempts,\n\t\t\"attempt_errors\":         attemptErrors,\n\t\t\"first_attempt_ok\":       firstAttemptOK,\n\t\t\"first_attempt_error\":    firstAttemptErr,\n\t\t\"target_became_leader\":   targetEverLeader,\n\t\t\"samples\":                samples,\n\t\t\"leaderless_samples\":     leaderless,\n\t\t\"leaderless_ms_at_least\": leaderless * int(sampleEvery/time.Millisecond),\n\t\t\"final_leader\":           finalLeader,\n\t\t\"final_leader_is_target\": finalIsTarget,\n\t\t\"final_leader_is_voter\":  finalLeader != \"\" && !finalIsTarget,\n\t\t\"post_apply_error\":       applyErr,\n\t\t\"post_apply_ms\":          applyMs,\n\t\t\"post_config_error\":      configErr,\n\t})\n\tt.Logf(\"case=%s mode=%s futureOK=%v err=%q targetLeader=%v leaderless=%d final=%q\",\n\t\tname, mode, futureOK, futureErr, targetEverLeader, leaderless, finalLeader)\n}\n\nfunc TestAssuranceTransferAutomaticVsExplicit(t *testing.T) {\n\tt.Run(\"control_automatic_transfer\", func(t *testing.T) {\n\t\txgRun(t, \"control_automatic_transfer\", false)\n\t})\n\tt.Run(\"trigger_explicit_to_demoted\", func(t *testing.T) {\n\t\txgRun(t, \"trigger_explicit_to_demoted\", true)\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceTransferAutomaticVsExplicit"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admit_control",
+          "event": "xg_case_control_automatic_transfer",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_automatic_transfer",
+              "reference": null
+            },
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "automatic",
+              "reference": null
+            },
+            {
+              "field": "role_view",
+              "op": "eq",
+              "value": "nonvoter",
+              "reference": null
+            },
+            {
+              "field": "converged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "admit_trigger",
+          "event": "xg_case_trigger_explicit_to_demoted",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "trigger_explicit_to_demoted",
+              "reference": null
+            },
+            {
+              "field": "mode",
+              "op": "eq",
+              "value": "explicit_to_demoted_member",
+              "reference": null
+            },
+            {
+              "field": "role_view",
+              "op": "eq",
+              "value": "nonvoter",
+              "reference": null
+            },
+            {
+              "field": "converged",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "api_transfer_to_server_doc",
+      "raft_transfer_accept",
+      "raft_transfer_body",
+      "raft_pick_server",
+      "raft_timeout_now",
+      "raft_vote_nonvoter"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two transfer attempts on separate four-member clusters with one demoted member each: an automatic LeadershipTransfer() control on a cluster whose demoted member is a follower, and an explicit LeadershipTransferToServer for that demoted member on an identical cluster.",
+      "assumptions": [
+        "The demoted member is chosen at the moment of demotion so it is a follower, because demoting the sitting leader starts a transfer of its own.",
+        "Each case bootstraps its own cluster, so the two cases share no state.",
+        "The harness waits up to two seconds for the demoted member's own GetConfiguration to report the non-voter role before transferring, and records whether that convergence happened.",
+        "A transfer future is awaited for at most five seconds per attempt and at most five attempts are made, retrying only while the error names a transfer already in progress."
+      ],
+      "excluded": [
+        "No assertion about data safety or about entries applied during the transfer; the probe records the outcome of one client write after the watch window.",
+        "The five-member cluster and the non-converged demotion race are covered by other receipts and are not repeated here.",
+        "Failover time and vote counts are sampled every ten milliseconds, so an interval shorter than that can be missed."
+      ],
+      "parameters": {
+        "members": 4,
+        "voters_after_demotion": 3,
+        "nonvoters": 1,
+        "watch_ms": 3000,
+        "attempt_timeout_ms": 5000,
+        "max_attempts": 5
+      }
+    },
+    "prefix": "Each case bootstraps a four-peer cluster with the in-memory transport and waits for a leader, demotes one non-leader member with DemoteVoter, and polls that member's GetConfiguration until its own view reports the non-voter role. A case event records the mode, the demoted member, its role view, convergence time and the leader before the transfer. The control calls LeadershipTransfer() and the trigger calls LeadershipTransferToServer(targetID, targetAddress); each future is awaited on its own goroutine for at most five seconds, and while the error names a transfer already in progress the harness retries, up to five attempts, recording every attempt's error. A result event records the future outcome, per-attempt errors, whether the target ever reported Leader during a three-second sample, the leaderless sample count, the final leader and whether it is a voter, then submits one client Apply and one GetConfiguration to the current leader and records their errors.",
+    "requirement": null,
+    "responsibility": "LeadershipTransferToServer accepts a caller-named member and is documented as transferring leadership to that server; the library, not the caller, owns the target check and the transfer bookkeeping. On a configuration in which the named member has no vote, the same library already skips such members when it chooses a target itself, so the explicit entry point is the only path that can admit a target that cannot win, and it must either refuse that target or install it.",
+    "comparisons": [
+      {
+        "event": "xg_result_control_automatic_transfer",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_control",
+        "assertion": {
+          "field": "future_ok",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The automatic transfer on a cluster that contains a demoted member must complete without error; a false witness contradicts it."
+      },
+      {
+        "event": "xg_result_trigger_explicit_to_demoted",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "admit_trigger",
+        "assertion": {
+          "field": "target_became_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "If an explicit transfer to a configured member is admitted rather than refused for having no vote, that member must become leader; a false witness contradicts it."
+      }
+    ],
+    "knowledge": [
+      {
+        "entry_id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-0",
+        "revision": 6,
+        "assertion": "pickServer skips servers whose suffrage is not Voter, while an explicit id is looked up in leaderState.replState, which contains non-voters, and proceeds to replicate and send TimeoutNow."
+      },
+      {
+        "entry_id": "f7da39e9771e40d29f8d7ec3d1c7d886-knowledge-1",
+        "revision": 6,
+        "assertion": "A voter receiving a RequestVote from a configured non-voter adopts a higher term and steps down before rejecting the vote, and timeoutNow performs no membership check."
+      }
+    ]
+  },
+  "snapshot_id": "9609e4f2ef5e47e593bf5a34a559a1b4",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "6f0e1da8cb8048f5b28060a73243fa6b",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

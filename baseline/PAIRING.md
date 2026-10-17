@@ -11,6 +11,7 @@ baseline 保持 [task.md](task.md) 的普通自主调查；CA 保留自己的研
 | 原生能力 | 共同 `common_settings()`；保留普通 shell、工具发现及原生压缩，关闭自动 skills/plugins/memory/hooks 和子 Agent |
 | 执行 | 普通 shell 禁网；baseline `isolated_exec` 与 CA 固定执行均在独立网络中允许同次调用内的 localhost、线程及子进程 |
 | 权限 | 源码、依赖及保留日志只读，工作区可写；不开放宿主网络、凭据或旧研究材料 |
+| Go | 两侧每次新运行的编译缓存为空，仅在本次运行内复用；CA 正式执行保留独立源码副本。CA 使用 `-count=1`，baseline 默认 `GOFLAGS=-mod=readonly -count=1`，复用编译产物时仍实际运行测试 |
 | Cargo | 共用工具定位和离线依赖环境，`CARGO_BUILD_JOBS=2`；配对 CA 设置 `cargo_seed_cache_dir: null`，两侧各自保留运行内构建复用 |
 | Maven | 共用 JDK/Maven 定位、离线依赖及空私有 settings；预先在副本完成依赖准备，正式执行不下载 |
 | 预算 | 配对显式设置相同总时长、调用和动作时限；当前本地配置为 7200 秒、200 回合、单回合 900 秒，CA 另限 80 次正式执行；HashiCorp 动作 600 秒，OmniPaxos/ZooKeeper 动作 1200 秒 |
