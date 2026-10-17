@@ -93,7 +93,7 @@ def isolated_command(command, workspace, directory, hosts, tool_roots=(), read_o
     if not executable:
         raise FileNotFoundError('Bubblewrap is required; no host execution fallback')
     args = [executable, '--die-with-parent', '--new-session', '--unshare-net', '--unshare-pid',
-            '--unshare-ipc', '--unshare-uts', '--cap-drop', 'ALL']
+            '--unshare-ipc', '--unshare-uts', '--hostname', 'audit-local', '--cap-drop', 'ALL']
     for name in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/libexec', '/usr/include', '/usr/share', '/etc/alternatives'):
         if Path(name).is_dir():args += ['--ro-bind', name, name]
     for name in ('/bin', '/sbin', '/lib', '/lib64'):
@@ -141,7 +141,7 @@ async def execute(control, arguments, request_id):
             record['status'] = 'timeout'
         else:
             hosts = folder/'hosts'
-            hosts.write_text('127.0.0.1 localhost\n::1 localhost\n')
+            hosts.write_text('127.0.0.1 localhost audit-local\n::1 localhost audit-local\n')
             command = isolated_command(args.argv, work, cwd, hosts, control['tool_roots'], control['read_only_roots'])
             record['command'] = command
             write_json(folder/'result.json', record)

@@ -25,6 +25,52 @@ from support.responses import ResponsesFixture, message
 
 pytestmark = pytest.mark.real
 
+
+@pytest.mark.parametrize('route', ['baseline', 'ca', 'ca_view'])
+def test_java_local_identity_and_loopback(tmp_path, route):
+    java = shutil.which('java')
+    if not java or not shutil.which('bwrap'):
+        pytest.skip('Java and Bubblewrap are required')
+    java = Path(java).resolve()
+    work = tmp_path/'work'
+    work.mkdir()
+    (work/'LocalIdentity.java').write_text('''import java.net.*;
+public class LocalIdentity {
+    public static void main(String[] args) throws Exception {
+        InetAddress local = InetAddress.getLocalHost();
+        if (!local.getHostName().equals("audit-local") || !local.isLoopbackAddress())
+            throw new AssertionError(local);
+        for (InetAddress address : new InetAddress[] {local,
+                InetAddress.getByName("127.0.0.1"), InetAddress.getByName("::1")}) {
+            try (ServerSocket server = new ServerSocket(0, 1, address);
+                 Socket client = new Socket(address, server.getLocalPort());
+                 Socket accepted = server.accept()) {
+                client.getOutputStream().write(42);
+                if (accepted.getInputStream().read() != 42) throw new AssertionError(address);
+            }
+        }
+        for (InetAddress address : InetAddress.getAllByName("localhost"))
+            if (!address.isLoopbackAddress()) throw new AssertionError(address);
+        System.out.println("LOCAL_IDENTITY_OK");
+    }
+}''')
+    control = dict(work=str(work), records=str(tmp_path/'executions'), turn='java-local',
+        tool_roots=[str(java.parent.parent)], read_only_roots=[], environment={'PATH': '/usr/bin:/bin'},
+        allow_experiments=True, action_timeout=30, run_deadline=time.monotonic()+60)
+    command = [str(java), 'LocalIdentity.java']
+    if route == 'baseline':
+        result = asyncio.run(local_exec.execute(control, {'argv': command}, 'java-local'))
+        assert result['exit_code'] == 0, result
+        text = result['stdout']['preview']
+    else:
+        from consensus_assurance.adapters.runners.experiment import run_experiment
+        from consensus_assurance.adapters.runners.process import ProcessRunner, output
+        result = run_experiment(ProcessRunner(tmp_path), command, work, 'java-local', 30, 'bwrap',
+            view_path=Path('/tmp/audit-view') if route == 'ca_view' else None)
+        assert result.exit_code == 0, output(result)
+        text = output(result)
+    assert 'LOCAL_IDENTITY_OK' in text
+
 toolchains = pytest.mark.parametrize('environment', ['go_module', 'cargo'], indirect=True, scope='module')
 
 
@@ -535,7 +581,7 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
     control={**client.execution_control,'turn':'lifecycle-'+stop,'allow_experiments':True,'action_timeout':10,
              'run_deadline':time.monotonic()+30}
     if stop=='action_timeout':control['action_timeout']=.5
-    if stop=='total_seconds':control['run_deadline']=time.monotonic()+1
+    if stop=='total_seconds':control['run_deadline']=time.monotonic()+5
     runner.write_json(client.control_path,control)
     server = None
     if stop in {'parent_exit', 'parent_kill'}:

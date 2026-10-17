@@ -32,7 +32,13 @@ def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None
     executable = shutil.which("bwrap")
     if not executable:
         raise FileNotFoundError("bubblewrap is required by execution_isolation=bwrap")
+    hosts = workspace / '.execution' / 'hosts'
+    if hosts.parent.is_symlink() or hosts.is_symlink():
+        raise ValueError('Execution hosts file must be a private regular file')
+    hosts.parent.mkdir(exist_ok=True)
+    hosts.write_text('127.0.0.1 localhost audit-local\n::1 localhost audit-local\n')
     args = [executable, "--die-with-parent", "--new-session", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/",
+            "--unshare-uts", "--hostname", "audit-local", "--ro-bind", str(hosts), "/etc/hosts",
             "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/tmp", "--dev", "/dev", "--proc", "/proc"]
     # The host root is read-only; /home, /root and /tmp are hidden.
     # The workspace is writable, but unrelated unmasked host paths remain readable.

@@ -45,7 +45,7 @@ BASELINE_ACCEPTANCE_DIR="$HOME/.cache/consensus-assurance/local-compat-$(date +%
 
 Codex 客户端继承启动终端中显式配置的 HTTP／HTTPS／ALL／NO_PROXY（含小写形式）及 SSL_CERT_FILE／SSL_CERT_DIR，以连接模型服务；这些设置不传入模型 shell 或隔离执行环境。
 
-baseline 的唯一 MCP 是 `baseline_local.isolated_exec`，设置 `required=true`，参数只有普通 `argv`、工作副本内相对 `cwd` 和可选 `timeout_seconds`。普通 shell 禁止网络；该工具每次创建独立网络、PID、IPC 和文件视图，提供固定的 IPv4／IPv6 localhost 映射，允许同次调用内的本地 TCP，不开放宿主网络或任意挂载。源码和依赖只读，输出由宿主服务保留；命令退出、取消、断开及父进程退出均清理后代进程。完整组继续使用自己原有的固定执行器。
+baseline 的唯一 MCP 是 `baseline_local.isolated_exec`，设置 `required=true`，参数只有普通 `argv`、工作副本内相对 `cwd` 和可选 `timeout_seconds`。普通 shell 禁止网络；该工具每次创建独立网络、PID、IPC 和文件视图，将私有主机名 `audit-local` 和 `localhost` 映射到 IPv4／IPv6 回环地址，允许同次调用内的本地 TCP，不开放宿主网络或任意挂载。源码和依赖只读，输出由宿主服务保留；命令退出、取消、断开及父进程退出均清理后代进程。完整组继续使用自己原有的固定执行器。
 
 可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；`cargo_dependency_cache_dir` 仅只读提供 Cargo home 的 `registry/`、`git/`，不开放认证配置。Cargo 默认读取用户 Cargo home 的依赖树；Maven 通过可选 `maven_dependency_cache_dir` 指定只读仓库，默认 `~/.m2/repository`。Rust 与 Maven 的工具定位、离线环境和依赖权限与 CA 共用。每 run 的构建和临时目录位于 `work/.runtime/`，构建耗时计入预算；该临时目录不留存并在收尾删除；复现源码、脚本、笔记和必要输出须由 Agent 放在 `work` 下其他普通目录，沿用安全文件差异留存。已有实验被清理的复现文件不因此恢复。不复制或全量扫描宿主缓存。当前 Rust 配对关闭 CA 跨运行编译种子；运行内缓存继续各自复用，见 [配对条件](PAIRING.md)。
 
@@ -72,3 +72,5 @@ runs/<run-id>/
 报告也在工作区变更中保留，`last_completed_report` 指向实际保留的版本；报告未变时复用该路径，后续超时修改不覆盖它。不再复制 `turns/N/report.md`；历史归档及旧链接不改写。回合末文件不冒充每条命令开始时的快照，模型自行 tee 的内容不冒充宿主原始输出。
 
 结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。保留未完成回合、工作报告、测试和原始输出；历史运行不进入新审计上下文。历史运行保留在本地 `baseline/runs/` 和原 Git 提交，不随发布工作树分发。
+
+Git 归档时，目标自带的 `.gitignore` 仍可能忽略最终研究日志。选定运行后，应核对报告引用的 `work` 文件；对通过凭据检查的必要日志使用显式 `git add -f -- <文件路径>`，保留报告原有相对路径。不要强制添加整个运行目录或构建生成目录。Maven 离线依赖预检只验证 `test-compile`；`package` 等其他生命周期需要提前准备对应插件，不能从预检通过推断所有打包插件已经齐全。
