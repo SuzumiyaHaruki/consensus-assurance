@@ -1,0 +1,23 @@
+Turning the finding into a quantified, reproducible defect and closing out the baselines.
+
+**What I did this turn**
+
+1. **Established that the whole captured test suite is green** — the core suite needed a private network namespace (kompact's TCP harness is blocked in the ordinary shell), so I ran it through the isolated executor: 37 passed / 0 failed / 4 ignored, plus 42 passed for the `unicache` feature set. So finding 1 is outside the captured tests' coverage, not something they'd already catch.
+
+2. **Extended the defect's extent and sharpened its consequence** in [audit_batch_alignment_test.rs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/omnipaxos_runtime/tests/audit_batch_alignment_test.rs) (6 tests: 5 failing repros + 1 passing control; bit-identical outcomes across 4 runs):
+
+   - **Multiple victims, not a one-off race.** Six concurrent `append_notify` calls with `batch_size = 4` returned indices `[1, 2, 3, 4, 4, 5]` for entries `[1000…6000]`: calls 5 and 6 were each told the index of the write immediately before them, because the victim's consumed placeholder makes its own advance eat the next caller's placeholder.
+   - **The caller is told "decided" while its entry is unaccepted.** Inspecting state at the instant call 3 resolves: it got `Ok(2)` while `decided_idx = 2` and the decided log was `[1000, 2000]` — entry 3000 was not in the log at all. Nothing had committed it when the caller was told it was durable.
+   - **Cross-node.** The remote path (`TaggedProposal` → `Assigned`) sends the wrong index to the *originating follower*, so this is not confined to the node that issued the call.
+   - **Grounding in the intended contract.** The shipped example [main.rs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/examples/kv_store_async/src/main.rs:132) documents the exact use the defect breaks: "the caller specifically needs to know its durable decided index before proceeding … safe to announce".
+
+3. **Updated the report** with the baselines, exact reproduction commands, the new evidence blocks, and a reworked unresolved list.
+
+**Unresolved, recorded in the report**
+
+- The durability consequence if the leader dies before the batch holding the entry flushes (needs a restart/partition harness the runtime API doesn't expose — source-based consequence only).
+- Subscriber cursor desync in `push_to_sub`/`push_to_all_subs` when a subscription starts below `compacted_idx` (unreachable through the actor API, since it exposes no trim/snapshot command).
+- Stale-placeholder cases on leadership change / `AcceptSync` resync (ballot guard appears to cover them; not exercised).
+- Adversarial cases for core compaction and the unicache encode/decode path.
+
+Next natural step, if budget remains: build the partition-and-restart harness to upgrade the durability consequence from suspicion to an executed observation, or hunt for a second independent defect in the core's resync/trim interplay.

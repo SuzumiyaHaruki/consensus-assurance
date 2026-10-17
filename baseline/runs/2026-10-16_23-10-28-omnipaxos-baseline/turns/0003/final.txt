@@ -1,0 +1,26 @@
+Root cause is now an executed observation plus a validated fix, all preserved.
+
+**What I did this turn**
+
+1. **Instrumented a copy of the crate** (`work/diag/omnipaxos_runtime/`, captured source untouched) to trace the batching bookkeeping directly. The trace shows the mechanism verbatim — one placeholder queued for two `accepted_idx` advances, and the queued item consumed by the advance the flush-triggering call had already resolved:
+
+   `append_tracked: accepted 0->2 … NO placeholder` → `append_tracked: accepted 2->2, batched 0->1, Local(6da8…)` → `idx 1: popped Untracked`, `idx 2: popped Local(6da8…)`.
+
+2. **Quantified it on an ordinary workload** (randomised soak, 40 `append_notify` calls per seed over all three nodes): 63–75 of 120 calls returned a wrong index at `batch_size = 4`, 0 errors; the `batch_size = 1` control is 0/120 across every run, which validates the checker and shows the defect is batching-dependent. Victims include follower-issued calls, so the leader's wrong index travels over the wire.
+
+3. **Validated the candidate fix**, which is the missing counterpart to `append_tracked`'s deferral branch (queue something for the advance the immediate-accept path just caused):
+
+   | build | 8-test audit file |
+   | --- | --- |
+   | captured source | 2 passed, 6 failed (`notes/repro_run7.log`) |
+   | diagnostic copy + fix | **8 passed, 0 failed** (`notes/diag_fix_run2.log`) |
+
+   Every repro — deterministic, remote/follower, multi-victim, and the randomised soak — passes with that one change; both controls pass in either build. That pins the whole observed behaviour on the accounting hole rather than on scheduling or the core log.
+
+4. **Fixed a flaw in my own repros** found while doing that: the earlier versions awaited the victim's reply before flushing its batch, which only terminated because the buggy build replied early; they would have hung on a corrected implementation. They now trigger every flush inside the same burst and were verified to pass on the corrected build. The "reply arrives while the entry is not even accepted" observation from the buggy build is preserved (`notes/repro_run5.log`, test doc comment).
+
+5. **Hygiene**: the audit test file is gated for the `unicache` feature combination, and `cargo test -p omnipaxos_runtime --all-features` still passes 24 + 4 tests, so the added artifact doesn't disturb the captured baseline.
+
+Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/report.md) — finding, necessary conditions, extent, soak numbers, instrumented trace, candidate fix, and the unchanged unresolved list (durability consequence if the leader dies before the batch flushes; subscriber-cursor desync below `compacted_idx`, unreachable through the actor API; stale-placeholder cases on leadership change; adversarial core compaction/unicache cases).
+
+Next useful step if budget remains: either grind the remaining core-surfaced paths (resync/trim interplay) for a second independent defect, or characterise whether the same accounting hole can be reached without `append_notify` at all (plain `append` + a follower's replicated batch), which would widen the blast radius beyond the new API.

@@ -1,0 +1,20 @@
+Audit progress: I found and reproduced a concrete correctness defect in the async runtime layer, and the report is written.
+
+**Finding: `append_notify` returns another entry's log index**
+
+`OmniPaxosHandle::append_notify` promises the caller's *decided log index*, yet under specific batching conditions it resolves with the index of a different write. Source: [actor.rs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/omnipaxos_runtime/src/actor.rs:370) — `append_tracked` pushes a placeholder into `unconfirmed_local` only when an append is *deferred* by batching. When an append instead *fills* the batch, the entry is accepted inside that same call and resolved directly, so no placeholder is recorded even though `accepted_idx` advanced once per flushed entry. [`reconcile_unconfirmed`](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/omnipaxos_runtime/src/actor.rs:438) then pops one placeholder per single index advance, so the stale advance of the flush-triggering entry consumes the *next* write's placeholder — one index too early.
+
+Conditions: `batch_size > 1`; a buffered write, then a write that fills the batch in the same call, then at least one further `append_notify` buffered before the next `tick()`. A tick in between re-aligns the bookkeeping (verified by a control test).
+
+Executed evidence (`omnipaxos_runtime/tests/audit_batch_alignment_test.rs`, added by this audit; captured tests untouched):
+
+- `batch_size = 2`: `append_notify(3000)` returned `idx 2`, but index 2 holds entry 2000; entry 3000 was decided at index 3. 3/3 runs.
+- `batch_size = 4`: `append_notify(5000)` returned `idx 4` (holds 4000); own entry at 5.
+- Follower path: a *follower's* tagged proposal got `Assigned { idx: 4 }` from the leader for an entry that landed at index 5 — 5/5 runs.
+- Control (same cluster/entries/order, one tick inserted): passes with the correct indices, pinning the cause on that accounting rather than batching, election, forwarding, or the core log.
+
+Reproduce with `cargo test -p omnipaxos_runtime --features tokio_runtime --test audit_batch_alignment_test -- --nocapture --test-threads=1`; logs are under `work/notes/repro_run*.log`. The baseline suite is green (24/24), so this is not something the captured tests already catch. The core log itself stays correct — the entry is accepted one index later — so this is a broken per-call API guarantee rather than a demonstrated cluster-safety violation.
+
+Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/report.md) (includes mechanism, necessary conditions, impact, and checked alternative explanations).
+
+Next useful work, recorded as unresolved: how far the one-index shift propagates across a sequence of writes; whether subscriber cursors desync when `subscribe_decided` starts below `compacted_idx` (`read_decided_suffix` collapses the compacted prefix into one item while `next_idx` counts items); and the untouched core compaction/unicache paths.

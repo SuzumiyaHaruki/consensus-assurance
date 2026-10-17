@@ -1,0 +1,14 @@
+A fourth defect surfaced in the last stretch — this one executed, in the storage layer.
+
+**Finding 4: both bundled storages violate the documented `Storage` contract.** The trait says plainly (`storage/mod.rs:162-171`) that for `get_entries(from, to)` and `get_suffix(from)`, *"if entries do not exist for the complete interval, an empty Vector should be returned"*. My probe (which cost a ~9-minute RocksDB build that earlier passes could not afford) trims to index 2 and then asks for intervals reaching below the compacted prefix:
+
+```
+[audit-pstore] get_entries(0, 3) with compacted=2 -> Err(ErrHelper); get_suffix(0) -> Err(ErrHelper)
+panicked: contract: an interval that does not fully exist must yield an empty vector
+```
+
+`PersistentStorage` only guards the *upper* bound and then walks `to - from` consecutive keys, so a key missing below the compacted prefix surfaces as an opaque error (`persistent_storage.rs:336-351`). `MemoryStorage` deviates differently on the same input: it subtracts `trimmed_idx` from the index (`memory_storage.rs:92-104`), a `usize` underflow — a panic in debug, a wrapped range in release. So the two implementations disagree with the contract *and* with each other. Reachability is not demonstrated — every core call site I traced keeps `from ≥ compact_idx` — and I recorded the one shape I could not rule out (a node whose snapshot type reports `use_snapshots() == false` but which compacted locally past another node's accepted index, per finding 2's pattern, then serves a plain-suffix sync from below its own compacted prefix, which would hit the error path as a panic via the core's `.expect(READ_ERROR_MSG)`).
+
+That probe flips from "prepared but unexecuted" to an evidence artifact like the others, and it fails by design.
+
+**Final tally**: three defects with executed evidence — finding 1 and finding 2 each with deterministic reproductions *and* validated fixes, finding 4 by contract assertion against RocksDB — plus finding 3, which I deliberately narrowed and documented as an observation rather than a defect (with the refuted fix attempt and the `handle_acceptsync`-only-in-`Phase::Prepare` insight). [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/report.md) is at 1056 lines with the executive summary, baselines, one-command reproduction, verification map, all four findings, negative results, caveats, the open list (reachability probe for finding 4; the experiment that would settle finding 3; finding 1's durability consequence) and the artifact inventory; the captured sources remain byte-identical to the read-only tree.

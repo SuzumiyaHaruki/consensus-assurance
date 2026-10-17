@@ -21,7 +21,7 @@ from consensus_assurance.adapters.storage.files import write_json, digest
 from . import local_exec
 
 
-def process(command, cwd, folder, timeout, *, env, stdin="", secrets=()):
+def process(command, cwd, folder, timeout, *, env, stdin="", secrets=(), execution_control=None):
     """Keep partial bytes and terminate all descendants on every exit path."""
     folder.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -34,7 +34,26 @@ def process(command, cwd, folder, timeout, *, env, stdin="", secrets=()):
                 raise subprocess.TimeoutExpired(command, timeout)
             child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
                                      stdout=out, stderr=err, start_new_session=True)
-            child.communicate(stdin.encode(), timeout=timeout)
+            payload, remaining = stdin.encode(), timeout
+            control = json.loads(execution_control.read_text()) if execution_control else None
+            while True:
+                if control:
+                    clock = json.loads(Path(control['execution_clock_path']).read_text())
+                    now = time.monotonic()
+                    limits = {'total_seconds': control['run_deadline'] - now,
+                              'agent_turn_timeout': timeout - (now - started) + local_exec.execution_seconds(clock, now)}
+                    basis = min(limits, key=limits.get)
+                    remaining = limits[basis]
+                    if remaining <= 0:
+                        result['timeout_limit'] = basis
+                        raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    child.communicate(payload, timeout=min(remaining, .2) if execution_control else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    if not execution_control:
+                        raise
+                    payload = None
             result["exit_code"] = child.returncode
         except subprocess.TimeoutExpired:
             result["status"] = "timeout"
@@ -251,7 +270,7 @@ class Codex:
             'read_only_roots': [str(self.root/'source'), *map(str, dependencies)],
             'environment': {**self.tool_environment, 'PATH': tool_path + ':/usr/bin:/bin'},
             'action_timeout': self.config.budget.action_timeout, 'run_deadline': self.deadline,
-            'turn_deadline': min(self.deadline, time.monotonic()+30), 'turn': 'environment-check',
+            'turn': 'environment-check',
             'allow_experiments': True}
         # check-env authorizes only the fixed local probe. Real calls require both original switches.
         self.control_path = self.home/'local-exec.json'
@@ -420,7 +439,7 @@ print('PERMISSIONS_VERIFIED')
     def check_environment(self):
         self.prompt_probe()
         self.dependency_probe()
-        self.execution_control.update(allow_experiments=True, turn_deadline=time.monotonic()+self.limit())
+        self.execution_control.update(allow_experiments=True)
         write_json(self.control_path, self.execution_control)
         try:
             asyncio.run(asyncio.wait_for(self.mcp_probe(), self.limit()))
@@ -448,13 +467,17 @@ print('PERMISSIONS_VERIFIED')
         for path, expected in implementation['reload_inputs'].items():
             if digest(Path(path).read_bytes()) != expected:
                 raise ValueError('Isolated execution implementation changed; start a new run')
-        self.execution_control.update(turn=folder.name, turn_deadline=min(self.deadline, time.monotonic()+timeout),
+        # Late cleanup from a previous service can only update that turn's private clock.
+        clock_path = self.home / ('execution-clock-' + folder.name + '.json')
+        write_json(clock_path, {'elapsed_seconds': 0.0})
+        self.execution_control.update(turn=folder.name, execution_clock_path=str(clock_path),
                                       allow_experiments=True)
         write_json(self.control_path, self.execution_control)
         command = [*self.prefix(), "exec", *(["resume"] if session_id else []), "--strict-config",
                    "--skip-git-repo-check", "--ignore-user-config", "--json",
                    "--output-last-message", str(folder / "final.txt"), *options(self.settings)]
         command += [session_id, "-"] if session_id else ["-"]
-        result = process(command, self.work, folder, timeout, env=self.environment, stdin=prompt, secrets=self.secrets)
+        result = process(command, self.work, folder, timeout, env=self.environment, stdin=prompt, secrets=self.secrets,
+                         execution_control=self.control_path)
         local_exec.reconcile(self.root/'executions', folder.name, 'Codex turn ended: '+result['status'])
         return decode(folder, result, session_id)

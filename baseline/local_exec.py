@@ -24,6 +24,7 @@ from consensus_assurance.adapters.storage.files import write_json
 DESCRIPTION = ('Run an ordinary local test in a private network and PID namespace. The ordinary shell retains its current restrictions. '
                'Use this tool for TCP or a bounded isolated run; start all communicating processes within the same invocation. '
                'Returns execution output, not an audit verdict. cwd is relative to this run working copy. '
+               'Execution pauses the Agent turn timer but remains bounded by the action and total run limits. '
                'No background service survives an invocation. Complete raw logs are retained read-only.')
 
 
@@ -64,10 +65,16 @@ def timestamp():
 def remaining(control, requested):
     limits = {'requested': requested if requested is not None else control['action_timeout'],
               'action_timeout': control['action_timeout'],
-              'agent_turn_timeout': control['turn_deadline'] - time.monotonic(),
               'total_seconds': control['run_deadline'] - time.monotonic()}
     key = min(limits, key=limits.get)
     return max(0, limits[key]), key
+
+
+def execution_seconds(clock, now):
+    """Only the trusted serial execution service can pause the Agent timer."""
+    active = clock.get('active')
+    # A dead service cannot keep granting time after its last action deadline.
+    return clock['elapsed_seconds'] + (max(0, min(now, active[1]) - active[0]) if active else 0)
 
 
 def validate_directory(work, relative):
@@ -123,7 +130,13 @@ async def execute(control, arguments, request_id):
     write_json(folder/'result.json', record)
     child = None
     pumps = []
+    clock_path = Path(control['execution_clock_path']) if control.get('execution_clock_path') else None
+    clock = None
     try:
+        if clock_path:
+            clock = json.loads(clock_path.read_text())
+            clock['active'] = [started, started + limit]
+            write_json(clock_path, clock)
         if limit <= 0:
             record['status'] = 'timeout'
         else:
@@ -173,6 +186,10 @@ async def execute(control, arguments, request_id):
             if record['status'] == 'completed' and record['exit_code'] and record['stderr']['preview'].startswith('bwrap:'):
                 record['status'] = 'launch_error'
             write_json(folder/'result.json', record)
+            if clock is not None:
+                clock['elapsed_seconds'] += record['elapsed_seconds']
+                clock.pop('active', None)
+                write_json(clock_path, clock)
     return record
 
 

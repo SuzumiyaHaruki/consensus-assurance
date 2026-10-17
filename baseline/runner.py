@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from consensus_assurance.adapters.storage.files import digest, write_json
@@ -213,8 +213,9 @@ def brief(root, source, target, deadline, timeout, calls_left):
         "permissions": "Source/logs read only; work writable; ordinary shell has no network. isolated_exec supports private local TCP; no host or external network.",
         "tool_environment": f"Offline {target['execution_backend']}. work/.runtime is disposable, excluded from retained artifacts and removed at cleanup. Keep reproduction source, scripts, notes and outputs needed for review elsewhere under work.",
         "remaining_total_seconds": remaining, "turn_timeout_seconds": timeout, "remaining_agent_calls": calls_left,
-        "generated_at": now(), "estimated_turn_deadline_utc": (datetime.now(timezone.utc) + timedelta(seconds=timeout)).isoformat(),
-        "deadline_basis": "Host monotonic clock; preparation, tool work and model waiting all consume total time."}, indent=2)
+        "generated_at": now(),
+        "deadline_basis": "Host monotonic clock; preparation, tool work and model waiting all consume total time. "
+                          "Only isolated_exec execution pauses the Agent turn timer; ordinary shell and model waiting count against it."}, indent=2)
 
 
 def loop(config, root, source, target, client, deadline, record):
@@ -241,7 +242,7 @@ def loop(config, root, source, target, client, deadline, record):
             result = {"status": "cancelled", "session_id": session}
         except (ValueError, OSError) as exc:
             result = {"status": "external_blocker_needs_review", "session_id": session, "reason": str(exc)}
-        result["timeout_limit"] = "total_seconds" if remaining <= config.budget.agent_turn_timeout else "agent_turn_timeout"
+        result.setdefault("timeout_limit", "total_seconds" if remaining <= config.budget.agent_turn_timeout else "agent_turn_timeout")
         result["ended_at"] = now()
         result["run_elapsed_seconds"] = time.monotonic() - start
         actual = save_changes(root / "work", folder / "changes", previous)

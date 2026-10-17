@@ -263,7 +263,8 @@ def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop,
     assert (root / f"turns/{turns:04d}/changes/files/report.md").exists()
 
 
-def test_preparation_counts_and_timeout_uses_minimum(tmp_path, monkeypatch):
+@pytest.mark.parametrize('during_execution', [False, True])
+def test_preparation_counts_and_total_timeout_survives_turn_accounting(tmp_path, monkeypatch, during_execution):
     c = configuration(tmp_path)
     c.budget.total_seconds, c.budget.agent_turn_timeout = 10.0, 8.0
     clock = [100.0]
@@ -271,10 +272,16 @@ def test_preparation_counts_and_timeout_uses_minimum(tmp_path, monkeypatch):
     class Client(ScriptedClient):
         statuses = ["timeout"]
         def prepare(self):
-            clock[0] += 3
+            clock[0] += 0 if during_execution else 3
             return {}
+        def turn(self, *args):
+            result = super().turn(*args)
+            if during_execution:
+                clock[0] = 110
+                result['timeout_limit'] = 'total_seconds'
+            return result
     result = runner.run(c, load_target(c), client_factory=Client)
-    assert Client.instances[-1].calls[0][0] == 7
+    assert Client.instances[-1].calls[0][0] == (8 if during_execution else 7)
     assert result["stop"] == "total_deadline"
 
 
@@ -359,7 +366,7 @@ def test_execution_keeps_empty_arguments_but_rejects_invalid_executable_and_nul(
     monkeypatch.setattr(local_exec, "isolated_command", lambda argv, *args: argv)
     control = {"work": str(tmp_path), "records": str(tmp_path / "executions"), "turn": "arguments",
                "tool_roots": [], "read_only_roots": [], "environment": {}, "allow_experiments": True,
-               "action_timeout": 5, "turn_deadline": time.monotonic() + 10, "run_deadline": time.monotonic() + 20}
+               "action_timeout": 5, "run_deadline": time.monotonic() + 20}
     if valid:
         result = asyncio.run(local_exec.execute(control, {"argv": argv}, "arguments"))
         assert result["status"] == "completed" and result["exit_code"] == 0
@@ -379,12 +386,50 @@ def test_tool_arguments_and_directory_boundary(tmp_path):
         with pytest.raises((ValueError, OSError)):local_exec.validate_directory(work,relative)
 
 
-@pytest.mark.parametrize('basis,value', [('requested',1),('action_timeout',2),('agent_turn_timeout',3),('total_seconds',4),('total_seconds',-1)])
+@pytest.mark.parametrize('basis,value', [('requested',1),('action_timeout',2),('total_seconds',4),('total_seconds',-1)])
 def test_local_execution_limit_selection(monkeypatch, basis, value):
     monkeypatch.setattr(local_exec.time,'monotonic',lambda:100)
-    control={'action_timeout':20,'turn_deadline':130,'run_deadline':140}
-    if basis != 'requested':control[{'agent_turn_timeout':'turn_deadline','total_seconds':'run_deadline'}.get(basis,basis)] = value + (100 if basis in {'agent_turn_timeout','total_seconds'} else 0)
+    control={'action_timeout':20,'run_deadline':140}
+    if basis != 'requested':control['run_deadline' if basis=='total_seconds' else basis] = value + (100 if basis=='total_seconds' else 0)
     assert local_exec.remaining(control, value if basis=='requested' else 99) == (max(0,value),basis)
+
+
+@pytest.mark.parametrize('mode', ['completed', 'agent_timeout', 'total_timeout', 'stale_clock', 'stdout_only'])
+def test_turn_clock_excludes_only_recorded_execution_and_preserves_deadlines(tmp_path, mode):
+    control = tmp_path/'private-control.json'
+    clock = tmp_path/'private-clock.json'
+    runner.write_json(clock, {'elapsed_seconds':0.0})
+    runner.write_json(control, {'run_deadline':time.monotonic() + (.8 if mode=='total_timeout' else 10),
+                               'execution_clock_path':str(clock)})
+    # This subprocess supplies synthetic service timing; the real MCP boundary is tested separately.
+    script = '''import json,time
+from pathlib import Path
+clock=Path(CLOCK)
+data=json.loads(clock.read_text())
+started=time.monotonic()
+data['active']=[started,started+DURATION]
+def save():
+    temporary=clock.with_suffix('.tmp')
+    temporary.write_text(json.dumps(data))
+    temporary.replace(clock)
+if MODE=='stdout_only':
+    print(json.dumps(data),flush=True)
+else:
+    save()
+time.sleep(5 if MODE in {'stdout_only','stale_clock'} else DURATION)
+data={'elapsed_seconds':time.monotonic()-started}
+save()
+print('EXECUTION_RETURNED',flush=True)
+time.sleep(5 if MODE=='agent_timeout' else 0)
+'''.replace('CLOCK',repr(str(clock))).replace('DURATION',repr(.3 if mode=='stale_clock' else 1.2)).replace('MODE',repr(mode))
+    result=codex.process([sys.executable,'-c',script],tmp_path,tmp_path/'logs',.6,
+                         env=os.environ.copy(),execution_control=control)
+    assert result['status']==('completed' if mode=='completed' else 'timeout')
+    output=(tmp_path/'logs/stdout.jsonl').read_text()
+    assert ('EXECUTION_RETURNED' in output)==(mode in {'completed','agent_timeout'})
+    if mode!='completed':
+        assert result['timeout_limit']==('total_seconds' if mode=='total_timeout' else 'agent_turn_timeout')
+    assert result['elapsed_seconds'] < (1.2 if mode in {'total_timeout','stale_clock','stdout_only'} else 2.2)
 
 
 def test_process_timeout_kills_descendant_and_keeps_bytes(tmp_path):

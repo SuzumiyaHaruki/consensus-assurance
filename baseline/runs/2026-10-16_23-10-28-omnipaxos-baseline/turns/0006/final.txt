@@ -1,0 +1,19 @@
+This turn's sweep found a third issue — a liveness one — in the captured core.
+
+**Finding 3 — a lagging follower can stay behind indefinitely** (executed symptom, source-based mechanism; the report labels it that way explicitly).
+
+A workspace-wide run surfaced a captured test failing that I hadn't touched: `sync_full_test`. Characterisation:
+
+- Alone: 4/4 passes. With 8 CPU hogs on this 4-core box: 3/4 fail at the captured 8 s budget.
+- **Slow vs stuck**: I ran the *captured test binary* against a diagnostic config copy with the budget raised to 120 s → 2 of 4 runs sat out the entire budget (122.91 s) while the passing runs finish in 2.53 s. So it is non-convergence, not slowness — a 48× margin.
+- **State at the stall** (same signature in the very first observation): follower `decided = accepted = 5`, its log holding only the snapshot it merged during the sync, while the leader had `Decided(3..5), Decided(10), Decided(11), Decided(12), StopSign` — i.e. decided 9. No resend round in 120 s closed the gap. It is a liveness/availability gap, not divergence.
+
+Mechanism I found in the source (as a hypothesis to instrument, not an observation): neither role ever re-sends `AcceptDecide`/`AcceptSync` (`resend_messages_leader` in `Phase::Accept` only re-sends Prepare/stop-sign traffic), the follower's `Phase::Accept` resend path is a no-op, an *older* sequence number is dropped silently (`MessageStatus::Outdated => ()`) so no recovery is triggered, and a re-sent `Decide` cannot help because a follower's decided index is clamped to its accepted index. Recovery therefore depends on a *newer* sequence number arriving or the user calling `reconnected(pid)` — which is why `reconnect_test` covers dropped accepts but this path does not.
+
+Also this turn:
+
+- Verified the candidate fix for finding 1 against the **captured** runtime suite: 24/24 pass with the fix applied.
+- Closed the reconfiguration/StopSign boundary question with a passing probe (core log, subscriber stream and `Reconfigured` event all agree; StopSign delivered once, last, `decided = true`).
+- Corrected baseline counts by summing the saved logs (core 34 captured / 37 with probes, unicache 41, runtime 28) and noted that my earlier figures were eyeballed.
+
+Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-16_23-10-28-omnipaxos-baseline/work/report.md) — three findings with mechanisms, necessary conditions, evidence and reproduction recipes; negative results; caveats; and a prioritized open list whose top item is instrumenting a core copy (or a deterministic one-lost-`AcceptDecide` probe) to pin finding 3's exact trigger. Artifacts: three audit test files, two diagnostic copies, 39 logs.

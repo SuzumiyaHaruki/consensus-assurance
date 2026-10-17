@@ -136,7 +136,7 @@ def execution(request, environment):
                 text = Path(result['stdout']['path']).read_text() + Path(result['stderr']['path']).read_text()
                 return result, text
         def execute(command, name, timeout=90):
-            client.execution_control.update(turn=name, turn_deadline=time.monotonic()+timeout, run_deadline=client.deadline, allow_experiments=True)
+            client.execution_control.update(turn=name, run_deadline=client.deadline, allow_experiments=True)
             runner.write_json(client.control_path, client.execution_control)
             return asyncio.run(call(command, timeout))
         return request.param, client.work, execute
@@ -257,8 +257,16 @@ def test_real_exec_resume_request_tools_and_result_consumption(environment, monk
         for number in (1, 2):
             turn.clear()
             turn.update(folder=client.root/'turns'/f'fixture-request-{number}', call_id=f'fixture-{number}')
-            result = client.turn(turn['folder'], 'Synthetic local routing fixture only; no remote inference.', 30, session)
+            result = client.turn(turn['folder'], 'Synthetic local routing fixture only; no remote inference.', 8, session)
             assert result['status'] == 'completed', result
+            assert result['elapsed_seconds'] > 12 > result['timeout_seconds']
+            clock_path = Path(json.loads(client.control_path.read_text())['execution_clock_path'])
+            clock = json.loads(clock_path.read_text())
+            assert 12 <= clock['elapsed_seconds'] < 20 and 'active' not in clock
+            if number == 1:
+                first_clock, first_bytes = clock_path, clock_path.read_bytes()
+            else:
+                assert clock_path != first_clock and first_clock.read_bytes() == first_bytes
             assert turn.get('execution_id') and not capture.errors
             session = result['session_id']
             results.append({**result, 'execution_id': turn['execution_id']})
@@ -439,6 +447,8 @@ def test_execution_stops_descendants(environment, stop):
 @toolchains
 def test_mcp_permissions_arguments_and_results(environment):
     client = environment
+    clock_path = client.home/'permission-clock.json'
+    runner.write_json(clock_path, {'elapsed_seconds':0.0})
     socket_directory = tempfile.TemporaryDirectory(prefix='baseline-ipc-')
     host_socket = Path(socket_directory.name)/'host-control.sock'
     unix = socket.socket(socket.AF_UNIX)
@@ -478,12 +488,12 @@ try:os.lseek(1,0,0)
 except OSError as e:assert e.errno==errno.ESPIPE
 else:raise AssertionError('Raw log is seekable by test process')
 print(json.dumps({'denied':blocked,'pids':[p.name for p in pids],'env':dict(os.environ),'fds':[os.readlink(p) for p in pathlib.Path('/proc/self/fd').glob('*') if p.exists()]}))
-'''.replace('PRIVATE', repr(list(map(str,[secret, log, client.root/'turns/permission-canary', client.control_path, client.root/'inputs/task.md', runner.TASK.parent/'README.md'])))).replace('READONLY', repr([str(client.root/'source/fixture.txt'), *canaries])).replace('SOCKET', repr(str(host_socket)))
+'''.replace('PRIVATE', repr(list(map(str,[secret, log, client.root/'turns/permission-canary', client.control_path, clock_path, client.root/'inputs/task.md', runner.TASK.parent/'README.md'])))).replace('READONLY', repr([str(client.root/'source/fixture.txt'), *canaries])).replace('SOCKET', repr(str(host_socket)))
     link=client.work/'outside';link.symlink_to(client.root.parent,target_is_directory=True)
     host_program=client.root.parent/'host-only.py'
     host_program.write_text("#!/usr/bin/python3\nprint('HOST_PROGRAM_CONTROL')\n");host_program.chmod(0o755)
     assert subprocess.check_output([str(host_program)],text=True).strip()=='HOST_PROGRAM_CONTROL'
-    client.execution_control.update(turn='mcp-boundaries', allow_experiments=True, turn_deadline=time.monotonic()+60)
+    client.execution_control.update(turn='mcp-boundaries', allow_experiments=True, execution_clock_path=str(clock_path))
     runner.write_json(client.control_path, client.execution_control)
     async def scenario():
         async with mcp_session(client) as (session, _):
@@ -514,7 +524,7 @@ print(json.dumps({'denied':blocked,'pids':[p.name for p in pids],'env':dict(os.e
         socket_directory.cleanup()
 
 
-@pytest.mark.parametrize('stop', ['action_timeout','cancelled',
+@pytest.mark.parametrize('stop', ['action_timeout','total_seconds','cancelled',
                                'stdio_disconnect','service_death','background_exit','parent_exit','parent_kill'])
 def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(environment, stop):
     client=environment
@@ -523,8 +533,9 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
     script="import subprocess,sys,time,pathlib;subprocess.Popen([sys.executable,'-c',"+repr(child)+"],start_new_session=True);\nwhile not pathlib.Path("+repr(str(heartbeat))+").exists():time.sleep(.01)\nprint('CHILD_STARTED',flush=True)\n"
     if stop!='background_exit':script+='time.sleep(60)\n'
     control={**client.execution_control,'turn':'lifecycle-'+stop,'allow_experiments':True,'action_timeout':10,
-             'turn_deadline':time.monotonic()+20,'run_deadline':time.monotonic()+30}
+             'run_deadline':time.monotonic()+30}
     if stop=='action_timeout':control['action_timeout']=.5
+    if stop=='total_seconds':control['run_deadline']=time.monotonic()+1
     runner.write_json(client.control_path,control)
     server = None
     if stop in {'parent_exit', 'parent_kill'}:
@@ -555,7 +566,7 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
                 os.kill(parent, signal.SIGTERM if stop == 'parent_exit' else signal.SIGKILL)
             try:
                 response=await asyncio.wait_for(task,8)
-                if stop=='action_timeout':
+                if stop in {'action_timeout','total_seconds'}:
                     assert response.structuredContent['status']=='timeout'
                     assert response.structuredContent['timeout_limit']==stop
                 elif stop=='background_exit':assert response.structuredContent['exit_code']==0
