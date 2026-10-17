@@ -374,7 +374,6 @@ def run(config, target, *, client_factory=Codex, environment_only=False):
         scrub_work(root)
         write_json(root / "run.json", record)
         index(root, record)
-        freeze(root)
     return {"ok": (record["stop"] == "environment_checked" if environment_only else
                    record["stop"] in {"agent_call_limit", "total_deadline"}),
             "run_dir": str(root), "stop": record["stop"], "reason": record.get("reason"),
