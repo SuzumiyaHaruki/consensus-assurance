@@ -62,10 +62,46 @@ def git(repo: Path, *args):
         return None
 
 
+def fixed_submodules(repo):
+    """Validate initialized gitlinks without fetching or following branch tips."""
+    records = {}
+    def visit(root, prefix=Path('.')):
+        tree = git(root, 'ls-tree', '-rz', 'HEAD')
+        if tree is None:
+            if (root/'.git').exists():raise ValueError(f'Cannot inspect fixed Git tree: {root}')
+            return
+        for entry in tree.split('\0'):
+            if not entry:continue
+            meta, name = entry.split('\t', 1)
+            mode, kind, expected = meta.split()
+            if mode != '160000':continue
+            relative = prefix / name
+            child = root / name
+            if Path(name).is_absolute() or '..' in Path(name).parts or any(
+                    p.is_symlink() for p in [child, *child.parents] if p.is_relative_to(repo)):
+                raise ValueError(f'Unsafe submodule path: {relative}')
+            actual = git(child, 'rev-parse', 'HEAD') if (child/'.git').exists() else None
+            if actual != expected:
+                raise ValueError(f'Submodule {relative}: expected {expected}; actual {actual or "missing/uninitialized"}')
+            status = git(child, 'status', '--porcelain', '--untracked-files=all')
+            if status != '':
+                raise ValueError(f'Submodule {relative}: expected {expected}; actual dirty or unreadable working tree')
+            records[str(relative)] = expected
+            visit(child, relative)
+    visit(repo)
+    return records
+
+
 def capture(repo: Path, destination: Path | None = None, *, excluded_dirs=(), analysis_roots=(), expected_module=None) -> Snapshot:
     repo = repo.resolve()
     if destination and destination.resolve().is_relative_to(repo):
         raise ValueError("Snapshot destination must be outside the original repository")
+    submodules = fixed_submodules(repo)
+    tracked = {}
+    for name in submodules:
+        listing = git(repo/name, 'ls-files', '-z')
+        if listing is None:raise ValueError(f'Cannot enumerate fixed submodule: {name}')
+        tracked[name] = set(listing.split('\0'))
     contents, excluded, reasons, readable = {}, [], {}, []
     for folder, dirs, names in os.walk(repo, followlinks=False):
         kept = []
@@ -79,7 +115,9 @@ def capture(repo: Path, destination: Path | None = None, *, excluded_dirs=(), an
         for name in sorted(names):
             path = Path(folder) / name
             rel = str(path.relative_to(repo))
-            if path.is_symlink() or sensitive_file(path) or name in {"AGENTS.md", "SKILL.md"}:
+            owner = max((p for p in submodules if Path(rel).is_relative_to(p)), key=len, default=None)
+            if owner and str(Path(rel).relative_to(owner)) not in tracked[owner]:continue
+            if path.is_symlink() or sensitive_file(path) or name in {".git", "AGENTS.md", "SKILL.md"}:
                 excluded.append(rel)
                 reasons[rel] = "Excluded credential-like name, instruction file, symlink, oversize file or sensitive content"
                 continue
@@ -112,4 +150,4 @@ def capture(repo: Path, destination: Path | None = None, *, excluded_dirs=(), an
     commit = git(repo, "rev-parse", "HEAD")
     return Snapshot(repo=str(repo), commit=commit, branch=git(repo, "branch", "--show-current") or None,
         dirty=(bool(git(repo, "status", "--porcelain")) if commit else None),
-        files=contents, excluded=sorted(excluded), readable_files=sorted(readable), exclusion_reasons=reasons)
+        files=contents, excluded=sorted(excluded), readable_files=sorted(readable), exclusion_reasons=reasons, submodules=submodules)

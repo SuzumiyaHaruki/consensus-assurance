@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import json
 import os
 import subprocess
@@ -259,7 +260,7 @@ def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop,
     assert not (root / 'work/.runtime').exists()
     for name in ('check.py','output.txt'):
         assert (root/'work/reproduction'/name).read_bytes() == (root/'turns/0001/changes/files/reproduction'/name).read_bytes()
-    assert not (root / "run.json").stat().st_mode & 0o222
+    assert (root / "run.json").stat().st_mode & 0o200
     assert (root / f"turns/{turns:04d}/changes/files/report.md").exists()
 
 
@@ -478,3 +479,23 @@ def test_implementation_identity_preserves_dirty_and_external_source(tmp_path, m
     assert 'tests/baseline/test_fixture.py' not in later['retained_source']
     assert later['retained_source']['src/.env']['record'] is None
     assert len(first['reload_inputs']) == 2
+
+
+def test_fixed_submodules_are_shared_and_fail_closed(tmp_path):
+    from consensus_assurance.adapters.storage.snapshot import capture
+    repo = make_repo(tmp_path/'repo')
+    child = make_repo(repo/'nested')
+    runner.git(repo, 'add', 'nested')
+    runner.git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'Fixed child')
+    expected = runner.git(child, 'rev-parse', 'HEAD').decode().strip()
+    baseline = runner.capture_source(repo, tmp_path/'baseline', time.monotonic()+30)
+    ca = capture(repo, tmp_path/'ca')
+    assert ca.submodules == baseline['submodules'] == {'nested': expected}
+    assert (tmp_path/'ca/nested/go.mod').read_bytes() == (tmp_path/'baseline/nested/go.mod').read_bytes()
+    assert not (tmp_path/'ca/nested/.git').exists() and not (tmp_path/'baseline/nested/.git').exists()
+    runner.git(child, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-qm', 'Mismatch')
+    for call in [lambda:capture(repo), lambda:runner.capture_source(repo,tmp_path/'bad',time.monotonic()+30)]:
+        with pytest.raises(ValueError, match='Submodule nested: expected .*actual'):call()
+    shutil.rmtree(child)
+    for call in [lambda:capture(repo), lambda:runner.capture_source(repo,tmp_path/'missing',time.monotonic()+30)]:
+        with pytest.raises(ValueError, match='nested.*missing/uninitialized'):call()

@@ -1,5 +1,7 @@
 import json
 import re
+import os
+import subprocess
 from pathlib import Path
 from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.adapters.runners.experiment import local_package
@@ -40,10 +42,10 @@ def go_test_diagnostics(text):
 
 class GoModuleBackend:
     name = "go_module"
-    version = "3"
+    version = "4"
     harness_kind = "go_test"
     harness_filename = "assurance_generated_test.go"
-    harness_instructions = "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. Optional test_names selects exact top-level names and their subtests; omission runs all TestAssurance tests. Unselected code still compiles and package initialization still runs. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs."
+    harness_instructions = "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. Optional test_names selects exact top-level names and their subtests; omission runs all TestAssurance tests. Unselected code still compiles and package initialization still runs. execution_package is repository-relative; the nearest captured go.mod selects the execution module. Local replacements must remain in the captured repository; Go workspaces are unsupported. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs."
 
     def environment(self, workspace):
         return {"GOCACHE": str(workspace / ".execution/go-build"), "GOPROXY": "off", "GOSUMDB": "off",
@@ -52,13 +54,46 @@ class GoModuleBackend:
     def read_only_roots(self):
         return [Path.home() / "go/pkg/mod"]
 
+    @staticmethod
+    def module_for(source, package):
+        for parent in [Path(package), *Path(package).parents]:
+            if (source/parent/'go.work').exists():
+                raise ValueError('Go workspaces are not supported')
+        for parent in [Path(package), *Path(package).parents]:
+            if (source/parent/'go.mod').is_file():return parent
+        raise ValueError('Selected package has no captured go.mod')
+
+    @staticmethod
+    def local_modules(source, module, target_files):
+        pending, seen = [module], set()
+        while pending:
+            current = pending.pop()
+            if current in seen:continue
+            seen.add(current)
+            path = source/current/'go.mod'
+            if (str(current/'go.mod') not in target_files or not path.resolve().is_relative_to(source.resolve())
+                    or any(p.is_symlink() for p in [path, *path.parents] if p.is_relative_to(source))):
+                raise ValueError('Local replacement requires a captured go.mod: ' + str(current))
+            data = json.loads(subprocess.check_output(['go', 'mod', 'edit', '-json', str(path.resolve())],
+                env={**os.environ, 'GOTOOLCHAIN':'local', 'GOWORK':'off'}, timeout=10))
+            for replacement in data.get('Replace') or []:
+                new = replacement['New']
+                if new.get('Version'):continue
+                relative = Path(new['Path'])
+                destination = source/current/relative
+                if relative.is_absolute() or not destination.resolve().is_relative_to(source.resolve()) or any(
+                        p.is_symlink() for p in [destination, *destination.parents] if p.is_relative_to(source)):
+                    raise ValueError('Local replacement escapes captured source: ' + new['Path'])
+                pending.append(destination.resolve().relative_to(source.resolve()))
+        return sorted(str(p) for p in seen)
+
     def resolve_harness(self, harness, source, target_files):
         self.test_pattern(harness.test_names)
         package = local_package(harness.execution_package if harness.execution_package is not None else self.package)
         filename = str(Path(package) / Path(self.harness_filename).name) if harness.execution_package is not None else self.harness_filename
-        if 'go.mod' not in target_files:
-            raise ValueError("Go execution requires the captured module's go.mod")
-        # All generated helpers stay in the same module too. Installation checks collisions and symlinks.
+        module = self.module_for(source, package)
+        self.local_modules(source, module, target_files)
+        # All generated helpers stay in the selected module. Installation checks collisions and symlinks.
         for name in [package, *harness.files]:
             relative = Path(name)
             if relative.is_absolute() or ".." in relative.parts or 'vendor' in relative.parts:
@@ -68,12 +103,26 @@ class GoModuleBackend:
                 path = source / parent
                 if path.is_symlink() or (path.exists() and not path.is_dir()):
                     raise ValueError("Package path traverses a symlink or non-directory")
-                if (parent != Path('.') and str(parent / 'go.mod') in target_files) or str(parent / 'go.work') in target_files:
-                    raise ValueError("Nested modules and Go workspaces are not supported")
+                if str(parent / 'go.work') in target_files:
+                    raise ValueError("Go workspaces are not supported")
+            if self.module_for(source, str(directory)) != module:
+                raise ValueError('Generated helpers must stay in the selected module')
         if not any(Path(name).parent == Path(package) and name.endswith('.go') for name in target_files):
             raise ValueError("execution_package must select an existing captured Go package")
         harness.execution_package = package
         return filename
+
+    def execute(self, runner, command, workspace, snapshot_id, timeout, mode, action):
+        from .experiment import run_experiment
+        package = Path(local_package(command[-1]))
+        module = self.module_for(workspace, str(package))
+        modules = self.local_modules(workspace, module, {str(p.relative_to(workspace)) for p in workspace.rglob('go.mod')})
+        if module != Path('.'):
+            command = [command[0], '-C', str(module), *command[1:-1], local_package(str(package.relative_to(module)))]
+        check = run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action, adapter=self, prepared=True)
+        check.parameters.update(module_directory=str(module), local_modules=modules,
+                                module_execution_cwd=str(workspace/module))
+        return check
 
     def parse_test_result(self, check, text):
         facts = go_test_diagnostics(text)

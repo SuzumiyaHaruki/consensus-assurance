@@ -116,6 +116,7 @@ class Snapshot(Record):
     created_at: str = Field(default_factory=now)
     readable_files: list[str] | None = None
     exclusion_reasons: dict[str, str] = {}
+    submodules: dict[str, str] = {}
 
 
 class Material(Record):

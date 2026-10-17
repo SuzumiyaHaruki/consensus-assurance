@@ -14,7 +14,7 @@ from pathlib import Path
 
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.storage.snapshot import (
-    EXCLUDED_DIRS, sensitive_file,
+    EXCLUDED_DIRS, sensitive_file, fixed_submodules,
 )
 
 from .codex import Codex
@@ -91,11 +91,12 @@ def git(repo, *args, deadline=None, stdin=None):
 
 def capture_source(repo, destination, deadline):
     repo = Path(repo)
+    submodules = fixed_submodules(repo)
     if git(repo, "status", "--porcelain", "--untracked-files=all", deadline=deadline).strip():
         raise ValueError("Target must be a clean Git commit; dirty files are never cleaned automatically")
     commit = git(repo, "rev-parse", "HEAD", deadline=deadline).decode().strip()
     tree = git(repo, "ls-tree", "-rz", "--full-tree", commit, deadline=deadline)
-    entries, excluded = [], {}
+    entries, excluded, files = [], {}, {}
     for record in tree.split(b"\0"):
         if not record:
             continue
@@ -105,6 +106,12 @@ def capture_source(repo, destination, deadline):
         path = Path(name)
         if path.is_absolute() or ".." in path.parts:
             raise ValueError("Unsafe Git tree path")
+        if (mode == '160000' and not (set(path.parts) & EXCLUDED)
+                and path.name not in {'AGENTS.md', 'SKILL.md'} and not sensitive_file(path)):
+            nested = capture_source(repo/path, destination/path, deadline)
+            files.update({str(path/key):value for key,value in nested['files'].items()})
+            excluded.update({str(path/key):value for key,value in nested['excluded'].items()})
+            continue
         if (set(path.parts) & EXCLUDED or path.name in {"AGENTS.md", "SKILL.md"}
                 or sensitive_file(path)
                 or mode not in {"100644", "100755"} or kind != "blob"):
@@ -113,7 +120,7 @@ def capture_source(repo, destination, deadline):
             entries.append((name, mode, oid))
     payload = git(repo, "cat-file", "--batch", deadline=deadline,
                   stdin="".join(oid + "\n" for _, _, oid in entries).encode()) if entries else b""
-    offset, files = 0, {}
+    offset = 0
     destination.mkdir(parents=True, exist_ok=True)
     for name, mode, oid in entries:
         if time.monotonic() >= deadline:
@@ -135,7 +142,7 @@ def capture_source(repo, destination, deadline):
         files[name] = {"git_blob": oid, "mode": mode, "size": size}
     if not files:
         raise ValueError("No authorized regular source files remain")
-    return {"commit": commit, "files": files, "excluded": excluded, "capture": "committed Git blobs, no history"}
+    return {"commit": commit, "files": files, "submodules":submodules, "excluded": excluded, "capture": "committed Git blobs, no history"}
 
 
 def file_inventory(root, *, exclude=WORK_EXCLUDED):

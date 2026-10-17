@@ -10,7 +10,7 @@ Maintain a readable report at the path in the run brief as useful results become
 
 This is a budgeted, continuing audit. Returning a reply hands control back to the runner, which may ask you to continue the same audit while budget remains. Choose useful further work rather than repeating a finished summary. The run brief gives actual source, tool, permission and time limits.
 
-Work only within those permissions. If authorization, a safety restriction or an external prerequisite blocks further work, report that blocker explicitly with a final response beginning RUN_BLOCKED:, and do not attempt a workaround.
+Work only within those permissions. Record the affected scope when a module, test or investigation is blocked by dependencies or build prerequisites; choose other useful authorized work when it remains possible. Use a final response beginning RUN_BLOCKED: only when a blocker prevents the audit as a whole from continuing. Do not bypass authorization, safety restrictions or external prerequisites.
 
 <!-- continuation -->
 

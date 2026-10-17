@@ -13,7 +13,7 @@ export PATH="$HOME/.local/bin:$PATH"
 .venv/bin/python -m baseline run --config /absolute/path/to/local-config.yaml
 ```
 
-[DeepSeek](../configs/baseline/deepseek.yaml)、[OpenAI](../configs/baseline/openai.yaml)、[自定义服务](../configs/baseline/custom-provider.yaml) 和 [HashiCorp 配对草案](PAIRING.md) 默认关闭授权。填写 `repo_path`、实际模型和连接；相对路径以 YAML 所在目录为准。`run` 要求 `allow_agent_materials`、`allow_experiments` 同时为 `true`，凭据只放环境变量。目标必须是干净 Git 提交，输出与源仓库分离；不会替用户清理工作树。
+[DeepSeek](../configs/baseline/deepseek.yaml)、[OpenAI](../configs/baseline/openai.yaml)、[自定义服务](../configs/baseline/custom-provider.yaml) 和 [HashiCorp 配对草案](PAIRING.md) 默认关闭授权。填写 `repo_path`、实际模型和连接；相对路径以 YAML 所在目录为准。`run` 要求 `allow_agent_materials`、`allow_experiments` 同时为 `true`，凭据只放环境变量。目标必须是干净 Git 提交，输出与源仓库分离；不会替用户清理工作树。已初始化的子模块按父仓库 gitlink 提交核对并捕获，记录路径和提交；缺失、版本不符或子模块工作树不干净时报告具体路径，不自动下载或切换版本。
 
 `check-env` 是独立的本地检查：捕获源码、验证权限、提示隔离、功能设置、工具版本、离线依赖，以及标准 MCP STDIO 工具清单和固定 TCP 收发。它不调用模型、不执行目标测试、不创建 app-server 会话，也不使用真实认证。Go 依赖检查为 `go list -m all`，Rust 为离线 `cargo metadata`，Maven 为所选模块及上游的离线 `test-compile -DskipTests`；不执行测试。`environment_checked` 只证明这些本地项目通过。
 

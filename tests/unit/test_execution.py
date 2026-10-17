@@ -426,3 +426,36 @@ def test_java_source_screening_keeps_types_and_dummy_inputs_not_credentials(tmp_
     inventory,_=file_inventory(repo)
     assert (name not in snapshot.files)==excluded
     assert (name not in inventory)==excluded
+
+
+@pytest.mark.real
+def test_nested_go_module_replacements_and_execution(tmp_path):
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.runners.experiment import run_experiment, install_harness
+    from consensus_assurance.core.types import Harness
+    root=tmp_path/'workspace';root.mkdir()
+    (root/'go.mod').write_text('module example.org/root\n\ngo 1.20\n')
+    (root/'value.go').write_text('package root\nconst Value = 7\n')
+    child=root/'child';child.mkdir()
+    (child/'go.mod').write_text('module example.org/child\n\ngo 1.20\nrequire example.org/root v0.0.0\nreplace example.org/root => ../\n')
+    (child/'value.go').write_text('package child\n')
+    files=capture(root).files
+    backend=GoModuleBackend()
+    harness=Harness(kind='go_test', execution_package='child', description='Local replacement',semantic_changes=[],
+        source='package child\nimport("testing"; r "example.org/root")\nfunc TestAssuranceLocal(t *testing.T){if r.Value!=7{t.Fatal(r.Value)}}\n')
+    name=backend.resolve_harness(harness,root,files)
+    assert name=='child/assurance_generated_test.go'
+    install_harness(root,name,harness,files)
+    result=run_experiment(ProcessRunner(tmp_path),backend.experiment_command(harness.execution_package,name),root,'local',60,'bwrap',adapter=backend)
+    assert result.outcome=='tests_passed',result
+    assert result.parameters['module_directory']=='child' and result.parameters['local_modules']==['.','child']
+    assert result.command[result.command.index('-C')+1]=='child'
+    (child/'go.mod').write_text('module example.org/child\nreplace example.org/root => ../../outside\n')
+    with pytest.raises(ValueError,match='escapes captured'):backend.resolve_harness(harness,root,files)
+    (child/'go.mod').write_text('module example.org/child\nreplace example.org/root => ../missing\n')
+    with pytest.raises(ValueError,match='captured go.mod'):backend.resolve_harness(harness,root,files)
+    (child/'go.mod').write_text('module example.org/child\nreplace example.org/root => ../alias\n')
+    (root/'alias').symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError,match='escapes captured'):backend.resolve_harness(harness,root,files)
+    (root/'go.work').write_text('go 1.20\nuse ./child\n')
+    with pytest.raises(ValueError,match='workspaces'):backend.resolve_harness(harness,root,files)

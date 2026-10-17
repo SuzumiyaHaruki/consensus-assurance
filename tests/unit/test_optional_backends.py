@@ -147,7 +147,7 @@ def test_retired_configuration_and_products_are_rejected():
     {'execution_package':'/tmp'}, {'execution_package':'../outside'}, {'execution_package':'-args'},
     {'execution_package':'./...'}, {'execution_package':'. ./internal/core'}, {'execution_package':'.;true'},
     {'execution_package':'example.org/other'}, {'execution_package':'internal/escape'},
-    {'execution_package':'internal/child'}, {'execution_package':'internal/core/value.go'},
+    {'execution_package':'internal/core/value.go'},
     {'files':{'value.go':'helper.go'}}, {'files':{'go.work':'helper.go'}},
     {'files':{'internal/core/go.mod':'helper.go'}},
     {'execution_package':'internal/core','files':{'internal/core/assurance_generated_test.go':'helper.go'}},
