@@ -1,0 +1,105 @@
+{
+  "rationale": "Eighty-second pass: follow the one caveat left open in the vote-durability account rather than leaving it as an assumption. The account said the ordering rested on the logdb state cache being updated only for states that actually reached the commit batch. Reading the cache shows the opposite mechanism: setState replaces the cached state while the write batch is still being built, so a failed commit would leave the cache holding a state that never reached disk. What closes that window is not the cache but the caller - the engine's only call site treats a raft state write error as fatal and panics, so no live process can observe the stale cache, and a fresh process rebuilds it from disk. The update corrects that counterevidence item in the vote account, records the cache ordering as a Behavior, and closes the two questions whose accounts are now settled.",
+  "sources": [
+    {
+      "id": "logdb_state_cache",
+      "file": "internal/logdb/cache.go",
+      "start_line": 52,
+      "end_line": 68,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "906e79862ace448b9e00cb13160756e8-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    },
+    {
+      "id": "abbf3be3f34045ceb2d57f1ff85fe065-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": "",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_raft_state_cache_order",
+      "kind": "behavior",
+      "statement": "The logdb keeps a per-node cache of the last raft state it was asked to write. When a raft state is put into a write batch, setState compares it with the cached value: an equal value returns false and the state is not written again, while a different or first value replaces the cache immediately and returns true, so the cache is updated while the batch is still being assembled and before the batch is committed. The only caller of the raft state write in the captured tree is the engine's step loop, which treats a write error as fatal and panics instead of retrying or continuing, so a failed commit ends the process rather than leaving a live cache that disagrees with disk; a new process starts with an empty cache rebuilt from the stored state.",
+      "conditions": "A raft update with a non-empty raft state is written through the logdb raft state write path, and the enclosing write batch either commits or fails.",
+      "source_ids": [
+        "logdb_state_cache",
+        "logdb_save_state_cache",
+        "logdb_save_raft_state",
+        "engine_process_steps_order"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "906e79862ace448b9e00cb13160756e8-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "raft_vote_grant",
+        "raft_raft_state",
+        "raft_message_buffer",
+        "node_message_routing",
+        "logdb_save_raft_state",
+        "logdb_save_state_cache",
+        "logdb_state_cache",
+        "engine_process_steps_order",
+        "node_process_raft_update",
+        "raft_load_state_gate"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim for this question: a granted vote is persisted before its response leaves the node, so a crash in that window cannot leave the node free to grant a different vote in the same term, and the suspicion of a vote-durability gap is refuted for the traced paths. Basis, in the order the response travels. (1) The vote handler makes its decision and, on a grant, records the candidate in the raft vote field; whether it grants or rejects, it only appends a response to the raft message buffer, because the raft send helper appends and never transmits, so at the end of the step the vote exists only in raft memory together with a buffered response. (2) The engine's batch order puts the raft state write ahead of every non-free-order message: it collects updates, offers the fast-apply subset, sends free-order messages and processes ready-to-read and dropped work, writes the raft state of all updates in one logdb write batch, and only then calls each node's raft-update step, which is where the vote response is handed to the transport. A vote response is neither a replicate nor a ping, so it cannot take the earlier path. (3) The state written at that point is the raft state of the same update batch, included whenever it differs from the state recorded at the last commit; a grant changes the vote field (and possibly the term), so the update carries it, and the logdb puts the marshalled term, vote and commit into the write batch alongside the entries. (4) The write batch is committed as a unit before the call returns, so what the transport observes is: state write returns, then the response is handed over. (5) The state cache does not weaken this. It is updated while the batch is being assembled rather than after the commit, so a failed commit would leave the cache claiming a state that never reached disk - but the engine's only call site panics on a raft state write error, so the process ends instead of continuing with the stale cache, and a new process rebuilds the cache from what was actually stored. (6) On a restart the persisted state is loaded through the state-loading gate, which restores term and vote with the commit index, so the recovered node sees the vote it granted. (7) The free-order exception is deliberate and narrow: replicate and ping messages carry no decision of the node's own that a lost write could contradict, and sending them early is what lets replication reach followers without waiting for the leader's disk; the durable decision itself is never in that class.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "906e79862ace448b9e00cb13160756e8-knowledge-0",
+          "revision": 1,
+          "assertion": "A vote grant only changes raft state and appends a response, and the engine writes the raft state before sending any non-free-order message."
+        }
+      ],
+      "counterevidence": [
+        "The guarantee is conditional on the logdb write returning only after the batch is durable; the target requires the write to succeed and treats an error as fatal, but the fsync contract belongs to the storage layer, so the ordering shown here is necessary and not by itself sufficient for durability across a power loss.",
+        "The state cache is updated before the write batch commits, not after it, so the ordering relies on a failed write being fatal rather than on the cache holding only committed states; the protection is the engine's panic, and any future caller that handled a write error and kept running would reopen the window this account closes.",
+        "Free-order replicate messages do leave before the raft state write, so a crash in that window can leave a follower holding entries the sender never persisted; this is the documented section 10.2.1 pattern rather than a vote issue, but it means the pass order is not uniformly write-first.",
+        "A rejection response is sent under the same ordering even though it changes nothing that needs durability, so the ordering protects the grant case only when the grant actually changed the state; an unchanged state produces no new state write."
+      ],
+      "limitations": [
+        "Source reading only: no crash or restart was executed against a vote in this pass, so the ordering is established from the call structure rather than measured.",
+        "The logdb implementation's fsync behaviour and its write-batch commit path are used as preconditions and are not traced here.",
+        "The transport is assumed to hand a message to a peer only when the node calls it; asynchronous transport queues that could reorder or drop messages are outside this trace.",
+        "Joint configurations, witness vote responses and the interaction of a vote grant with a concurrent configuration change are not part of this account."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,201 @@
+{
+  "rationale": "This pass follows the persistence path that carries a step worker's raft updates to disk and asks whether the worker that assembles a batch and the log-db implementation that receives it agree on where that batch belongs. They do not use the same partitioner: newWorkReady builds a FixedPartitioner(ExecShards), so a step worker owns the clusters whose id hashes into its bucket modulo the execution shard count, while the ShardedDB constructor builds a DoubleFixedPartitioner(ExecShards, LogDB.Shards) and resolves the target shard as (clusterID % LogDB.Shards) % ExecShards. processSteps hands the whole batch of one worker to ShardedDB.SaveRaftState together with the worker id, and SaveRaftState panics with 'multiple pid value found' as soon as two updates in that batch resolve to different shards. Nothing on the acceptance path relates the two counts: NodeHostConfig.Validate only asks EngineConfig.Validate whether each count is non-zero, and LogDBConfig.Shards is an exported tuning field with no stated constraint. With the default 16/16 the two notions coincide, which is why the mismatch is invisible in normal deployments; an accepted expert configuration such as 4 execution shards and 6 log-db shards separates them, and cluster ids 1 and 9 then share step bucket 1 while landing in log-db partitions 1 and 3. The panic is raised inside the step worker, which runs under the engine's stopper without a recover unless error injection is enabled, so the consequence would be process termination rather than a failed write. This pass submits a focused probe of the routing arithmetic and of the log-db write path for such an accepted configuration so the premise can be confirmed by a retained receipt; the defect account and its crash consequence follow the receipt.",
+  "sources": [
+    {
+      "id": "engine_work_ready_partitioner",
+      "file": "engine.go",
+      "start_line": 135,
+      "end_line": 151,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_load_bucket_nodes",
+      "file": "engine.go",
+      "start_line": 1250,
+      "end_line": 1281,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_step_batch_save",
+      "file": "engine.go",
+      "start_line": 1287,
+      "end_line": 1320,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_step_worker_launch",
+      "file": "engine.go",
+      "start_line": 1030,
+      "end_line": 1042,
+      "kind": "code_observation"
+    },
+    {
+      "id": "server_fixed_partitioner",
+      "file": "internal/server/partition.go",
+      "start_line": 32,
+      "end_line": 41,
+      "kind": "code_observation"
+    },
+    {
+      "id": "server_double_partitioner",
+      "file": "internal/server/partition.go",
+      "start_line": 43,
+      "end_line": 61,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logdb_sharded_save_raft_state",
+      "file": "internal/logdb/sharded.go",
+      "start_line": 150,
+      "end_line": 175,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logdb_sharded_partition_id",
+      "file": "internal/logdb/sharded.go",
+      "start_line": 292,
+      "end_line": 306,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logdb_sharded_constructor_partitioner",
+      "file": "internal/logdb/sharded.go",
+      "start_line": 105,
+      "end_line": 118,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_engine_validate",
+      "file": "config/config.go",
+      "start_line": 866,
+      "end_line": 880,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_nodehost_validate_expert",
+      "file": "config/config.go",
+      "start_line": 512,
+      "end_line": 568,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config_logdb_shards_field",
+      "file": "config/config.go",
+      "start_line": 721,
+      "end_line": 735,
+      "kind": "document_statement"
+    },
+    {
+      "id": "nodehost_node_logdb_metrics_partition",
+      "file": "nodehost.go",
+      "start_line": 1622,
+      "end_line": 1632,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@exec_shards_logdb_partition_mismatch",
+      "question": "When an accepted expert configuration sets Engine.ExecShards and Expert.LogDB.Shards so that the log-db shard count does not divide the execution shard count, can the raft-state batch one step worker assembles contain updates that resolve to different log-db partitions, so that ShardedDB.SaveRaftState panics inside that worker and ends the process?",
+      "source_ids": [
+        "engine_work_ready_partitioner",
+        "engine_load_bucket_nodes",
+        "engine_step_batch_save",
+        "engine_step_worker_launch",
+        "server_fixed_partitioner",
+        "server_double_partitioner",
+        "logdb_sharded_save_raft_state",
+        "logdb_sharded_partition_id",
+        "logdb_sharded_constructor_partitioner",
+        "config_engine_validate",
+        "config_nodehost_validate_expert",
+        "config_logdb_shards_field",
+        "nodehost_node_logdb_metrics_partition"
+      ],
+      "hypothesis": "The step stage routes clusters with clusterID % ExecShards and the sharded logdb routes them with (clusterID % LogDB.Shards) % ExecShards, both derived from configuration counts that validation never relates. The two agree when the log-db shard count divides the execution shard count, including the default 16/16, and diverge otherwise, so a step worker then owns clusters from more than one log-db partition. Because processSteps passes its whole batch with the worker id to ShardedDB.SaveRaftState, and saveRaftStateCtx resolves one partition id for the entire batch and panics when the updates disagree, two clusters of one bucket that both produce updates in the same iteration make the log-db write path panic inside the step worker.",
+      "discriminator": "Whether the step bucket and log-db partition of the same cluster id coincide for a configuration whose two counts differ, and what the log-db write path does with a batch that mixes partitions; the submitted probe observes the routing of sample ids and the outcome of single-partition and mixed-partition batches through the exported configuration, factory and SaveRaftState path.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_step_logdb_shard_routing",
+      "kind": "behavior",
+      "statement": "The execution engine assigns a cluster to a step worker with the fixed partitioner newWorkReady builds from ExecShards, so the worker owns the clusters whose id is congruent to its bucket modulo ExecShards, and processSteps passes the batch it assembled with the worker id to ShardedDB.SaveRaftState. The sharded logdb selects the target shard with DoubleFixedPartitioner(ExecShards, LogDB.Shards), that is (clusterID % LogDB.Shards) % ExecShards, uses the context indexed by the worker id, and panics with 'multiple pid value found' when one batch's updates resolve to more than one shard. NodeHostConfig.Validate accepts any positive ExecShards and LogDB.Shards, since EngineConfig.Validate only rejects zero counts, so when LogDB.Shards does not divide ExecShards a step bucket can hold clusters whose log-db partitions differ.",
+      "conditions": "The NodeHost uses the built-in sharded logdb and an Expert configuration whose Engine.ExecShards and LogDB.Shards are positive counts where LogDB.Shards does not divide ExecShards, for example 4 and 6, and one step worker holds at least two clusters, such as cluster ids 1 and 9, that both produce a raft update in the same step iteration.",
+      "source_ids": [
+        "engine_work_ready_partitioner",
+        "engine_load_bucket_nodes",
+        "engine_step_batch_save",
+        "server_fixed_partitioner",
+        "server_double_partitioner",
+        "logdb_sharded_save_raft_state",
+        "logdb_sharded_partition_id",
+        "config_engine_validate",
+        "config_nodehost_validate_expert"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@exec_shards_logdb_partition_mismatch",
+    "harness_path": "assurance_logdb_shard_route_test.go",
+    "files": {},
+    "execution_package": ".",
+    "test_names": [
+      "TestAssuranceLogDBShardRouting"
+    ],
+    "features": [],
+    "default_features": true,
+    "all_features": false,
+    "source_ids": [
+      "engine_work_ready_partitioner",
+      "engine_load_bucket_nodes",
+      "engine_step_batch_save",
+      "server_fixed_partitioner",
+      "server_double_partitioner",
+      "logdb_sharded_save_raft_state",
+      "logdb_sharded_partition_id",
+      "config_engine_validate",
+      "config_nodehost_validate_expert",
+      "nodehost_node_logdb_metrics_partition"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Compare the cluster bucket the execution engine uses to assign clusters to a step worker with the shard the sharded logdb derives for the same cluster id, for an accepted expert configuration whose two counts differ, and observe how the log-db write path treats a batch assembled from a single step bucket.",
+      "assumptions": [
+        "The configuration is assembled from the exported ExpertConfig, EngineConfig and LogDBConfig values and passed through NodeHostConfig.Validate, so the probe uses the same acceptance path a user's configuration takes.",
+        "The log-db object is created through the exported DefaultFactory over the in-memory filesystem with the default pebble store, so the write path runs the target's own ShardedDB implementation rather than a stand-in.",
+        "Step routing is reproduced with NewFixedPartitioner(ExecShards), the partitioner newWorkReady builds for the step stage, and log-db routing with NewDoubleFixedPartitioner(ExecShards, LogDB.Shards), the partitioner the ShardedDB constructor builds.",
+        "The updates handed to SaveRaftState carry only cluster identifiers, which is enough to reach the partition check that runs before any shard is touched."
+      ],
+      "excluded": [
+        "No NodeHost, transport, raft peer or running cluster participates; the batch a step worker would assemble is supplied directly, and the engine's assembly of that batch remains a source-traced claim.",
+        "The probe does not observe the process-level outcome of the panic; the behaviour of a panic raised in a worker launched through the engine's stopper is cited from earlier evidence instead.",
+        "Configurations whose log-db shard count divides the execution shard count are not probed; the same run records only the routing of the sample ids and the write outcomes of the three batches."
+      ],
+      "parameters": {}
+    },
+    "prefix": "The test builds an expert configuration with four execution shards and six log-db shards from the exported config values and reports whether NodeHostConfig.Validate accepts it. It then reports, for cluster ids 1, 7 and 9, the step bucket (clusterID % ExecShards) and the log-db partition ((clusterID % LogDB.Shards) % ExecShards). It creates the sharded log-db through the exported default factory over the in-memory filesystem and calls SaveRaftState with worker id 2 three times: once for the single cluster 9, once for clusters 1 and 7 which share a log-db partition, and once for clusters 1 and 9 which share step bucket 1 but not a log-db partition, recovering any panic and reporting its message.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,123 @@
+{
+  "rationale": "Eighty-third pass: correct an overreach found by comparing two accounts that had grown apart. The snapshot-save question treats a hard save error as ending the process, and that termination is what keeps a failed save from stranding the saving flag. The worker-panic question records that the same termination depends on the launcher supplied by the pinned dependency, which is outside the captured snapshot. The behavior entry behind both statements still asserts termination as a target fact. This pass narrows the entry to what the target supports - the panic leaves the worker function and nothing in the target recovers it - names the launcher as the unresolved link, and reopens the save question's gap, because if the launcher recovered the panic the node would keep running with the saving flag set, the apply loop would skip the cluster and the periodic snapshot duty would be silently lost, which is the defect the earlier account had refuted. No new evidence is claimed; the measurement of the save-error path is unchanged.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": "599c7a85d804468187c5a652986302d1-knowledge-0",
+      "ref": null,
+      "kind": "behavior",
+      "statement": "A non-soft error returned by node.save is raised as a panic inside the snapshot worker: ssWorker.save calls panic(err) when node.save returns an error, and neither workerMain nor handle installs a recover, so the panic leaves the worker function. The only recover in engine.go is installed around step workers when error injection is enabled, and NodeHost.Start's recover wraps only the body of Start and re-panics through panicNow for error values, so no recover inside the captured target converts a runtime snapshot save error into a node-level or cluster-level result. Whether that panic then ends the process or only the goroutine depends on the launcher the syncutil stopper uses in the pinned goutils dependency, which is not part of the captured snapshot, so the target supports the propagation out of the worker but not the outcome after it.",
+      "conditions": "A snapshot save task is executed by the snapshot worker pool, and node.doSave returns an error other than the abort-class and soft errors it handles internally; the goroutine launcher comes from the pinned dependency and is outside the snapshot.",
+      "source_ids": [
+        "engine_ssworker_handle",
+        "engine_error_injection_recover",
+        "node_save_and_dosave",
+        "nodehost_start_recover_scope",
+        "engine_worker_launch"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "The termination half of the earlier statement exceeded the captured evidence. The worker goroutine is launched by dependency code, so the entry now stops at 'the panic leaves the worker function', keeps only the recovers that exist inside the target, and names the launcher as the unresolved link.",
+      "affected_uses": [
+        "599c7a85d804468187c5a652986302d1-interpretation-0",
+        "a9985060b7284b23b73850ed64c83991-interpretation-0",
+        "c3ec64cde7004d51a6f138a9c1fef2e4-interpretation-0"
+      ]
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "node_save_snapshot_required",
+        "node_save_and_dosave",
+        "node_process_save_status",
+        "request_pending_snapshot_apply",
+        "engine_ssworker_handle",
+        "engine_apply_loop_status",
+        "engine_error_injection_recover",
+        "engine_worker_launch",
+        "node_save_done",
+        "snapshotstate_notify_status"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "defect_claim": null,
+      "rationale": "Current claim: the control flow around a periodic snapshot save is traced and the non-fatal outcomes are settled, but the conclusion that a hard save error cannot strand the snapshot duty depends on a link the captured target does not contain, so the claim is now conditional and the defect judgment is withdrawn. Basis: (1) saveSnapshotRequired advances the requested snapshot index only when it actually requests a snapshot, and it suppresses further periodic requests while the node reports itself busy snapshotting, so the requested index alone cannot suppress later attempts. (2) On every non-fatal path node.save returns nil, node.saveDone stores a completed save task through notifySnapshotStatus and signals the apply worker, and the apply worker's processStatusTransition calls processSaveStatus, which clears the saving flag before handling the next task; this covers the soft-error and abort-class returns and does not depend on any launcher. (3) A hard error is different: ssWorker.save calls panic(err) and neither the worker body nor anything else in the target recovers it, so the panic leaves the worker function. What happens next is decided by the launcher the syncutil stopper supplies from the pinned goutils dependency, which is not part of the captured snapshot. (4) The two outcomes differ in consequence, which is why the conclusion cannot stay refuted. If the launcher lets the panic end the process, the node never runs with a stale saving flag, as the earlier account argued. If it recovers the panic and only that goroutine dies, the process keeps running with the saving flag set: processSaveStatus would report the cluster busy on every pass, the apply loop would skip the cluster's tasks, and the periodic snapshot duty would be silently lost while entries keep committing - exactly the stranding this question originally suspected. (5) The evidence does not choose between those outcomes, so the earlier refutation is withdrawn and the question remains open pending the launcher behavior.",
+      "answers": {
+        "9bf8b80283c042d1b383e211c89c1701-gap-1": {
+          "explanation": "Reopened. The earlier resolution rested on the process ending at the save panic. The panic itself and the absence of any recover inside the target are established, but the launcher that decides whether the process ends is dependency code outside the captured snapshot. Under the terminating outcome the node cannot continue with the saving flag set; under a recovering launcher it would keep running with the flag set, the apply loop would keep skipping that cluster, and later periodic snapshots would stay suppressed. The gap is therefore unresolved until the launcher behavior is established.",
+          "resolved": false
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+          "revision": 1,
+          "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+        },
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+          "revision": 1,
+          "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+        },
+        {
+          "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-1",
+          "revision": 1,
+          "assertion": "Non-fatal save outcomes complete through saveDone and processSaveStatus, clearing the saving flag without depending on the launcher."
+        }
+      ],
+      "counterevidence": [
+        "A hard save error bypasses the pendingSnapshot.apply report for that request, so a user-requested snapshot never receives a rejected or aborted result on that path; only the process ending prevents that from becoming a live stuck request.",
+        "The saving flag is cleared by the apply worker, so a recovered panic would leave the flag set on a node that is still serving requests, which converts the earlier refutation into the suspected liveness defect rather than merely an error-reporting gap.",
+        "The non-fatal paths are independent of the launcher and remain settled: the soft-error, abort-class and already-up-to-date returns all reach saveDone and clear the flag."
+      ],
+      "limitations": [
+        "The deciding link, the goroutine launcher in the pinned goutils dependency, is outside the captured snapshot and is not used as target evidence.",
+        "No execution of a failing save was performed in this pass; the account remains a source argument.",
+        "Does not cover a Save implementation that blocks without returning, or storage faults handled outside node.doSave.",
+        "Does not quantify how much log growth could accumulate before a later eligible periodic snapshot if the node did keep running with the flag set."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    },
+    {
+      "investigation_id": "a9985060b7284b23b73850ed64c83991-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "engine_ssworker_handle",
+        "engine_worker_launch",
+        "engine_pool_worker_launch",
+        "engine_error_injection_recover",
+        "nodehost_start_recover_scope"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "defect_claim": null,
+      "rationale": "Current claim: within the captured target a panic raised by the snapshot save path is not recovered, and everything after that point depends on the launcher. The save path calls panic(err) when node.save returns an error, the worker body and its handle function install no recover, the only recover in engine.go wraps step workers when error injection is enabled, and NodeHost.Start's recover wraps only the body of Start and re-panics error values. The workers are launched through the syncutil stopper's RunWorker, whose implementation lives in the pinned goutils dependency rather than in the snapshot, so the target establishes that the panic leaves the worker function but not whether the process or only the goroutine ends. This is the same link that the periodic-save question now depends on, and the two accounts are kept consistent: this question stays conditional with no defect claim, and the save question has withdrawn its refutation until the launcher behavior is established. The distinction matters because the two outcomes differ in consequence: a terminated process loses the node, while a recovered panic would leave a live node whose snapshot worker is gone and whose saving flag stays set.",
+      "answers": {
+        "ebd0cff4e07244289acc246a6a556320-gap-8": {
+          "explanation": "Still unresolved. No recover inside the captured target covers a worker goroutine, so the panic leaves the worker function, but the launcher that decides the outcome is dependency code outside the snapshot. The save question now records the same dependency, so resolving this gap would also settle whether a failed snapshot save can strand a live node.",
+          "resolved": false
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "If the worker wrapper recovered panics, a hard save error would stop one worker rather than the process, and the earlier save-failure refutation would become a liveness defect in which the saving flag never clears.",
+        "The dependency's stopper implementation was read during earlier work and appears to call the worker without a recover, which supports the terminating outcome, but that reading is dependency code and is not cited here as target evidence."
+      ],
+      "limitations": [
+        "The launcher body is dependency code and is not part of the captured target snapshot.",
+        "No execution of a panicking worker was performed; the fault cannot be produced without either running a panicking state machine against a live engine or observing process exit, and neither is available under the current isolation."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

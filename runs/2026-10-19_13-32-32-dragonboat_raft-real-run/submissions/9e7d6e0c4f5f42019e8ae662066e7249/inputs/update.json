@@ -1,0 +1,91 @@
+{
+  "rationale": "Seventy-first pass: check the completion gate behind the linearizable read, which the earlier ReadIndex work covered from the raft side but never from the client side. SyncRead resolves a ReadIndex request and then reads the local state machine, so the safety of the answer depends on that request completing only after the local applied index has reached the confirmed index; confirming quorum alone would allow a read of stale local state. Reading the three steps settles it: the read request is registered with the node, the caller waits for its request state, and the state is completed only by the applied-index pass when the batch carries an index that the applied index has reached. The pass records that gate and an explained negative for the stale-read suspicion.",
+  "sources": [
+    {
+      "id": "nodehost_syncread",
+      "file": "nodehost.go",
+      "start_line": 597,
+      "end_line": 611,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_linearizable_read",
+      "file": "nodehost.go",
+      "start_line": 1485,
+      "end_line": 1500,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_read_index",
+      "file": "nodehost.go",
+      "start_line": 1468,
+      "end_line": 1483,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_readindex_applied",
+      "file": "request.go",
+      "start_line": 908,
+      "end_line": 937,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@linearizable_read_gate",
+      "question": "Does a linearizable read through SyncRead wait for the local applied index to reach the index confirmed by the ReadIndex protocol before the state machine is queried, or can it query state that is older than the confirmed read index?",
+      "source_ids": [
+        "nodehost_syncread",
+        "nodehost_linearizable_read",
+        "nodehost_read_index",
+        "request_pending_readindex_applied"
+      ],
+      "hypothesis": "The read request is registered with the node, the caller blocks on its request state, and that state is completed only when a batch carries a ready-to-read index and the node's applied index has reached it, so the lookup runs on state at or beyond the confirmed index.",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_linearizable_read_gate",
+      "kind": "behavior",
+      "statement": "A linearizable read registers a read request with the node and marks the cluster ready to step, then waits on that request state before invoking the user state machine's lookup on the same node. The request state is completed by the node's applied-index pass, which completes only batches that carry a ready-to-read index and whose index has been reached by the applied index; a registered batch whose index is still zero is not completed by that pass. Consequently the lookup that produces the answer runs against state that already includes every entry up to the index the ReadIndex protocol confirmed, rather than against local state from before that confirmation.",
+      "conditions": "A client issues a linearizable read through the node host with a deadline, the node registers the read and the ReadIndex protocol later produces a ready-to-read index for it, and the node's state machine keeps applying entries.",
+      "source_ids": [
+        "nodehost_syncread",
+        "nodehost_linearizable_read",
+        "nodehost_read_index",
+        "request_pending_readindex_applied"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@linearizable_read_gate",
+      "source_ids": [
+        "nodehost_syncread",
+        "nodehost_linearizable_read",
+        "nodehost_read_index",
+        "request_pending_readindex_applied"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a linearizable read cannot observe state older than the index the ReadIndex protocol confirmed, because the lookup is gated on the request state being completed by the applied-index pass rather than by the confirmation alone. The client side is explicit: SyncRead calls the linearizable-read helper with a closure that performs the state machine lookup, and the helper first resolves a read index, then waits for the returned request state, releases it, and only afterwards invokes the closure with the node (nodehost.go:597-611, 1485-1500). The read index step registers the request through the node and marks the cluster ready to step (nodehost.go:1468-1483), so the confirmation work is scheduled rather than performed inline. The gate itself is in the node layer: the applied-index pass completes a batch only when the batch carries a ready-to-read index and that index is at or below the node's applied index, and a batch whose index is still zero is skipped, which is why registration cannot complete a read on its own (request.go:908-937). Combined with the raft-side behaviour recorded earlier - the leader confirms a context only after quorum-1 matching heartbeat responses, and every state transition discards registered contexts - the answer a client receives reflects state applied up to a quorum-confirmed index, not merely the local applied index at the moment the request arrived. Two bounds belong with the account: this is the in-memory state machine path, since on-disk state machines complete reads through a different lookup contract, and the account establishes ordering rather than freshness, so a read may return state newer than the confirmed index if more entries were applied by the time the closure runs.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_linearizable_read_gate",
+          "revision": 1,
+          "assertion": "The lookup runs only after the applied-index pass completes the request at or beyond the confirmed read index."
+        }
+      ],
+      "counterevidence": [
+        "The gate bounds staleness, not freshness: entries applied after the confirmed index are visible to the lookup, so the returned state can be newer than the index that was confirmed.",
+        "Completion depends on the node's event loop continuing to run the applied-index pass; a node that stops applying holds the read until its deadline, which the earlier timeout account covers."
+      ],
+      "limitations": [
+        "Source trace only: no read was executed against a cluster for this question.",
+        "The account covers the in-memory state machine path; on-disk state machines and concurrent lookups were not traced.",
+        "Whether the lookup and the apply pass can run concurrently on the same state machine depends on the state machine's own locking, which this account does not examine."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "rationale": "Fifteenth pass: isolate the one link the executed account leaves source-based. The raft-layer receipt shows a discarded read context produces no dropped report, so the client-visible outcome is decided entirely in the node layer. This turn registers that as its own question with the caller contract in view: a ReadIndex invocation supplies a timeout, the request sits in pendingReadIndex.batches with no index, and completion depends on pendingReadIndex.applied/gc being driven. The question is whether that path always terminates such a request with RequestTimeout before or at the caller deadline, including when the node is quiesced and when the only events are local ticks. No defect is claimed; the discriminator names the observation that would settle it.",
+  "sources": [
+    {
+      "id": "node_read_call_contract",
+      "file": "node.go",
+      "start_line": 414,
+      "end_line": 426,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_process_ready_to_read",
+      "file": "node.go",
+      "start_line": 1058,
+      "end_line": 1063,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@discarded_read_client_outcome",
+      "question": "After the raft layer silently discards a registered read context, does the node layer always terminate the corresponding ReadIndex invocation with a result no later than the caller's declared timeout window, including when the only events delivered are local ticks in a quiesced cluster?",
+      "source_ids": [
+        "node_read_call_contract",
+        "node_process_ready_to_read",
+        "node_handle_events",
+        "node_tick",
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout",
+        "node_dropped_readindexes"
+      ],
+      "hypothesis": "A discarded context leaves the batch with index 0, so only the deadline path can complete it: pendingReadIndex.applied marks requests whose deadline has passed as RequestTimeout, and applied runs from event-loop iterations that LocalTick batches also trigger, including while the node is quiesced.",
+      "discriminator": "Whether an event-loop iteration with only local ticks reaches pendingReadIndexes.applied and the gc gate, and whether the caller deadline plus gcTick bounds the observed completion time in a node-level observation.",
+      "disposition": "active"
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@discarded_read_client_outcome",
+      "question": "Is there any state in which a request assigned to pendingReadIndex.batches after a discarded context never reaches applied/gc, so the completed channel receives no result at all?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@discarded_read_client_outcome",
+      "source_ids": [
+        "node_read_call_contract",
+        "node_process_ready_to_read",
+        "node_handle_events",
+        "node_tick",
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": null,
+      "rationale": "Current state: the mechanism is traced by source but the guarantee is not established. node.read builds a request through pendingReadIndexes.read with a caller-supplied timeout and does not itself arm any timer (node.go:414-426); handleReadIndex then assigns a fresh SystemCtx per batch and calls the raft layer (node.go:1225-1233), and processReadyToRead only supplies indexes when ReadyToReads arrive (node.go:1058-1063). With a discarded context there is no ReadyToRead, so completion depends on pendingReadIndex.applied/gc, which marks requests whose deadline has passed as RequestTimeout and removes batches once the SystemCtx expiry has passed (request.go:908-954, 403-414). applied is reached from handleEvents whenever an event occurred, and LocalTick messages count as events, including quiesced ticks (node.go:1132-1166, 1478-1492). What stays open is whether any state blocks that call: for instance a node whose event loop stops processing messages, a batch whose SystemCtx values collide with an earlier batch, or a stopped node path that terminates requests differently. Until one of these is excluded, the client-visible guarantee remains conditional on event-loop progress, which is exactly what the registered gap asks.",
+      "knowledge": [
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+          "revision": 1,
+          "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+        }
+      ],
+      "counterevidence": [
+        "The deadline path requires event-loop progress, so a stopped or wedged node delivers no result; that is a node-liveness boundary rather than a protocol defect, and it is outside the stated conditions."
+      ],
+      "limitations": [
+        "Source-only for this revision; no node-level execution.",
+        "Does not measure the completion latency relative to the caller deadline."
+      ]
+    }
+  ]
+}

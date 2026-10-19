@@ -1,0 +1,78 @@
+{
+  "rationale": "Seventy-ninth pass: interpret the retained receipt for the snapshot-install frontier probe and close the question. The receipt records exactly the four observations the source trace predicted - the frontier moving to the snapshot index when the recovery task is queued, a committed batch straddling the frontier reduced to the single entry above it, the recovery task reported to the apply loop ahead of that entry task, and a gap beyond the frontier refused rather than skipped - so the account moves from source reading alone to source plus a passing execution for the node's own frontier bookkeeping and task boundary. The update records the receipt against the experiment, narrows the previous on-disk limitation to what the source actually shows about the load-or-skip decision, marks the question explained and binds the two behavior entries that the receipt exercises. The asynchronous recovery worker and the raft peer's committed gate remain source-supported and are kept as explicit limits.",
+  "sources": [
+    {
+      "id": "rsm_recover_on_disk_gate",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 288,
+      "end_line": 351,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "545f390aeead46dc8d1f3abd858fd5e3-question-0",
+      "disposition": "explained",
+      "discriminator": ""
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "545f390aeead46dc8d1f3abd858fd5e3-question-0",
+      "experiment_id": "545f390aeead46dc8d1f3abd858fd5e3-experiment",
+      "source_ids": [
+        "raft_restore_snapshot_gate",
+        "logentry_restore_snapshot",
+        "inmemory_restore_snapshot",
+        "inmemory_clear_snapshot",
+        "peer_update_snapshot_field",
+        "peer_update_commit_snapshot",
+        "node_process_snapshot",
+        "node_push_snapshot",
+        "node_entries_to_apply",
+        "node_push_entries",
+        "rsm_handle_snapshot_boundary",
+        "node_process_recover_status",
+        "rsm_recover_out_of_date_guard",
+        "rsm_recover_on_disk_gate",
+        "engine_process_steps_order",
+        "engine_apply_snapshot_and_update"
+      ],
+      "executions": {
+        "e175eb76994f4c069b04c83ef8411750": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "refuted",
+      "rationale": "Current claim for this experiment: a snapshot install leaves the node with one applied frontier, and the suspicion that committed entries could be replayed on top of recovered state or that later entries could outrun the recovery is refuted for the traced paths, now with a retained execution behind the node-side half of the claim. The receipt e175eb76994f4c069b04c83ef8411750 executed TestAssuranceSnapshotInstallFrontier and passed with four parsed events. Event 0, 'pushed', recorded pushed_index 5 and ss_index 5 after pushSnapshot queued a snapshot at index 5, term 2 with an applied index of 0, so the node's frontier and its recorded snapshot index move to the snapshot index when the recovery task is queued rather than when it completes. Event 1, 'filtered', recorded count 1 and first_index 6 when committed entries 3, 4, 5 and 6 were offered, so every entry at or below the snapshot was dropped and only the first entry above it survived. Event 2, 'first_task', recorded recover true and index 5 for the task the state machine reported after that surviving entry had been pushed behind the recovery task, so the recovery reaches the apply loop before the later committed entry rather than after it. Event 3, 'hole', recorded panicked true when a single committed entry at index 8 was offered after the frontier had advanced to 6, so a gap between the frontier and the next entry is refused instead of being silently dropped or applied. Around those measurements the source chain explains why the arithmetic is only ever reached with a safe input and why the order is not accidental. (1) The raft layer attaches a snapshot to an update only when its index is above the committed index, so an adopted snapshot is always above every entry index the node has already pushed; a snapshot at or below committed is refused and attached to nothing, and a snapshot whose index and term the log already holds moves only the commit index. (2) The adopted snapshot stays in the update until that update commits, and the update commit raises Processed to at least the snapshot index and clears the in-memory snapshot pointer, so the peer does not hand the same snapshot out again. (3) The engine processes a snapshot update in the second pass, after the raft state write and the snapshot flag removal, and calls processSnapshot before applyRaftUpdates, which is exactly the order the probe mirrors: recovery queued first, filtering applied to the update's committed entries second. (4) The state machine returns the first snapshot task it reaches to the apply loop after applying whatever was queued ahead of it, and the recovering flag makes the apply loop skip that cluster until the completion is read, which is why the entry task measured behind the recovery task cannot be applied early. (5) A recovery that finds the state machine already at or beyond the snapshot index returns an out-of-date result that the node treats as an aborted recovery, so an equal-index recovery task ends without moving the frontier again. The asymmetry the receipt makes visible is deliberate and bounded: the node's frontier moves at queue time while state machine state moves at completion, and the recovering gate covers that interval.",
+      "counterevidence": [
+        "pushSnapshot sets pushedIndex and the node's snapshot index when the recovery task is queued, so during the asynchronous recovery the node's recorded frontier is ahead of the state machine's actual applied index; event 0 shows that move directly, and only the queue order and the recovering gate keep committed entries from being offered in that window.",
+        "Committed entries queued before the snapshot are applied to the state machine before the recovery task is handled and are then overwritten by the recovered snapshot state, so a snapshot install re-executes those updates rather than skipping them; this is idempotent because the recovery replaces state at the snapshot index, and the probe does not exercise that replay.",
+        "node.pushSnapshot treats a snapshot index equal to pushedIndex, to the node's snapshot index or to the applied index as acceptable and only panics when it is strictly lower, so the equal-index case relies on the raft layer's committed gate and on the state machine's out-of-date recovery result rather than on pushSnapshot's own comparison.",
+        "The probe's gap control only shows that entriesToApply refuses a hole once the frontier has moved; it does not show that such a batch cannot arise, so that exclusion still rests on the raft layer's committed gate rather than on the execution."
+      ],
+      "limitations": [
+        "The probe observes the node's frontier bookkeeping and the state machine's task boundary without a raft peer or a recovery worker, so the peer's committed gate, the asynchronous recovery and the recovering gate are source-supported rather than measured.",
+        "The snapshot metadata is supplied directly with an applied index of 0, so the run does not exercise the raft layer's refusal of a snapshot at or below committed, nor the branch where the log already holds an entry at the snapshot index with the snapshot term.",
+        "For an on-disk state machine the source shows recovery loads the snapshot only when its OnDiskIndex exceeds the state machine's recorded on-disk index and otherwise only applies the metadata, but no execution in this experiment covers that branch, and the snapshotter's file lifecycle is used only as a precondition.",
+        "Restart and offload paths that reconstruct the frontier through replayLog and setInitialStatus are outside this trace, so the claim is about a live follower receiving a snapshot."
+      ],
+      "knowledge": [
+        {
+          "entry_id": "545f390aeead46dc8d1f3abd858fd5e3-knowledge-0",
+          "revision": 1,
+          "assertion": "The raft layer attaches a snapshot to the update only when its index is above the committed index and clears it once the update commit acknowledges StableSnapshotTo."
+        },
+        {
+          "entry_id": "545f390aeead46dc8d1f3abd858fd5e3-knowledge-1",
+          "revision": 1,
+          "assertion": "pushSnapshot moves pushedIndex and the node's snapshot index to the snapshot index when it queues the recovery task, entriesToApply keeps only entries above that index and refuses a gap, and the state machine reports the recovery task before tasks queued behind it."
+        }
+      ]
+    }
+  ]
+}

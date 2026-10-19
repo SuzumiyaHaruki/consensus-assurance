@@ -1,0 +1,108 @@
+{
+  "rationale": "Third pass, new topic. The ReadIndex authority question is closed, so this turn opened the persistence/progress side of the same axes: the periodic snapshot duty in node.doSave/saveSnapshotRequired. Sources establish how a save result is classified (soft vs abort vs hard error), that every save reports to the pending snapshot request through pendingSnapshot.apply, and the exact conditions that permit a periodic snapshot request. The open question is whether a hard save error leaves the snapshot state machine or the requested-index gate in a state that suppresses later snapshot attempts and therefore log compaction; that is registered as a live investigation with a gap, and no defect is claimed yet.",
+  "sources": [
+    {
+      "id": "node_save_snapshot_required",
+      "file": "node.go",
+      "start_line": 651,
+      "end_line": 667,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_save_and_dosave",
+      "file": "node.go",
+      "start_line": 693,
+      "end_line": 760,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_process_save_status",
+      "file": "node.go",
+      "start_line": 1451,
+      "end_line": 1467,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_snapshot_apply",
+      "file": "request.go",
+      "start_line": 648,
+      "end_line": 668,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@snapshot_save_failure_progress",
+      "question": "When a periodic snapshot save returns a non-soft error from node.doSave, does the node keep an enabled path to take a later snapshot and compact its raft log, or can the failure leave the snapshot state machine or the requested-index gate in a state that suppresses later attempts?",
+      "source_ids": [
+        "node_save_snapshot_required",
+        "node_save_and_dosave",
+        "node_process_save_status",
+        "request_pending_snapshot_apply"
+      ],
+      "hypothesis": "A hard save error is returned to the caller of node.save, which is the state-machine worker path, while n.ss.getReqIndex() has already been advanced by saveSnapshotRequired; if the saving flag is not cleared on that path, subsequent periodic snapshot requests stay suppressed even after the SM becomes healthy again.",
+      "discriminator": "Trace how the error from n.save propagates through rsm.StateMachine.Handle, node.applyRaftUpdates/handleTask and the node worker, whether processSaveStatus/clearSaving runs for a failed save task, and what later resets reqSnapshotIndex.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_save_error_classification",
+      "kind": "behavior",
+      "statement": "node.doSave classifies state-machine save failures: abort-class errors (ErrSnapshotStopped/ErrSnapshotAborted) remove the temp snapshot directory and report the pending snapshot request as aborted, soft errors (ErrCompacted/ErrSnapshotOutOfDate) return (0, nil) silently, and any other error is returned to the caller; after doSave returns, node.save reports the pending request through pendingSnapshot.apply with ignored set when the returned index is 0.",
+      "conditions": "A snapshot save task (periodic, user-requested or exported) reaches node.save with a non-empty or empty SSRequest key, and rsm.StateMachine.Save returns an error.",
+      "source_ids": [
+        "node_save_and_dosave",
+        "request_pending_snapshot_apply"
+      ]
+    },
+    {
+      "ref": "@ki_periodic_snapshot_conditions",
+      "kind": "behavior",
+      "statement": "saveSnapshotRequired only reports a periodic snapshot when SnapshotEntries is non-zero, when both the pushed and applied indexes exceed SnapshotEntries plus the last committed snapshot index and SnapshotEntries plus the last requested snapshot index, and when the state machine is not busy snapshotting; it then records the applied index as the requested index.",
+      "conditions": "A raft update is committed by node.processRaftUpdate after syncing tasks, i.e. the periodic (not user-requested) snapshot trigger.",
+      "source_ids": [
+        "node_save_snapshot_required"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@snapshot_save_failure_progress",
+      "question": "Does a non-soft error from node.doSave leave the saving flag set or the requested snapshot index advanced in a way that blocks all later periodic snapshot requests, and is that state ever cleared without restarting the node?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@snapshot_save_failure_progress",
+      "source_ids": [
+        "node_save_snapshot_required",
+        "node_save_and_dosave",
+        "node_process_save_status",
+        "request_pending_snapshot_apply"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Current claim: no defect is established yet; the question is whether a hard snapshot-save error can strand the periodic snapshot duty. What the sources do establish: saveSnapshotRequired advances the requested index (ss.setReqIndex(applied)) before any save runs and suppresses new periodic requests while the state machine reports busy snapshotting (node.go:651-667); doSave already holds the save state when it calls n.sm.Save and, on a hard error, returns the error to node.save without itself reporting a terminal snapshot result (node.go:693-760); node.save reports the pending user/periodic request only after doSave returns a value, so a hard error bypasses that report (node.go:693-706; request.go:648-668). What remains undecided is the enclosing control flow: whether the save task error propagates to rsm.StateMachine.Handle and the node worker in a way that clears the saving flag through processSaveStatus (node.go:1451-1467) or terminates the node, and whether n.ss.reqSnapshotIndex is ever reset after such a failure. Until that control flow is traced, the possible outcomes are a one-off failed snapshot request (no defect) or a durable suppression of snapshots and therefore of automatic log compaction (bounded progress defect), and the account stays unresolved.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_save_error_classification",
+          "revision": 1,
+          "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+        },
+        {
+          "entry_id": "@ki_periodic_snapshot_conditions",
+          "revision": 1,
+          "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+        }
+      ],
+      "counterevidence": [
+        "processSaveStatus exists and clears the saving flag when a completed save task is available, which would make a failure recoverable if the failed task is still delivered through the completion path."
+      ],
+      "limitations": [
+        "Source reading only for this revision; the error propagation from rsm.StateMachine.Handle to the node worker has not been traced yet.",
+        "No execution evidence; a harness would need a state machine whose Save fails once and then succeeds to observe whether a later periodic snapshot is still requested."
+      ]
+    }
+  ]
+}

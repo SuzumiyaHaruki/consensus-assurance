@@ -1,0 +1,76 @@
+{
+  "id": "15c34c2517fd4a47a4c18a8e2bab7fc9-experiment",
+  "investigation_id": "15c34c2517fd4a47a4c18a8e2bab7fc9-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package dragonboat\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/lni/dragonboat/v3/config\"\n\t\"github.com/lni/dragonboat/v3/internal/fileutil\"\n\t\"github.com/lni/dragonboat/v3/internal/logdb\"\n\t\"github.com/lni/dragonboat/v3/internal/server\"\n\t\"github.com/lni/dragonboat/v3/internal/vfs\"\n\tpb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\n// TestAssuranceLogDBShardRouting compares the cluster bucket the execution\n// engine uses to assign clusters to a step worker with the partition id the\n// sharded logdb derives from the same cluster id, for an expert configuration\n// whose two counts differ, and records what the sharded logdb does with a\n// raft-state batch assembled from a single step bucket.\nfunc TestAssuranceLogDBShardRouting(t *testing.T) {\n\texpert := config.GetDefaultExpertConfig()\n\texpert.LogDB = config.GetTinyMemLogDBConfig()\n\texpert.Engine.ExecShards = 4\n\texpert.LogDB.Shards = 6\n\tcfg := config.NodeHostConfig{\n\t\tNodeHostDir:    \"/assurance-shard-route\",\n\t\tRaftAddress:    \"localhost:9010\",\n\t\tRTTMillisecond: 200,\n\t\tExpert:         expert,\n\t}\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"config\\\",\\\"exec_shards\\\":%d,\\\"logdb_shards\\\":%d,\\\"validate_error\\\":%q}\\n\",\n\t\texpert.Engine.ExecShards, expert.LogDB.Shards, errorText(cfg.Validate()))\n\n\t// newWorkReady builds the step-side partitioner with the execution shard\n\t// count only, while the sharded logdb builds its own partitioner from both\n\t// counts.\n\tstepP := server.NewFixedPartitioner(expert.Engine.ExecShards)\n\tdbP := server.NewDoubleFixedPartitioner(expert.Engine.ExecShards,\n\t\texpert.LogDB.Shards)\n\tfor _, cid := range []uint64{1, 7, 9} {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"routing\\\",\\\"cluster_id\\\":%d,\\\"step_bucket\\\":%d,\\\"logdb_partition\\\":%d}\\n\",\n\t\t\tcid, stepP.GetPartitionID(cid), dbP.GetPartitionID(cid))\n\t}\n\n\tfs := vfs.MemStrictFS\n\tdir := \"/assurance-shard-route/logdb\"\n\tif err := fileutil.MkdirAll(dir, fs); err != nil {\n\t\tt.Fatalf(\"mkdir failed %v\", err)\n\t}\n\tldb, err := logdb.NewDefaultFactory(fs).Create(cfg, nil, []string{dir}, nil)\n\tif err != nil {\n\t\tt.Fatalf(\"logdb creation failed %v\", err)\n\t}\n\tdefer func() {\n\t\tif err := ldb.Close(); err != nil {\n\t\t\tt.Errorf(\"logdb close failed %v\", err)\n\t\t}\n\t}()\n\n\tsave := func(name string, updates []pb.Update, workerID uint64) {\n\t\tmsg := \"\"\n\t\tpanicked := false\n\t\tfunc() {\n\t\t\tdefer func() {\n\t\t\t\tif r := recover(); r != nil {\n\t\t\t\t\tpanicked = true\n\t\t\t\t\tmsg = fmt.Sprintf(\"%v\", r)\n\t\t\t\t}\n\t\t\t}()\n\t\t\tif err := ldb.SaveRaftState(updates, workerID); err != nil {\n\t\t\t\tmsg = fmt.Sprintf(\"error: %v\", err)\n\t\t\t}\n\t\t}()\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"save\\\",\\\"case\\\":%q,\\\"worker_id\\\":%d,\\\"panicked\\\":%t,\\\"message\\\":%q}\\n\",\n\t\t\tname, workerID, panicked, msg)\n\t}\n\t// A single cluster whose logdb partition differs from its step bucket.\n\tsave(\"single\", []pb.Update{{ClusterID: 9}}, 2)\n\t// Two clusters of one bucket that share a logdb partition.\n\tsave(\"same_partition\", []pb.Update{{ClusterID: 1}, {ClusterID: 7}}, 2)\n\t// The batch step worker 2 assembles for bucket 1 when clusters 1 and 9\n\t// both produce updates in the same iteration.\n\tsave(\"mixed_partition\", []pb.Update{{ClusterID: 1}, {ClusterID: 9}}, 2)\n}\n\nfunc errorText(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceLogDBShardRouting"
+      ],
+      "features": [],
+      "default_features": true,
+      "all_features": false,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "engine_work_ready_partitioner",
+      "engine_load_bucket_nodes",
+      "engine_step_batch_save",
+      "server_fixed_partitioner",
+      "server_double_partitioner",
+      "logdb_sharded_save_raft_state",
+      "logdb_sharded_partition_id",
+      "config_engine_validate",
+      "config_nodehost_validate_expert",
+      "nodehost_node_logdb_metrics_partition"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Compare the cluster bucket the execution engine uses to assign clusters to a step worker with the shard the sharded logdb derives for the same cluster id, for an accepted expert configuration whose two counts differ, and observe how the log-db write path treats a batch assembled from a single step bucket.",
+      "assumptions": [
+        "The configuration is assembled from the exported ExpertConfig, EngineConfig and LogDBConfig values and passed through NodeHostConfig.Validate, so the probe uses the same acceptance path a user's configuration takes.",
+        "The log-db object is created through the exported DefaultFactory over the in-memory filesystem with the default pebble store, so the write path runs the target's own ShardedDB implementation rather than a stand-in.",
+        "Step routing is reproduced with NewFixedPartitioner(ExecShards), the partitioner newWorkReady builds for the step stage, and log-db routing with NewDoubleFixedPartitioner(ExecShards, LogDB.Shards), the partitioner the ShardedDB constructor builds.",
+        "The updates handed to SaveRaftState carry only cluster identifiers, which is enough to reach the partition check that runs before any shard is touched."
+      ],
+      "excluded": [
+        "No NodeHost, transport, raft peer or running cluster participates; the batch a step worker would assemble is supplied directly, and the engine's assembly of that batch remains a source-traced claim.",
+        "The probe does not observe the process-level outcome of the panic; the behaviour of a panic raised in a worker launched through the engine's stopper is cited from earlier evidence instead.",
+        "Configurations whose log-db shard count divides the execution shard count are not probed; the same run records only the routing of the sample ids and the write outcomes of the three batches."
+      ],
+      "parameters": {}
+    },
+    "prefix": "The test builds an expert configuration with four execution shards and six log-db shards from the exported config values and reports whether NodeHostConfig.Validate accepts it. It then reports, for cluster ids 1, 7 and 9, the step bucket (clusterID % ExecShards) and the log-db partition ((clusterID % LogDB.Shards) % ExecShards). It creates the sharded log-db through the exported default factory over the in-memory filesystem and calls SaveRaftState with worker id 2 three times: once for the single cluster 9, once for clusters 1 and 7 which share a log-db partition, and once for clusters 1 and 9 which share step bucket 1 but not a log-db partition, recovering any panic and reporting its message.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "b961633ee3874799b5847afdeeff74f3",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "15c34c2517fd4a47a4c18a8e2bab7fc9",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

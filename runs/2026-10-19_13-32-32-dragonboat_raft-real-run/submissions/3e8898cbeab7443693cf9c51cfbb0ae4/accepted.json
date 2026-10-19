@@ -1,0 +1,112 @@
+{
+  "rationale": "Eleventh pass. This turn resolved the proposal-pause question by tracing the measured size itself. The in-memory accounting increases on append, resets by Set on replacement or truncation, and decreases by exactly the applied slice size in appliedLogTo, so the count tracks live in-memory entries rather than a monotone counter; entries are applied from the committed region by the state-machine worker, which does not depend on new proposals being admitted. The remaining components the limiter consults are follower-reported sizes, which are dropped after gcTick ticks of silence, and the leader's own size. The pause therefore has a release path that runs without proposal intake, and the gap is answered accordingly. The account is explanatory with the suspicion refuted, limited to the traced size accounting.",
+  "sources": [
+    {
+      "id": "inmemory_applied_log_to",
+      "file": "internal/raft/inmemory.go",
+      "start_line": 138,
+      "end_line": 165,
+      "kind": "code_observation"
+    },
+    {
+      "id": "inmemory_merge_accounting",
+      "file": "internal/raft/inmemory.go",
+      "start_line": 199,
+      "end_line": 227,
+      "kind": "code_observation"
+    },
+    {
+      "id": "inmemory_rate_limited_gate",
+      "file": "internal/raft/inmemory.go",
+      "start_line": 240,
+      "end_line": 247,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "b1532231bc7a45cb88f4c1cbac908f9c-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_inmem_size_accounting",
+      "kind": "behavior",
+      "statement": "The raft in-memory rate limiter's own size is maintained as a live measure of in-memory entries: merge increases it by the appended slice size, sets it to the replacement size when entries replace or truncate earlier ones, sets it to zero on snapshot restore, and appliedLogTo decreases it by exactly the size of the entries that moved below the marker index. The limiter only participates when enabled, so a node with the default disabled limiter never pauses proposals on this account.",
+      "conditions": "InMemRateLimiter enabled for the node; entries appended, replaced, restored from snapshot, or applied by the state machine.",
+      "source_ids": [
+        "inmemory_applied_log_to",
+        "inmemory_merge_accounting",
+        "inmemory_rate_limited_gate",
+        "inmemory_applied_decreases"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "b1532231bc7a45cb88f4c1cbac908f9c-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "node_handle_proposals_pause",
+        "rate_limiter_hysteresis",
+        "rate_limiter_constants",
+        "inmemory_applied_decreases",
+        "inmemory_applied_log_to",
+        "inmemory_merge_accounting",
+        "inmemory_rate_limited_gate",
+        "node_handle_events"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: the proposal pause is not self-sustaining within the traced scope, so the suspicion of an unbounded intake stall is refuted. Basis: (1) the limiter's own size is a live measure, not a monotone counter: merge increases it by the appended slice size (internal/raft/inmemory.go:205-206), replaces it with the resulting size when entries replace or truncate earlier ones (215, 226), clears it on snapshot restore (241), and appliedLogTo decreases it by the size of exactly the entries moved below the marker (162); (2) entries leave the in-memory region when the state-machine worker applies committed entries, which is driven by committed log content and application progress rather than by admitting new proposals, so pausing intake cannot keep the measure from falling; (3) the other components consulted by limitedByInMemSize are follower-reported sizes, which are ignored and garbage-collected once older than gcTick ticks (internal/server/rate.go:168-204), and the limiter accepts a state change after at most the hysteresis window of ChangeTickThreashold ticks (155-166); (4) handleProposals recomputes paused on every event-loop iteration, so once the measure drops below the threshold the queue is drained again (node.go:1206-1223). Counterevidence considered: a node whose committed-but-unapplied backlog genuinely exceeds the configured in-memory limit will keep proposals paused for as long as application lags, which is the intended backpressure and could look like a stall under a badly sized limit or a slow state machine; that is a configuration and workload property, and the release still depends on application progress rather than on intake. Limitations: source reasoning only, no execution; the claim does not cover a state machine that stops applying entirely, a LogDB busy signal whose worker never completes (storage faults are fatal elsewhere), or whether the hysteresis latency is acceptable for a given workload.",
+      "answers": {
+        "b1532231bc7a45cb88f4c1cbac908f9c-gap-4": {
+          "explanation": "Yes. appliedLogTo decreases the recorded size by exactly the applied slice size for every entry that moves below the in-memory marker (internal/raft/inmemory.go:138-165), and merge maintains the same measure on append, replacement and restore (199-241). Applying entries requires no new proposals: the apply path consumes committed entries handed to the state machine and signals readiness independently, and handleProposals recomputes the paused decision on each event-loop iteration. Follower-reported sizes, the other input to limitedByInMemSize, are discarded after gcTick ticks. So a rate-limited node returns to accepting proposals once the committed backlog is applied and the measure falls below the release threshold, provided the limiter is enabled at all and the state machine keeps applying.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "b1532231bc7a45cb88f4c1cbac908f9c-knowledge-0",
+          "revision": 1,
+          "assertion": "Proposal intake is paused by the rate limiter or LogDB busy signal, and the rate limiter applies hysteresis before changing state."
+        },
+        {
+          "entry_id": "@ki_inmem_size_accounting",
+          "revision": 1,
+          "assertion": "The in-memory size measure is maintained by merge, restore and appliedLogTo, and falls when entries are applied."
+        }
+      ],
+      "counterevidence": [
+        "A genuinely large committed backlog keeps the pause in place until application catches up, so the pause length follows application throughput rather than a fixed bound.",
+        "The limiter's hysteresis delays the release by up to ChangeTickThreashold ticks after the measure falls below the threshold."
+      ],
+      "limitations": [
+        "Source reasoning only; no CheckRun receipt or measurement of pause duration.",
+        "Does not cover a state machine that stops applying or a LogDB busy signal that never clears.",
+        "Does not judge whether the configured in-memory limit and hysteresis are well sized for any particular workload."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

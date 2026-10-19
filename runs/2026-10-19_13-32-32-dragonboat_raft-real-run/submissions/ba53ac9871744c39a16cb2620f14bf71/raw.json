@@ -1,0 +1,70 @@
+{
+  "rationale": "Fifty-ninth pass: interpret the fast-apply selector receipt. All six events matched the source-derived prediction, including the boundary case, so the account moves from a source trace to an observed selection rule. This pass appends the experiment-scoped interpretation, attaches the receipt to the existing behavior entry, and leaves the question-level account in place.",
+  "knowledge": [
+    {
+      "id": "5391750a45264f538bd823fb03c5fb3e-knowledge-0",
+      "kind": "behavior",
+      "statement": "The engine handles each batch of node updates in a fixed order: it collects updates from stepNode, offers the fast-apply subset to the state machine pipeline, sends replicate messages and processes ready-to-read, dropped entries and dropped read indexes, calls logdb.SaveRaftState, handles saved snapshots, then offers the remaining updates to the apply pipeline before appending the entries to the local log and committing the update back to raft. Which pass an update belongs to is decided by setFastApply: the flag starts true, is cleared when the update carries a non-empty snapshot, and is cleared when the last committed entry index falls between the first and last entry being saved in the same update. Consequently an entry written in the current round is never offered to the apply pipeline before that round's log write returns, and the entries offered early are ones an earlier round already persisted.",
+      "conditions": "The engine processes a batch of node updates that may contain both committed entries to apply and entries to save, with or without an installed snapshot.",
+      "source_ids": [
+        "engine_process_steps_order",
+        "engine_apply_snapshot_and_update",
+        "peer_set_fast_apply",
+        "node_apply_raft_updates",
+        "node_process_raft_update"
+      ],
+      "executions": {
+        "bdb88758a40b4024a977b75880a9eb50": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "5391750a45264f538bd823fb03c5fb3e-question-0",
+      "experiment_id": "2fe62b4886d945fa9c037b132ed9a570-experiment",
+      "source_ids": [
+        "engine_process_steps_order",
+        "engine_apply_snapshot_and_update",
+        "peer_set_fast_apply",
+        "node_apply_raft_updates",
+        "node_process_raft_update"
+      ],
+      "executions": {
+        "bdb88758a40b4024a977b75880a9eb50": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "refuted",
+      "rationale": "Current claim for this experiment: the selector that decides whether an update may be applied before the round's log write behaves exactly as the step loop requires - it permits the early pass only when no snapshot is installed and the whole committed range lies below the entries being saved. The retained receipt bdb88758a40b4024a977b75880a9eb50 executed TestAssuranceFastApplySelection and passed with six events. Event 0 'apply_covers_save_range' saved indexes 1-2 and committed 1-2 and reported fast_apply=false. Event 1 'apply_tail_inside_save_range' saved 3-4, committed up to 3, and reported false, which fixes the boundary at the lower edge of the save range rather than one entry above it. Event 2 'apply_strictly_below_save_range' saved 5-6 with committed entries ending at 4 and reported true. Event 3 'snapshot_install' carried a snapshot at index 5 and reported false even though nothing was to be saved. Event 4 'apply_only' with committed entries ending at 4 and no entries to save reported true. Event 5 'save_only' with entries 5-6 to save and no committed entries reported true. Read together, the rule is: an update is offered to the state machine before SaveRaftState only when it installs no snapshot and its committed entries all sit strictly below the first index being saved, which is the case in which an earlier round already persisted them; every update that writes the committed entries in this round takes the second pass, after the log write. That is the ordering the engine loop relies on (engine.go:1290-1338, 1354-1375; peer.go:199-226), so the earlier suspicion that a client could see an applied result for an entry not yet written on the responding node is refuted within this scope: completion still depends on raft commit, which requires quorum persistence, and the local write for the current round always precedes the offering of those entries to the apply pipeline.",
+      "knowledge": [
+        {
+          "entry_id": "5391750a45264f538bd823fb03c5fb3e-knowledge-0",
+          "revision": 2,
+          "assertion": "The selector's six observed decisions match the ordering the step loop needs."
+        }
+      ],
+      "counterevidence": [
+        "Fast-apply remains true for apply-only and save-only updates, so the early pass does run for those shapes; the guarantee is about entries written in the current round, not about a general ban on applying before the round's write.",
+        "The probe fixes the rule at the selector, and the selector is only one link: the engine loop and SaveRaftState still have to honour the flag, which the earlier source trace established but this receipt did not execute."
+      ],
+      "limitations": [
+        "Object-level selector probe: the engine step loop, the LogDB write and any crash or recovery were not executed, so the receipt observes the decision input to the ordering rather than the ordering itself.",
+        "The six updates are hand-built with validateUpdate-consistent ranges rather than emitted by a raft node, so unusual shapes such as committed entries above the save range are out of scope.",
+        "Only the fast-apply flag is measured; which pass a real node's update received, and when a user Update returned, are not observed here."
+      ]
+    }
+  ]
+}

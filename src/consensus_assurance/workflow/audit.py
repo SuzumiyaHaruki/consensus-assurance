@@ -295,6 +295,7 @@ def _execute(engine):
                 engine.implementation.prepare_run(engine.runner,state.snapshot.id,engine.budget.timeout(),engine.config.execution_isolation)
             except ValueError as exc:raise Blocked(str(exc)) from exc
         state.stop_reason = 'Not started'
+        previous = None  # Feedback context only; a resumed/recovered delivery starts without it.
         while engine.budget.remaining() > 0:
             pending = state.pending_action
             recovering = pending and pending.kind == 'agent_turn' and pending.status == 'running' and any(
@@ -302,7 +303,10 @@ def _execute(engine):
                 (CheckRun.model_validate_json(p.read_text()) for p in (engine.root/'logs').glob('*/check.json')))
             if not recovering and state.usage.get('agent_calls', 0) >= engine.config.budget.agent_calls:
                 raise BudgetExhausted('agent_calls budget exhausted; retained local work remains visible')
-            request = prompt(engine, methods if not state.agent_session_id else '')
+            request = prompt(engine, methods if not state.agent_session_id else '', previous)
+            previous = {'submission':state.current_submission.copy(), 'check_count':len(state.checks),
+                'agent_calls':state.usage.get('agent_calls', 0), 'action_id':pending.id} \
+                if not recovering and pending and pending.status == 'completed' else None
             if hasattr(engine.agent, 'prepare'):
                 engine.agent.read_only_roots = engine.implementation.read_only_roots() if engine.implementation else []
                 engine.agent.tool_environment = engine.implementation.environment(draft) if engine.implementation else {}
@@ -587,9 +591,9 @@ def validate_submission(state, root, name, implementation):
     return result
 
 
-def prompt(engine, method):
+def prompt(engine, method, previous=None):
     from .research import operation_summary
     return (method + '\nConsult relevant entries in the current research index at ' + str(engine.root / 'research.json') +
             '; previews point to full records in state.json. Use the small update example as needed. Consult only relevant $defs in ' +
             str(engine.root / 'submission.schema.json') + '; no full-schema reading prerequisite.\n' +
-            '\nCurrent work (controller records):\n' + json.dumps(operation_summary(engine.state, engine.root)))
+            '\nCurrent work (controller records):\n' + json.dumps(operation_summary(engine.state, engine.root, previous)))

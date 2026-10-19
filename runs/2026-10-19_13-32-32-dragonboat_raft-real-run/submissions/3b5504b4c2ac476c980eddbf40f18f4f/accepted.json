@@ -1,0 +1,105 @@
+{
+  "rationale": "Sixth pass. This turn resolved the witness/ReadIndex eligibility question by locating the captured witness contract instead of guessing at intent. config.Config documents a witness as a Raft node without actual log replication and without a state machine, referencing section 11.7.2 of Ongaro's thesis; that makes a witness a voting member whose support is evidence about votes and leadership rather than about stored entries. Read-index confirmation only needs evidence that no higher-term leader has been elected, which a witness can supply, so counting its echoed heartbeat context toward quorum-1 is consistent with the stated role. The gap is answered as resolved and the suspicion refuted, with the remaining limit that this rests on the documented role rather than an execution.",
+  "sources": [
+    {
+      "id": "config_witness_contract",
+      "file": "config/config.go",
+      "start_line": 169,
+      "end_line": 176,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "config_witness_validation",
+      "file": "config/config.go",
+      "start_line": 213,
+      "end_line": 220,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "37b5dc8bae1c4a87883de59ff9d8463f-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_witness_documented_role",
+      "kind": "fact",
+      "statement": "The captured configuration contract defines a witness as a Raft node without actual log replication and without a state machine, following section 11.7.2 of Ongaro's thesis, and it forbids witness nodes from taking snapshots or being observers. Because raft.votingMembers() includes witnesses, a witness supplies quorum support for elections, commits and read-index confirmation while holding no application data of its own.",
+      "conditions": "A configuration that includes at least one witness; witness support is documented as experimental.",
+      "source_ids": [
+        "config_witness_contract",
+        "config_witness_validation",
+        "raft_voting_members",
+        "raft_broadcast_heartbeat_hint"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "37b5dc8bae1c4a87883de59ff9d8463f-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "raft_broadcast_heartbeat_hint",
+        "raft_voting_members",
+        "raft_witness_heartbeat_echo",
+        "raft_readindex_confirm",
+        "raft_readindex_confirm_core",
+        "peer_handle_response_filter",
+        "config_witness_contract",
+        "config_witness_validation"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: counting a witness's heartbeat response toward a leader's ReadIndex confirmation is consistent with the captured witness contract, so the eligibility behavior is not a defect. Basis: (1) the configuration contract states that a witness is a Raft node without actual log replication and without a state machine, citing section 11.7.2 of Ongaro's thesis, and it disallows witness snapshots and the observer role (config/config.go:169-176, 213-220); in that thesis section witnesses are voting members used to keep quorum without storing data. (2) raft.votingMembers() merges remotes and witnesses, so quorum() counts witnesses and broadcastHeartbeatMessageWithHint delivers the read context to them (raft.go:418-428, 839-852); a witness echoes Hint/HintHigh through handleHeartbeatMessage (raft.go:1316-1325), Peer.Handle admits its response (peer.go:185-196), and readIndex.confirm counts accepted responders toward quorum-1 (raft.go:1728-1741, 1771-1790; readindex.go:84-99). (3) The ReadIndex protocol's confirmation step asks whether the leader still holds authority at its term; a witness that answers with the current term has not granted a vote to a higher-term candidate, which is the evidence the step needs, and it needs no stored entries because the returned index is the leader's commit index and the requester completes only after its own applied index reaches it. (4) The asymmetry at handleLeaderReadIndex, which refuses witness requesters (raft.go:1662-1676), is consistent with this reading: witnesses confirm leadership but do not serve reads. Counterevidence considered: a configuration of voters {A,B} plus witness W with quorum 2 can complete a read confirmation with A and W while B is unreachable, so witness support is load-bearing for read availability; that follows from the documented voter role rather than from an accidental counting path. Limitations: this rests on the documented contract plus source reasoning, not on an execution or on a documented statement about read-index specifically; it does not claim that a witness-only confirmation preserves data availability in the sense of committed-entry durability, which the witness design trades away by not storing entries; and it does not settle whether the experimental witness feature should be strengthened beyond the thesis role.",
+      "answers": {
+        "37b5dc8bae1c4a87883de59ff9d8463f-gap-2": {
+          "explanation": "Yes, a read context can complete with a witness confirmation and no other non-leader full member, for example with voters {A,B} plus witness W where quorum is 2, A leads and only W echoes the context. That support is sufficient for the read protocol's purpose because the confirmation only establishes that no higher-term vote has been granted within a quorum of the current configuration, and the witness is a documented voting member that holds no log (config/config.go:169-176, 213-220; raft.go:418-428, 839-852, 1771-1790; readindex.go:84-99). The requester still waits for its own applied index to reach the confirmed commit index, so the witness is never asked to supply entries. The eligibility is therefore by design rather than an unintended counting path; the durability trade-off (a quorum can be assembled without a second data-bearing copy) is a property of the documented witness role and responsibility of the deployment, not a defect in the confirmation code.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "37b5dc8bae1c4a87883de59ff9d8463f-knowledge-0",
+          "revision": 1,
+          "assertion": "Witnesses are voting members and receive hinted heartbeats that they echo back."
+        },
+        {
+          "entry_id": "@ki_witness_documented_role",
+          "revision": 1,
+          "assertion": "A witness is documented as a voting Raft node without log replication or a state machine."
+        }
+      ],
+      "counterevidence": [
+        "handleLeaderReadIndex refuses a ReadIndex request whose requester is a witness (raft.go:1662-1676); this asymmetry supports the reading that witnesses confirm leadership but do not serve reads.",
+        "A witness-only confirmation means a read can complete while a data-bearing voter is unreachable, making witness availability load-bearing for read liveness in such configurations."
+      ],
+      "limitations": [
+        "Documented role plus source reasoning only; no CheckRun receipt and no witness-specific statement about read-index in the captured tree.",
+        "Does not extend to durability of committed entries in witness configurations, which the witness design trades away by not storing entries.",
+        "Witness support is marked experimental in the captured configuration, so the contract this relies on may be narrow."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

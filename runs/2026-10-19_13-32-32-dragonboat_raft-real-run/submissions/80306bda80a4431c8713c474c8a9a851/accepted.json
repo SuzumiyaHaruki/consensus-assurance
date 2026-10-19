@@ -1,0 +1,190 @@
+{
+  "rationale": "Fifty-third pass: switch from the client-reporting endpoint to a duty that crosses an authority change - a queued leadership-transfer request. The public call is fire-and-forget, so the risk worth checking is that a target queued in the node layer outlives the local leader's authority and later causes a TimeoutNow message from a deposed leader, or that it is consumed in a state where nothing records it. Reading the request path, the raft handler map and the state-reset code settles it: the node layer consumes the target exactly once, the raft layer installs the transfer target only in leader state, and every state transition clears it, so no stale TimeoutNow can be produced; requests issued on a candidate, observer or witness are silently ignored, which the captured API documentation already covers as best effort. No execution is needed, and the account is recorded with the bounded consequences that remain.",
+  "sources": [
+    {
+      "id": "node_request_leader_transfer",
+      "file": "node.go",
+      "start_line": 428,
+      "end_line": 436,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_handle_leader_transfer",
+      "file": "node.go",
+      "start_line": 1150,
+      "end_line": 1189,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_leader_transfer",
+      "file": "request.go",
+      "start_line": 538,
+      "end_line": 567,
+      "kind": "code_observation"
+    },
+    {
+      "id": "peer_request_leader_transfer",
+      "file": "internal/raft/peer.go",
+      "start_line": 106,
+      "end_line": 112,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_handle_leader_transfer",
+      "file": "internal/raft/raft.go",
+      "start_line": 1742,
+      "end_line": 1769,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_follower_transfer_forward",
+      "file": "internal/raft/raft.go",
+      "start_line": 1946,
+      "end_line": 1953,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_leader_transfer_abort_on_reset",
+      "file": "internal/raft/raft.go",
+      "start_line": 1003,
+      "end_line": 1023,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_leader_transfer_timeout",
+      "file": "internal/raft/raft.go",
+      "start_line": 547,
+      "end_line": 549,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_handler_map",
+      "file": "internal/raft/raft.go",
+      "start_line": 2095,
+      "end_line": 2169,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_request_leader_transfer_doc",
+      "file": "nodehost.go",
+      "start_line": 1292,
+      "end_line": 1310,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@leader_transfer_authority",
+      "question": "When a leadership-transfer request is queued in the node layer and the local node changes authority before the request reaches raft, or the local node is not the leader at all, can the request survive the change and produce a stale TimeoutNow from a node that no longer leads, or does it leave an unrecorded pending duty?",
+      "source_ids": [
+        "node_request_leader_transfer",
+        "node_handle_leader_transfer",
+        "request_pending_leader_transfer",
+        "peer_request_leader_transfer",
+        "raft_handle_leader_transfer",
+        "raft_follower_transfer_forward",
+        "raft_leader_transfer_abort_on_reset",
+        "raft_leader_transfer_timeout",
+        "raft_handler_map"
+      ],
+      "hypothesis": "The raft layer keeps the transfer target only while the node is leader and clears it on every state transition, so a queued transfer can at most be forwarded once to the current leader from a follower, and is discarded without a terminal result elsewhere; no stale TimeoutNow is possible and no duty outlives the request.",
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_leader_transfer_request_path",
+      "kind": "behavior",
+      "statement": "node.requestLeaderTransfer rejects an uninitialized node and a witness, and otherwise offers the target to a capacity-one channel (NoNode yields an invalid-target error, an occupied channel yields a busy error); node.handleLeaderTransfer consumes that target once per event-loop pass and hands it to Peer.RequestLeaderTransfer, which injects a LeaderTransfer message carrying the target in Hint. Raft dispatches LeaderTransfer only in leader and follower states: a leader requires the target to be one of its remotes and not itself, records it as the transfer target, resets its election tick and sends TimeoutNow immediately when the target is already caught up, while a follower forwards the message once to the leader it knows and drops it with a warning when no leader is known. Candidates, observers and witnesses have no LeaderTransfer handler, and the default handler ignores unknown message types, so a request accepted by those nodes is discarded silently. There is no completion channel on this path; the only caller-visible outcome is the error returned when the request is submitted.",
+      "conditions": "RequestLeaderTransfer or SyncRequestLeaderTransfer is called on any non-witness, initialized node of an existing cluster, including a node that is a follower, candidate or observer at the time the queued target is handed to raft.",
+      "source_ids": [
+        "node_request_leader_transfer",
+        "node_handle_leader_transfer",
+        "request_pending_leader_transfer",
+        "peer_request_leader_transfer",
+        "raft_handle_leader_transfer",
+        "raft_follower_transfer_forward",
+        "raft_handler_map",
+        "nodehost_request_leader_transfer_doc"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@ki_leader_transfer_lifetime",
+      "kind": "behavior",
+      "statement": "The raft-layer leadership transfer exists only as leaderTransferTarget and is bounded in time and by authority: handleLeaderTransfer sets it only while the node is leader, reset() calls abortLeaderTransfer so every state transition (including the check-quorum step-down) clears it, leaderTick aborts it once an election timeout has elapsed since the target was set, removing the target node aborts it, and the deferred TimeoutNow for a lagging target is sent only from the replicate-response path guarded by leaderTransfering(), which requires the node to still be leader. While a transfer is in progress the leader drops proposals and reports them as dropped rather than accepting them.",
+      "conditions": "A leader has accepted a leadership-transfer request and is either waiting for the target to catch up, has lost quorum or leadership, or has had the target removed from the configuration.",
+      "source_ids": [
+        "raft_handle_leader_transfer",
+        "raft_leader_transfer_abort_on_reset",
+        "raft_leader_transfer_timeout",
+        "raft_handler_map"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@leader_transfer_authority",
+      "experiment_id": null,
+      "source_ids": [
+        "node_request_leader_transfer",
+        "node_handle_leader_transfer",
+        "request_pending_leader_transfer",
+        "peer_request_leader_transfer",
+        "raft_handle_leader_transfer",
+        "raft_follower_transfer_forward",
+        "raft_leader_transfer_abort_on_reset",
+        "raft_leader_transfer_timeout",
+        "raft_handler_map",
+        "nodehost_request_leader_transfer_doc"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a leadership-transfer request cannot outlive the local node's authority, and it cannot produce a stale TimeoutNow from a node that has stopped leading. The pending duty lives in two places and both are bounded. In the node layer the target sits in a capacity-one channel; node.handleLeaderTransfer (node.go:1182-1189), called once per event-loop pass from handleEvents (node.go:1132-1160), consumes it and immediately hands it to Peer.RequestLeaderTransfer, so at most one target is outstanding and nothing retries it later. In the raft layer the target exists only as leaderTransferTarget, and handleLeaderTransfer (raft.go:1742-1769) is installed only for leader state (raft.go:2138), requires the target to be present in r.remotes and different from the local node, and then either sends TimeoutNow at once when the target's match already equals the last log index or waits for the target to catch up through the replicate-response path, which re-checks leaderTransfering() - a predicate that requires the node to still be leader (raft.go:366-368). Loss of authority clears the target: every become* transition calls reset(), which calls abortLeaderTransfer (raft.go:1003-1023), and the check-quorum step-down goes through becomeFollower, so a deposed leader has no remaining path that can emit TimeoutNow. Two further bounds exist: leaderTick aborts the transfer once an election timeout elapses (raft.go:547-549, 600-621), and removeNode aborts it when the target itself is removed (raft.go:1196-1210). The residual states are benign rather than silent duties: a LeaderTransfer message reaching a candidate, observer or witness has no handler, and defaultHandle ignores unknown types (raft.go:2095-2100, 2102-2169), so the request simply has no effect; a follower forwards the message once to the leader it currently knows and warns and drops it when it knows none (raft.go:1946-1953). The captured documentation covers exactly that, describing the call as returning an error only when the request fails to be started and stating that the transfer may still fail afterwards (nodehost.go:1292-1310), and the node layer's errors are limited to uninitialized, witness, invalid target and busy (node.go:428-436; request.go:538-567). Bounded consequences worth stating rather than dismissing: while a transfer is pending the leader drops proposals and reports them as dropped, and because accepting a transfer resets electionTick to zero the next check-quorum evaluation is postponed by up to one election timeout; both end when the transfer completes or aborts at the election-timeout bound, and no stale message survives that point.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "@ki_leader_transfer_request_path",
+          "revision": 1,
+          "assertion": "The queued target is consumed once and dispatched only in leader and follower states; other states ignore it."
+        },
+        {
+          "entry_id": "@ki_leader_transfer_lifetime",
+          "revision": 1,
+          "assertion": "The raft-layer transfer target is cleared by every state transition, by an election timeout and by removal of the target."
+        }
+      ],
+      "counterevidence": [
+        "A request accepted on a candidate, observer or witness returns nil and is then discarded without any effect, so a successful return from RequestLeaderTransfer is weaker than callers might assume; the captured documentation states the transfer may fail after a successful return, which covers this case.",
+        "Accepting a transfer resets the raft election tick to zero, which postpones the next check-quorum evaluation by up to one election timeout, so the request does interact with the mechanism that steps a partitioned leader down.",
+        "While a transfer is pending the leader refuses proposals and reports them as dropped, so clients observe dropped proposals during the transfer window rather than a backlog."
+      ],
+      "limitations": [
+        "Source trace only: no raft node, nodehost, transport or client invocation was executed for this question, and no receipt is cited.",
+        "Message-level delivery of a forwarded LeaderTransfer, including its handling when the forwarding node's term is stale on arrival at the leader, was not exercised; onMessageTermNotMatched is expected to drop such a message, but that path is taken from other recorded knowledge rather than traced here.",
+        "The interaction between a transfer and a concurrently applied configuration change that removes the leader was read at the abort site only; the ordering of those two steps in one apply batch is not established by this account."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

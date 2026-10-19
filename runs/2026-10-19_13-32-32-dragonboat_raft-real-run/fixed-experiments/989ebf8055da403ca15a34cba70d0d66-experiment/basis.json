@@ -1,0 +1,67 @@
+{
+  "id": "989ebf8055da403ca15a34cba70d0d66-experiment",
+  "investigation_id": "989ebf8055da403ca15a34cba70d0d66-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package dragonboat\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/lni/dragonboat/v3/internal/rsm\"\n)\n\n// TestAssuranceSnapshotRequestOutcome probes the completion contract of a\n// user-requested snapshot: a request that is never reported back is expected to\n// end with a timeout once the logical clock passes its deadline, after which the\n// object accepts a new request that can be completed normally.\nfunc TestAssuranceSnapshotRequestOutcome(t *testing.T) {\n\terrName := func(err error) string {\n\t\tif err == nil {\n\t\t\treturn \"nil\"\n\t\t}\n\t\treturn err.Error()\n\t}\n\tsnapshotC := make(chan rsm.SSRequest, 4)\n\tp := newPendingSnapshot(snapshotC)\n\n\treq, err := p.request(rsm.UserRequested, \"\", false, 0, 5)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_request\\\",\\\"case\\\":\\\"expired\\\",\\\"err\\\":%q,\\\"queued\\\":%d,\\\"state_returned\\\":%t}\\n\",\n\t\terrName(err), len(snapshotC), req != nil)\n\tif req != nil {\n\t\tselect {\n\t\tcase r := <-req.CompletedC:\n\t\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_early\\\",\\\"got\\\":%q}\\n\", r.code.String())\n\t\tdefault:\n\t\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_early\\\",\\\"got\\\":\\\"none\\\"}\\n\")\n\t\t}\n\t\tp.tick(20)\n\t\tp.gc()\n\t\tselect {\n\t\tcase r := <-req.CompletedC:\n\t\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_expired\\\",\\\"got\\\":%q,\\\"result_value\\\":%d}\\n\",\n\t\t\t\tr.code.String(), r.result.Value)\n\t\tdefault:\n\t\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_expired\\\",\\\"got\\\":\\\"none\\\"}\\n\")\n\t\t}\n\t}\n\n\treq2, err := p.request(rsm.UserRequested, \"\", false, 0, 5)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_request\\\",\\\"case\\\":\\\"completed\\\",\\\"err\\\":%q,\\\"queued\\\":%d,\\\"state_returned\\\":%t}\\n\",\n\t\terrName(err), len(snapshotC), req2 != nil)\n\tif req2 != nil {\n\t\tvar key uint64\n\t\tstale := 0\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase ssreq := <-snapshotC:\n\t\t\t\tif ssreq.Key == req2.key {\n\t\t\t\t\tkey = ssreq.Key\n\t\t\t\t} else {\n\t\t\t\t\tstale++\n\t\t\t\t}\n\t\t\t\tcontinue\n\t\t\tdefault:\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t\tmatched := key != 0 && key == req2.key\n\t\tp.apply(key, false, false, 42)\n\t\tselect {\n\t\tcase r := <-req2.CompletedC:\n\t\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_completed\\\",\\\"key_matched\\\":%t,\\\"stale_requests\\\":%d,\\\"got\\\":%q,\\\"result_value\\\":%d}\\n\",\n\t\t\t\tmatched, stale, r.code.String(), r.result.Value)\n\t\tdefault:\n\t\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_completed\\\",\\\"key_matched\\\":%t,\\\"stale_requests\\\":%d,\\\"got\\\":\\\"none\\\"}\\n\",\n\t\t\t\tmatched, stale)\n\t\t}\n\t}\n\n\t_, err = p.request(rsm.UserRequested, \"\", false, 0, 0)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_request\\\",\\\"case\\\":\\\"zero_timeout\\\",\\\"err\\\":%q}\\n\", errName(err))\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceSnapshotRequestOutcome"
+      ],
+      "features": [],
+      "default_features": true,
+      "all_features": false,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "request_pending_snapshot",
+      "rsm_snapshot_request_type",
+      "request_logical_clock"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Probe the pending-snapshot completion contract at the object level: one request that expires, one that completes, and one rejected for a zero timeout.",
+      "assumptions": [
+        "The snapshot channel is a buffered channel that stands in for the node's snapshot request channel, so handing a request over is observable without a node.",
+        "The logical clock is advanced explicitly with the object's own tick method, so the deadline is passed deterministically rather than by waiting.",
+        "A matching apply is supplied with the key carried by the pending request state, which is the same key written into the snapshot request that was queued."
+      ],
+      "excluded": [
+        "Any raft node, snapshotter, state machine or log write; the snapshot is never taken.",
+        "Behaviour of a request whose key does not match the pending state, beyond the stale entries the probe consumes while looking for its own request."
+      ],
+      "parameters": {}
+    },
+    "prefix": "A pendingSnapshot is created over a buffered rsm.SSRequest channel with the default logical clock. A user-requested snapshot is submitted with a five tick timeout and the channel length, returned state and error are reported; the completed channel is checked before the clock advances; the clock is then advanced to 20 and the gc pass is run, and the completed channel is read again. A second request is submitted with the same timeout, the queued requests are drained until the one whose key matches the new state is found, the number of stale requests is recorded, and a matching apply with value 42 is delivered before the completed channel is read. Finally a request with a zero timeout is submitted.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "b961633ee3874799b5847afdeeff74f3",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "989ebf8055da403ca15a34cba70d0d66",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

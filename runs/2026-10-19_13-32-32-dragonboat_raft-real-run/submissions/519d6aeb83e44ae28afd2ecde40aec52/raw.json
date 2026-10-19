@@ -1,0 +1,101 @@
+{
+  "rationale": "Sixty-fourth pass: close the caller side of the exactly-once story. The session decisions and the snapshot that carries them are recorded, but both only work if the client keeps the same series across a retry. Reading the two proposal entry points and the session helpers settles it: both API comments state that a timed-out proposal is retried with the unchanged session and that the session is advanced only after a successful completion, the session helper enforces that discipline by panicking unless the series id is exactly one ahead of the acknowledged value, and the captured Chinese overview states the same rule. The pass records the documented retry protocol, its enforcement and an explained negative.",
+  "sources": [
+    {
+      "id": "nodehost_propose_session_contract",
+      "file": "nodehost.go",
+      "start_line": 820,
+      "end_line": 829,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_syncpropose_session_contract",
+      "file": "nodehost.go",
+      "start_line": 563,
+      "end_line": 569,
+      "kind": "code_observation"
+    },
+    {
+      "id": "client_session_proposal_completed",
+      "file": "client/session.go",
+      "start_line": 104,
+      "end_line": 120,
+      "kind": "code_observation"
+    },
+    {
+      "id": "client_session_valid_for_proposal",
+      "file": "client/session.go",
+      "start_line": 131,
+      "end_line": 150,
+      "kind": "code_observation"
+    },
+    {
+      "id": "docs_session_retry_protocol",
+      "file": "docs/overview.CHS.md",
+      "start_line": 84,
+      "end_line": 84,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@session_retry_duty",
+      "question": "Does the captured client contract require a timed-out proposal to be retried with the unchanged session series, and does the session helper enforce that the series is advanced only after a successful completion, so the server's deduplication can recognise the retry?",
+      "source_ids": [
+        "nodehost_propose_session_contract",
+        "nodehost_syncpropose_session_contract",
+        "client_session_proposal_completed",
+        "client_session_valid_for_proposal",
+        "docs_session_retry_protocol"
+      ],
+      "hypothesis": "Both proposal entry points document that a timed-out proposal is retried without updating the session and that the session is advanced only after a successful completion, and the session helper enforces the rule by panicking unless the series id is exactly one ahead of the acknowledged value.",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_session_retry_duty",
+      "kind": "behavior",
+      "statement": "The captured client contract makes series advancement a caller duty tied to success: the asynchronous proposal documentation states that on a timeout the caller may retry the same proposal without updating the session, that a rejection usually means the session was evicted and the client should be treated as failed, and that only a successful completion requires calling ProposalCompleted; the synchronous entry point states the same rule in terms of its timeout and invalid-session errors, and the captured Chinese overview says that a timed-out proposal is retried directly without calling ProposalCompleted. The session helper enforces the discipline: ProposalCompleted advances the series and the acknowledged value only when the current series id is exactly one ahead of the acknowledged value and otherwise panics, and the validity check used before proposing rejects a session whose acknowledged value has overtaken its series. A client that follows the contract therefore retries a timed-out proposal under the same series, which is the input the server's session decisions need in order to return the stored result instead of applying the command again.",
+      "conditions": "A client uses a regular (non-NO-OP) session to propose to a state machine that supports session-managed updates, and the proposal ends with a timeout, a rejection, or a successful completion.",
+      "source_ids": [
+        "nodehost_propose_session_contract",
+        "nodehost_syncpropose_session_contract",
+        "client_session_proposal_completed",
+        "client_session_valid_for_proposal",
+        "docs_session_retry_protocol"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@session_retry_duty",
+      "source_ids": [
+        "nodehost_propose_session_contract",
+        "nodehost_syncpropose_session_contract",
+        "client_session_proposal_completed",
+        "client_session_valid_for_proposal",
+        "docs_session_retry_protocol"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: the caller-side rule that makes the server's session deduplication effective is documented, consistent across both proposal entry points, and enforced by the session helper, so a proposal that times out is retried under the same series rather than being turned into a second command. The asynchronous entry point documents that when the result is a timeout the caller can retry the same proposal without updating the session, that a rejection usually means the server evicted the session and the client should be treated as failed, and that a successful completion requires calling ProposalCompleted to advance the session (nodehost.go:820-829). The synchronous entry point states the same rule in terms of its error values (nodehost.go:563-569), and the captured Chinese overview repeats it: after a successful proposal the application calls ProposalCompleted, while after a timeout it does not, and instead calls the proposal method again to retry (docs/overview.CHS.md:84). The session helper makes the discipline checkable rather than advisory: ProposalCompleted advances the series id and the acknowledged value only when the current series is exactly one ahead of the acknowledged value, panicking otherwise (client/session.go:104-120), and the pre-proposal validity check refuses a session whose acknowledged value has overtaken its series while reusing the same series is permitted (client/session.go:131-150). That is exactly the input the server needs: the recorded session decisions return the stored result without a state machine update when the same series is retried, which is why the contract can promise at-most-once application across a timeout. Two bounds belong with the account: the rule is a caller duty, so a client that advances the session on a timeout and then retries under a new series defeats deduplication by construction, and the documentation offers no mechanism to detect that misuse, since a new series is indistinguishable from a genuinely new command.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_session_retry_duty",
+          "revision": 1,
+          "assertion": "Both API comments and the overview require retrying a timed-out proposal under the unchanged session, and ProposalCompleted enforces series advancement only on success."
+        }
+      ],
+      "counterevidence": [
+        "The contract is a caller duty: a client that calls ProposalCompleted after a timeout and then retries produces a new series, which the server cannot distinguish from a new command, so deduplication is defeated without any error being raised.",
+        "The rejection case is documented as usually meaning eviction, but the guidance is to treat the client as failed rather than to retry, so the safe path depends on the caller honouring a recommendation rather than on an enforced check."
+      ],
+      "limitations": [
+        "Source and documentation trace only: no client was run against a cluster for this question, and no receipt is cited.",
+        "The account reads the documented contract and the helper's enforcement; it does not measure what an application in the wild does on timeout, which is outside the captured target.",
+        "Only the regular-session path was traced; NO-OP sessions are documented as bypassing this machinery and were not re-read here."
+      ]
+    }
+  ]
+}

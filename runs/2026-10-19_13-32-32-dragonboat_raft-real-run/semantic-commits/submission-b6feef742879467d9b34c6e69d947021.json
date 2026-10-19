@@ -1,0 +1,1205 @@
+{
+  "input": {
+    "rationale": "Thirteenth pass: interpret the first retained execution. The fixed raft-level harness passed and emitted three events. 'registered' shows the leader had a committed current-term entry (committed=true, at_term=true) and registered the read context (registered=true), so the admission precondition held. 'step_down' shows the node left leader state (still_leader=false), reported zero dropped read contexts (dropped=0) and retained no pending context (pending=false), matching the source claim that reset() discards contexts silently. 'stale_resp' shows a heartbeat response carrying the discarded context added zero ready-to-read entries (ready_added=0), matching the source claim that post-step-down HeartbeatResp is not handled. The added interpretation is experiment-level with conclusion holds and the original suspicion refuted; the earlier question-level account stays as the broader source-based account and is not withdrawn.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+        "experiment_id": "b9e49b2df9c8453aab2f0b292ce3c176-experiment",
+        "source_ids": [
+          "raft_handle_readindex_path",
+          "raft_checkquorum_handler",
+          "raft_reset_replaces_readindex",
+          "raft_readindex_confirm_core",
+          "raft_follower_handler_map",
+          "raft_term_check"
+        ],
+        "executions": {
+          "3008fe6b26434113be5cd484d8d7a5a6": [
+            0,
+            1,
+            2
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "refuted",
+        "rationale": "Current claim for this experiment: the raft layer discards a registered read context on the CheckQuorum step-down without reporting it, and a heartbeat response carrying that discarded context afterwards does not complete a read. The retained receipt 3008fe6b26434113be5cd484d8d7a5a6 executed TestAssuranceReadIndexDiscardedOnStepDown and passed, with parsed event index 0 'registered' recording committed=true, at_term=true, registered=true; index 1 'step_down' recording still_leader=false, dropped=0, pending=false; index 2 'stale_resp' recording ready_added=0. The test also asserted the same three endpoints, so the passing status and the events agree. These observations align with the source path: handleLeaderReadIndex admits the context only with a committed current-term entry (raft.go:1662-1696), handleLeaderCheckQuorum steps down when quorum is lost (raft.go:1608-1615), reset installs a fresh readIndex so the context disappears without a dropped report (raft.go:1003-1025), and follower state has no HeartbeatResp handler, so the later response changes nothing (raft.go:2116-2129, 1430-1478). Scope limits: the harness drives the raft layer directly with the package's in-memory test log, so it shows raft-layer bookkeeping rather than node-layer client outcomes; the node-layer RequestTimeout completion path established earlier remains source-based; no comparison records were registered for this experiment, so the predicate is read from the emitted fields listed above; and a single schedule is exercised, so this is one witness rather than a schedule-independence argument.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The event set does not observe the node layer, so it cannot by itself show which client-visible result a discarded context receives; that link stays with the earlier source-based account.",
+          "dropped=0 is consistent with a silent discard and would also be consistent with a context that had already completed, which is excluded only by the registered=true event preceding it."
+        ],
+        "limitations": [
+          "Raft-layer probe with the in-memory test log; no transport, ticks, or node event loop.",
+          "One execution schedule; no repetition or schedule variation.",
+          "No experiment comparison records were registered, so field reading is interpretive."
+        ],
+        "joint_history": "",
+        "failure_attribution": null
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "interpretations": [
+      {
+        "id": "1b1f6ec36e5540a5a256dc25dd86cc61-interpretation-0",
+        "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_leader_readindex",
+          "raft_heartbeat_resp",
+          "raft_readindex_confirm",
+          "raft_checkquorum_stepdown",
+          "raft_reset_replaces_readindex",
+          "raft_candidate_readindex_dropped",
+          "raft_report_dropped_readindex",
+          "raft_follower_handler_map",
+          "raft_term_check",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter",
+          "node_read_admission",
+          "node_handle_events",
+          "node_tick",
+          "node_dropped_readindexes",
+          "request_pending_readindex_applied_gc",
+          "request_dropped_timeout"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Current conclusion: a ReadIndex request outstanding when the leader loses authority keeps a legal, bounded terminal path, and a deposed leader cannot complete it from stale confirmations, although the terminal result is RequestTimeout rather than an explicit dropped result. Basis: (1) the leader only registers a read context after it has a committed entry at its current term (internal/raft/raft.go:1662-1696), otherwise it reports the context in droppedReadIndexes and node.processDroppedReadIndexes forwards that to pendingReadIndex.dropped (node.go:1021-1026); (2) registration is followed immediately by heartbeats carrying that context, and confirmation needs quorum-1 matching responses plus the leader's implicit count, at which point earlier contexts are released with the later index and either a local ReadyToRead is added or a ReadIndexResp is sent (raft.go:1728-1741, 1771-1790; readindex.go:30-116); (3) every state transition, including the CheckQuorum step-down at raft.go:1608-1615, runs reset() which installs a fresh readIndex (raft.go:1003-1025), so registered contexts are discarded without any DroppedReadIndexes entry; (4) after the step-down the node cannot confirm them from heartbeat responses, because follower state has no HeartbeatResp handler (raft.go:2116-2129) and lower-term messages are dropped (raft.go:1430-1478), and Peer.Handle additionally ignores responses from unknown peers (peer.go:185-196); (5) consequently the node-layer batch keeps index 0 and is terminated by pendingReadIndex.applied/gc as RequestTimeout once the caller-supplied deadline passes, which is reached from ordinary event-loop iterations because LocalTick messages make handleEvents report an event and call pendingReadIndexes.applied (node.go:1132-1166, 1478-1492; request.go:908-954, 403-414). Counterevidence considered: handleCandidateReadIndex reports the same context twice (raft.go:1998-2012 plus reportDroppedReadIndex), but pendingReadIndex.dropped deletes the batch on the first delivery, so the duplicate result is a no-op rather than a double notification; and handleFollowerReadIndexResp does set the leader id and add a ready-to-read, but only for a context the leader confirmed before the transition, so it does not resurrect authority for a discarded context. Limitations: this account is source-only for this revision and rests on the node event loop being driven while the request is pending; it does not measure how long the timeout path takes, does not claim the timeout code is the most useful client-visible result, and does not cover the same-batch confirmation/reset race named in the registered gap.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-0",
+            "revision": 1,
+            "assertion": "Leader rejects ReadIndex without a committed current-term entry and reports the context as dropped."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-1",
+            "revision": 1,
+            "assertion": "Quorum-1 heartbeat confirmations plus the leader complete a context and release earlier contexts with the later index."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-2",
+            "revision": 1,
+            "assertion": "reset() replaces the readIndex instance and discards registered contexts without a dropped notification."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-3",
+            "revision": 1,
+            "assertion": "A node that left leader state has no HeartbeatResp handler, so stale confirmations cannot complete a read context."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+            "revision": 1,
+            "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+          }
+        ],
+        "counterevidence": [
+          "handleCandidateReadIndex appends the same SystemCtx twice (explicit append after reportDroppedReadIndex), but the second pendingReadIndex.dropped call finds no batch and is a no-op, so this does not create a double client notification.",
+          "handleFollowerReadIndexResp sets the leader id and adds a ready-to-read from a ReadIndexResp (raft.go:1955-1963), which is a legitimate completion only for a context the leader confirmed while it still held authority."
+        ],
+        "limitations": [
+          "Source-only account for this revision; no CheckRun receipt backs it.",
+          "Assumes the node event loop keeps processing LocalTick messages while the read request is pending; a stalled engine or stopped node is outside the stated conditions.",
+          "Does not quantify how late the timeout-based completion is relative to the confirmation-based path, nor whether client-visible RequestTimeout should be replaced by a dropped result.",
+          "Same-batch confirmation/reset ordering remains open as the registered gap."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "1b1f6ec36e5540a5a256dc25dd86cc61"
+      },
+      {
+        "id": "f358830ea2834c98a1f8b66c3394cf66-interpretation-0",
+        "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_leader_readindex",
+          "raft_heartbeat_resp",
+          "raft_readindex_confirm",
+          "raft_checkquorum_stepdown",
+          "raft_reset_replaces_readindex",
+          "raft_candidate_readindex_dropped",
+          "raft_report_dropped_readindex",
+          "raft_follower_handler_map",
+          "raft_term_check",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter",
+          "peer_commit_clears_update",
+          "raft_clear_ready_to_read",
+          "node_read_admission",
+          "node_handle_events",
+          "node_tick",
+          "node_dropped_readindexes",
+          "request_pending_readindex_applied_gc",
+          "request_dropped_timeout"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Current conclusion: a ReadIndex request outstanding when the leader loses authority keeps a legal, bounded terminal path, a deposed leader cannot complete it from stale confirmations, and the same-batch confirmation/step-down ordering does not lose the response that confirmation produced. Basis: (1) the leader only registers a read context after it has a committed entry at its current term (internal/raft/raft.go:1662-1696), otherwise reporting the context in droppedReadIndexes, which node.processDroppedReadIndexes forwards to pendingReadIndex.dropped (node.go:1021-1026); (2) registration is followed immediately by heartbeats carrying that context, and confirmation requires quorum-1 matching responses plus the leader's implicit count, after which earlier contexts are released with the later index and either a local ReadyToRead is added or a ReadIndexResp is sent (raft.go:1728-1741, 1771-1790; readindex.go:30-116); (3) every state transition, including the CheckQuorum step-down (raft.go:1608-1615), runs reset(), which installs a fresh readIndex, so contexts registered earlier are discarded without any DroppedReadIndexes entry (raft.go:1003-1025); (4) after the step-down the node cannot confirm them from heartbeat responses, because follower state has no HeartbeatResp handler (raft.go:2116-2129), lower-term messages are dropped (raft.go:1430-1478), and Peer.Handle ignores responses from unknown peers (peer.go:185-196); (5) a request whose context is never confirmed or indexed therefore has index 0 in the node layer and is terminated as RequestTimeout by pendingReadIndex.applied/gc once the caller-supplied deadline passes, a path driven by ordinary event-loop iterations because LocalTick messages make handleEvents report an event and call pendingReadIndexes.applied (node.go:1132-1166, 1478-1492; request.go:908-954, 403-414); (6) the previously open same-batch window is closed by source: confirm and the ReadyToRead/ReadIndexResp emission run inside one handler call with no state transition in between, and messages plus ReadyToRead survive a later reset because they are cleared only by Peer.Commit after the Update is collected (peer.go:284-294, raft.go:1649-1651). Counterevidence considered: handleCandidateReadIndex reports the same context twice (raft.go:1998-2012 plus reportDroppedReadIndex), but pendingReadIndex.dropped deletes the batch on first delivery, so the duplicate is a no-op; handleFollowerReadIndexResp sets the leader id and adds a ready-to-read from a ReadIndexResp (raft.go:1955-1963), which completes only a context confirmed while the sender held authority, so it does not resurrect authority for a discarded context, though it can leave a follower pointing at a leader that has since stepped down. Limitations: source-only account, no CheckRun receipt; assumes the node event loop keeps processing LocalTick messages while the request is pending; does not quantify the latency of the timeout path or judge whether RequestTimeout is the preferable client-visible code; the residual follower-side leader-id staleness noted above is a liveness observation that this question does not attempt to bound.",
+        "answers": {
+          "1b1f6ec36e5540a5a256dc25dd86cc61-gap-0": {
+            "explanation": "The window does not exist as stated. handleLeaderHeartbeatResp calls handleReadIndexLeaderConfirmation, which calls readIndex.confirm and then immediately appends either ReadyToRead (r.addReadyToRead) or a ReadIndexResp message (r.send) for every completed status; no state transition or reset can intervene inside that call frame, and confirmation is a prerequisite for those emissions. A step-down later in the same event-loop iteration does not discard them: reset() rebuilds readIndex/remotes/observers/witnesses/votes but leaves r.msgs and r.readyToRead untouched (raft.go:1003-1025), and they are cleared only by Peer.Commit after the Update carrying them has been handed to the node layer (peer.go:284-294; readyToRead only when UpdateCommit.ReadyToRead > 0). The deadline path established earlier therefore remains a fallback for contexts that were never confirmed, not for a confirmed context whose response was lost in the same batch.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-0",
+            "revision": 1,
+            "assertion": "Leader rejects ReadIndex without a committed current-term entry and reports the context as dropped."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-1",
+            "revision": 1,
+            "assertion": "Quorum-1 heartbeat confirmations plus the leader complete a context and release earlier contexts with the later index."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-2",
+            "revision": 1,
+            "assertion": "reset() replaces the readIndex instance and discards registered contexts without a dropped notification."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-3",
+            "revision": 1,
+            "assertion": "A node that left leader state has no HeartbeatResp handler, so stale confirmations cannot complete a read context."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+            "revision": 1,
+            "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+          },
+          {
+            "entry_id": "f358830ea2834c98a1f8b66c3394cf66-knowledge-0",
+            "revision": 1,
+            "assertion": "Messages and ReadyToRead produced before a reset in the same Update are still delivered, because reset does not clear them and Peer.Commit clears them afterwards."
+          }
+        ],
+        "counterevidence": [
+          "handleCandidateReadIndex appends the same SystemCtx twice (explicit append after reportDroppedReadIndex), but the second pendingReadIndex.dropped call finds no batch and is a no-op, so this does not create a double client notification.",
+          "handleFollowerReadIndexResp sets the leader id from the ReadIndexResp sender (raft.go:1955-1963). It completes only a context the sender confirmed while it held authority, but a response delivered after the sender stepped down can still leave the follower treating a former leader as leader until the next heartbeat or election."
+        ],
+        "limitations": [
+          "Source-only account for this revision; no CheckRun receipt backs it.",
+          "Assumes the node event loop keeps processing LocalTick messages while the read request is pending; a stalled engine or stopped node is outside the stated conditions.",
+          "Does not quantify how late the timeout-based completion is relative to the confirmation-based path, nor whether client-visible RequestTimeout should be replaced by a dropped result.",
+          "Does not bound how long a follower may keep a stale leader id after receiving a ReadIndexResp from a leader that stepped down before delivery."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "f358830ea2834c98a1f8b66c3394cf66"
+      },
+      {
+        "id": "9bf8b80283c042d1b383e211c89c1701-interpretation-0",
+        "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_save_snapshot_required",
+          "node_save_and_dosave",
+          "node_process_save_status",
+          "request_pending_snapshot_apply"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current claim: no defect is established yet; the question is whether a hard snapshot-save error can strand the periodic snapshot duty. What the sources do establish: saveSnapshotRequired advances the requested index (ss.setReqIndex(applied)) before any save runs and suppresses new periodic requests while the state machine reports busy snapshotting (node.go:651-667); doSave already holds the save state when it calls n.sm.Save and, on a hard error, returns the error to node.save without itself reporting a terminal snapshot result (node.go:693-760); node.save reports the pending user/periodic request only after doSave returns a value, so a hard error bypasses that report (node.go:693-706; request.go:648-668). What remains undecided is the enclosing control flow: whether the save task error propagates to rsm.StateMachine.Handle and the node worker in a way that clears the saving flag through processSaveStatus (node.go:1451-1467) or terminates the node, and whether n.ss.reqSnapshotIndex is ever reset after such a failure. Until that control flow is traced, the possible outcomes are a one-off failed snapshot request (no defect) or a durable suppression of snapshots and therefore of automatic log compaction (bounded progress defect), and the account stays unresolved.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+            "revision": 1,
+            "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+          },
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+            "revision": 1,
+            "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+          }
+        ],
+        "counterevidence": [
+          "processSaveStatus exists and clears the saving flag when a completed save task is available, which would make a failure recoverable if the failed task is still delivered through the completion path."
+        ],
+        "limitations": [
+          "Source reading only for this revision; the error propagation from rsm.StateMachine.Handle to the node worker has not been traced yet.",
+          "No execution evidence; a harness would need a state machine whose Save fails once and then succeeds to observe whether a later periodic snapshot is still requested."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9bf8b80283c042d1b383e211c89c1701"
+      },
+      {
+        "id": "599c7a85d804468187c5a652986302d1-interpretation-0",
+        "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_save_snapshot_required",
+          "node_save_and_dosave",
+          "node_process_save_status",
+          "request_pending_snapshot_apply",
+          "engine_ssworker_handle",
+          "engine_apply_loop_status",
+          "engine_error_injection_recover",
+          "node_save_done",
+          "snapshotstate_notify_status"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: the suspicion is refuted within the traced scope. A periodic snapshot save that fails with a hard error does not leave a live node whose snapshot duty is silently suppressed, and the non-fatal outcomes do not either. Basis: (1) saveSnapshotRequired advances ss.reqSnapshotIndex only when it actually requests a snapshot and suppresses further periodic requests while n.isBusySnapshotting() reports busy (node.go:651-667); (2) the save task is executed by ssWorker.save, which calls panic(err) on any error from node.save and has no recover in workerMain or handle (engine.go:275-305); the recover at engine.go:1029-1044 is installed only for step workers when error injection is enabled, and nodehost.go's recover covers NodeHost.Start, so a runtime save error ends the process instead of leaving the save flag set with a node that keeps applying entries; (3) on every non-fatal path, node.save returns nil and node.saveDone stores a completed save task via notifySnapshotStatus(save=true) and signals applyReady (node.go:846-850; snapshotstate.go:185-211), and the apply worker calls processStatusTransition before handleTask, so processSaveStatus clears the saving flag and later periodic snapshots remain enabled (engine.go:1200-1212; node.go:1451-1467); (4) the (0, nil) paths inside doSave are the soft-error case, the abort case that already reported aborted through pendingSnapshot.apply, and the already-up-to-date early return, in which node.save reports the pending user request as rejected (node.go:693-760; request.go:648-668). Counterevidence considered: a hard error bypasses the pendingSnapshot report for that request, but since the process panics at the same point, no client-visible state is retained in a live node, so it cannot strand later snapshot requests. Limitations: this is a source argument, not an execution; it does not cover a state machine whose Save blocks indefinitely (no error at all), nor storage faults inside snapshotter.commit that return errors handled elsewhere, nor whether process termination is an acceptable recovery policy versus returning an error to the caller. The claim is limited to the periodic-save control flow in this snapshot.",
+        "answers": {
+          "9bf8b80283c042d1b383e211c89c1701-gap-1": {
+            "explanation": "No such state survives. A non-soft error makes node.save return an error, and ssWorker.save panics on that error with no recover around workerMain/handle (engine.go:275-305; the engine recover at 1029-1044 is restricted to step workers under error injection and nodehost.go's recover wraps only NodeHost.Start), so the node does not continue with the saving flag set or an advanced requested index. On the non-fatal paths the flag is cleared: node.save returns nil, saveDone records a completed save task (node.go:846-850; snapshotstate.go:185-211), and the apply worker's processStatusTransition/processSaveStatus clears saving before executing the next task (engine.go:1200-1212; node.go:1451-1467). n.ss.reqSnapshotIndex does not need an explicit reset for recovery because saveSnapshotRequired compares applied against SnapshotEntries plus the requested index, so the next request occurs once applied advances by a further SnapshotEntries window; only restart resets it, and restart also resets the process that would have carried a stale session. The gap is resolved as a refutation of the stranding hypothesis.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+            "revision": 1,
+            "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+          },
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+            "revision": 1,
+            "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+          },
+          {
+            "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-0",
+            "revision": 1,
+            "assertion": "A hard save error panics the snapshot worker, ending the process rather than stranding in-process snapshot state."
+          },
+          {
+            "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-fatal save outcomes complete through saveDone and processSaveStatus, clearing the saving flag."
+          }
+        ],
+        "counterevidence": [
+          "A hard save error bypasses the pendingSnapshot.apply report for that request, so a user-requested snapshot never receives a rejected/aborted result on that path; the process panic is what prevents this from becoming a live stuck request."
+        ],
+        "limitations": [
+          "Source argument only; no CheckRun receipt.",
+          "Does not cover a Save implementation that blocks without returning, or storage faults handled outside node.doSave.",
+          "Does not judge whether terminating the process on a save error is an acceptable policy; only that it prevents a silent in-process stranding of the periodic snapshot duty.",
+          "Does not quantify how much log growth can accumulate between the requested-index advance and the next eligible periodic snapshot."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "599c7a85d804468187c5a652986302d1"
+      },
+      {
+        "id": "37b5dc8bae1c4a87883de59ff9d8463f-interpretation-0",
+        "investigation_id": "37b5dc8bae1c4a87883de59ff9d8463f-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_broadcast_heartbeat_hint",
+          "raft_voting_members",
+          "raft_witness_heartbeat_echo",
+          "raft_readindex_confirm",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Current state: the eligibility behavior is established but the correctness judgment is not. votingMembers() merges remotes and witnesses (raft.go:418-428), so quorum() counts witnesses and broadcastHeartbeatMessageWithHint sends the read context to every voting member including witnesses (raft.go:839-852). A witness handles a leader heartbeat through handleWitnessHeartbeat -> handleFollowerHeartbeat -> handleHeartbeatMessage, which echoes Hint and HintHigh in the response (raft.go:1316-1325), and Peer.Handle admits responses from known witnesses (peer.go:185-196), so handleLeaderHeartbeatResp can pass that response to handleReadIndexLeaderConfirmation, where readIndex.confirm counts it toward quorum-1 without checking whether the responder is a witness (raft.go:1728-1741, 1771-1790; readindex.go:84-99). What is not decided is correctness: a witness is a voting member that votes in elections and stores metadata entries only, so its confirmation that it has not granted a higher-term vote may be exactly the evidence the read protocol needs, in which case the behavior is intended and safe; the alternative reading is that a data-bearing majority is also required for reads. The question stays open with no defect claim, and the gap records the concrete configuration (for example voters {A,B} plus witness W with quorum 2, where A is leader and only W responds) that would settle it.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "37b5dc8bae1c4a87883de59ff9d8463f-knowledge-0",
+            "revision": 1,
+            "assertion": "Witnesses are voting members and receive hinted heartbeats that they echo back."
+          }
+        ],
+        "counterevidence": [
+          "handleLeaderReadIndex explicitly refuses to serve a ReadIndex request whose requester is a witness (raft.go:1662-1676), showing the author distinguished witness requesters from witness voters; that asymmetry is consistent with counting witness confirmations deliberately."
+        ],
+        "limitations": [
+          "Source reading only; no execution and no documentary statement of witness duties has been located in the captured tree yet.",
+          "Does not establish whether a witness-only confirmation can coexist with an unreachable data-bearing majority, which is the configuration that would matter for read availability."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "37b5dc8bae1c4a87883de59ff9d8463f"
+      },
+      {
+        "id": "3b5504b4c2ac476c980eddbf40f18f4f-interpretation-0",
+        "investigation_id": "37b5dc8bae1c4a87883de59ff9d8463f-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_broadcast_heartbeat_hint",
+          "raft_voting_members",
+          "raft_witness_heartbeat_echo",
+          "raft_readindex_confirm",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter",
+          "config_witness_contract",
+          "config_witness_validation"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: counting a witness's heartbeat response toward a leader's ReadIndex confirmation is consistent with the captured witness contract, so the eligibility behavior is not a defect. Basis: (1) the configuration contract states that a witness is a Raft node without actual log replication and without a state machine, citing section 11.7.2 of Ongaro's thesis, and it disallows witness snapshots and the observer role (config/config.go:169-176, 213-220); in that thesis section witnesses are voting members used to keep quorum without storing data. (2) raft.votingMembers() merges remotes and witnesses, so quorum() counts witnesses and broadcastHeartbeatMessageWithHint delivers the read context to them (raft.go:418-428, 839-852); a witness echoes Hint/HintHigh through handleHeartbeatMessage (raft.go:1316-1325), Peer.Handle admits its response (peer.go:185-196), and readIndex.confirm counts accepted responders toward quorum-1 (raft.go:1728-1741, 1771-1790; readindex.go:84-99). (3) The ReadIndex protocol's confirmation step asks whether the leader still holds authority at its term; a witness that answers with the current term has not granted a vote to a higher-term candidate, which is the evidence the step needs, and it needs no stored entries because the returned index is the leader's commit index and the requester completes only after its own applied index reaches it. (4) The asymmetry at handleLeaderReadIndex, which refuses witness requesters (raft.go:1662-1676), is consistent with this reading: witnesses confirm leadership but do not serve reads. Counterevidence considered: a configuration of voters {A,B} plus witness W with quorum 2 can complete a read confirmation with A and W while B is unreachable, so witness support is load-bearing for read availability; that follows from the documented voter role rather than from an accidental counting path. Limitations: this rests on the documented contract plus source reasoning, not on an execution or on a documented statement about read-index specifically; it does not claim that a witness-only confirmation preserves data availability in the sense of committed-entry durability, which the witness design trades away by not storing entries; and it does not settle whether the experimental witness feature should be strengthened beyond the thesis role.",
+        "answers": {
+          "37b5dc8bae1c4a87883de59ff9d8463f-gap-2": {
+            "explanation": "Yes, a read context can complete with a witness confirmation and no other non-leader full member, for example with voters {A,B} plus witness W where quorum is 2, A leads and only W echoes the context. That support is sufficient for the read protocol's purpose because the confirmation only establishes that no higher-term vote has been granted within a quorum of the current configuration, and the witness is a documented voting member that holds no log (config/config.go:169-176, 213-220; raft.go:418-428, 839-852, 1771-1790; readindex.go:84-99). The requester still waits for its own applied index to reach the confirmed commit index, so the witness is never asked to supply entries. The eligibility is therefore by design rather than an unintended counting path; the durability trade-off (a quorum can be assembled without a second data-bearing copy) is a property of the documented witness role and responsibility of the deployment, not a defect in the confirmation code.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "37b5dc8bae1c4a87883de59ff9d8463f-knowledge-0",
+            "revision": 1,
+            "assertion": "Witnesses are voting members and receive hinted heartbeats that they echo back."
+          },
+          {
+            "entry_id": "3b5504b4c2ac476c980eddbf40f18f4f-knowledge-0",
+            "revision": 1,
+            "assertion": "A witness is documented as a voting Raft node without log replication or a state machine."
+          }
+        ],
+        "counterevidence": [
+          "handleLeaderReadIndex refuses a ReadIndex request whose requester is a witness (raft.go:1662-1676); this asymmetry supports the reading that witnesses confirm leadership but do not serve reads.",
+          "A witness-only confirmation means a read can complete while a data-bearing voter is unreachable, making witness availability load-bearing for read liveness in such configurations."
+        ],
+        "limitations": [
+          "Documented role plus source reasoning only; no CheckRun receipt and no witness-specific statement about read-index in the captured tree.",
+          "Does not extend to durability of committed entries in witness configurations, which the witness design trades away by not storing entries.",
+          "Witness support is marked experimental in the captured configuration, so the contract this relies on may be narrow."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3b5504b4c2ac476c980eddbf40f18f4f"
+      },
+      {
+        "id": "38116b05f0304877af38e351c44578a1-interpretation-0",
+        "investigation_id": "38116b05f0304877af38e351c44578a1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_make_replicate_witness_metadata",
+          "raft_try_commit_median",
+          "raft_replicate_resp_match_update",
+          "raft_voting_members",
+          "config_witness_contract",
+          "config_witness_validation"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Current state: the commit-support behavior is established, the correctness judgment is not. makeReplicateMessage replaces non-config entries with metadata placeholders when the target is a witness (raft.go:718-750), the witness appends them and answers with LogIndex equal to the last index in the message through handleReplicateMessage, and the leader advances that witness's match in handleLeaderReplicateResp via rp.tryUpdate (raft.go:1697-1727). tryCommit builds its matched array from remotes and witnesses, so with two voters and one witness the sorted array has three values and the median is reached by the leader plus the witness alone (raft.go:418-428, 891-912). The configuration contract describes a witness as a voter without log replication or a state machine and forbids it snapshots (config/config.go:169-176, 213-220), so no member ever asks the witness for data; the consequence is that such a cluster can acknowledge a committed entry whose only data-bearing copy is the leader. Whether that is a defect or a documented deployment trade-off is what remains open: the witness role explicitly excludes stored data, which suggests the durability limit is intrinsic to the role rather than a bug in tryCommit, but the captured tree has not yet been shown to state failure tolerance for witness configurations, so the account stays unresolved with no defect claim.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "38116b05f0304877af38e351c44578a1-knowledge-0",
+            "revision": 1,
+            "assertion": "Witness metadata acknowledgements advance a witness match and count toward the median used by tryCommit."
+          }
+        ],
+        "counterevidence": [
+          "The witness contract already excludes log replication, so a witness-only acknowledgement is consistent with the declared participant role rather than an implementation slip."
+        ],
+        "limitations": [
+          "Source reading only; no execution demonstrating the two-voter plus witness commit.",
+          "Has not yet located documentation stating required failure tolerance for witness configurations."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "38116b05f0304877af38e351c44578a1"
+      },
+      {
+        "id": "c29267e4deb347dbba13781041bf2699-interpretation-0",
+        "investigation_id": "38116b05f0304877af38e351c44578a1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_make_replicate_witness_metadata",
+          "raft_try_commit_median",
+          "raft_replicate_resp_match_update",
+          "raft_voting_members",
+          "config_witness_contract",
+          "config_witness_validation",
+          "docs_devops_quorum_contract"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: a commit that rests on the leader plus a witness is a documented consequence of quorum membership, not an implementation defect. Basis: (1) a leader sends a witness metadata placeholders in place of non-config entries (raft.go:718-750), the witness acknowledges the last index it received through handleReplicateMessage, and the leader advances that witness's match in handleLeaderReplicateResp (raft.go:1697-1727); (2) tryCommit builds its matched array from remotes plus witnesses and takes the median, so with two voters and one witness the leader's own match plus the witness acknowledgement reaches the commit index (raft.go:418-428, 891-912); (3) the configuration contract defines a witness as a voter without log replication or a state machine (config/config.go:169-176, 213-220), and the captured operations documentation states that the group is available while it has quorum and that losing the quorum nodes means losing data, with snapshot import as the documented repair path (docs/devops.md:9-11). Read together, the quorum a client relies on may contain a member that stores nothing, so the resulting durability limit belongs to the declared configuration semantics; no commit-time check promises a data-bearing acknowledgement. Counterevidence considered: the behavior does make witness availability load-bearing for commit progress and reduces the number of data copies behind a successful acknowledgement; that is a deployment trade-off visible from the documented contract, and the tree offers no statement that witnesses change the quorum rule or that commits require a data-storing supporter. Limitations: this rests on documentation plus source reasoning, with no execution; it does not validate that operators actually read the trade-off, and it does not cover configurations mixing observers or multiple witnesses beyond what votingMembers shows. The claim is limited to the witness commit path and does not assert general durability guarantees for non-witness clusters.",
+        "answers": {
+          "38116b05f0304877af38e351c44578a1-gap-3": {
+            "explanation": "The captured tree states the general quorum rule rather than a witness-specific one: docs/devops.md says the Raft group is available while it still has quorum and that when the quorum nodes are gone the data cannot be resolved without loss, pointing at snapshot import as the repair path, and config/config.go defines a witness as a voter with no log replication and no state machine. There is no statement requiring commit support from a member that stores the entry, and no commit-time check enforcing one: tryCommit uses the median match over remotes plus witnesses only. The consequence is therefore bounded by the documented quorum contract, which the witness role changes in kind (a quorum node without stored entries) rather than in rule.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "38116b05f0304877af38e351c44578a1-knowledge-0",
+            "revision": 1,
+            "assertion": "Witness metadata acknowledgements advance a witness match and count toward the median used by tryCommit."
+          },
+          {
+            "entry_id": "c29267e4deb347dbba13781041bf2699-knowledge-0",
+            "revision": 1,
+            "assertion": "Availability and data loss are documented in terms of quorum membership, and a witness is a quorum member without stored entries."
+          }
+        ],
+        "counterevidence": [
+          "The witness contract already excludes log replication, so a witness-only acknowledgement is consistent with the declared participant role rather than an implementation slip.",
+          "A two-voter plus witness cluster reaches commit progress with the leader and the witness alone, which makes the witness's availability load-bearing for writes and leaves only one data-bearing copy behind the acknowledgement."
+        ],
+        "limitations": [
+          "Documentation plus source reasoning only; no CheckRun receipt demonstrating the two-voter plus witness commit.",
+          "The captured tree contains no witness-specific durability statement, so the trade-off is inferred from the general quorum contract and the witness role.",
+          "Does not cover configurations with observers or several witnesses beyond what votingMembers and tryCommit show."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c29267e4deb347dbba13781041bf2699"
+      },
+      {
+        "id": "b1532231bc7a45cb88f4c1cbac908f9c-interpretation-0",
+        "investigation_id": "b1532231bc7a45cb88f4c1cbac908f9c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_handle_proposals_pause",
+          "rate_limiter_hysteresis",
+          "rate_limiter_constants",
+          "inmemory_applied_decreases"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Current state: the pause mechanism is established; whether it can hold indefinitely is not. handleProposals computes paused from the raft rate limiter and the LogDB busy signal and passes it to incomingProposals.get, and entryQueue.add refuses new entries while paused, so a paused node stops both draining and growing the queue (node.go:1206-1223; queue.go add). InMemRateLimiter.RateLimited accepts a new measurement only when at least ChangeTickThreashold ticks have elapsed since the last accepted change, and limitedByInMemSize ignores follower sizes older than gcTick and compares against 70% of the maximum while already limited (internal/server/rate.go:20-30, 155-193), so the gate has deliberate hysteresis. The partial evidence that the gate releases is that applying entries shrinks the in-memory log and is expected to Decrease the recorded size (internal/raft/inmemory.go:143-165), and application progress depends on committed entries reaching the state machine rather than on new proposals. What is not yet established is whether the applied-index path is the only driver of size reduction for the component that triggers the limit, whether follower-reported sizes can hold it up, and whether the LogDB busy signal has an independent release path. Until those are traced the account stays unresolved with no defect claim; the registered gap states the concrete next check.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b1532231bc7a45cb88f4c1cbac908f9c-knowledge-0",
+            "revision": 1,
+            "assertion": "Proposal intake is paused by the rate limiter or LogDB busy signal, and the rate limiter applies hysteresis before changing state."
+          }
+        ],
+        "counterevidence": [
+          "The limiter's hysteresis exists to avoid flapping and is paired with a follower-state gc window, so the sticky state may be intentional rather than a stall."
+        ],
+        "limitations": [
+          "Source reading only; the applied-index size accounting and the LogDB busy signal's release path have not been traced yet.",
+          "Does not quantify how long a paused node stays paused under a steady high-size workload."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "b1532231bc7a45cb88f4c1cbac908f9c"
+      },
+      {
+        "id": "3e8898cbeab7443693cf9c51cfbb0ae4-interpretation-0",
+        "investigation_id": "b1532231bc7a45cb88f4c1cbac908f9c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_handle_proposals_pause",
+          "rate_limiter_hysteresis",
+          "rate_limiter_constants",
+          "inmemory_applied_decreases",
+          "inmemory_applied_log_to",
+          "inmemory_merge_accounting",
+          "inmemory_rate_limited_gate",
+          "node_handle_events"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: the proposal pause is not self-sustaining within the traced scope, so the suspicion of an unbounded intake stall is refuted. Basis: (1) the limiter's own size is a live measure, not a monotone counter: merge increases it by the appended slice size (internal/raft/inmemory.go:205-206), replaces it with the resulting size when entries replace or truncate earlier ones (215, 226), clears it on snapshot restore (241), and appliedLogTo decreases it by the size of exactly the entries moved below the marker (162); (2) entries leave the in-memory region when the state-machine worker applies committed entries, which is driven by committed log content and application progress rather than by admitting new proposals, so pausing intake cannot keep the measure from falling; (3) the other components consulted by limitedByInMemSize are follower-reported sizes, which are ignored and garbage-collected once older than gcTick ticks (internal/server/rate.go:168-204), and the limiter accepts a state change after at most the hysteresis window of ChangeTickThreashold ticks (155-166); (4) handleProposals recomputes paused on every event-loop iteration, so once the measure drops below the threshold the queue is drained again (node.go:1206-1223). Counterevidence considered: a node whose committed-but-unapplied backlog genuinely exceeds the configured in-memory limit will keep proposals paused for as long as application lags, which is the intended backpressure and could look like a stall under a badly sized limit or a slow state machine; that is a configuration and workload property, and the release still depends on application progress rather than on intake. Limitations: source reasoning only, no execution; the claim does not cover a state machine that stops applying entirely, a LogDB busy signal whose worker never completes (storage faults are fatal elsewhere), or whether the hysteresis latency is acceptable for a given workload.",
+        "answers": {
+          "b1532231bc7a45cb88f4c1cbac908f9c-gap-4": {
+            "explanation": "Yes. appliedLogTo decreases the recorded size by exactly the applied slice size for every entry that moves below the in-memory marker (internal/raft/inmemory.go:138-165), and merge maintains the same measure on append, replacement and restore (199-241). Applying entries requires no new proposals: the apply path consumes committed entries handed to the state machine and signals readiness independently, and handleProposals recomputes the paused decision on each event-loop iteration. Follower-reported sizes, the other input to limitedByInMemSize, are discarded after gcTick ticks. So a rate-limited node returns to accepting proposals once the committed backlog is applied and the measure falls below the release threshold, provided the limiter is enabled at all and the state machine keeps applying.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "b1532231bc7a45cb88f4c1cbac908f9c-knowledge-0",
+            "revision": 1,
+            "assertion": "Proposal intake is paused by the rate limiter or LogDB busy signal, and the rate limiter applies hysteresis before changing state."
+          },
+          {
+            "entry_id": "3e8898cbeab7443693cf9c51cfbb0ae4-knowledge-0",
+            "revision": 1,
+            "assertion": "The in-memory size measure is maintained by merge, restore and appliedLogTo, and falls when entries are applied."
+          }
+        ],
+        "counterevidence": [
+          "A genuinely large committed backlog keeps the pause in place until application catches up, so the pause length follows application throughput rather than a fixed bound.",
+          "The limiter's hysteresis delays the release by up to ChangeTickThreashold ticks after the measure falls below the threshold."
+        ],
+        "limitations": [
+          "Source reasoning only; no CheckRun receipt or measurement of pause duration.",
+          "Does not cover a state machine that stops applying or a LogDB busy signal that never clears.",
+          "Does not judge whether the configured in-memory limit and hysteresis are well sized for any particular workload."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3e8898cbeab7443693cf9c51cfbb0ae4"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "b6feef742879467d9b34c6e69d947021",
+      "result": {
+        "submission": "update.json",
+        "summary": "Interpreted the first retained execution. The fixed raft-level harness passed with three parsed events: registration confirmed a committed current-term entry before the read context was admitted; the CheckQuorum step-down left the node non-leader, reported zero dropped read contexts and retained no pending context; and the late heartbeat response carrying that context added no ready-to-read entry. Recorded an experiment-level interpretation with conclusion holds and the original suspicion refuted, citing receipt 3008fe6b26434113be5cd484d8d7a5a6 at parsed indices 0-2, and kept the earlier question-level source account intact. Limits recorded: raft-layer probe only, one schedule, and no registered comparison records."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-1b1f6ec36e5540a5a256dc25dd86cc61": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-1b1f6ec36e5540a5a256dc25dd86cc61.json"
+      },
+      "submission-f358830ea2834c98a1f8b66c3394cf66": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-f358830ea2834c98a1f8b66c3394cf66.json"
+      },
+      "submission-9bf8b80283c042d1b383e211c89c1701": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-9bf8b80283c042d1b383e211c89c1701.json"
+      },
+      "submission-599c7a85d804468187c5a652986302d1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-599c7a85d804468187c5a652986302d1.json"
+      },
+      "submission-37b5dc8bae1c4a87883de59ff9d8463f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-37b5dc8bae1c4a87883de59ff9d8463f.json"
+      },
+      "submission-3b5504b4c2ac476c980eddbf40f18f4f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-3b5504b4c2ac476c980eddbf40f18f4f.json"
+      },
+      "submission-38116b05f0304877af38e351c44578a1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-38116b05f0304877af38e351c44578a1.json"
+      },
+      "submission-c29267e4deb347dbba13781041bf2699": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-c29267e4deb347dbba13781041bf2699.json"
+      },
+      "submission-383a0a4f49204b6aab51ba7077d0f718": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-383a0a4f49204b6aab51ba7077d0f718.json"
+      },
+      "submission-b1532231bc7a45cb88f4c1cbac908f9c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-b1532231bc7a45cb88f4c1cbac908f9c.json"
+      },
+      "submission-3e8898cbeab7443693cf9c51cfbb0ae4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-3e8898cbeab7443693cf9c51cfbb0ae4.json"
+      },
+      "submission-b9e49b2df9c8453aab2f0b292ce3c176": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-b9e49b2df9c8453aab2f0b292ce3c176.json"
+      }
+    }
+  },
+  "after": {
+    "interpretations": [
+      {
+        "id": "1b1f6ec36e5540a5a256dc25dd86cc61-interpretation-0",
+        "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_leader_readindex",
+          "raft_heartbeat_resp",
+          "raft_readindex_confirm",
+          "raft_checkquorum_stepdown",
+          "raft_reset_replaces_readindex",
+          "raft_candidate_readindex_dropped",
+          "raft_report_dropped_readindex",
+          "raft_follower_handler_map",
+          "raft_term_check",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter",
+          "node_read_admission",
+          "node_handle_events",
+          "node_tick",
+          "node_dropped_readindexes",
+          "request_pending_readindex_applied_gc",
+          "request_dropped_timeout"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Current conclusion: a ReadIndex request outstanding when the leader loses authority keeps a legal, bounded terminal path, and a deposed leader cannot complete it from stale confirmations, although the terminal result is RequestTimeout rather than an explicit dropped result. Basis: (1) the leader only registers a read context after it has a committed entry at its current term (internal/raft/raft.go:1662-1696), otherwise it reports the context in droppedReadIndexes and node.processDroppedReadIndexes forwards that to pendingReadIndex.dropped (node.go:1021-1026); (2) registration is followed immediately by heartbeats carrying that context, and confirmation needs quorum-1 matching responses plus the leader's implicit count, at which point earlier contexts are released with the later index and either a local ReadyToRead is added or a ReadIndexResp is sent (raft.go:1728-1741, 1771-1790; readindex.go:30-116); (3) every state transition, including the CheckQuorum step-down at raft.go:1608-1615, runs reset() which installs a fresh readIndex (raft.go:1003-1025), so registered contexts are discarded without any DroppedReadIndexes entry; (4) after the step-down the node cannot confirm them from heartbeat responses, because follower state has no HeartbeatResp handler (raft.go:2116-2129) and lower-term messages are dropped (raft.go:1430-1478), and Peer.Handle additionally ignores responses from unknown peers (peer.go:185-196); (5) consequently the node-layer batch keeps index 0 and is terminated by pendingReadIndex.applied/gc as RequestTimeout once the caller-supplied deadline passes, which is reached from ordinary event-loop iterations because LocalTick messages make handleEvents report an event and call pendingReadIndexes.applied (node.go:1132-1166, 1478-1492; request.go:908-954, 403-414). Counterevidence considered: handleCandidateReadIndex reports the same context twice (raft.go:1998-2012 plus reportDroppedReadIndex), but pendingReadIndex.dropped deletes the batch on the first delivery, so the duplicate result is a no-op rather than a double notification; and handleFollowerReadIndexResp does set the leader id and add a ready-to-read, but only for a context the leader confirmed before the transition, so it does not resurrect authority for a discarded context. Limitations: this account is source-only for this revision and rests on the node event loop being driven while the request is pending; it does not measure how long the timeout path takes, does not claim the timeout code is the most useful client-visible result, and does not cover the same-batch confirmation/reset race named in the registered gap.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-0",
+            "revision": 1,
+            "assertion": "Leader rejects ReadIndex without a committed current-term entry and reports the context as dropped."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-1",
+            "revision": 1,
+            "assertion": "Quorum-1 heartbeat confirmations plus the leader complete a context and release earlier contexts with the later index."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-2",
+            "revision": 1,
+            "assertion": "reset() replaces the readIndex instance and discards registered contexts without a dropped notification."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-3",
+            "revision": 1,
+            "assertion": "A node that left leader state has no HeartbeatResp handler, so stale confirmations cannot complete a read context."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+            "revision": 1,
+            "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+          }
+        ],
+        "counterevidence": [
+          "handleCandidateReadIndex appends the same SystemCtx twice (explicit append after reportDroppedReadIndex), but the second pendingReadIndex.dropped call finds no batch and is a no-op, so this does not create a double client notification.",
+          "handleFollowerReadIndexResp sets the leader id and adds a ready-to-read from a ReadIndexResp (raft.go:1955-1963), which is a legitimate completion only for a context the leader confirmed while it still held authority."
+        ],
+        "limitations": [
+          "Source-only account for this revision; no CheckRun receipt backs it.",
+          "Assumes the node event loop keeps processing LocalTick messages while the read request is pending; a stalled engine or stopped node is outside the stated conditions.",
+          "Does not quantify how late the timeout-based completion is relative to the confirmation-based path, nor whether client-visible RequestTimeout should be replaced by a dropped result.",
+          "Same-batch confirmation/reset ordering remains open as the registered gap."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "1b1f6ec36e5540a5a256dc25dd86cc61"
+      },
+      {
+        "id": "f358830ea2834c98a1f8b66c3394cf66-interpretation-0",
+        "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_leader_readindex",
+          "raft_heartbeat_resp",
+          "raft_readindex_confirm",
+          "raft_checkquorum_stepdown",
+          "raft_reset_replaces_readindex",
+          "raft_candidate_readindex_dropped",
+          "raft_report_dropped_readindex",
+          "raft_follower_handler_map",
+          "raft_term_check",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter",
+          "peer_commit_clears_update",
+          "raft_clear_ready_to_read",
+          "node_read_admission",
+          "node_handle_events",
+          "node_tick",
+          "node_dropped_readindexes",
+          "request_pending_readindex_applied_gc",
+          "request_dropped_timeout"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": null,
+        "rationale": "Current conclusion: a ReadIndex request outstanding when the leader loses authority keeps a legal, bounded terminal path, a deposed leader cannot complete it from stale confirmations, and the same-batch confirmation/step-down ordering does not lose the response that confirmation produced. Basis: (1) the leader only registers a read context after it has a committed entry at its current term (internal/raft/raft.go:1662-1696), otherwise reporting the context in droppedReadIndexes, which node.processDroppedReadIndexes forwards to pendingReadIndex.dropped (node.go:1021-1026); (2) registration is followed immediately by heartbeats carrying that context, and confirmation requires quorum-1 matching responses plus the leader's implicit count, after which earlier contexts are released with the later index and either a local ReadyToRead is added or a ReadIndexResp is sent (raft.go:1728-1741, 1771-1790; readindex.go:30-116); (3) every state transition, including the CheckQuorum step-down (raft.go:1608-1615), runs reset(), which installs a fresh readIndex, so contexts registered earlier are discarded without any DroppedReadIndexes entry (raft.go:1003-1025); (4) after the step-down the node cannot confirm them from heartbeat responses, because follower state has no HeartbeatResp handler (raft.go:2116-2129), lower-term messages are dropped (raft.go:1430-1478), and Peer.Handle ignores responses from unknown peers (peer.go:185-196); (5) a request whose context is never confirmed or indexed therefore has index 0 in the node layer and is terminated as RequestTimeout by pendingReadIndex.applied/gc once the caller-supplied deadline passes, a path driven by ordinary event-loop iterations because LocalTick messages make handleEvents report an event and call pendingReadIndexes.applied (node.go:1132-1166, 1478-1492; request.go:908-954, 403-414); (6) the previously open same-batch window is closed by source: confirm and the ReadyToRead/ReadIndexResp emission run inside one handler call with no state transition in between, and messages plus ReadyToRead survive a later reset because they are cleared only by Peer.Commit after the Update is collected (peer.go:284-294, raft.go:1649-1651). Counterevidence considered: handleCandidateReadIndex reports the same context twice (raft.go:1998-2012 plus reportDroppedReadIndex), but pendingReadIndex.dropped deletes the batch on first delivery, so the duplicate is a no-op; handleFollowerReadIndexResp sets the leader id and adds a ready-to-read from a ReadIndexResp (raft.go:1955-1963), which completes only a context confirmed while the sender held authority, so it does not resurrect authority for a discarded context, though it can leave a follower pointing at a leader that has since stepped down. Limitations: source-only account, no CheckRun receipt; assumes the node event loop keeps processing LocalTick messages while the request is pending; does not quantify the latency of the timeout path or judge whether RequestTimeout is the preferable client-visible code; the residual follower-side leader-id staleness noted above is a liveness observation that this question does not attempt to bound.",
+        "answers": {
+          "1b1f6ec36e5540a5a256dc25dd86cc61-gap-0": {
+            "explanation": "The window does not exist as stated. handleLeaderHeartbeatResp calls handleReadIndexLeaderConfirmation, which calls readIndex.confirm and then immediately appends either ReadyToRead (r.addReadyToRead) or a ReadIndexResp message (r.send) for every completed status; no state transition or reset can intervene inside that call frame, and confirmation is a prerequisite for those emissions. A step-down later in the same event-loop iteration does not discard them: reset() rebuilds readIndex/remotes/observers/witnesses/votes but leaves r.msgs and r.readyToRead untouched (raft.go:1003-1025), and they are cleared only by Peer.Commit after the Update carrying them has been handed to the node layer (peer.go:284-294; readyToRead only when UpdateCommit.ReadyToRead > 0). The deadline path established earlier therefore remains a fallback for contexts that were never confirmed, not for a confirmed context whose response was lost in the same batch.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-0",
+            "revision": 1,
+            "assertion": "Leader rejects ReadIndex without a committed current-term entry and reports the context as dropped."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-1",
+            "revision": 1,
+            "assertion": "Quorum-1 heartbeat confirmations plus the leader complete a context and release earlier contexts with the later index."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-2",
+            "revision": 1,
+            "assertion": "reset() replaces the readIndex instance and discards registered contexts without a dropped notification."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-3",
+            "revision": 1,
+            "assertion": "A node that left leader state has no HeartbeatResp handler, so stale confirmations cannot complete a read context."
+          },
+          {
+            "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+            "revision": 1,
+            "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+          },
+          {
+            "entry_id": "f358830ea2834c98a1f8b66c3394cf66-knowledge-0",
+            "revision": 1,
+            "assertion": "Messages and ReadyToRead produced before a reset in the same Update are still delivered, because reset does not clear them and Peer.Commit clears them afterwards."
+          }
+        ],
+        "counterevidence": [
+          "handleCandidateReadIndex appends the same SystemCtx twice (explicit append after reportDroppedReadIndex), but the second pendingReadIndex.dropped call finds no batch and is a no-op, so this does not create a double client notification.",
+          "handleFollowerReadIndexResp sets the leader id from the ReadIndexResp sender (raft.go:1955-1963). It completes only a context the sender confirmed while it held authority, but a response delivered after the sender stepped down can still leave the follower treating a former leader as leader until the next heartbeat or election."
+        ],
+        "limitations": [
+          "Source-only account for this revision; no CheckRun receipt backs it.",
+          "Assumes the node event loop keeps processing LocalTick messages while the read request is pending; a stalled engine or stopped node is outside the stated conditions.",
+          "Does not quantify how late the timeout-based completion is relative to the confirmation-based path, nor whether client-visible RequestTimeout should be replaced by a dropped result.",
+          "Does not bound how long a follower may keep a stale leader id after receiving a ReadIndexResp from a leader that stepped down before delivery."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "f358830ea2834c98a1f8b66c3394cf66"
+      },
+      {
+        "id": "9bf8b80283c042d1b383e211c89c1701-interpretation-0",
+        "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_save_snapshot_required",
+          "node_save_and_dosave",
+          "node_process_save_status",
+          "request_pending_snapshot_apply"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": "unresolved",
+        "rationale": "Current claim: no defect is established yet; the question is whether a hard snapshot-save error can strand the periodic snapshot duty. What the sources do establish: saveSnapshotRequired advances the requested index (ss.setReqIndex(applied)) before any save runs and suppresses new periodic requests while the state machine reports busy snapshotting (node.go:651-667); doSave already holds the save state when it calls n.sm.Save and, on a hard error, returns the error to node.save without itself reporting a terminal snapshot result (node.go:693-760); node.save reports the pending user/periodic request only after doSave returns a value, so a hard error bypasses that report (node.go:693-706; request.go:648-668). What remains undecided is the enclosing control flow: whether the save task error propagates to rsm.StateMachine.Handle and the node worker in a way that clears the saving flag through processSaveStatus (node.go:1451-1467) or terminates the node, and whether n.ss.reqSnapshotIndex is ever reset after such a failure. Until that control flow is traced, the possible outcomes are a one-off failed snapshot request (no defect) or a durable suppression of snapshots and therefore of automatic log compaction (bounded progress defect), and the account stays unresolved.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+            "revision": 1,
+            "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+          },
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+            "revision": 1,
+            "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+          }
+        ],
+        "counterevidence": [
+          "processSaveStatus exists and clears the saving flag when a completed save task is available, which would make a failure recoverable if the failed task is still delivered through the completion path."
+        ],
+        "limitations": [
+          "Source reading only for this revision; the error propagation from rsm.StateMachine.Handle to the node worker has not been traced yet.",
+          "No execution evidence; a harness would need a state machine whose Save fails once and then succeeds to observe whether a later periodic snapshot is still requested."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "9bf8b80283c042d1b383e211c89c1701"
+      },
+      {
+        "id": "599c7a85d804468187c5a652986302d1-interpretation-0",
+        "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_save_snapshot_required",
+          "node_save_and_dosave",
+          "node_process_save_status",
+          "request_pending_snapshot_apply",
+          "engine_ssworker_handle",
+          "engine_apply_loop_status",
+          "engine_error_injection_recover",
+          "node_save_done",
+          "snapshotstate_notify_status"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: the suspicion is refuted within the traced scope. A periodic snapshot save that fails with a hard error does not leave a live node whose snapshot duty is silently suppressed, and the non-fatal outcomes do not either. Basis: (1) saveSnapshotRequired advances ss.reqSnapshotIndex only when it actually requests a snapshot and suppresses further periodic requests while n.isBusySnapshotting() reports busy (node.go:651-667); (2) the save task is executed by ssWorker.save, which calls panic(err) on any error from node.save and has no recover in workerMain or handle (engine.go:275-305); the recover at engine.go:1029-1044 is installed only for step workers when error injection is enabled, and nodehost.go's recover covers NodeHost.Start, so a runtime save error ends the process instead of leaving the save flag set with a node that keeps applying entries; (3) on every non-fatal path, node.save returns nil and node.saveDone stores a completed save task via notifySnapshotStatus(save=true) and signals applyReady (node.go:846-850; snapshotstate.go:185-211), and the apply worker calls processStatusTransition before handleTask, so processSaveStatus clears the saving flag and later periodic snapshots remain enabled (engine.go:1200-1212; node.go:1451-1467); (4) the (0, nil) paths inside doSave are the soft-error case, the abort case that already reported aborted through pendingSnapshot.apply, and the already-up-to-date early return, in which node.save reports the pending user request as rejected (node.go:693-760; request.go:648-668). Counterevidence considered: a hard error bypasses the pendingSnapshot report for that request, but since the process panics at the same point, no client-visible state is retained in a live node, so it cannot strand later snapshot requests. Limitations: this is a source argument, not an execution; it does not cover a state machine whose Save blocks indefinitely (no error at all), nor storage faults inside snapshotter.commit that return errors handled elsewhere, nor whether process termination is an acceptable recovery policy versus returning an error to the caller. The claim is limited to the periodic-save control flow in this snapshot.",
+        "answers": {
+          "9bf8b80283c042d1b383e211c89c1701-gap-1": {
+            "explanation": "No such state survives. A non-soft error makes node.save return an error, and ssWorker.save panics on that error with no recover around workerMain/handle (engine.go:275-305; the engine recover at 1029-1044 is restricted to step workers under error injection and nodehost.go's recover wraps only NodeHost.Start), so the node does not continue with the saving flag set or an advanced requested index. On the non-fatal paths the flag is cleared: node.save returns nil, saveDone records a completed save task (node.go:846-850; snapshotstate.go:185-211), and the apply worker's processStatusTransition/processSaveStatus clears saving before executing the next task (engine.go:1200-1212; node.go:1451-1467). n.ss.reqSnapshotIndex does not need an explicit reset for recovery because saveSnapshotRequired compares applied against SnapshotEntries plus the requested index, so the next request occurs once applied advances by a further SnapshotEntries window; only restart resets it, and restart also resets the process that would have carried a stale session. The gap is resolved as a refutation of the stranding hypothesis.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+            "revision": 1,
+            "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+          },
+          {
+            "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+            "revision": 1,
+            "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+          },
+          {
+            "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-0",
+            "revision": 1,
+            "assertion": "A hard save error panics the snapshot worker, ending the process rather than stranding in-process snapshot state."
+          },
+          {
+            "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-1",
+            "revision": 1,
+            "assertion": "Non-fatal save outcomes complete through saveDone and processSaveStatus, clearing the saving flag."
+          }
+        ],
+        "counterevidence": [
+          "A hard save error bypasses the pendingSnapshot.apply report for that request, so a user-requested snapshot never receives a rejected/aborted result on that path; the process panic is what prevents this from becoming a live stuck request."
+        ],
+        "limitations": [
+          "Source argument only; no CheckRun receipt.",
+          "Does not cover a Save implementation that blocks without returning, or storage faults handled outside node.doSave.",
+          "Does not judge whether terminating the process on a save error is an acceptable policy; only that it prevents a silent in-process stranding of the periodic snapshot duty.",
+          "Does not quantify how much log growth can accumulate between the requested-index advance and the next eligible periodic snapshot."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "599c7a85d804468187c5a652986302d1"
+      },
+      {
+        "id": "37b5dc8bae1c4a87883de59ff9d8463f-interpretation-0",
+        "investigation_id": "37b5dc8bae1c4a87883de59ff9d8463f-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_broadcast_heartbeat_hint",
+          "raft_voting_members",
+          "raft_witness_heartbeat_echo",
+          "raft_readindex_confirm",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Current state: the eligibility behavior is established but the correctness judgment is not. votingMembers() merges remotes and witnesses (raft.go:418-428), so quorum() counts witnesses and broadcastHeartbeatMessageWithHint sends the read context to every voting member including witnesses (raft.go:839-852). A witness handles a leader heartbeat through handleWitnessHeartbeat -> handleFollowerHeartbeat -> handleHeartbeatMessage, which echoes Hint and HintHigh in the response (raft.go:1316-1325), and Peer.Handle admits responses from known witnesses (peer.go:185-196), so handleLeaderHeartbeatResp can pass that response to handleReadIndexLeaderConfirmation, where readIndex.confirm counts it toward quorum-1 without checking whether the responder is a witness (raft.go:1728-1741, 1771-1790; readindex.go:84-99). What is not decided is correctness: a witness is a voting member that votes in elections and stores metadata entries only, so its confirmation that it has not granted a higher-term vote may be exactly the evidence the read protocol needs, in which case the behavior is intended and safe; the alternative reading is that a data-bearing majority is also required for reads. The question stays open with no defect claim, and the gap records the concrete configuration (for example voters {A,B} plus witness W with quorum 2, where A is leader and only W responds) that would settle it.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "37b5dc8bae1c4a87883de59ff9d8463f-knowledge-0",
+            "revision": 1,
+            "assertion": "Witnesses are voting members and receive hinted heartbeats that they echo back."
+          }
+        ],
+        "counterevidence": [
+          "handleLeaderReadIndex explicitly refuses to serve a ReadIndex request whose requester is a witness (raft.go:1662-1676), showing the author distinguished witness requesters from witness voters; that asymmetry is consistent with counting witness confirmations deliberately."
+        ],
+        "limitations": [
+          "Source reading only; no execution and no documentary statement of witness duties has been located in the captured tree yet.",
+          "Does not establish whether a witness-only confirmation can coexist with an unreachable data-bearing majority, which is the configuration that would matter for read availability."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "37b5dc8bae1c4a87883de59ff9d8463f"
+      },
+      {
+        "id": "3b5504b4c2ac476c980eddbf40f18f4f-interpretation-0",
+        "investigation_id": "37b5dc8bae1c4a87883de59ff9d8463f-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_broadcast_heartbeat_hint",
+          "raft_voting_members",
+          "raft_witness_heartbeat_echo",
+          "raft_readindex_confirm",
+          "raft_readindex_confirm_core",
+          "peer_handle_response_filter",
+          "config_witness_contract",
+          "config_witness_validation"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: counting a witness's heartbeat response toward a leader's ReadIndex confirmation is consistent with the captured witness contract, so the eligibility behavior is not a defect. Basis: (1) the configuration contract states that a witness is a Raft node without actual log replication and without a state machine, citing section 11.7.2 of Ongaro's thesis, and it disallows witness snapshots and the observer role (config/config.go:169-176, 213-220); in that thesis section witnesses are voting members used to keep quorum without storing data. (2) raft.votingMembers() merges remotes and witnesses, so quorum() counts witnesses and broadcastHeartbeatMessageWithHint delivers the read context to them (raft.go:418-428, 839-852); a witness echoes Hint/HintHigh through handleHeartbeatMessage (raft.go:1316-1325), Peer.Handle admits its response (peer.go:185-196), and readIndex.confirm counts accepted responders toward quorum-1 (raft.go:1728-1741, 1771-1790; readindex.go:84-99). (3) The ReadIndex protocol's confirmation step asks whether the leader still holds authority at its term; a witness that answers with the current term has not granted a vote to a higher-term candidate, which is the evidence the step needs, and it needs no stored entries because the returned index is the leader's commit index and the requester completes only after its own applied index reaches it. (4) The asymmetry at handleLeaderReadIndex, which refuses witness requesters (raft.go:1662-1676), is consistent with this reading: witnesses confirm leadership but do not serve reads. Counterevidence considered: a configuration of voters {A,B} plus witness W with quorum 2 can complete a read confirmation with A and W while B is unreachable, so witness support is load-bearing for read availability; that follows from the documented voter role rather than from an accidental counting path. Limitations: this rests on the documented contract plus source reasoning, not on an execution or on a documented statement about read-index specifically; it does not claim that a witness-only confirmation preserves data availability in the sense of committed-entry durability, which the witness design trades away by not storing entries; and it does not settle whether the experimental witness feature should be strengthened beyond the thesis role.",
+        "answers": {
+          "37b5dc8bae1c4a87883de59ff9d8463f-gap-2": {
+            "explanation": "Yes, a read context can complete with a witness confirmation and no other non-leader full member, for example with voters {A,B} plus witness W where quorum is 2, A leads and only W echoes the context. That support is sufficient for the read protocol's purpose because the confirmation only establishes that no higher-term vote has been granted within a quorum of the current configuration, and the witness is a documented voting member that holds no log (config/config.go:169-176, 213-220; raft.go:418-428, 839-852, 1771-1790; readindex.go:84-99). The requester still waits for its own applied index to reach the confirmed commit index, so the witness is never asked to supply entries. The eligibility is therefore by design rather than an unintended counting path; the durability trade-off (a quorum can be assembled without a second data-bearing copy) is a property of the documented witness role and responsibility of the deployment, not a defect in the confirmation code.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "37b5dc8bae1c4a87883de59ff9d8463f-knowledge-0",
+            "revision": 1,
+            "assertion": "Witnesses are voting members and receive hinted heartbeats that they echo back."
+          },
+          {
+            "entry_id": "3b5504b4c2ac476c980eddbf40f18f4f-knowledge-0",
+            "revision": 1,
+            "assertion": "A witness is documented as a voting Raft node without log replication or a state machine."
+          }
+        ],
+        "counterevidence": [
+          "handleLeaderReadIndex refuses a ReadIndex request whose requester is a witness (raft.go:1662-1676); this asymmetry supports the reading that witnesses confirm leadership but do not serve reads.",
+          "A witness-only confirmation means a read can complete while a data-bearing voter is unreachable, making witness availability load-bearing for read liveness in such configurations."
+        ],
+        "limitations": [
+          "Documented role plus source reasoning only; no CheckRun receipt and no witness-specific statement about read-index in the captured tree.",
+          "Does not extend to durability of committed entries in witness configurations, which the witness design trades away by not storing entries.",
+          "Witness support is marked experimental in the captured configuration, so the contract this relies on may be narrow."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3b5504b4c2ac476c980eddbf40f18f4f"
+      },
+      {
+        "id": "38116b05f0304877af38e351c44578a1-interpretation-0",
+        "investigation_id": "38116b05f0304877af38e351c44578a1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_make_replicate_witness_metadata",
+          "raft_try_commit_median",
+          "raft_replicate_resp_match_update",
+          "raft_voting_members",
+          "config_witness_contract",
+          "config_witness_validation"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Current state: the commit-support behavior is established, the correctness judgment is not. makeReplicateMessage replaces non-config entries with metadata placeholders when the target is a witness (raft.go:718-750), the witness appends them and answers with LogIndex equal to the last index in the message through handleReplicateMessage, and the leader advances that witness's match in handleLeaderReplicateResp via rp.tryUpdate (raft.go:1697-1727). tryCommit builds its matched array from remotes and witnesses, so with two voters and one witness the sorted array has three values and the median is reached by the leader plus the witness alone (raft.go:418-428, 891-912). The configuration contract describes a witness as a voter without log replication or a state machine and forbids it snapshots (config/config.go:169-176, 213-220), so no member ever asks the witness for data; the consequence is that such a cluster can acknowledge a committed entry whose only data-bearing copy is the leader. Whether that is a defect or a documented deployment trade-off is what remains open: the witness role explicitly excludes stored data, which suggests the durability limit is intrinsic to the role rather than a bug in tryCommit, but the captured tree has not yet been shown to state failure tolerance for witness configurations, so the account stays unresolved with no defect claim.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "38116b05f0304877af38e351c44578a1-knowledge-0",
+            "revision": 1,
+            "assertion": "Witness metadata acknowledgements advance a witness match and count toward the median used by tryCommit."
+          }
+        ],
+        "counterevidence": [
+          "The witness contract already excludes log replication, so a witness-only acknowledgement is consistent with the declared participant role rather than an implementation slip."
+        ],
+        "limitations": [
+          "Source reading only; no execution demonstrating the two-voter plus witness commit.",
+          "Has not yet located documentation stating required failure tolerance for witness configurations."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "38116b05f0304877af38e351c44578a1"
+      },
+      {
+        "id": "c29267e4deb347dbba13781041bf2699-interpretation-0",
+        "investigation_id": "38116b05f0304877af38e351c44578a1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "raft_make_replicate_witness_metadata",
+          "raft_try_commit_median",
+          "raft_replicate_resp_match_update",
+          "raft_voting_members",
+          "config_witness_contract",
+          "config_witness_validation",
+          "docs_devops_quorum_contract"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: a commit that rests on the leader plus a witness is a documented consequence of quorum membership, not an implementation defect. Basis: (1) a leader sends a witness metadata placeholders in place of non-config entries (raft.go:718-750), the witness acknowledges the last index it received through handleReplicateMessage, and the leader advances that witness's match in handleLeaderReplicateResp (raft.go:1697-1727); (2) tryCommit builds its matched array from remotes plus witnesses and takes the median, so with two voters and one witness the leader's own match plus the witness acknowledgement reaches the commit index (raft.go:418-428, 891-912); (3) the configuration contract defines a witness as a voter without log replication or a state machine (config/config.go:169-176, 213-220), and the captured operations documentation states that the group is available while it has quorum and that losing the quorum nodes means losing data, with snapshot import as the documented repair path (docs/devops.md:9-11). Read together, the quorum a client relies on may contain a member that stores nothing, so the resulting durability limit belongs to the declared configuration semantics; no commit-time check promises a data-bearing acknowledgement. Counterevidence considered: the behavior does make witness availability load-bearing for commit progress and reduces the number of data copies behind a successful acknowledgement; that is a deployment trade-off visible from the documented contract, and the tree offers no statement that witnesses change the quorum rule or that commits require a data-storing supporter. Limitations: this rests on documentation plus source reasoning, with no execution; it does not validate that operators actually read the trade-off, and it does not cover configurations mixing observers or multiple witnesses beyond what votingMembers shows. The claim is limited to the witness commit path and does not assert general durability guarantees for non-witness clusters.",
+        "answers": {
+          "38116b05f0304877af38e351c44578a1-gap-3": {
+            "explanation": "The captured tree states the general quorum rule rather than a witness-specific one: docs/devops.md says the Raft group is available while it still has quorum and that when the quorum nodes are gone the data cannot be resolved without loss, pointing at snapshot import as the repair path, and config/config.go defines a witness as a voter with no log replication and no state machine. There is no statement requiring commit support from a member that stores the entry, and no commit-time check enforcing one: tryCommit uses the median match over remotes plus witnesses only. The consequence is therefore bounded by the documented quorum contract, which the witness role changes in kind (a quorum node without stored entries) rather than in rule.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "38116b05f0304877af38e351c44578a1-knowledge-0",
+            "revision": 1,
+            "assertion": "Witness metadata acknowledgements advance a witness match and count toward the median used by tryCommit."
+          },
+          {
+            "entry_id": "c29267e4deb347dbba13781041bf2699-knowledge-0",
+            "revision": 1,
+            "assertion": "Availability and data loss are documented in terms of quorum membership, and a witness is a quorum member without stored entries."
+          }
+        ],
+        "counterevidence": [
+          "The witness contract already excludes log replication, so a witness-only acknowledgement is consistent with the declared participant role rather than an implementation slip.",
+          "A two-voter plus witness cluster reaches commit progress with the leader and the witness alone, which makes the witness's availability load-bearing for writes and leaves only one data-bearing copy behind the acknowledgement."
+        ],
+        "limitations": [
+          "Documentation plus source reasoning only; no CheckRun receipt demonstrating the two-voter plus witness commit.",
+          "The captured tree contains no witness-specific durability statement, so the trade-off is inferred from the general quorum contract and the witness role.",
+          "Does not cover configurations with observers or several witnesses beyond what votingMembers and tryCommit show."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "c29267e4deb347dbba13781041bf2699"
+      },
+      {
+        "id": "b1532231bc7a45cb88f4c1cbac908f9c-interpretation-0",
+        "investigation_id": "b1532231bc7a45cb88f4c1cbac908f9c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_handle_proposals_pause",
+          "rate_limiter_hysteresis",
+          "rate_limiter_constants",
+          "inmemory_applied_decreases"
+        ],
+        "executions": {},
+        "conclusion": "unresolved",
+        "defect_claim": null,
+        "rationale": "Current state: the pause mechanism is established; whether it can hold indefinitely is not. handleProposals computes paused from the raft rate limiter and the LogDB busy signal and passes it to incomingProposals.get, and entryQueue.add refuses new entries while paused, so a paused node stops both draining and growing the queue (node.go:1206-1223; queue.go add). InMemRateLimiter.RateLimited accepts a new measurement only when at least ChangeTickThreashold ticks have elapsed since the last accepted change, and limitedByInMemSize ignores follower sizes older than gcTick and compares against 70% of the maximum while already limited (internal/server/rate.go:20-30, 155-193), so the gate has deliberate hysteresis. The partial evidence that the gate releases is that applying entries shrinks the in-memory log and is expected to Decrease the recorded size (internal/raft/inmemory.go:143-165), and application progress depends on committed entries reaching the state machine rather than on new proposals. What is not yet established is whether the applied-index path is the only driver of size reduction for the component that triggers the limit, whether follower-reported sizes can hold it up, and whether the LogDB busy signal has an independent release path. Until those are traced the account stays unresolved with no defect claim; the registered gap states the concrete next check.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b1532231bc7a45cb88f4c1cbac908f9c-knowledge-0",
+            "revision": 1,
+            "assertion": "Proposal intake is paused by the rate limiter or LogDB busy signal, and the rate limiter applies hysteresis before changing state."
+          }
+        ],
+        "counterevidence": [
+          "The limiter's hysteresis exists to avoid flapping and is paired with a follower-state gc window, so the sticky state may be intentional rather than a stall."
+        ],
+        "limitations": [
+          "Source reading only; the applied-index size accounting and the LogDB busy signal's release path have not been traced yet.",
+          "Does not quantify how long a paused node stays paused under a steady high-size workload."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "b1532231bc7a45cb88f4c1cbac908f9c"
+      },
+      {
+        "id": "3e8898cbeab7443693cf9c51cfbb0ae4-interpretation-0",
+        "investigation_id": "b1532231bc7a45cb88f4c1cbac908f9c-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "node_handle_proposals_pause",
+          "rate_limiter_hysteresis",
+          "rate_limiter_constants",
+          "inmemory_applied_decreases",
+          "inmemory_applied_log_to",
+          "inmemory_merge_accounting",
+          "inmemory_rate_limited_gate",
+          "node_handle_events"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "defect_claim": "refuted",
+        "rationale": "Current claim: the proposal pause is not self-sustaining within the traced scope, so the suspicion of an unbounded intake stall is refuted. Basis: (1) the limiter's own size is a live measure, not a monotone counter: merge increases it by the appended slice size (internal/raft/inmemory.go:205-206), replaces it with the resulting size when entries replace or truncate earlier ones (215, 226), clears it on snapshot restore (241), and appliedLogTo decreases it by the size of exactly the entries moved below the marker (162); (2) entries leave the in-memory region when the state-machine worker applies committed entries, which is driven by committed log content and application progress rather than by admitting new proposals, so pausing intake cannot keep the measure from falling; (3) the other components consulted by limitedByInMemSize are follower-reported sizes, which are ignored and garbage-collected once older than gcTick ticks (internal/server/rate.go:168-204), and the limiter accepts a state change after at most the hysteresis window of ChangeTickThreashold ticks (155-166); (4) handleProposals recomputes paused on every event-loop iteration, so once the measure drops below the threshold the queue is drained again (node.go:1206-1223). Counterevidence considered: a node whose committed-but-unapplied backlog genuinely exceeds the configured in-memory limit will keep proposals paused for as long as application lags, which is the intended backpressure and could look like a stall under a badly sized limit or a slow state machine; that is a configuration and workload property, and the release still depends on application progress rather than on intake. Limitations: source reasoning only, no execution; the claim does not cover a state machine that stops applying entirely, a LogDB busy signal whose worker never completes (storage faults are fatal elsewhere), or whether the hysteresis latency is acceptable for a given workload.",
+        "answers": {
+          "b1532231bc7a45cb88f4c1cbac908f9c-gap-4": {
+            "explanation": "Yes. appliedLogTo decreases the recorded size by exactly the applied slice size for every entry that moves below the in-memory marker (internal/raft/inmemory.go:138-165), and merge maintains the same measure on append, replacement and restore (199-241). Applying entries requires no new proposals: the apply path consumes committed entries handed to the state machine and signals readiness independently, and handleProposals recomputes the paused decision on each event-loop iteration. Follower-reported sizes, the other input to limitedByInMemSize, are discarded after gcTick ticks. So a rate-limited node returns to accepting proposals once the committed backlog is applied and the measure falls below the release threshold, provided the limiter is enabled at all and the state machine keeps applying.",
+            "resolved": true
+          }
+        },
+        "knowledge": [
+          {
+            "entry_id": "b1532231bc7a45cb88f4c1cbac908f9c-knowledge-0",
+            "revision": 1,
+            "assertion": "Proposal intake is paused by the rate limiter or LogDB busy signal, and the rate limiter applies hysteresis before changing state."
+          },
+          {
+            "entry_id": "3e8898cbeab7443693cf9c51cfbb0ae4-knowledge-0",
+            "revision": 1,
+            "assertion": "The in-memory size measure is maintained by merge, restore and appliedLogTo, and falls when entries are applied."
+          }
+        ],
+        "counterevidence": [
+          "A genuinely large committed backlog keeps the pause in place until application catches up, so the pause length follows application throughput rather than a fixed bound.",
+          "The limiter's hysteresis delays the release by up to ChangeTickThreashold ticks after the measure falls below the threshold."
+        ],
+        "limitations": [
+          "Source reasoning only; no CheckRun receipt or measurement of pause duration.",
+          "Does not cover a state machine that stops applying or a LogDB busy signal that never clears.",
+          "Does not judge whether the configured in-memory limit and hysteresis are well sized for any particular workload."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "3e8898cbeab7443693cf9c51cfbb0ae4"
+      },
+      {
+        "id": "b6feef742879467d9b34c6e69d947021-interpretation-0",
+        "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+        "experiment_id": "b9e49b2df9c8453aab2f0b292ce3c176-experiment",
+        "source_ids": [
+          "raft_handle_readindex_path",
+          "raft_checkquorum_handler",
+          "raft_reset_replaces_readindex",
+          "raft_readindex_confirm_core",
+          "raft_follower_handler_map",
+          "raft_term_check"
+        ],
+        "executions": {
+          "3008fe6b26434113be5cd484d8d7a5a6": [
+            0,
+            1,
+            2
+          ]
+        },
+        "conclusion": "holds",
+        "defect_claim": "refuted",
+        "rationale": "Current claim for this experiment: the raft layer discards a registered read context on the CheckQuorum step-down without reporting it, and a heartbeat response carrying that discarded context afterwards does not complete a read. The retained receipt 3008fe6b26434113be5cd484d8d7a5a6 executed TestAssuranceReadIndexDiscardedOnStepDown and passed, with parsed event index 0 'registered' recording committed=true, at_term=true, registered=true; index 1 'step_down' recording still_leader=false, dropped=0, pending=false; index 2 'stale_resp' recording ready_added=0. The test also asserted the same three endpoints, so the passing status and the events agree. These observations align with the source path: handleLeaderReadIndex admits the context only with a committed current-term entry (raft.go:1662-1696), handleLeaderCheckQuorum steps down when quorum is lost (raft.go:1608-1615), reset installs a fresh readIndex so the context disappears without a dropped report (raft.go:1003-1025), and follower state has no HeartbeatResp handler, so the later response changes nothing (raft.go:2116-2129, 1430-1478). Scope limits: the harness drives the raft layer directly with the package's in-memory test log, so it shows raft-layer bookkeeping rather than node-layer client outcomes; the node-layer RequestTimeout completion path established earlier remains source-based; no comparison records were registered for this experiment, so the predicate is read from the emitted fields listed above; and a single schedule is exercised, so this is one witness rather than a schedule-independence argument.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "The event set does not observe the node layer, so it cannot by itself show which client-visible result a discarded context receives; that link stays with the earlier source-based account.",
+          "dropped=0 is consistent with a silent discard and would also be consistent with a context that had already completed, which is excluded only by the registered=true event preceding it."
+        ],
+        "limitations": [
+          "Raft-layer probe with the in-memory test log; no transport, ticks, or node event loop.",
+          "One execution schedule; no repetition or schedule variation.",
+          "No experiment comparison records were registered, so field reading is interpretive."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "operation_id": "b6feef742879467d9b34c6e69d947021"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "b6feef742879467d9b34c6e69d947021",
+      "action": "update",
+      "no_change": false,
+      "references": {},
+      "effects": [
+        {
+          "object": "interpretations",
+          "action": "append",
+          "target": "interpretations[0]",
+          "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+          "changed_fields": [
+            "experiment_id",
+            "source_ids",
+            "executions",
+            "conclusion",
+            "defect_claim",
+            "rationale",
+            "answers",
+            "knowledge",
+            "counterevidence",
+            "limitations"
+          ]
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-1b1f6ec36e5540a5a256dc25dd86cc61": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-1b1f6ec36e5540a5a256dc25dd86cc61.json"
+      },
+      "submission-f358830ea2834c98a1f8b66c3394cf66": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-f358830ea2834c98a1f8b66c3394cf66.json"
+      },
+      "submission-9bf8b80283c042d1b383e211c89c1701": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-9bf8b80283c042d1b383e211c89c1701.json"
+      },
+      "submission-599c7a85d804468187c5a652986302d1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-599c7a85d804468187c5a652986302d1.json"
+      },
+      "submission-37b5dc8bae1c4a87883de59ff9d8463f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-37b5dc8bae1c4a87883de59ff9d8463f.json"
+      },
+      "submission-3b5504b4c2ac476c980eddbf40f18f4f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-3b5504b4c2ac476c980eddbf40f18f4f.json"
+      },
+      "submission-38116b05f0304877af38e351c44578a1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-38116b05f0304877af38e351c44578a1.json"
+      },
+      "submission-c29267e4deb347dbba13781041bf2699": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-c29267e4deb347dbba13781041bf2699.json"
+      },
+      "submission-383a0a4f49204b6aab51ba7077d0f718": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-383a0a4f49204b6aab51ba7077d0f718.json"
+      },
+      "submission-b1532231bc7a45cb88f4c1cbac908f9c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-b1532231bc7a45cb88f4c1cbac908f9c.json"
+      },
+      "submission-3e8898cbeab7443693cf9c51cfbb0ae4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-3e8898cbeab7443693cf9c51cfbb0ae4.json"
+      },
+      "submission-b9e49b2df9c8453aab2f0b292ce3c176": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-b9e49b2df9c8453aab2f0b292ce3c176.json"
+      },
+      "submission-b6feef742879467d9b34c6e69d947021": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-19_13-32-32-dragonboat_raft-real-run/semantic-commits/submission-b6feef742879467d9b34c6e69d947021.json"
+      }
+    }
+  }
+}

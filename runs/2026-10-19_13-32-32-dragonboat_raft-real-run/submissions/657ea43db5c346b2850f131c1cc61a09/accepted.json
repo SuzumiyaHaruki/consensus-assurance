@@ -1,0 +1,73 @@
+{
+  "rationale": "Ninety-second pass: close a visible asymmetry in the read path. The leader's ReadIndex handler has two rejection branches that look different: the no-committed-entry case reports the context as dropped, which the node layer turns into a terminal dropped result, while the branch that sees the requester listed as a witness only logs and returns. That asymmetry would matter if a witness could get a read request registered, because the request would then have to wait for its deadline rather than learning that the operation is invalid. Tracing admission shows it cannot: the node's read entry point rejects an uninitialized node and rejects a witness with an invalid-operation error before any request state is created or offered to raft, and the client read path in the host goes through that same entry point. The raft-layer witness branch is therefore a defence-in-depth decision that no in-tree caller reaches, and the terminal behaviour a caller actually sees for a witness read is an immediate error rather than a timeout.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@witness_read_admission",
+      "question": "Can a read request registered through the node layer reach the leader's ReadIndex handler from a witness node, where the handler logs the request as dropped without reporting it and would leave the caller to its deadline, or does admission reject the request before any request state exists?",
+      "source_ids": [
+        "node_read_admission",
+        "raft_leader_readindex",
+        "node_read_call_contract"
+      ],
+      "hypothesis": "The node's read entry point rejects a witness with an invalid-operation error before creating request state, and the host's read path goes through that entry point, so the raft handler's witness branch has no in-tree caller and the client observes an immediate error rather than a timeout.",
+      "discriminator": "",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_witness_read_admission_blocks",
+      "kind": "behavior",
+      "statement": "The node's read entry point checks that the node is initialized and then rejects a witness node with an invalid-operation error before it asks the pending read-index object for request state. The host's linearizable-read path resolves the node and calls that same entry point, so a witness NodeHost fails a read immediately and no read request state is created, offered to the readiness queue or sent to raft on its behalf. The leader-side handler keeps a separate branch for a ReadIndex message whose sender is listed as a witness: it logs the request and returns without registering it, and unlike the branch for a leader that has no committed entry at its current term it does not report the context in the dropped-read-index list. Because admission already refuses witness reads, that branch is a defence-in-depth path that no in-tree caller reaches; if it were reached the caller would receive no dropped notification and would be left to its own deadline.",
+      "conditions": "A client issues a linearizable read through a node host whose local node is configured as a witness, or any caller invokes the node's read entry point on such a node; the leader-side branch applies to a ReadIndex message whose sender the leader has recorded as a witness.",
+      "source_ids": [
+        "node_read_admission",
+        "raft_leader_readindex",
+        "node_read_call_contract"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@witness_read_admission",
+      "experiment_id": null,
+      "source_ids": [
+        "node_read_admission",
+        "raft_leader_readindex",
+        "node_read_call_contract"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a witness read never reaches the leader's unreported witness branch, because admission rejects it before request state exists, so the suspicion that a witness read is left to its deadline is refuted for the traced paths. Basis: (1) the node's read entry point checks initialization first and then rejects a witness with an invalid-operation error, and only after those checks does it obtain request state from the pending read-index object, so a witness never has a registered read to complete or drop. (2) The host's linearizable-read path resolves the cluster's node and then calls that entry point, returning its error to the caller before any waiting happens, so the client observes an immediate invalid-operation result rather than a timeout. (3) The leader's ReadIndex handler does keep a branch for a requester recorded as a witness, and that branch only logs and returns, in contrast with the no-committed-entry branch which reports the context as dropped; but with admission in place the branch has no in-tree producer of request state behind it. (4) The asymmetry is therefore a defence-in-depth detail rather than a client-visible defect: the layer that would otherwise leave a caller to its deadline is only reachable by a peer that is not following the same admission rule, and the in-tree caller is refused first. The behaviour a witness caller sees is an invalid-operation error, which is a terminal outcome and does not depend on any deadline.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The raft handler's witness branch really does differ from the no-committed-entry branch in reporting: the latter appends the context to the dropped list while the former only logs, so the defence-in-depth path would be silent if it were ever reached from outside the node layer.",
+        "The admission check keys on the node's own witness configuration rather than on its membership view, so a node whose configuration and applied membership disagree about its role would be judged by the configuration flag at admission and by the leader's membership view at the handler.",
+        "Only the node-layer read entry point is traced; a caller that reaches the raft peer's ReadIndex method directly, bypassing the node, would not pass through the admission check, but no in-tree caller does that."
+      ],
+      "limitations": [
+        "Source reading only; no execution of a witness read is part of this account, and a live witness cluster cannot be started under the supplied isolation because it needs a TCP listener.",
+        "The account covers the linearizable-read path in the host; other client entry points that might eventually reach the read entry point are not enumerated here.",
+        "The raft handler's witness branch is examined only for its reporting behaviour, not for what a leader would do with a witness ReadIndex request in a configuration whose membership view and configuration disagree."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

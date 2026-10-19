@@ -1,0 +1,82 @@
+{
+  "rationale": "Sixteenth pass: settle the node-layer link by completing the trace of the deadline path. pendingReadIndex.applied exits early only when the holder is stopped or has no batches; with one unindexed batch it proceeds, cannot complete it through the index test because rb.index is 0, and then falls through to the gc gate. The gc pass times out requests whose deadline has passed and only then clears them from the batch, and it deletes a batch by SystemCtx expiry only after every request in it is nil, so removal without notification cannot happen. The remaining exits are the explicit dropped and close paths, which notify. The gap is answered accordingly, with the lateness of the result relative to the caller deadline stated as a property rather than hidden.",
+  "sources": [
+    {
+      "id": "request_pending_readindex_add_dropped",
+      "file": "request.go",
+      "start_line": 861,
+      "end_line": 905,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_readindex_close",
+      "file": "request.go",
+      "start_line": 803,
+      "end_line": 822,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "2e69ab7d5b5442d99729e726bef9c52d-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "2e69ab7d5b5442d99729e726bef9c52d-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "node_read_call_contract",
+        "node_process_ready_to_read",
+        "node_handle_events",
+        "node_tick",
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout",
+        "request_pending_readindex_add_dropped",
+        "request_pending_readindex_close"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: while the node is running, a ReadIndex invocation whose context the raft layer discarded still receives exactly one terminal result, delivered as RequestTimeout at or after its declared deadline, and no path silently removes the batch without notifying. Basis: (1) the request is created through pendingReadIndexes.read with a caller timeout and no separate timer (node.go:414-426, request.go:823-840); (2) with a discarded context no ReadyToRead arrives, so addReady never sets an index and applied's index test cannot complete the batch (request.go:861-873, 908-936); (3) applied still proceeds past its early return because the holder is not stopped and batches is non-empty, and its gc pass calls timeout on requests whose deadline has passed before clearing them, so the client receives RequestTimeout (request.go:939-957, 403-414); (4) batch removal on SystemCtx expiry requires every request in the batch to be nil, which only happens after that notification (request.go:950-957), and the remaining exits are dropped() and close(), which notify or terminate rather than dropping silently (request.go:803-822, 892-905); (5) applied is reached whenever handleEvents processed any event, and LocalTick messages count, including quiesced ticks (node.go:1132-1166, 1478-1492). Counterevidence considered: the completion is not prompt at the deadline, since the gc gate runs at most once per gcTick ticks and requires an event-loop iteration, so the client can observe the timeout later than the nominal deadline; and a stopped or wedged node delivers nothing, which is the node-liveness boundary already recorded. Limitations: source reasoning for this revision, without a node-level execution; the claim covers the read path only and says nothing about proposal or config-change timeouts; it does not state how late the notification can be beyond the gc gate and event cadence.",
+      "answers": {
+        "2e69ab7d5b5442d99729e726bef9c52d-gap-5": {
+          "explanation": "No such state was found for a running node. Every exit from the batch path notifies: applied's gc pass times out expired requests before clearing them, dropped() notifies each request and deletes the batch, and close() terminates whatever remains. Batch deletion on SystemCtx expiry is conditional on all requests being nil, which only follows a notification. The one early return in applied (stopped or no batches) applies when there is nothing to notify or when close/stop already terminated the requests. The residual condition is not a silent loss but lateness: the notification fires on the first event-loop iteration after the deadline in which the gc gate opens, so it can trail the caller's timeout by up to the gate interval plus event cadence.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+          "revision": 1,
+          "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+        }
+      ],
+      "counterevidence": [
+        "The timeout notification is not armed at the deadline itself; it depends on the gc gate opening and on further event-loop iterations, so observed completion can trail the nominal deadline.",
+        "A stopped or wedged node produces no result at all, which is a node-liveness boundary outside the stated conditions."
+      ],
+      "limitations": [
+        "Source reasoning only for this revision; the node layer was not executed.",
+        "Covers the ReadIndex path only, not proposal or config-change timeouts.",
+        "Does not bound the lateness beyond the gc gate interval and the event cadence."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

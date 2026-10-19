@@ -1,0 +1,69 @@
+{
+  "id": "01bcefcf95814e4592e2b72925ab23ff-experiment",
+  "investigation_id": "ba7e7b508855495d86f97710296b3bb8-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package dragonboat\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/lni/dragonboat/v3/config\"\n\t\"github.com/lni/dragonboat/v3/internal/rsm\"\n\t\"github.com/lni/dragonboat/v3/internal/vfs\"\n\tpb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\nfunc assuranceCCEntry(t *testing.T, index uint64, cc pb.ConfigChange) pb.Entry {\n\tt.Helper()\n\tdata, err := cc.Marshal()\n\tif err != nil {\n\t\tt.Fatalf(\"failed to marshal config change %v\", err)\n\t}\n\treturn pb.Entry{Index: index, Term: 1, Type: pb.ConfigChangeEntry, Cmd: data}\n}\n\n// TestAssuranceWitnessRecordFromMembership lets the replicated state machine\n// build its membership from configuration-change entries - first the cluster's\n// only voting member, then the local node as a witness - and then reads back\n// what node.notifyConfigChange stores and what node.getClusterInfo reports.\nfunc TestAssuranceWitnessRecordFromMembership(t *testing.T) {\n\tfs := vfs.GetTestFS()\n\tcfg := config.Config{ClusterID: 1, NodeID: 2}\n\tn := &node{\n\t\tclusterID:    1,\n\t\tnodeID:       2,\n\t\tconfig:       cfg,\n\t\tinitializedC: make(chan struct{}),\n\t\tsysEvents:    &sysEventListener{},\n\t}\n\tn.sm = rsm.NewStateMachine(\n\t\trsm.NewNativeSM(cfg, &rsm.InMemStateMachine{}, nil),\n\t\tnil, cfg, &testDummyNodeProxy{}, fs)\n\n\tn.sm.TaskQ().Add(rsm.Task{Entries: []pb.Entry{\n\t\tassuranceCCEntry(t, 1, pb.ConfigChange{\n\t\t\tType: pb.AddNode, NodeID: 1, Address: \"a1\", ConfigChangeId: 0,\n\t\t}),\n\t\tassuranceCCEntry(t, 2, pb.ConfigChange{\n\t\t\tType: pb.AddWitness, NodeID: 2, Address: \"a2\", ConfigChangeId: 1,\n\t\t}),\n\t}})\n\tif _, err := n.sm.Handle(nil, nil); err != nil {\n\t\tt.Fatalf(\"failed to apply config changes %v\", err)\n\t}\n\tm := n.sm.GetMembership()\n\t_, localIsWitness := m.Witnesses[2]\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"membership\\\",\\\"addresses\\\":%d,\\\"witnesses\\\":%d,\\\"local_is_witness\\\":%t,\\\"config_change_id\\\":%d}\\n\",\n\t\tlen(m.Addresses), len(m.Witnesses), localIsWitness, m.ConfigChangeId)\n\n\tn.notifyConfigChange()\n\tstored, ok := n.clusterInfo.Load().(*ClusterInfo)\n\tif !ok || stored == nil {\n\t\tt.Fatalf(\"no cluster record stored\")\n\t}\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"stored\\\",\\\"is_witness\\\":%t,\\\"is_observer\\\":%t,\\\"config_index\\\":%d,\\\"node_count\\\":%d}\\n\",\n\t\tstored.IsWitness, stored.IsObserver, stored.ConfigChangeIndex, len(stored.Nodes))\n\n\treported := n.getClusterInfo()\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"reported\\\",\\\"is_witness\\\":%t,\\\"is_observer\\\":%t,\\\"pending\\\":%t,\\\"config_index\\\":%d,\\\"node_count\\\":%d}\\n\",\n\t\treported.IsWitness, reported.IsObserver, reported.Pending,\n\t\treported.ConfigChangeIndex, len(reported.Nodes))\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceWitnessRecordFromMembership"
+      ],
+      "features": [],
+      "default_features": true,
+      "all_features": false,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "node_notify_config_change",
+      "node_get_cluster_info",
+      "rsm_config_change_apply",
+      "rsm_handle_task_entries",
+      "membership_apply_config_change"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Build a node's membership through the replicated state machine's own configuration-change path and compare the cluster record the node stores with the summary it reports for the same node.",
+      "assumptions": [
+        "The configuration-change entries are marshalled into the entry payload exactly as the state machine's config-change handler expects, with configuration-change indexes 0 and 1 so each change is up to date with the membership it follows.",
+        "The entries are delivered as one task through the state machine's own task queue, which is the path the apply worker uses, rather than by mutating the membership object directly.",
+        "The node carries a system-event listener with no configured user listener, whose publish call returns immediately, and a dummy node proxy that ignores the configuration-change callback; no raft peer, transport or nodehost participates."
+      ],
+      "excluded": [
+        "Cluster bootstrap and the raft layer's own membership maps; the experiment stops at the node layer's cluster summary.",
+        "Snapshotting and restart, so the record examined is the one produced by applying the two entries."
+      ],
+      "parameters": {}
+    },
+    "prefix": "A node is built with cluster ID 1, node ID 2 and a native in-memory state machine. One task carrying two entries is added to the state machine's task queue: an AddNode entry at index 1 for node 1 with configuration-change index 0, and an AddWitness entry at index 2 for node 2 with configuration-change index 1. The state machine's handle call consumes the task. The membership is then read back and reported, node.notifyConfigChange is called, the stored cluster record is read from the node, and node.getClusterInfo is called for the value a client would receive.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "b961633ee3874799b5847afdeeff74f3",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "01bcefcf95814e4592e2b72925ab23ff",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

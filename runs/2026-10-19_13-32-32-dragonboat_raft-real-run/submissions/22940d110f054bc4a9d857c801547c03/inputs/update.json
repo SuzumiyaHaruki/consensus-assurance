@@ -1,0 +1,79 @@
+{
+  "rationale": "Twenty-third pass: resolve the quiesce/snapshot question using the activity rule rather than another open thread. The chain is: every received message is recorded into the quiesce state, which exits quiesce and resets the idle clock; chunk acknowledgements are received messages, so an active transfer keeps the leader awake and leaderTick keeps running the pending-snapshot ack timeout. A stalled transfer therefore coincides with absent acknowledgements, and the cluster can only re-quiesce after the idle threshold, at which point the tick-driven backstop is suspended until the next message wakes the node. That makes the stall bounded by cluster activity rather than unbounded, and the gap is answered on that basis while the residual dependence on future activity is stated plainly.",
+  "sources": [
+    {
+      "id": "node_record_message_quiesce",
+      "file": "node.go",
+      "start_line": 1266,
+      "end_line": 1272,
+      "kind": "code_observation"
+    },
+    {
+      "id": "quiesce_threshold",
+      "file": "quiesce.go",
+      "start_line": 81,
+      "end_line": 99,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "472e9ca7e8a8446391293cd2f1b50f23-question-0",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_quiesce_activity_rule",
+      "kind": "behavior",
+      "statement": "Every message the node layer processes is recorded in the quiesce state, which resets the idle clock and exits quiesce; a heartbeat or heartbeat response carrying a read context is recorded as read activity rather than being skipped as background traffic. A node therefore enters quiesce only after the idle threshold of electionTick times ten ticks has passed without processed messages, which means any transfer or request that keeps producing acknowledgements keeps the cluster out of quiesce.",
+      "conditions": "Quiesce enabled; messages processed through the node message queue.",
+      "source_ids": [
+        "node_record_message_quiesce",
+        "quiesce_threshold",
+        "node_tick_quiesce_branch"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "472e9ca7e8a8446391293cd2f1b50f23-question-0",
+      "source_ids": [
+        "raft_quiesced_tick",
+        "raft_leader_tick_snapshot_ack",
+        "raft_check_pending_snapshot_ack",
+        "node_tick_quiesce_branch",
+        "node_record_message_quiesce",
+        "quiesce_threshold"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: an in-flight snapshot cannot be stranded indefinitely by quiesce alone, because the transfer's own acknowledgements keep the leader out of quiesce and any later message restarts the tick-driven backstop. Basis: (1) each processed message is recorded in the quiesce state, which resets the idle clock and exits quiesce, and hinted heartbeats are recorded as read activity rather than ignored (node.go:1266-1272); (2) entry into quiesce requires an idle interval of electionTick times ten ticks (quiesce.go:81-99), so a stream that keeps producing acknowledgements keeps the node active and leaderTick keeps calling checkPendingSnapshotAck (raft.go:600-631, 1832-1861); (3) a stalled transfer is precisely the case in which acknowledgements stop, so the cluster may fall into quiesce and the ack timeout is suspended while quiesced (raft.go:632-638; node.go:1478-1492); (4) the suspension ends as soon as any message is processed, because that both exits quiesce and gives leaderTick a chance to run, at which point the pending ack timer resumes counting and can drive the remote out of snapshot state. Counterevidence considered: if the cluster receives no further messages at all, the transfer stays pending indefinitely, but that condition also means there is no client activity, no replication traffic and no follower progress to protect; it is a quiescent-cluster property rather than a hidden loss of the transfer's completion, because the transfer re-arms when the cluster wakes. Limitations: this is a source argument, not an execution; it does not cover a follower that remains reachable but silently drops acknowledgements while also sending nothing else, nor does it bound the time to resume after waking, which depends on the next tick.",
+      "answers": {
+        "472e9ca7e8a8446391293cd2f1b50f23-gap-6": {
+          "explanation": "The independent driver is the stream's own traffic and, after a stall, the next message that wakes the node. Acknowledgements are ordinary received messages, they are recorded into the quiesce state, and that recording resets the idle clock and exits quiesce (node.go:1266-1272; quiesce.go:81-99). While the cluster stays awake, leaderTick runs and checkPendingSnapshotAck can force a snapshot status decision when acks stop. If acks stop and the cluster then quiesces, no component retries by itself; the transfer re-arms on the next processed message, which restarts leaderTick. The stall is therefore bounded by cluster activity rather than by an internal timer during quiesce.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "472e9ca7e8a8446391293cd2f1b50f23-knowledge-0",
+          "revision": 1,
+          "assertion": "Quiesced ticks skip leaderTick, so heartbeat, check-quorum and snapshot-ack timeout work does not run while quiesced."
+        },
+        {
+          "entry_id": "@ki_quiesce_activity_rule",
+          "revision": 1,
+          "assertion": "Every processed message resets the idle clock and exits quiesce, so transfer traffic keeps the leader ticking."
+        }
+      ],
+      "counterevidence": [
+        "With no messages at all the transfer remains pending; the justification for calling that acceptable is that the cluster is idle, not that the transfer is guaranteed to finish."
+      ],
+      "limitations": [
+        "Source reasoning only; no execution of a stalled stream under quiesce.",
+        "Does not cover a follower that drops acknowledgements yet sends nothing else, nor the resume latency after waking."
+      ]
+    }
+  ]
+}

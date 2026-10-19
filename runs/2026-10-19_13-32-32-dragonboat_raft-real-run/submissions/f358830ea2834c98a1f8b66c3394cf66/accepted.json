@@ -1,0 +1,137 @@
+{
+  "rationale": "Second pass. This turn closed the discriminator left open by the previous interpretation: whether a confirmation that completes a read context in the same event batch as a step-down can lose its ReadIndexResp/ReadyToRead. Sources show confirmation and response emission happen inside a single handler call frame (no state transition inside handleReadIndexLeaderConfirmation), and reset() does not clear r.msgs or r.readyToRead; they are cleared only by Peer.Commit after the Update has been handed to the node layer. So the same-batch window does not lose the response; the remaining gap-0 explanation records that protection. The investigation's conclusion stays explanatory with no defect claim, and a new behavior entry records the Update-lifetime protection that makes the negative hold.",
+  "sources": [
+    {
+      "id": "peer_commit_clears_update",
+      "file": "internal/raft/peer.go",
+      "start_line": 284,
+      "end_line": 294,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_clear_ready_to_read",
+      "file": "internal/raft/raft.go",
+      "start_line": 1649,
+      "end_line": 1651,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_update_lifetime_survives_reset",
+      "kind": "behavior",
+      "statement": "Outbound raft messages and ReadyToRead entries produced before a state transition in the same Update are still delivered afterwards: reset() replaces readIndex, remotes, observers, witnesses and votes but does not touch r.msgs or r.readyToRead, and Peer.Commit clears them only after the Update has been handed to the node layer (msgs unconditionally, readyToRead when UpdateCommit.ReadyToRead > 0).",
+      "conditions": "A confirmation completes read contexts and produces ReadIndexResp/ReadyToRead, and a state transition (for example the CheckQuorum step-down) occurs later in the same event-loop iteration before the Update is collected and committed.",
+      "source_ids": [
+        "raft_reset_replaces_readindex",
+        "raft_readindex_confirm",
+        "peer_commit_clears_update",
+        "raft_clear_ready_to_read"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "1b1f6ec36e5540a5a256dc25dd86cc61-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "raft_leader_readindex",
+        "raft_heartbeat_resp",
+        "raft_readindex_confirm",
+        "raft_checkquorum_stepdown",
+        "raft_reset_replaces_readindex",
+        "raft_candidate_readindex_dropped",
+        "raft_report_dropped_readindex",
+        "raft_follower_handler_map",
+        "raft_term_check",
+        "raft_readindex_confirm_core",
+        "peer_handle_response_filter",
+        "peer_commit_clears_update",
+        "raft_clear_ready_to_read",
+        "node_read_admission",
+        "node_handle_events",
+        "node_tick",
+        "node_dropped_readindexes",
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": null,
+      "rationale": "Current conclusion: a ReadIndex request outstanding when the leader loses authority keeps a legal, bounded terminal path, a deposed leader cannot complete it from stale confirmations, and the same-batch confirmation/step-down ordering does not lose the response that confirmation produced. Basis: (1) the leader only registers a read context after it has a committed entry at its current term (internal/raft/raft.go:1662-1696), otherwise reporting the context in droppedReadIndexes, which node.processDroppedReadIndexes forwards to pendingReadIndex.dropped (node.go:1021-1026); (2) registration is followed immediately by heartbeats carrying that context, and confirmation requires quorum-1 matching responses plus the leader's implicit count, after which earlier contexts are released with the later index and either a local ReadyToRead is added or a ReadIndexResp is sent (raft.go:1728-1741, 1771-1790; readindex.go:30-116); (3) every state transition, including the CheckQuorum step-down (raft.go:1608-1615), runs reset(), which installs a fresh readIndex, so contexts registered earlier are discarded without any DroppedReadIndexes entry (raft.go:1003-1025); (4) after the step-down the node cannot confirm them from heartbeat responses, because follower state has no HeartbeatResp handler (raft.go:2116-2129), lower-term messages are dropped (raft.go:1430-1478), and Peer.Handle ignores responses from unknown peers (peer.go:185-196); (5) a request whose context is never confirmed or indexed therefore has index 0 in the node layer and is terminated as RequestTimeout by pendingReadIndex.applied/gc once the caller-supplied deadline passes, a path driven by ordinary event-loop iterations because LocalTick messages make handleEvents report an event and call pendingReadIndexes.applied (node.go:1132-1166, 1478-1492; request.go:908-954, 403-414); (6) the previously open same-batch window is closed by source: confirm and the ReadyToRead/ReadIndexResp emission run inside one handler call with no state transition in between, and messages plus ReadyToRead survive a later reset because they are cleared only by Peer.Commit after the Update is collected (peer.go:284-294, raft.go:1649-1651). Counterevidence considered: handleCandidateReadIndex reports the same context twice (raft.go:1998-2012 plus reportDroppedReadIndex), but pendingReadIndex.dropped deletes the batch on first delivery, so the duplicate is a no-op; handleFollowerReadIndexResp sets the leader id and adds a ready-to-read from a ReadIndexResp (raft.go:1955-1963), which completes only a context confirmed while the sender held authority, so it does not resurrect authority for a discarded context, though it can leave a follower pointing at a leader that has since stepped down. Limitations: source-only account, no CheckRun receipt; assumes the node event loop keeps processing LocalTick messages while the request is pending; does not quantify the latency of the timeout path or judge whether RequestTimeout is the preferable client-visible code; the residual follower-side leader-id staleness noted above is a liveness observation that this question does not attempt to bound.",
+      "answers": {
+        "1b1f6ec36e5540a5a256dc25dd86cc61-gap-0": {
+          "explanation": "The window does not exist as stated. handleLeaderHeartbeatResp calls handleReadIndexLeaderConfirmation, which calls readIndex.confirm and then immediately appends either ReadyToRead (r.addReadyToRead) or a ReadIndexResp message (r.send) for every completed status; no state transition or reset can intervene inside that call frame, and confirmation is a prerequisite for those emissions. A step-down later in the same event-loop iteration does not discard them: reset() rebuilds readIndex/remotes/observers/witnesses/votes but leaves r.msgs and r.readyToRead untouched (raft.go:1003-1025), and they are cleared only by Peer.Commit after the Update carrying them has been handed to the node layer (peer.go:284-294; readyToRead only when UpdateCommit.ReadyToRead > 0). The deadline path established earlier therefore remains a fallback for contexts that were never confirmed, not for a confirmed context whose response was lost in the same batch.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-0",
+          "revision": 1,
+          "assertion": "Leader rejects ReadIndex without a committed current-term entry and reports the context as dropped."
+        },
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-1",
+          "revision": 1,
+          "assertion": "Quorum-1 heartbeat confirmations plus the leader complete a context and release earlier contexts with the later index."
+        },
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-2",
+          "revision": 1,
+          "assertion": "reset() replaces the readIndex instance and discards registered contexts without a dropped notification."
+        },
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-3",
+          "revision": 1,
+          "assertion": "A node that left leader state has no HeartbeatResp handler, so stale confirmations cannot complete a read context."
+        },
+        {
+          "entry_id": "1b1f6ec36e5540a5a256dc25dd86cc61-knowledge-4",
+          "revision": 1,
+          "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+        },
+        {
+          "entry_id": "@ki_update_lifetime_survives_reset",
+          "revision": 1,
+          "assertion": "Messages and ReadyToRead produced before a reset in the same Update are still delivered, because reset does not clear them and Peer.Commit clears them afterwards."
+        }
+      ],
+      "counterevidence": [
+        "handleCandidateReadIndex appends the same SystemCtx twice (explicit append after reportDroppedReadIndex), but the second pendingReadIndex.dropped call finds no batch and is a no-op, so this does not create a double client notification.",
+        "handleFollowerReadIndexResp sets the leader id from the ReadIndexResp sender (raft.go:1955-1963). It completes only a context the sender confirmed while it held authority, but a response delivered after the sender stepped down can still leave the follower treating a former leader as leader until the next heartbeat or election."
+      ],
+      "limitations": [
+        "Source-only account for this revision; no CheckRun receipt backs it.",
+        "Assumes the node event loop keeps processing LocalTick messages while the read request is pending; a stalled engine or stopped node is outside the stated conditions.",
+        "Does not quantify how late the timeout-based completion is relative to the confirmation-based path, nor whether client-visible RequestTimeout should be replaced by a dropped result.",
+        "Does not bound how long a follower may keep a stale leader id after receiving a ReadIndexResp from a leader that stepped down before delivery."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

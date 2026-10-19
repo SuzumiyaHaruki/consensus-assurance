@@ -1,0 +1,104 @@
+{
+  "rationale": "Fifty-sixth pass: examine an anomaly spotted while tracing the leader's proposal handler. When a leader already holds a pending configuration change, a second configuration-change entry is reported to its client as dropped and then the entry is overwritten with a zero-valued application entry before the batch is appended. That raises the question this pass settles: whether the substituted entry can reach the user state machine as an empty command, or is consumed as a no-op. The replicated state machine classifies such an entry as an empty, non-session-managed entry, routes it to its noop handler and reports an empty applied result, so the log slot advances the applied index without any Update call. The pass records the behaviour and an explained negative with each hop anchored.",
+  "sources": [
+    {
+      "id": "raft_leader_propose_pending_config_drop",
+      "file": "internal/raft/raft.go",
+      "start_line": 1616,
+      "end_line": 1636,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_report_dropped_config_change",
+      "file": "internal/raft/raft.go",
+      "start_line": 2048,
+      "end_line": 2050,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm_handle_entry_dispatch",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 878,
+      "end_line": 895,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm_noop_entry",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 993,
+      "end_line": 1000,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raftpb_entry_is_empty",
+      "file": "raftpb/raft.go",
+      "start_line": 157,
+      "end_line": 175,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@config_change_noop_substitution",
+      "question": "When a leader refuses a configuration-change entry because another change is already pending, does the zero-valued application entry that replaces it in the appended batch reach the user state machine as an empty command, and does the requesting client still receive a terminal dropped result?",
+      "source_ids": [
+        "raft_leader_propose_pending_config_drop",
+        "raft_report_dropped_config_change",
+        "node_process_dropped_entries",
+        "rsm_handle_entry_dispatch",
+        "rsm_noop_entry",
+        "raftpb_entry_is_empty"
+      ],
+      "hypothesis": "The refused configuration change is reported to the client through the dropped-entry list, and the substituted entry is classified as an empty application entry that the state machine consumes as a no-op, advancing the applied index without invoking the user Update or Lookup code.",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_config_change_noop_substitution",
+      "kind": "behavior",
+      "statement": "While a leader already holds a pending configuration change, a further configuration-change entry in an incoming proposal batch is reported to its client as dropped (reportDroppedConfigChange appends the entry to the dropped-entry list, which the node turns into a dropped result on the pending config change) and the entry itself is replaced by a zero-valued application entry before appendEntries runs; the pending flag is set again in the same loop. The substituted entry carries no type data beyond the application type, so Entry.IsEmpty reports true for it, and the replicated state machine's per-entry dispatch sends it to the noop handler, which only records the applied index and term and reports an empty applied result. A configuration change refused this way therefore leaves a committed log slot that consumes no user command and applies no membership effect.",
+      "conditions": "The leader has a configuration change pending and receives a proposal batch containing at least one further configuration-change entry; the substituted entry is then committed and applied by the replicated state machine.",
+      "source_ids": [
+        "raft_leader_propose_pending_config_drop",
+        "raft_report_dropped_config_change",
+        "node_process_dropped_entries",
+        "rsm_handle_entry_dispatch",
+        "rsm_noop_entry",
+        "raftpb_entry_is_empty"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@config_change_noop_substitution",
+      "source_ids": [
+        "raft_leader_propose_pending_config_drop",
+        "raft_report_dropped_config_change",
+        "node_process_dropped_entries",
+        "rsm_handle_entry_dispatch",
+        "rsm_noop_entry",
+        "raftpb_entry_is_empty"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: the entry that replaces a refused configuration change is inert, and the requesting client still gets a dropped result, so the substitution does not smuggle an empty command into the user state machine. The refusal happens in the leader's proposal handler: for each configuration-change entry, if a change is already pending the handler reports it through reportDroppedConfigChange and overwrites that slice element with a zero-valued application entry, then sets the pending flag and appends the batch (raft.go:1616-1636; reportDroppedConfigChange at raft.go:2048-2050 appends the original entry to the dropped-entry list). The node layer consumes that list in processDroppedEntries, which routes a configuration-change entry to pendingConfigChange.dropped and thereby delivers Dropped and clears the request slot (node.go:1027-1036), so the caller is not left waiting for its deadline. The substituted entry is not a command: Entry.IsEmpty reports true for an entry that is neither a configuration change nor session managed and whose payload is absent (raftpb/raft.go:157-175), and the state machine's dispatch for a non-configuration, non-session-managed entry takes the empty branch, calls the noop handler and reports an empty applied result, panicking only on the impossible case of a non-empty, non-session-managed entry (statemachine.go:878-895). The noop handler's only effects are recording the applied index and term (statemachine.go:993-1000), so the committed slot advances application progress without invoking the user's Update or exposing an empty command. Two consequences worth stating: the cluster's log gains one extra no-op entry per refused configuration change, which is accounted for in the applied index and therefore in the compaction thresholds, and a badly behaved batch that mixed a dropped change with valid proposals would still append the valid entries, since only the configuration-change element is replaced.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_config_change_noop_substitution",
+          "revision": 1,
+          "assertion": "The refused configuration change is reported as dropped and its replacement entry is applied as a no-op that never reaches user code."
+        }
+      ],
+      "counterevidence": [
+        "The substituted entry still occupies a raft log slot and is committed, so the applied index advances by one for each refused configuration change; this is visible to callers that watch the applied index but carries no membership effect.",
+        "The leader sets the pending-configuration flag again in the same loop iteration that refused the change, so the flag's lifetime is tied to the change that is actually appended rather than to the refused one."
+      ],
+      "limitations": [
+        "Source trace only: no live leader, pending configuration change or state machine application was executed for this question, and no receipt is cited.",
+        "The account covers the leader's has-pending-configuration branch; other refusal paths for configuration changes, such as a change arriving during a leadership transfer, go through the broader proposal-drop path recorded elsewhere and are not re-traced here.",
+        "Whether a user state machine can observe the extra applied index through its own result stream is not measured; the trace establishes only that its Update and Lookup code is not invoked for the substituted entry."
+      ]
+    }
+  ]
+}

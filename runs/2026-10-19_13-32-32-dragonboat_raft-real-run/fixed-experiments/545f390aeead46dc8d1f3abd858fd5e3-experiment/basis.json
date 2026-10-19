@@ -1,0 +1,70 @@
+{
+  "id": "545f390aeead46dc8d1f3abd858fd5e3-experiment",
+  "investigation_id": "545f390aeead46dc8d1f3abd858fd5e3-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package dragonboat\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/lni/dragonboat/v3/config\"\n\t\"github.com/lni/dragonboat/v3/internal/rsm\"\n\t\"github.com/lni/dragonboat/v3/internal/vfs\"\n\tpb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\ntype assuranceNoopPipeline struct{}\n\nfunc (p *assuranceNoopPipeline) setCloseReady(*node)            {}\nfunc (p *assuranceNoopPipeline) setStepReady(uint64)            {}\nfunc (p *assuranceNoopPipeline) setCommitReady(uint64)          {}\nfunc (p *assuranceNoopPipeline) setApplyReady(uint64)           {}\nfunc (p *assuranceNoopPipeline) setStreamReady(uint64)          {}\nfunc (p *assuranceNoopPipeline) setSaveReady(uint64)            {}\nfunc (p *assuranceNoopPipeline) setRecoverReady(uint64)         {}\n\n// TestAssuranceSnapshotInstallFrontier drives node.pushSnapshot and\n// node.entriesToApply, then reads the first task the state machine reports to\n// the apply loop, to see how a snapshot install moves the pushed/applied\n// frontier and how committed entries around that frontier are treated.\nfunc TestAssuranceSnapshotInstallFrontier(t *testing.T) {\n\tfs := vfs.GetTestFS()\n\tcfg := config.Config{ClusterID: 1, NodeID: 1}\n\tn := &node{\n\t\tclusterID:    1,\n\t\tnodeID:       1,\n\t\tconfig:       cfg,\n\t\tinitializedC: make(chan struct{}),\n\t\tsysEvents:    &sysEventListener{},\n\t\tss:           &snapshotState{},\n\t\tpipeline:     &assuranceNoopPipeline{},\n\t}\n\tn.sm = rsm.NewStateMachine(\n\t\trsm.NewNativeSM(cfg, &rsm.InMemStateMachine{}, nil),\n\t\tnil, cfg, &testDummyNodeProxy{}, fs)\n\tn.toApplyQ = n.sm.TaskQ()\n\n\tss := pb.Snapshot{Index: 5, Term: 2}\n\tn.pushSnapshot(ss, 0)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"pushed\\\",\\\"pushed_index\\\":%d,\\\"ss_index\\\":%d}\\n\",\n\t\tn.pushedIndex, n.ss.getIndex())\n\n\tgot := n.entriesToApply([]pb.Entry{\n\t\t{Index: 3, Term: 2},\n\t\t{Index: 4, Term: 2},\n\t\t{Index: 5, Term: 2},\n\t\t{Index: 6, Term: 2},\n\t})\n\tfirst := uint64(0)\n\tif len(got) > 0 {\n\t\tfirst = got[0].Index\n\t}\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"filtered\\\",\\\"count\\\":%d,\\\"first_index\\\":%d}\\n\",\n\t\tlen(got), first)\n\n\tn.pushEntries(got)\n\ttask, err := n.handleTask(nil, nil)\n\tif err != nil {\n\t\tt.Fatalf(\"handleTask returned %v\", err)\n\t}\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"first_task\\\",\\\"recover\\\":%t,\\\"index\\\":%d}\\n\",\n\t\ttask.Recover, task.Index)\n\n\thole := func() (panicked bool) {\n\t\tdefer func() {\n\t\t\tif r := recover(); r != nil {\n\t\t\t\tpanicked = true\n\t\t\t}\n\t\t}()\n\t\tn.entriesToApply([]pb.Entry{{Index: 8, Term: 2}})\n\t\treturn false\n\t}()\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"hole\\\",\\\"panicked\\\":%t}\\n\", hole)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceSnapshotInstallFrontier"
+      ],
+      "features": [],
+      "default_features": true,
+      "all_features": false,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "node_push_snapshot",
+      "node_entries_to_apply",
+      "node_push_entries",
+      "rsm_handle_snapshot_boundary"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Probe the node-level applied frontier around a snapshot install: the pushed and snapshot indexes a queued snapshot establishes, how committed entries on both sides of that frontier are filtered, and which queued task the state machine reports first to the apply loop.",
+      "assumptions": [
+        "The node is built directly with a native in-memory state machine over the test filesystem, an empty snapshot state and a recording-free no-op pipeline, the same construction style the package's own node tests use, so pushSnapshot and entriesToApply run against target code without a raft peer, transport or nodehost.",
+        "The snapshot is supplied as a metadata record with index 5 and term 2 and a zero applied index, which is the shape an adopted snapshot has after the raft layer has already checked that its index is above the committed index.",
+        "The committed-entry batch is supplied directly to entriesToApply as indexes 3 to 6, standing in for the entries the raft peer would place alongside the snapshot update.",
+        "The task reported by the state machine queue is read once, without running the recovery worker, so the probe observes the boundary between the recovery task and the entry task rather than the completion of recovery."
+      ],
+      "excluded": [
+        "Any raft peer, transport, log write or snapshot file; the snapshot is never written or recovered.",
+        "The asynchronous recovery worker and the recovering gate that follows it, which remain supported by source reading.",
+        "The on-disk state machine recovery branch and the restart path."
+      ],
+      "parameters": {}
+    },
+    "prefix": "A node is built with a native in-memory state machine and its task queue is attached as the apply queue. A snapshot at index 5, term 2 is passed to pushSnapshot with an applied index of 0, and the node's pushed index and snapshot index are reported. entriesToApply is then called with committed entries at indexes 3, 4, 5 and 6, and the number and first index of the entries it returns are reported. Those returned entries are pushed through pushEntries, and the first task the state machine reports from its queue is recorded with its recovery flag and index. Finally entriesToApply is called with a single committed entry at index 8, which is beyond the frontier plus one, and whether that call panics is recorded.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "b961633ee3874799b5847afdeeff74f3",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "545f390aeead46dc8d1f3abd858fd5e3",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

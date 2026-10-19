@@ -1,0 +1,75 @@
+{
+  "rationale": "Eighty-fifth pass: complete the target-side half of the worker-panic consequence chain, which the previous passes left at 'the panic leaves the worker function'. The snapshot worker pool marks a worker busy and records the cluster as saving, recovering or streaming when it hands out a job, and it clears both only in the completion handler that runs when the worker reports back. A job whose worker never reports back therefore leaves its pool slot marked busy and its cluster permanently in progress, so the pool shrinks by one worker and refuses every later save, recover and stream for that cluster; with a fixed number of snapshot workers, repeated panics exhaust the pool for all clusters. That chain is target code and holds under either launcher outcome once the goroutine stops without completing, which is why it belongs in the account next to the dependency link rather than behind it.",
+  "sources": [
+    {
+      "id": "engine_pool_completed",
+      "file": "engine.go",
+      "start_line": 509,
+      "end_line": 543,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_pool_start",
+      "file": "engine.go",
+      "start_line": 608,
+      "end_line": 633,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_pool_get_worker",
+      "file": "engine.go",
+      "start_line": 362,
+      "end_line": 369,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_snapshot_pool_completion_leak",
+      "kind": "behavior",
+      "statement": "Before a snapshot worker runs a job, the worker pool records the worker as busy and records the cluster as saving, recovering or streaming, refusing a second concurrent marker of the same or another kind for that cluster. Those records are removed only by the pool's completion handler, which runs when the worker's completion channel fires after the job function returns: it deletes the cluster's in-progress marker, requires exactly one marker to have been present, and marks the worker idle again. The worker's completion signal is sent by the worker loop after its handle call returns, so a job that ends by panicking without returning never produces it. Consequently that worker stays marked busy and is skipped by the pool's worker selection for the rest of the process, and the cluster stays marked in progress, which makes the pool refuse every later save, recover and stream request for it. With a fixed pool size, each such event permanently removes one worker.",
+      "conditions": "A snapshot save, recover or stream job is handed to a worker of the snapshot worker pool, and the job function does not return normally, for example because it panics on a hard save error.",
+      "source_ids": [
+        "engine_pool_start",
+        "engine_pool_completed",
+        "engine_pool_get_worker",
+        "engine_pool_worker_launch",
+        "engine_ssworker_handle"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "a9985060b7284b23b73850ed64c83991-question-0",
+      "source_ids": [
+        "engine_ssworker_handle",
+        "engine_worker_launch",
+        "engine_pool_worker_launch",
+        "engine_error_injection_recover",
+        "nodehost_start_recover_scope",
+        "engine_pool_start",
+        "engine_pool_completed",
+        "engine_pool_get_worker"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": null,
+      "rationale": "Current claim: within the captured target a panic raised by the snapshot save path is not recovered, and the consequences split into a part the target settles and a part that depends on the launcher. The settled part: the save path calls panic(err) when node.save returns an error, the worker body and its handle function install no recover, the only recover in engine.go wraps step workers when error injection is enabled, and NodeHost.Start's recover wraps only the body of Start and re-panics error values, so the panic leaves the worker function. The pool's own bookkeeping then has no path back: before the job runs, the pool marks the worker busy and records the cluster as saving, recovering or streaming, and those records are cleared only by the completion handler that the pool runs when the worker reports back after its handle call returns. A job that never returns never reports, so the pool keeps the worker busy and the cluster in progress, skips that worker in later selection, and refuses every later save, recover and stream for that cluster; with a fixed pool size, repeated such events exhaust the pool for all clusters. The unsettled part: whether the process ends at the panic or survives with that dead worker is decided by the launcher the syncutil stopper supplies from the pinned goutils dependency, which is not part of the captured snapshot. If the process ends, the pool state dies with it; if the launcher recovers the panic, the leak persists in a live process. Because that choice is what decides whether the leak matters, the question stays conditional with no defect claim, and the same dependency is what the snapshot-save question now rests on.",
+      "answers": {
+        "ebd0cff4e07244289acc246a6a556320-gap-8": {
+          "explanation": "Still unresolved. No recover inside the captured target covers a worker goroutine, so the panic leaves the worker function, and the target also shows what a non-returning job does to the pool: the worker stays busy, the cluster stays marked in progress, and later snapshot work for it is refused. Whether the process survives to experience that is decided by the launcher in the pinned dependency, which is outside the snapshot.",
+          "resolved": false
+        }
+      },
+      "counterevidence": [
+        "If the worker wrapper recovered panics, a hard save error would stop one worker rather than the process, and the earlier save-failure refutation would become a liveness defect in which the saving flag never clears and the pool loses the worker.",
+        "The pool's completion handler is also its bookkeeping check: it panics when the worker it is told about is not busy or when no in-progress marker is found, so the pool has no idle-period recovery sweep that could clear a marker left behind by a worker that never returned.",
+        "The dependency's stopper implementation was read during earlier work and appears to call the worker without a recover, which supports the terminating outcome, but that reading is dependency code and is not cited here as target evidence."
+      ],
+      "limitations": [
+        "The launcher body is dependency code and is not part of the captured target snapshot.",
+        "No execution of a panicking worker was performed; the fault cannot be produced without either running a panicking state machine against a live engine or observing process exit, and neither is available under the current isolation.",
+        "The pool-leak consequence is traced for the snapshot worker pool only; other worker pools in the engine are not compared here."
+      ]
+    }
+  ]
+}

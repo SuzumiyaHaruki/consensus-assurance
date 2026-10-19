@@ -1,0 +1,90 @@
+{
+  "rationale": "Fifty-first pass: follow the client-contract endpoint that reports a node's role. node.notifyConfigChange computes both role flags from the replicated membership and stores them in the node's cluster record, but node.getClusterInfo rebuilds the value it hands to callers and copies only the observer flag, not the witness flag. Since that rebuild is the only producer of NodeHostInfo.ClusterInfoList, the documented public field ClusterInfo.IsWitness appears to be false for every cluster, including a node whose stored record lists it as a witness. This pass registers the question and a focused object-level experiment that stores a witness record and an observer record and compares the rebuilt role flags, so the omission is measured against a control rather than inferred from the struct literal alone.",
+  "sources": [
+    {
+      "id": "node_notify_config_change",
+      "file": "node.go",
+      "start_line": 1496,
+      "end_line": 1518,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_get_cluster_info",
+      "file": "node.go",
+      "start_line": 1520,
+      "end_line": 1540,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_cluster_info_type",
+      "file": "nodehost.go",
+      "start_line": 163,
+      "end_line": 188,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_get_nodehost_info",
+      "file": "nodehost.go",
+      "start_line": 1415,
+      "end_line": 1437,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_cluster_info_list",
+      "file": "nodehost.go",
+      "start_line": 1835,
+      "end_line": 1847,
+      "kind": "code_observation"
+    },
+    {
+      "id": "nodehost_sync_get_cluster_membership",
+      "file": "nodehost.go",
+      "start_line": 633,
+      "end_line": 668,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@cluster_info_witness_flag",
+      "question": "Does the per-cluster summary that NodeHost.GetNodeHostInfo reports for a witness node identify that node as a witness, or does node.getClusterInfo drop the witness flag that the stored cluster record carries?",
+      "source_ids": [
+        "node_notify_config_change",
+        "node_get_cluster_info",
+        "nodehost_cluster_info_type",
+        "nodehost_get_nodehost_info",
+        "nodehost_cluster_info_list"
+      ],
+      "hypothesis": "The stored record written by node.notifyConfigChange carries IsWitness computed from the membership's witness set, but node.getClusterInfo rebuilds the returned value without copying that field, so every ClusterInfo reaching a caller reports IsWitness=false, including for a node that is a witness and whose record says so.",
+      "discriminator": "Whether the rebuilt summary preserves the stored role flags: the reported witness flag on a witness record compared with the reported observer flag on an otherwise identical observer record.",
+      "disposition": "active"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@cluster_info_witness_flag",
+    "harness_path": "assurance_generated_test.go",
+    "execution_package": ".",
+    "test_names": [
+      "TestAssuranceClusterInfoWitnessFlag"
+    ],
+    "source_ids": [
+      "node_notify_config_change",
+      "node_get_cluster_info",
+      "nodehost_get_nodehost_info",
+      "nodehost_cluster_info_list"
+    ],
+    "scope": {
+      "description": "Read back the per-node cluster summary that feeds NodeHostInfo.ClusterInfoList: one node holding a stored record that marks the local node as a witness, one control node holding an otherwise identical record that marks it as an observer, and one witness node whose record is still absent.",
+      "assumptions": [
+        "The stored records are supplied directly with the role flags that node.notifyConfigChange (node.go:1496-1518) writes when the replicated membership lists the local node in Witnesses or Observers; that producer is established by reading the code, not by running it here.",
+        "Each node carries a native in-memory state machine so the summary can report a state machine type, and its raft peer is left nil so the leader flag resolves to false; leader state does not affect the witness flag.",
+        "The stored member address maps and config change indexes are arbitrary but distinct per case, and are read back only to show which parts of the stored record survive the rebuild."
+      ],
+      "excluded": [
+        "NodeHost.GetNodeHostInfo and a live witness NodeHost cluster; the path from that method to node.getClusterInfo is read from source.",
+        "node.notifyConfigChange execution, which would require a state machine whose membership already lists the local node as a witness."
+      ]
+    },
+    "prefix": "A node is built with cluster ID 1, node ID 2 and a native in-memory state machine, and with config.IsWitness set for the witness cases. A ClusterInfo record with IsWitness true, three member addresses and config change index 7 is stored in the node's atomic cluster record, then node.getClusterInfo is called and its role flags, config change index, member count and pending flag are reported. The same read is repeated for an observer-flagged node whose stored record has IsObserver true, config change index 9 and two members, and for a witness node with no stored record."
+  }
+}

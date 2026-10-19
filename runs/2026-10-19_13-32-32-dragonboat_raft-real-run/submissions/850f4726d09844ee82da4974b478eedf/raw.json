@@ -1,0 +1,53 @@
+{
+  "rationale": "Fortieth pass: answer the chunk retry gap with the sender and cleanup paths just read. The chunk writer does not resend an individual chunk: it sends each block through the sink, and a send that is not accepted marks the writer failed and returns ErrSnapshotStreaming. That error is classified as a stream abort by the node, which swallows it and completes the stream task, leaving the transfer to be retried as a whole by the replicate path. On the receiver side, gc removes the temp directory and drops the tracked slot once a chunk has not refreshed the slot for the configured timeout. Together those make a duplicate or reordered chunk a dropped chunk followed by a whole-snapshot retry, not an indefinitely stalled transfer; the gap is answered on that basis and the account closes as explained.",
+  "sources": [
+    {
+      "id": "node_stream_abort_swallow",
+      "file": "node.go",
+      "start_line": 775,
+      "end_line": 790,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "1b69baf41f774576a124458fddac6138-question-0",
+      "disposition": "explained"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "1b69baf41f774576a124458fddac6138-question-0",
+      "source_ids": [
+        "chunk_record_ordering",
+        "chunk_add_locked",
+        "chunk_tick_and_gc",
+        "chunkwriter_ack",
+        "node_stream_abort_swallow"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a duplicated or reordered chunk cannot strand a transfer indefinitely through the chunk receiver alone. Basis: (1) the receiver accepts only the next expected id for a key and ignores other ids without advancing the expectation (chunk.go:194-250); (2) the sender does not resend single chunks: onNewChunk calls the sink's Receive and, when the chunk is not sent, marks the writer failed and returns ErrSnapshotStreaming (chunkwriter.go:100-120), so the only retry unit is the whole snapshot stream; (3) node.stream classifies ErrSnapshotStreaming as an abort and returns nil, so the stream task completes rather than crashing the worker, leaving the remote to be retried by the replicate path (node.go:775-790); (4) a receiver slot that stops receiving chunks is removed by gc once the chunk timeout elapses, and removal also deletes the temp directory (chunk.go:139-155), so the slot and its partial data are reclaimed. Counterevidence considered: a slot can hold partial data until the timeout, and a transfer can be restarted more than once, so progress is bounded by the timeout and by the sender's next attempt rather than immediate. Limitations: source reasoning only; no stream execution, and the retry cadence of the replicate path is not measured. The claim is limited to the chunk receiver and writer pair, not to the transport connection's own failure handling.",
+      "answers": {
+        "1b69baf41f774576a124458fddac6138-gap-7": {
+          "explanation": "Yes to both parts. The receiver's gc removes the temp directory and resets the tracked slot when a chunk has not refreshed it within the configured timeout (chunk.go:139-155). The sender cannot resend only the missing chunk because onNewChunk marks the writer failed and returns ErrSnapshotStreaming when a chunk is not accepted (chunkwriter.go:100-120); node.stream treats that error as a stream abort and returns nil (node.go:775-790), so the whole snapshot is retried later rather than a single chunk.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "12dac0340ae648a8841b2d306ec951c4-knowledge-0",
+          "revision": 1,
+          "assertion": "The receiver accepts only the next expected chunk id and ignores others without advancing."
+        }
+      ],
+      "counterevidence": [
+        "Partial snapshot data occupies disk and a slot until the receiver's timeout elapses, so the retry is not immediate."
+      ],
+      "limitations": [
+        "Source reasoning only; no stream execution.",
+        "Does not measure the replicate path's retry cadence after a stream abort."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "rationale": "Eighty-sixth pass: look for the crash policy in the target's own public contract instead of only in the launcher. The state machine interface documentation states it: apart from the abort-class errors, an implementation should return a non-nil error from SaveSnapshot or RecoverFromSnapshot only when the system needs to be immediately halted for a critical or non-recoverable error, and gives a disk error as the example. That is the requirement the save path implements when it panics, and it reframes the open dependency: a launcher that swallowed the panic would not merely leave an undocumented residue, it would defeat the documented halting requirement itself. The save question's classification does not change, because the mechanism that halts the system still runs through dependency code, but its account now has the contract on the requirement side rather than only the implementation's choice.",
+  "sources": [
+    {
+      "id": "statemachine_save_crash_contract",
+      "file": "statemachine/rsm.go",
+      "start_line": 240,
+      "end_line": 262,
+      "kind": "interface_statement"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_statemachine_fatal_error_contract",
+      "kind": "fact",
+      "statement": "The captured state machine interface documentation bounds what a non-nil error from the snapshot hooks means. For SaveSnapshot it states that, other than ErrSnapshotStopped and ErrSnapshotAborted, an implementation should return a non-nil error only when the system needs to be immediately halted for critical errors, with a disk error preventing the save as the example. For RecoverFromSnapshot it states the same bound with the example of a disk error preventing the complete read of a saved snapshot. The abort-class errors are separately defined as ways to abort the operation when the node is being closed, so the interface separates aborted work from errors that call for halting the system.",
+      "conditions": "An application implements the state machine interface and its SaveSnapshot or RecoverFromSnapshot returns an error; the node is running rather than being closed.",
+      "source_ids": [
+        "statemachine_save_crash_contract"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+      "source_ids": [
+        "node_save_snapshot_required",
+        "node_save_and_dosave",
+        "node_process_save_status",
+        "node_busy_snapshotting",
+        "request_pending_snapshot_apply",
+        "statemachine_save_crash_contract",
+        "engine_ssworker_handle",
+        "engine_apply_loop_status",
+        "engine_error_injection_recover",
+        "engine_worker_launch",
+        "node_save_done",
+        "snapshotstate_notify_status"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": null,
+      "rationale": "Current claim: the control flow around a periodic snapshot save is traced and the non-fatal outcomes are settled, and the hard-error path is now anchored to a documented requirement rather than only to an implementation choice; the claim stays conditional because the mechanism that carries out that requirement runs through the pinned dependency. Basis: (1) saveSnapshotRequired advances the requested snapshot index only when it actually requests a snapshot, and it suppresses further periodic requests while the node reports itself busy snapshotting, so the requested index alone cannot suppress later attempts. (2) On every non-fatal path node.save returns nil, node.saveDone stores a completed save task through notifySnapshotStatus and signals the apply worker, and processStatusTransition calls processSaveStatus, which clears the saving flag before handling the next task; this covers the soft-error and abort-class returns and does not depend on any launcher. (3) A hard error is the case the interface documentation reserves for halting: apart from the abort-class errors, an implementation should return a non-nil error from SaveSnapshot only when the system needs to be immediately halted for a critical error, so the save error is not an ordinary failure that the node is expected to absorb. (4) The target's response matches that requirement in structure but not in completion: ssWorker.save calls panic(err) and neither the worker body nor anything else in the target recovers it, so the panic leaves the worker function, and the outcome is decided by the launcher the syncutil stopper supplies from the pinned goutils dependency. (5) If the launcher lets the panic end the process, the documented halting requirement is met and the node never runs with a stale saving flag. If it recovers the panic, the process keeps running with the saving flag set and no completion recorded, which defeats the documented requirement and, for a state machine without concurrent snapshot support, stops the node applying entries while for a concurrent one it leaves every later save refused; the snapshot worker pool additionally keeps the worker busy and the cluster in progress. (6) The evidence therefore supports neither a refutation nor a defect assertion: the requirement is documented, the target's structural response is visible, and the deciding step is outside the snapshot.",
+      "answers": {
+        "9bf8b80283c042d1b383e211c89c1701-gap-1": {
+          "explanation": "Reopened and now better bounded. The interface documentation states that a non-nil save error outside the abort class means the system needs to be immediately halted, so the question is no longer whether the node should try to continue after such an error but whether the halt actually happens. The target raises the panic and does not recover it; the launcher in the pinned dependency decides the rest. Under a terminating launcher the flag cannot strand anything because the process is gone; under a recovering launcher the documented halt is defeated and the residue described in the account appears. Unresolved until the launcher behavior is established.",
+          "resolved": false
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+          "revision": 1,
+          "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+        },
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+          "revision": 1,
+          "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+        },
+        {
+          "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-1",
+          "revision": 1,
+          "assertion": "Non-fatal save outcomes complete through saveDone and processSaveStatus, clearing the saving flag without depending on the launcher."
+        }
+      ],
+      "counterevidence": [
+        "The documented requirement is a halting requirement, not a description of a mechanism: it tells us what the system should do, while whether the process actually ends is still decided by the launcher, so the contract narrows the question without answering the mechanism half.",
+        "A hard save error bypasses the pendingSnapshot.apply report for that request, so a user-requested snapshot never receives a rejected or aborted result on that path; only a completed halt prevents that from becoming a live stuck request.",
+        "The severity is not uniform if the halt does not happen: a state machine without concurrent snapshot support stops applying entries entirely, while a concurrent one keeps applying and only loses its snapshot duty, so any finding would need that qualification rather than a single node-wide stall claim.",
+        "The busy-snapshotting predicate combines a flag with a busy task channel, so a worker that died leaves the predicate false even though the saving flag is set; that is why the periodic trigger is not the mechanism that blocks recovery.",
+        "The non-fatal paths are independent of the launcher and remain settled: the soft-error, abort-class and already-up-to-date returns all reach saveDone and clear the flag."
+      ],
+      "limitations": [
+        "The deciding mechanism, the goroutine launcher in the pinned goutils dependency, is outside the captured snapshot and is not used as target evidence.",
+        "No execution of a failing save was performed in this pass; the account remains a source argument.",
+        "The interface documentation states an expectation for implementers but does not describe how the node enforces it, and it covers SaveSnapshot and RecoverFromSnapshot rather than every error path in the state machine interface.",
+        "Does not quantify how much log growth could accumulate before a later eligible periodic snapshot under either concurrency variant if the node did keep running with the flag set."
+      ]
+    }
+  ]
+}

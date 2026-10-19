@@ -1,0 +1,113 @@
+{
+  "rationale": "Tenth pass, new bounded-liveness question. While checking whether a proposal path can stall, the rate-limit gate on proposal intake came into view: node.handleProposals stops draining incomingProposals while the raft rate limiter or LogDB busy signal is set, and InMemRateLimiter only changes its recorded state after ChangeTickThreashold ticks of a different measurement. The open question is whether that gate can hold while the measurement it depends on can no longer fall, which would be a self-sustaining stop in proposal intake. The behavior and constants are recorded; the cycle is not yet excluded by source, so the investigation is opened unresolved with a gap rather than claimed as a defect.",
+  "sources": [
+    {
+      "id": "node_handle_proposals_pause",
+      "file": "node.go",
+      "start_line": 1206,
+      "end_line": 1223,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rate_limiter_hysteresis",
+      "file": "internal/server/rate.go",
+      "start_line": 155,
+      "end_line": 193,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rate_limiter_constants",
+      "file": "internal/server/rate.go",
+      "start_line": 20,
+      "end_line": 30,
+      "kind": "code_observation"
+    },
+    {
+      "id": "inmemory_applied_decreases",
+      "file": "internal/raft/inmemory.go",
+      "start_line": 143,
+      "end_line": 165,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@proposal_pause_cycle",
+      "question": "Can the rate-limit gate on proposal intake hold indefinitely because the in-memory log size it measures cannot fall while proposals are paused, and what releases it if the remaining size is dominated by entries that never commit?",
+      "source_ids": [
+        "node_handle_proposals_pause",
+        "rate_limiter_hysteresis",
+        "rate_limiter_constants",
+        "inmemory_applied_decreases"
+      ],
+      "hypothesis": "The gate is not self-sustaining: in-memory size falls when the state machine applies already committed entries, an event independent of proposal intake, so pausing proposals cannot keep the measured size above the threshold by itself.",
+      "discriminator": "Whether every component of the measured size (in-memory entries, follower-reported sizes, and the leader's own log size) can decrease without accepting new proposals, and whether committed-but-unapplied entries are bounded by application progress rather than by proposal intake.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_proposal_pause_gate",
+      "kind": "behavior",
+      "statement": "node.handleProposals drains the incoming proposal queue only when neither the raft rate limiter nor the LogDB busy signal is set: it passes paused into incomingProposals.get, and entryQueue.add rejects new entries while paused, so pausing stops both intake and queue growth. The rate-limiter state used for that decision changes only after ChangeTickThreashold (10) ticks have passed since the last accepted change, with gcTick (3) bounding how long a follower-reported size is considered current.",
+      "conditions": "Proposal path on a node whose InMemRateLimiter is enabled or whose LogDB is reporting busy.",
+      "source_ids": [
+        "node_handle_proposals_pause",
+        "rate_limiter_hysteresis",
+        "rate_limiter_constants"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@proposal_pause_cycle",
+      "question": "Does applying committed entries reduce the recorded in-memory size (im.rl.Decrease on appliedLogTo, plus Set on merge) without requiring new proposals, so a rate-limited node eventually accepts proposals again?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@proposal_pause_cycle",
+      "experiment_id": null,
+      "source_ids": [
+        "node_handle_proposals_pause",
+        "rate_limiter_hysteresis",
+        "rate_limiter_constants",
+        "inmemory_applied_decreases"
+      ],
+      "executions": {},
+      "conclusion": "unresolved",
+      "defect_claim": null,
+      "rationale": "Current state: the pause mechanism is established; whether it can hold indefinitely is not. handleProposals computes paused from the raft rate limiter and the LogDB busy signal and passes it to incomingProposals.get, and entryQueue.add refuses new entries while paused, so a paused node stops both draining and growing the queue (node.go:1206-1223; queue.go add). InMemRateLimiter.RateLimited accepts a new measurement only when at least ChangeTickThreashold ticks have elapsed since the last accepted change, and limitedByInMemSize ignores follower sizes older than gcTick and compares against 70% of the maximum while already limited (internal/server/rate.go:20-30, 155-193), so the gate has deliberate hysteresis. The partial evidence that the gate releases is that applying entries shrinks the in-memory log and is expected to Decrease the recorded size (internal/raft/inmemory.go:143-165), and application progress depends on committed entries reaching the state machine rather than on new proposals. What is not yet established is whether the applied-index path is the only driver of size reduction for the component that triggers the limit, whether follower-reported sizes can hold it up, and whether the LogDB busy signal has an independent release path. Until those are traced the account stays unresolved with no defect claim; the registered gap states the concrete next check.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "@ki_proposal_pause_gate",
+          "revision": 1,
+          "assertion": "Proposal intake is paused by the rate limiter or LogDB busy signal, and the rate limiter applies hysteresis before changing state."
+        }
+      ],
+      "counterevidence": [
+        "The limiter's hysteresis exists to avoid flapping and is paired with a follower-state gc window, so the sticky state may be intentional rather than a stall."
+      ],
+      "limitations": [
+        "Source reading only; the applied-index size accounting and the LogDB busy signal's release path have not been traced yet.",
+        "Does not quantify how long a paused node stays paused under a steady high-size workload."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

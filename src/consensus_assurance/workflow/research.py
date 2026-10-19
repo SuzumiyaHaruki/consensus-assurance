@@ -245,6 +245,8 @@ def execution_locator(check, fixed=None):
         'stdout':check.stdout, 'stderr':check.stderr}
     if fixed:
         value.update(fixed_experiment_locator(fixed))
+        value['measurement_sources'] = [value['harness'],
+            *(f'fixed-experiments/{fixed.id}/{name}' for name in fixed.basis.harness.files)]
     if selection := check.parameters.get('test_selection'):
         value['test_selection'] = {**selection, 'observed':selection['observed'][:20],
             'observed_omitted_count':max(0, len(selection['observed'])-20)}
@@ -318,6 +320,26 @@ def execution_feedback(state, root, fixed, check):
         events_omitted_count=0 if inline else len(events),
         parsing_error_count=len(observed['parsing_errors']), prerequisites=observed['prerequisites'])
     value.update(diagnostic_summary(observed))
+    if not inline:
+        indices = set()
+        for result in observed['comparisons']:
+            for key in ('evaluated_indices', 'missing_indices', 'outside_applicability_indices'):
+                indices.update(result[key])
+            for index, correlation in result['correlations'].items():
+                indices.add(int(index))
+                indices.update(correlation['alias_indices'].values())
+        shown, remaining = [], 6000
+        for index in sorted(indices):
+            event = {'event_index':index, 'observation':events[index]}
+            size = len(json.dumps(event, ensure_ascii=False))
+            if len(shown) < 8 and size <= remaining:
+                shown.append(event)
+                remaining -= size
+        value['comparison_events'] = shown
+        value['comparison_events_omitted_indices'] = sorted(indices - {e['event_index'] for e in shown})
+        value['comparison_event_selection'] = (
+            'Recorded comparison and correlated prerequisite events in receipt order; bounded preview, not complete coverage. '
+            'Measurement sources locate the code, not a field-to-expression mapping or simultaneous-sampling guarantee.')
     for comparison, result in zip(value['comparisons'], observed['comparisons'], strict=True):
         omitted = {} if inline else {k:len(result[k]) for k in ('correlations','diagnostics','limitations')}
         comparison['result'] = {k:v for k,v in result.items() if k not in omitted}
@@ -409,7 +431,53 @@ def interpretation_knowledge(state, prior, opinion):
     return list(references.values())
 
 
-def operation_summary(state, root):
+def repeated_submission(state, root, previous):
+    """Choose feedback from two fresh, processed turns; uncertainty keeps ordinary feedback."""
+    from .audit import Inputs, submission_files
+    from consensus_assurance.core.submissions import AuditSubmission
+    current = state.current_submission
+    if (previous is None or current.get('no_change') is not True
+            or len(state.checks) < 2 or len(state.agent_turns) < 2
+            or len(state.checks) != previous['check_count'] + 1
+            or state.usage.get('agent_calls') != previous['agent_calls'] + 1):
+        return False
+    prior = previous['submission']
+    if any(s.get('phase') != 'executed' or s.get('experiment_id') or s.get('execution_gap')
+           or s.get('rejected') for s in (prior, current)):
+        return False
+    pending = state.pending_action
+    checks = state.checks[-2:]
+    if (not pending or pending.kind != 'agent_turn' or pending.status != 'completed'
+            or pending.id == previous['action_id'] or checks[-1].pending_action_id != pending.id
+            or checks[0].pending_action_id != previous['action_id']
+            or prior.get('operation_id') == current.get('operation_id')):
+        return False
+    for check, turn, submission in zip(checks, state.agent_turns[-2:], (prior, current), strict=True):
+        if (check.action != 'agent_turn' or check.id != submission.get('operation_id')
+                or turn.get('check_id') != check.id or check.status.value != 'completed'
+                or not check.ended_at or check.parameters.get('agent_turn_completed') is not True
+                or check.parameters.get('agent_diagnostic') != {
+                    'message':'', 'transport_failure':False, 'session_unavailable':False}):
+            return False
+    tools = state.agent_turns[-1].get('tool_events')
+    if type(tools) is not int or tools != 0 or checks[-1].parameters.get('agent_tool_events') != tools:
+        return False
+    try:
+        archives = [Inputs(root / 'submissions' / check.id) for check in checks]
+        before, after = [archive.json('accepted.json') for archive in archives]
+        if before != after:
+            return False
+        submission = AuditSubmission.model_validate(after)
+        if submission.repeat_experiment_id is not None or submission.stop:
+            return False
+        # Identical JSON can reference changed files; use only the two retained inputs.
+        files = submission_files(submission)
+        return all(archives[0].read('inputs/' + name) == archives[1].read('inputs/' + name) for name in files)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def operation_summary(state, root, previous_turn=None):
     current = state.current_submission
     executed = bool(current.get('experiment_id') and current.get('phase') == 'executed' and not current.get('execution_gap'))
     summary = {k:current[k] for k in ('phase','operation_id','experiment_id','no_change','references','effects','execution_gap') if k in current}
@@ -535,12 +603,18 @@ def operation_summary(state, root):
         question['execution'] = execution_feedback(state, root, fixed, check)
     summary['necessary_gaps'] = necessary_gaps
     summary['reselection'] = reselection_view(state)
-    summary['next'] = (
-        'The unchanged submission is already retained; this call still consumed time and a model turn. '
-        if current.get('no_change') else '') + (
-        'Use current results, necessary gaps, source understanding and allocation to undertake useful investigation '
-        'or correction, reconsidering directions after a local answer. Follow audit-method.md; research.json provides '
-        'global navigation and receipt locators, and state.json retains full records and history.')
+    summary['next'] = ('The unchanged submission is retained. ' if current.get('no_change') else '') + (
+        'Choose concrete work from current evidence, gaps and source relationships. '
+        'Method: audit-method.md; navigation: research.json; full records and history: state.json.')
+    if repeated_submission(state, root, previous_turn):
+        summary['next'] = (
+            'This turn resubmitted the same retained content without changing research records or requesting target execution. '
+            'No tool actions were recorded in this turn, and no new target receipt or structured diagnostic intervened. '
+            'Retained content need not be resubmitted for preservation. Undertake concrete research to clarify an unresolved judgment, '
+            'in this question or another question or source relationship. Keep a still-valid conclusion; do not rewrite it merely to change text.')
+    if any(e.get('object') == 'experiments' and e.get('action') == 'unchanged' for e in current.get('effects', [])):
+        summary['next'] += (' The unchanged experiment definition was deduplicated, not rerun. '
+            'To execute saved inputs again, use repeat_experiment_id and explain the uncertainty in the existing rationale.')
     return summary
 
 

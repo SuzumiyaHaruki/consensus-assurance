@@ -1,0 +1,101 @@
+{
+  "rationale": "Fifty-seventh pass: check the durability side of client completion, which no earlier question covered. The engine applies updates in two passes around logdb.SaveRaftState, and the fast-apply pass runs before persistence, so the suspicion is that a client could observe an applied result for an entry that this node has not yet written. Reading the pass selector settles it: fast apply is disabled when the update carries a snapshot and when the last committed entry falls inside the range of entries being saved in that same round, so the pre-persistence pass only ever offers entries that a previous round already persisted, and an entry being saved now is offered only after SaveRaftState returns. Commit itself still requires quorum persistence, so completion is bounded by durability on a quorum rather than by local write ordering alone. The pass records the ordering and an explained negative.",
+  "sources": [
+    {
+      "id": "engine_process_steps_order",
+      "file": "engine.go",
+      "start_line": 1290,
+      "end_line": 1338,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_apply_snapshot_and_update",
+      "file": "engine.go",
+      "start_line": 1354,
+      "end_line": 1375,
+      "kind": "code_observation"
+    },
+    {
+      "id": "peer_set_fast_apply",
+      "file": "internal/raft/peer.go",
+      "start_line": 199,
+      "end_line": 226,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_apply_raft_updates",
+      "file": "node.go",
+      "start_line": 1077,
+      "end_line": 1079,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_process_raft_update",
+      "file": "node.go",
+      "start_line": 1081,
+      "end_line": 1096,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@fast_apply_durability",
+      "question": "Can the engine offer a committed entry to the replicated state machine before that same entry has been written to the local log, so that a client observes an applied result for data whose local persistence has not yet been acknowledged?",
+      "source_ids": [
+        "engine_process_steps_order",
+        "engine_apply_snapshot_and_update",
+        "peer_set_fast_apply",
+        "node_apply_raft_updates",
+        "node_process_raft_update"
+      ],
+      "hypothesis": "The pre-persistence apply pass is restricted to updates marked fast-apply, and that marking is cleared whenever the update installs a snapshot or when the last committed entry falls within the range of entries being saved in the same round, so entries persisted in the current round are only offered to the apply pipeline after the log write returns.",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_fast_apply_durability_bound",
+      "kind": "behavior",
+      "statement": "The engine handles each batch of node updates in a fixed order: it collects updates from stepNode, offers the fast-apply subset to the state machine pipeline, sends replicate messages and processes ready-to-read, dropped entries and dropped read indexes, calls logdb.SaveRaftState, handles saved snapshots, then offers the remaining updates to the apply pipeline before appending the entries to the local log and committing the update back to raft. Which pass an update belongs to is decided by setFastApply: the flag starts true, is cleared when the update carries a non-empty snapshot, and is cleared when the last committed entry index falls between the first and last entry being saved in the same update. Consequently an entry written in the current round is never offered to the apply pipeline before that round's log write returns, and the entries offered early are ones an earlier round already persisted.",
+      "conditions": "The engine processes a batch of node updates that may contain both committed entries to apply and entries to save, with or without an installed snapshot.",
+      "source_ids": [
+        "engine_process_steps_order",
+        "engine_apply_snapshot_and_update",
+        "peer_set_fast_apply",
+        "node_apply_raft_updates",
+        "node_process_raft_update"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@fast_apply_durability",
+      "source_ids": [
+        "engine_process_steps_order",
+        "engine_apply_snapshot_and_update",
+        "peer_set_fast_apply",
+        "node_apply_raft_updates",
+        "node_process_raft_update"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: the engine has no path that offers an entry to the state machine before that entry is durably written on the local node, and the early apply pass is limited to entries persisted in an earlier round. The ordering is explicit in the step loop: node.stepNode gathers updates, applySnapshotAndUpdate with fastApply=true processes only updates marked FastApply, replicate messages and the ready-to-read, dropped-entry and dropped-read-index handling follow, then logdb.SaveRaftState runs, then applySnapshotAndUpdate with fastApply=false processes the remaining updates and each node appends its entries to the local log and hands the commit back to raft (engine.go:1290-1338, 1354-1375). The selector that decides membership in the early pass is setFastApply: the flag starts true, a non-empty snapshot clears it, and a committed-entries tail that falls inside the saved range clears it (peer.go:199-226). So an entry that is being written in this round can only be applied in the second pass, after the write returned; an entry applied in the first pass was already written by an earlier round, and node.processRaftUpdate appends exactly the entries that still need writing before the update is committed back to raft (node.go:1077-1096). Durability of a completed client request therefore does not rest on this ordering alone: an entry is applied only once it is committed, and commit requires that a quorum of voting members stored it, so a completed proposal is recoverable from a surviving quorum even if the responding node crashes after replying. Two bounds worth keeping with the account: the apply pipeline is asynchronous, so the ordering above constrains when entries are offered to the state machine rather than when the user's Update returns, and the fast-apply optimisation does let a node apply entries whose local write happened in an earlier round while a later round is still writing, which is consistent with quorum durability but means local log state can trail the applied index during that window.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_fast_apply_durability_bound",
+          "revision": 1,
+          "assertion": "Entries saved in the current round reach the apply pipeline only after SaveRaftState returns; the early pass handles entries persisted earlier."
+        }
+      ],
+      "counterevidence": [
+        "The early apply pass does apply entries while the current round's log write has not happened yet, so on a crash the applied index may be ahead of the locally persisted log; recovery relies on quorum durability and on re-fetching from the leader rather than on local bytes matching the applied index.",
+        "Because apply is asynchronous, the loop order bounds the offering of entries, not the instant a user Update or a client completion is delivered."
+      ],
+      "limitations": [
+        "Source trace only: no engine run, log write or crash was executed for this question, and no receipt is cited.",
+        "The account does not trace the LogDB implementation's own fsync behaviour, so it establishes ordering relative to SaveRaftState rather than the durability guarantee inside the storage engine.",
+        "Recovery of a node whose applied index exceeds its persisted log after a crash is not exercised; the claim is limited to the ordering of application versus the write acknowledgement in the step loop."
+      ]
+    }
+  ]
+}

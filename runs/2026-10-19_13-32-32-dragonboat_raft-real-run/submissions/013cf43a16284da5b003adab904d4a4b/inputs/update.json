@@ -1,0 +1,97 @@
+{
+  "rationale": "Seventieth pass: close a small question on the apply path and enrich one existing entry. The state machine is fed committed entries in bounded batches, so a natural suspicion is that a cluster with more committed entries than one batch could leave the remainder unapplied once the batch is consumed. Reading the two ends of that path settles it: the node reports whether more committed entries remain, and the engine re-arms the cluster's step worker when that flag is set, so the next iteration collects the following batch. This pass adds the behavior entry for that re-arm, registers an explained negative for the starvation suspicion, and adds the newer witness-record receipt to the executions of the rebuild behavior entry so that entry cites both observations.",
+  "sources": [
+    {
+      "id": "engine_process_more_committed",
+      "file": "engine.go",
+      "start_line": 1348,
+      "end_line": 1352,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_push_entries",
+      "file": "node.go",
+      "start_line": 582,
+      "end_line": 588,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@committed_entry_rearm",
+      "question": "When a cluster has more committed entries than one apply batch carries, does anything keep the apply path moving so the remainder is eventually offered to the state machine, or can a consumed bounded batch leave the rest unapplied?",
+      "source_ids": [
+        "engine_process_more_committed",
+        "node_push_entries",
+        "engine_process_steps_order"
+      ],
+      "hypothesis": "The node reports whether more committed entries remain on the update it returns, and the engine re-arms the cluster's step worker when that flag is set, so the next iteration collects the following batch instead of waiting for an unrelated event.",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_committed_entry_rearm",
+      "kind": "behavior",
+      "statement": "Committed entries reach the state machine through a task pushed with the entries to apply and the pushed index set to the last entry of that batch; when the raft update for a cluster reports that more committed entries remain, the engine re-arms that cluster's step worker, so the next step iteration collects the following batch of committed entries rather than waiting for new raft activity. The apply path therefore drains a backlog over successive iterations instead of stalling on a consumed batch.",
+      "conditions": "A cluster has more committed entries than the batch handed to the apply path in one iteration, and the update built for that cluster reports that more committed entries remain.",
+      "source_ids": [
+        "engine_process_more_committed",
+        "node_push_entries",
+        "engine_process_steps_order"
+      ]
+    },
+    {
+      "id": "04a5314e97864beb941b6e229b2ea775-knowledge-0",
+      "kind": "behavior",
+      "statement": "node.notifyConfigChange computes both role flags from the replicated membership (isObserver from the Observers map, isWitness from the Witnesses map) and stores them in the node's atomic ClusterInfo. node.getClusterInfo rebuilds the value it returns from that record: it copies ClusterID, NodeID, IsObserver, ConfigChangeIndex and Nodes, recomputes IsLeader from the current raft peer and StateMachineType from the local state machine, and never assigns IsWitness; its no-record branch also leaves IsWitness false and sets Pending. Because node.getClusterInfo is the only producer of the elements of NodeHostInfo.ClusterInfoList, the public ClusterInfo.IsWitness returned by NodeHost.GetNodeHostInfo is false for every cluster, including a node whose stored record lists it as a witness.",
+      "conditions": "A node's cluster summary is read through node.getClusterInfo, reached from NodeHost.getClusterInfo and NodeHost.GetNodeHostInfo; the stored record was written by node.notifyConfigChange for a membership that lists the local node in Witnesses, or no record has been stored yet and the Pending branch applies.",
+      "source_ids": [
+        "node_notify_config_change",
+        "node_get_cluster_info",
+        "nodehost_cluster_info_type",
+        "nodehost_get_nodehost_info",
+        "nodehost_cluster_info_list"
+      ],
+      "executions": {
+        "df751474c61249939d500ad57df6586c": [
+          0,
+          1
+        ],
+        "128e306bc45e4348953c46c22c75f484": [
+          1,
+          2
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@committed_entry_rearm",
+      "source_ids": [
+        "engine_process_more_committed",
+        "node_push_entries",
+        "engine_process_steps_order"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a backlog of committed entries cannot be left half-applied by the bounded batching, because the update itself carries the signal that more work remains and the engine acts on it. The node side pushes the entries it was given as one task carrying those entries and records the last entry's index as the pushed index (node.go:582-588), so the batch boundary is explicit. The engine side reads the update's more-committed-entries flag after applying that batch and, when it is set, re-arms the cluster's step worker (engine.go:1348-1352), which is the same readiness mechanism the step loop uses to decide which clusters to visit next (engine.go:1290-1338). A cluster with a longer backlog is therefore revisited on the next iteration and the following batch is collected, rather than the remainder waiting for unrelated raft activity. Two bounds belong with the account: this is the engine's scheduling behaviour, so it says nothing about how quickly the state machine itself consumes a batch, and a state machine that blocks inside its own update routine holds the worker for that cluster regardless of the re-arm.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_committed_entry_rearm",
+          "revision": 1,
+          "assertion": "An update reporting more committed entries re-arms the step worker, so the backlog is drained over successive iterations."
+        }
+      ],
+      "counterevidence": [
+        "The re-arm depends on the update reporting that more committed entries remain; if that flag were not set while entries remained, the remainder would wait for other activity.",
+        "The signal only reschedules the cluster; a state machine whose update blocks delays the following batch no matter how often the worker is armed."
+      ],
+      "limitations": [
+        "Source trace only: no engine loop was run and no backlog was applied for this question.",
+        "The account covers the flag from the raft layer to the engine's readiness call; it does not measure how many entries a single batch carries in a running node.",
+        "On-disk state machines with asynchronous apply are outside this trace, since they may complete entries through a different readiness path."
+      ]
+    }
+  ]
+}

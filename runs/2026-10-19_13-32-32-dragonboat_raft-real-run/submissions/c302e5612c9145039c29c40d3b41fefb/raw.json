@@ -1,0 +1,131 @@
+{
+  "rationale": "Fifty-fifth pass: follow the completion side of a proposal that was actually accepted. A proposal reaches raft only after the node layer records it, so the interesting question is what terminates it when its entry is superseded after a leadership change instead of being reported as dropped. Reading the drop-reporting paths, the update plumbing and the pending-proposal bookkeeping settles the boundary: explicit drop notifications exist only where raft refuses the message outright, truncation of accepted entries produces no notification, and the deadline path releases the pending entry with a timeout. That is a documented terminal outcome rather than a lost duty, so the pass records the behaviour and an explained negative with the exact paths that do and do not notify.",
+  "sources": [
+    {
+      "id": "raft_report_dropped_proposal",
+      "file": "internal/raft/raft.go",
+      "start_line": 2052,
+      "end_line": 2061,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_follower_propose_drop",
+      "file": "internal/raft/raft.go",
+      "start_line": 1905,
+      "end_line": 1912,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_candidate_propose_drop",
+      "file": "internal/raft/raft.go",
+      "start_line": 1993,
+      "end_line": 1997,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_leader_propose_transfer_drop",
+      "file": "internal/raft/raft.go",
+      "start_line": 1615,
+      "end_line": 1625,
+      "kind": "code_observation"
+    },
+    {
+      "id": "peer_update_dropped_entries",
+      "file": "internal/raft/peer.go",
+      "start_line": 352,
+      "end_line": 355,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_process_dropped_entries",
+      "file": "node.go",
+      "start_line": 1027,
+      "end_line": 1036,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_proposal_dropped",
+      "file": "request.go",
+      "start_line": 1015,
+      "end_line": 1020,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_proposal_tick_gc",
+      "file": "request.go",
+      "start_line": 1031,
+      "end_line": 1045,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@proposal_truncation_outcome",
+      "question": "When a leader has accepted a proposal into its log and those entries are superseded after a leadership change rather than refused outright, does the client receive a dropped notification, and what releases the pending proposal bookkeeping in the node layer?",
+      "source_ids": [
+        "raft_report_dropped_proposal",
+        "raft_follower_propose_drop",
+        "raft_candidate_propose_drop",
+        "raft_leader_propose_transfer_drop",
+        "peer_update_dropped_entries",
+        "node_process_dropped_entries",
+        "request_pending_proposal_dropped",
+        "request_pending_proposal_tick_gc"
+      ],
+      "hypothesis": "Dropped notifications are produced only when raft refuses a proposal message before appending it, so an entry that was appended and later overwritten after a leadership change yields no notification and is terminated by the caller deadline as a timeout, with the pending bookkeeping released by the same deadline path.",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_proposal_drop_notification_scope",
+      "kind": "behavior",
+      "statement": "A dropped-proposal notification reaches the client only when raft refuses the proposal message before appending it: the leader refuses while a leadership transfer is in progress, a follower with no known leader drops and reports the proposal, and a candidate drops and reports it. reportDroppedProposal appends the entries to the update's dropped-entry list, and node.processDroppedEntries turns each into a dropped result on the matching pending proposal (or on the pending config change for a config entry). An entry that was appended by a leader and is later overwritten after a leadership change is not on that list, so no dropped result is produced for it; the pending proposal stays registered until its deadline passes, and the pending-proposal tick and gc passes then report the timeout that releases the entry.",
+      "conditions": "A client proposal is accepted by node.requestProposal and reaches raft; the entry is either refused before being appended (transfer in progress, follower without a leader, candidate) or appended and later superseded by another leader's log.",
+      "source_ids": [
+        "raft_report_dropped_proposal",
+        "raft_follower_propose_drop",
+        "raft_candidate_propose_drop",
+        "raft_leader_propose_transfer_drop",
+        "peer_update_dropped_entries",
+        "node_process_dropped_entries",
+        "request_pending_proposal_dropped",
+        "request_pending_proposal_tick_gc"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@proposal_truncation_outcome",
+      "source_ids": [
+        "raft_report_dropped_proposal",
+        "raft_follower_propose_drop",
+        "raft_candidate_propose_drop",
+        "raft_leader_propose_transfer_drop",
+        "peer_update_dropped_entries",
+        "node_process_dropped_entries",
+        "request_pending_proposal_dropped",
+        "request_pending_proposal_tick_gc"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a proposal whose entry was appended and then superseded after a leadership change ends with the caller's deadline outcome rather than a dropped notification, and the node layer keeps no orphaned bookkeeping for it. The notifying paths are narrow and enumerated: raft refuses a proposal message while a leadership transfer is in progress (raft.go:1615-1625), on a follower with no known leader (raft.go:1905-1912) and on a candidate (raft.go:1993-1997); each calls reportDroppedProposal, which appends the entries to r.droppedEntries (raft.go:2052-2061), Peer.update copies them into the update's dropped-entry list (peer.go:352-355), and node.processDroppedEntries converts each into pendingProposals.dropped or pendingConfigChange.dropped through the entry key (node.go:1027-1036; request.go:1015-1020). A leader that accepted entries has already handed them to raft; if a later leader overwrites those indexes, raft has no message of its own to report, and no other path adds the entry to the dropped list, so the client's request state is not completed by a drop. It is still completed: the proposal shard's tick marks the request expired once the caller deadline passes and its gc delivers RequestTimeout and clears the pending entry (request.go:1031-1045), which is the same terminal path recorded for an expired proposal with commit notification enabled. Two consequences bound the account rather than undermine it. A client cannot distinguish 'my entry was overwritten' from 'my entry is still in flight but slow' while waiting, so retry decisions rest on the timeout, which the captured proposal documentation already treats as a normal outcome that permits a retry. Config changes share the notifying path: a refused config-change entry is reported through pendingConfigChange.dropped, so the membership request does not wait for its deadline on those paths.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_proposal_drop_notification_scope",
+          "revision": 1,
+          "assertion": "Drop notifications cover only proposals raft refuses before appending; overwritten entries are released by the deadline path instead."
+        }
+      ],
+      "counterevidence": [
+        "The absence of a notification for overwritten entries means a client that relies on prompt failure detection must set a deadline; the captured proposal contract already describes timeout as a legal outcome, so this is a design consequence rather than a violated duty.",
+        "Config-change entries do receive a dropped result when raft refuses them, so the gap is specific to proposals that were already appended rather than to all client requests."
+      ],
+      "limitations": [
+        "Source trace only: no live proposal, leadership change or log truncation was executed for this question, and no receipt is cited.",
+        "The account does not establish whether a client can observe the overwrite through any other endpoint, such as the cluster membership or applied index, before its deadline.",
+        "Session handling of a retried proposal after a timeout is covered by other recorded knowledge and is not re-examined here."
+      ]
+    }
+  ]
+}

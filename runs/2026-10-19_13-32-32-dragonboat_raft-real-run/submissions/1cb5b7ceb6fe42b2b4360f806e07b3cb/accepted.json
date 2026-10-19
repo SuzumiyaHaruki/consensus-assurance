@@ -1,0 +1,110 @@
+{
+  "rationale": "Sixtieth pass: follow recovery after a refused snapshot install, which is the resynchronization counterpart of the snapshot-transfer work recorded earlier. A replica in the snapshot progress state is not sendable, so a rejected install could plausibly strand it: the leader would neither send entries nor take another snapshot. Reading the reject handler and the remote state machine settles it: a rejection clears the snapshot index, moves the replica to wait with next set from its match, and the very next heartbeat response moves wait to retry and triggers a replicate message for the missing range, so no timer or extra snapshot is needed. The pass records the behaviour and an explained negative.",
+  "sources": [
+    {
+      "id": "raft_handle_snapshot_status",
+      "file": "internal/raft/raft.go",
+      "start_line": 1792,
+      "end_line": 1810,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_handle_heartbeat_resp",
+      "file": "internal/raft/raft.go",
+      "start_line": 1728,
+      "end_line": 1740,
+      "kind": "code_observation"
+    },
+    {
+      "id": "remote_become_wait",
+      "file": "internal/raft/remote.go",
+      "start_line": 104,
+      "end_line": 129,
+      "kind": "code_observation"
+    },
+    {
+      "id": "remote_wait_to_retry_update",
+      "file": "internal/raft/remote.go",
+      "start_line": 143,
+      "end_line": 156,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@snapshot_reject_recovery",
+      "question": "When a follower rejects an installed snapshot, does the leader leave the replica in the non-sendable snapshot state with no path back to replication, or does a normal event restore it so the missing entries are eventually sent?",
+      "source_ids": [
+        "raft_handle_snapshot_status",
+        "raft_handle_heartbeat_resp",
+        "remote_become_wait",
+        "remote_wait_to_retry_update"
+      ],
+      "hypothesis": "The rejection clears the pending snapshot index and moves the replica to the wait state with next derived from its match, and the next heartbeat response both moves wait to retry and sends a replicate message covering the missing range, so recovery needs no timer, new snapshot or extra client action.",
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_snapshot_reject_recovery",
+      "kind": "behavior",
+      "statement": "A snapshot status for a replica that is not in the snapshot progress state is ignored. For a replica in that state with a zero Hint, a rejection clears the pending snapshot index and moves the replica through becomeRetry into the wait state, with next recomputed from the replica's match, while a success moves it to wait with the previous next preserved. Wait is not a sendable state, but the next heartbeat response always calls waitToRetry and, when the replica's match is below the leader's last index, sends it a replicate message, and a non-rejected response that advances match also moves wait to retry. A refused snapshot install therefore returns the replica to ordinary replication on the following heartbeat rather than leaving it stranded or requiring another snapshot.",
+      "conditions": "Leader tracks a follower, observer or witness in the snapshot progress state and receives a snapshot status with a zero hint, rejected or accepted; heartbeats continue to be exchanged.",
+      "source_ids": [
+        "raft_handle_snapshot_status",
+        "raft_handle_heartbeat_resp",
+        "remote_become_wait",
+        "remote_wait_to_retry_update"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@snapshot_reject_recovery",
+      "experiment_id": null,
+      "source_ids": [
+        "raft_handle_snapshot_status",
+        "raft_handle_heartbeat_resp",
+        "remote_become_wait",
+        "remote_wait_to_retry_update"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: a rejected snapshot install cannot strand a replica, because the leader returns it to ordinary replication on the next heartbeat. The reject path is explicit: the snapshot status handler ignores messages from replicas that are not in the snapshot state, and for a status with a zero hint it clears the pending snapshot index, then calls becomeWait for both the accepted and rejected cases (raft.go:1792-1810). becomeWait clears the snapshot acknowledgement, calls becomeRetry - which, for a replica still in the snapshot state, sets next to the larger of match+1 and snapshotIndex+1, and the snapshot index has just been cleared, so next becomes match+1 - and then moves the state to wait (remote.go:104-129). Wait is a paused state, so the leader sends no replication while it lasts, but the state is not terminal: the heartbeat response handler calls waitToRetry unconditionally and then sends a replicate message whenever the replica's match is below the leader's last index (raft.go:1728-1740), and tryUpdate itself calls waitToRetry whenever an accepted response advances match (remote.go:143-156). Because heartbeats are sent on the leader's heartbeat tick to every voting member and to observers, the window in which the replica is paused is bounded by the next heartbeat response, after which it is retried from match+1 and can receive either entries or, if the gap is beyond the log, another snapshot. Two bounds belong with this account: the recovery assumes the follower keeps answering heartbeats, and the wait window is therefore measured in heartbeats rather than in a count of ticks the leader can guarantee; and if the leader is quiesced, the earlier recorded quiesce behaviour applies, since any processed message exits quiesce and restarts the tick-driven work.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "@ki_snapshot_reject_recovery",
+          "revision": 1,
+          "assertion": "A rejected snapshot moves the replica to wait and the next heartbeat response resumes replication from its match."
+        }
+      ],
+      "counterevidence": [
+        "A rejection does not immediately resume replication: while the replica sits in the wait state it is paused, so repair waits at least until the next heartbeat response rather than happening within the same handling of the status message.",
+        "The path assumes heartbeats continue to be exchanged; if the follower stops answering, recovery depends on the leader's own liveness mechanisms rather than on this state transition."
+      ],
+      "limitations": [
+        "Source trace only: the reject path was not executed, and no receipt is cited.",
+        "The account covers the leader-side progress state and does not trace what the follower does internally after rejecting an install, such as retrying the transfer or waiting for the next install message.",
+        "Streaming snapshots that fail part-way, rather than reporting a status with a zero hint, are handled by the chunk and transport paths recorded elsewhere and are not re-traced here."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

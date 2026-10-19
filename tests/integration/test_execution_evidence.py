@@ -297,12 +297,14 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
         from consensus_assurance.workflow.research import operation_summary, current_view
         summary=operation_summary(engine.state,engine.root)
         assert not summary['questions']
+        assert 'experiment_id' not in summary and 'repeat_experiment_id' in summary['next']
         assert 'uncited_executions' not in summary
         result=current_view(engine.state,engine.root)['experiments'][0]['results'][0]
         assert result['experiment_id']==state['experiments'][0]['id']
         assert not result['interpretation_citations']['current']
         sub, files = duplicate(state)
-        sub['experiment']['prefix'] += ' A changed assumption.'
+        # The identical JSON now references changed executable bytes, so it needs capacity.
+        files['check.py'] += "print('changed measurement input')\n"
         return sub, files
 
     def source_answer(state):
@@ -340,12 +342,12 @@ marker.write_text('observed one invocation')
         saved['files'] = retained_files(engine.root, 'fixed-experiments', 'logs')
         sub, _ = repeat_existing(state)
         return sub, {'check.py': "raise AssertionError('Repeat must not read the current draft')\n"}
-    engine, repo = engine_for(tmp_path, [start, opinion, repeat, opinion, stop])
+    engine, repo = engine_for(tmp_path, [start, opinion, repeat, opinion, repeat, opinion, stop])
     state = engine.start(repo)
     checks = [c for c in state.checks if c.experiment_id]
-    assert state.usage['experiments'] == 2 and len(state.experiments) == 1
+    assert state.usage['experiments'] == 3 and len(state.experiments) == 1
     assert state.experiments[0].model_dump(mode='json') == saved['fixed']
-    assert len(checks) == len({c.id for c in checks}) == len({c.cwd for c in checks}) == 2
+    assert len(checks) == len({c.id for c in checks}) == len({c.cwd for c in checks}) == 3
     assert all(c.status == ExecutionStatus.COMPLETED and c.exit_code == 0 for c in checks)
     assert all(path.read_bytes() == raw for path, raw in saved['files'].items())
     results = [assessment(state, engine.root, state.experiments[0], c) for c in checks]

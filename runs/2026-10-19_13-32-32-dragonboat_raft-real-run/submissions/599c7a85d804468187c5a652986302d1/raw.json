@@ -1,0 +1,129 @@
+{
+  "rationale": "Fourth pass. This turn resolved the snapshot-save question left open last turn by tracing the enclosing control flow. The snapshot worker executes node.save and panics on a hard error; no recover wraps that worker (the recover at engine.go:1035 is limited to step workers under error injection, and nodehost.go:343 wraps NodeHost.Start only). Successful completion, including the (0, nil) returns for soft errors, abort-class errors and the already-up-to-date case, runs node.saveDone, which records a completed save task so the apply worker's processStatusTransition can clear the saving flag. The suspicion that a hard save failure leaves the node alive but permanently unable to snapshot is therefore refuted within the traced scope, and the registered gap is answered as resolved. The conclusion is explanatory, not a defect finding.",
+  "sources": [
+    {
+      "id": "engine_ssworker_handle",
+      "file": "engine.go",
+      "start_line": 275,
+      "end_line": 305,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_apply_loop_status",
+      "file": "engine.go",
+      "start_line": 1200,
+      "end_line": 1212,
+      "kind": "code_observation"
+    },
+    {
+      "id": "engine_error_injection_recover",
+      "file": "engine.go",
+      "start_line": 1029,
+      "end_line": 1044,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_save_done",
+      "file": "node.go",
+      "start_line": 846,
+      "end_line": 850,
+      "kind": "code_observation"
+    },
+    {
+      "id": "snapshotstate_notify_status",
+      "file": "snapshotstate.go",
+      "start_line": 185,
+      "end_line": 211,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+      "disposition": "explained"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_hard_save_error_panics_worker",
+      "kind": "behavior",
+      "statement": "A non-soft error returned by node.save terminates the process from the snapshot worker: ssWorker.save calls panic(err) when node.save returns an error, and neither workerMain nor handle recovers. The only recover in engine.go is installed around step workers when error injection is enabled, and nodehost.go's recover wraps NodeHost.Start, so a snapshot save error raised later at runtime is not converted into a node-level or cluster-level error.",
+      "conditions": "A snapshot save task is executed by the snapshot worker pool, and node.doSave returns an error other than the abort-class and soft errors it handles internally.",
+      "source_ids": [
+        "engine_ssworker_handle",
+        "engine_error_injection_recover",
+        "node_save_and_dosave"
+      ]
+    },
+    {
+      "ref": "@ki_save_completion_clears_flag",
+      "kind": "behavior",
+      "statement": "Every non-fatal save outcome completes normally: after node.save returns without error, saveDone records a completed save task through notifySnapshotStatus(save=true) and signals applyReady; the apply worker's processStatusTransition then calls processSaveStatus, which clears the saving flag. This covers the (0, nil) returns for soft errors, abort-class errors (already reported as aborted), and the already-up-to-date early return (reported as rejected through pendingSnapshot.apply).",
+      "conditions": "node.doSave returns without a hard error, including its silent (0, nil) paths; the apply worker keeps running for that cluster.",
+      "source_ids": [
+        "engine_ssworker_handle",
+        "node_save_done",
+        "snapshotstate_notify_status",
+        "node_process_save_status",
+        "engine_apply_loop_status",
+        "request_pending_snapshot_apply"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+      "source_ids": [
+        "node_save_snapshot_required",
+        "node_save_and_dosave",
+        "node_process_save_status",
+        "request_pending_snapshot_apply",
+        "engine_ssworker_handle",
+        "engine_apply_loop_status",
+        "engine_error_injection_recover",
+        "node_save_done",
+        "snapshotstate_notify_status"
+      ],
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: the suspicion is refuted within the traced scope. A periodic snapshot save that fails with a hard error does not leave a live node whose snapshot duty is silently suppressed, and the non-fatal outcomes do not either. Basis: (1) saveSnapshotRequired advances ss.reqSnapshotIndex only when it actually requests a snapshot and suppresses further periodic requests while n.isBusySnapshotting() reports busy (node.go:651-667); (2) the save task is executed by ssWorker.save, which calls panic(err) on any error from node.save and has no recover in workerMain or handle (engine.go:275-305); the recover at engine.go:1029-1044 is installed only for step workers when error injection is enabled, and nodehost.go's recover covers NodeHost.Start, so a runtime save error ends the process instead of leaving the save flag set with a node that keeps applying entries; (3) on every non-fatal path, node.save returns nil and node.saveDone stores a completed save task via notifySnapshotStatus(save=true) and signals applyReady (node.go:846-850; snapshotstate.go:185-211), and the apply worker calls processStatusTransition before handleTask, so processSaveStatus clears the saving flag and later periodic snapshots remain enabled (engine.go:1200-1212; node.go:1451-1467); (4) the (0, nil) paths inside doSave are the soft-error case, the abort case that already reported aborted through pendingSnapshot.apply, and the already-up-to-date early return, in which node.save reports the pending user request as rejected (node.go:693-760; request.go:648-668). Counterevidence considered: a hard error bypasses the pendingSnapshot report for that request, but since the process panics at the same point, no client-visible state is retained in a live node, so it cannot strand later snapshot requests. Limitations: this is a source argument, not an execution; it does not cover a state machine whose Save blocks indefinitely (no error at all), nor storage faults inside snapshotter.commit that return errors handled elsewhere, nor whether process termination is an acceptable recovery policy versus returning an error to the caller. The claim is limited to the periodic-save control flow in this snapshot.",
+      "answers": {
+        "9bf8b80283c042d1b383e211c89c1701-gap-1": {
+          "explanation": "No such state survives. A non-soft error makes node.save return an error, and ssWorker.save panics on that error with no recover around workerMain/handle (engine.go:275-305; the engine recover at 1029-1044 is restricted to step workers under error injection and nodehost.go's recover wraps only NodeHost.Start), so the node does not continue with the saving flag set or an advanced requested index. On the non-fatal paths the flag is cleared: node.save returns nil, saveDone records a completed save task (node.go:846-850; snapshotstate.go:185-211), and the apply worker's processStatusTransition/processSaveStatus clears saving before executing the next task (engine.go:1200-1212; node.go:1451-1467). n.ss.reqSnapshotIndex does not need an explicit reset for recovery because saveSnapshotRequired compares applied against SnapshotEntries plus the requested index, so the next request occurs once applied advances by a further SnapshotEntries window; only restart resets it, and restart also resets the process that would have carried a stale session. The gap is resolved as a refutation of the stranding hypothesis.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+          "revision": 1,
+          "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+        },
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+          "revision": 1,
+          "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+        },
+        {
+          "entry_id": "@ki_hard_save_error_panics_worker",
+          "revision": 1,
+          "assertion": "A hard save error panics the snapshot worker, ending the process rather than stranding in-process snapshot state."
+        },
+        {
+          "entry_id": "@ki_save_completion_clears_flag",
+          "revision": 1,
+          "assertion": "Non-fatal save outcomes complete through saveDone and processSaveStatus, clearing the saving flag."
+        }
+      ],
+      "counterevidence": [
+        "A hard save error bypasses the pendingSnapshot.apply report for that request, so a user-requested snapshot never receives a rejected/aborted result on that path; the process panic is what prevents this from becoming a live stuck request."
+      ],
+      "limitations": [
+        "Source argument only; no CheckRun receipt.",
+        "Does not cover a Save implementation that blocks without returning, or storage faults handled outside node.doSave.",
+        "Does not judge whether terminating the process on a save error is an acceptable policy; only that it prevents a silent in-process stranding of the periodic snapshot duty.",
+        "Does not quantify how much log growth can accumulate between the requested-index advance and the next eligible periodic snapshot."
+      ]
+    }
+  ]
+}

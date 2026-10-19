@@ -1,0 +1,175 @@
+{
+  "rationale": "Eightieth pass: take up the restart path that earlier snapshot accounts left as a limitation. A restart is the other place where the node's pushed index is not advanced entry by entry, and it is where the raft log's own applied marker is rebuilt from disk rather than from a live update. The trace follows replayLog, the logdb range query, the entry log's initialisation of committed and processed, the raft state-loading gate, the uninitialized-node recovery task and setInitialStatus, and then the on-disk state machine's own opened index. The finding is a coupling rather than a symptom: both sides of the frontier are anchored on the same snapshot index, so the first replayed committed entry is exactly the pushed index plus one, and an on-disk state machine that reopens ahead of the snapshot has the replayed entries up to its own index converted to applied placeholders instead of being executed again. Recording this as a Behavior and a source-only, defect-refuting account, with the desynchronisation and non-batched paths stated as limits rather than assumed away.",
+  "sources": [
+    {
+      "id": "node_replay_log",
+      "file": "node.go",
+      "start_line": 623,
+      "end_line": 650,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logdb_read_raft_state_range",
+      "file": "internal/logdb/db.go",
+      "start_line": 147,
+      "end_line": 177,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logreader_apply_snapshot_range",
+      "file": "internal/logdb/logreader.go",
+      "start_line": 207,
+      "end_line": 232,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_entry_log_init",
+      "file": "internal/raft/logentry.go",
+      "start_line": 86,
+      "end_line": 95,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_load_state_gate",
+      "file": "internal/raft/raft.go",
+      "start_line": 437,
+      "end_line": 445,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_uninitialized_recovery",
+      "file": "node.go",
+      "start_line": 1414,
+      "end_line": 1426,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_set_initial_status",
+      "file": "node.go",
+      "start_line": 1318,
+      "end_line": 1326,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm_apply_snapshot_meta",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 369,
+      "end_line": 375,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm_open_on_disk_index",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 408,
+      "end_line": 425,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm_handle_batch_skip",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 921,
+      "end_line": 961,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@restart_frontier_anchor",
+      "question": "When a node process restarts, do the raft log's replayed applied marker and the node's own pushed index end up anchored on the same snapshot, so that the first replayed committed entry is exactly one past that anchor, and are entries that an on-disk state machine already holds above the snapshot executed again instead of being treated as already applied?",
+      "source_ids": [
+        "node_replay_log",
+        "logdb_read_raft_state_range",
+        "logreader_apply_snapshot_range",
+        "raft_entry_log_init",
+        "raft_load_state_gate",
+        "node_uninitialized_recovery",
+        "node_set_initial_status",
+        "rsm_apply_snapshot_meta",
+        "rsm_open_on_disk_index",
+        "rsm_handle_batch_skip",
+        "rsm_handle_entry_dispatch",
+        "rsm_recover_out_of_date_guard"
+      ],
+      "hypothesis": "replayLog records the most recent stored snapshot in the log reader before the raft peer is built, and the logdb range is reported relative to that snapshot index, so the entry log's committed and processed indexes both start at the snapshot index. The node's pushed index is set later from the index the single initial recovery returns, which is the same snapshot index, so replay begins at the pushed index plus one. For an on-disk state machine the opened data index is tracked separately and replayed entries at or below it are applied as placeholders rather than executed.",
+      "discriminator": "Whether any restart path can make the recovery index differ from the log reader's snapshot marker, or let an on-disk state machine execute an entry it already contains; a snapshot store and logdb that disagree, and the non-batched apply path for configuration and session entries, are the two places where either could go wrong.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_restart_frontier_anchor",
+      "kind": "behavior",
+      "statement": "Node startup builds the raft peer from the log reader only after node.replayLog has recorded the most recent snapshot from the snapshot store in that reader and copied the persisted raft state and the logdb's entry range into it. The logdb range query reports the snapshot index itself as the first index when no entry exists past it, so the entry log's committed and processed indexes both start at the snapshot index, and the raft state-loading gate then requires the persisted commit to fall between that index and the last stored entry. The node's own frontier is set separately: the uninitialized node runs one recovery task with Initial set, and setInitialStatus stores the index that recovery returned as both the node's snapshot index and its pushed index. Because the recovery loads the same stored snapshot the log reader was anchored on and reports its index, the first committed entry the raft log hands out is pushed index plus one. For an on-disk state machine the index its own data was opened at is recorded as the initial and current on-disk index rather than as the snapshot index, entries at or below the opened index are converted to applied placeholders in the batched apply path and to no-op entries in the single-entry path, and configuration-change entries are not filtered by that check and are re-applied to the in-memory membership.",
+      "conditions": "A node process starts or restarts for an existing cluster, with or without a snapshot in the snapshot store, over a native in-memory or an on-disk state machine, and the logdb holds a persisted raft state consistent with the stored entries.",
+      "source_ids": [
+        "node_replay_log",
+        "logdb_read_raft_state_range",
+        "logreader_apply_snapshot_range",
+        "raft_entry_log_init",
+        "raft_load_state_gate",
+        "node_uninitialized_recovery",
+        "node_set_initial_status",
+        "rsm_apply_snapshot_meta",
+        "rsm_open_on_disk_index",
+        "rsm_handle_batch_skip",
+        "rsm_handle_entry_dispatch",
+        "rsm_recover_out_of_date_guard"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@restart_frontier_anchor",
+      "experiment_id": null,
+      "source_ids": [
+        "node_replay_log",
+        "logdb_read_raft_state_range",
+        "logreader_apply_snapshot_range",
+        "raft_entry_log_init",
+        "raft_load_state_gate",
+        "node_uninitialized_recovery",
+        "node_set_initial_status",
+        "rsm_apply_snapshot_meta",
+        "rsm_open_on_disk_index",
+        "rsm_handle_batch_skip",
+        "rsm_handle_entry_dispatch",
+        "rsm_recover_out_of_date_guard",
+        "node_entries_to_apply",
+        "node_push_entries"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim for this question: a restart re-derives one anchor from the stored snapshot on both sides of the frontier, so the replayed entries neither begin above the pushed index nor re-execute state an on-disk state machine already holds, and the suspicion of a startup gap or a duplicate application is refuted for the traced paths. Basis, in startup order. (1) replayLog reads the most recent snapshot from the snapshot store, records it in the log reader, and asks the logdb for its raft state and entry range from that snapshot index; when nothing is stored past the snapshot the range query reports the snapshot index itself with a zero entry count, so the reader's range stays anchored at the snapshot it was just given. (2) The raft peer is launched from that reader, and the entry log initialises its committed and processed indexes to one less than the reader's first index, which is the snapshot marker itself; a node with no snapshot and no entries therefore starts at zero, and a node with a snapshot at index S starts both markers at S. (3) The state-loading gate then admits the persisted raft state only when its commit falls between the initial committed value and the last stored entry, so a stored commit below the snapshot or beyond the stored log is refused at launch rather than turned into a silent skip. (4) The node is not initialised until one recovery task with Initial set has completed, and that task loads the same stored snapshot through the state machine's recovery, whose out-of-date check compares against the state machine's applied index rather than against any replayed entry; the recovery then records the snapshot's membership and applied index and reports the snapshot index. (5) setInitialStatus stores that reported index as both the node's snapshot index and its pushed index, which is the same S the raft log's processed marker was initialised to, so the first committed entry the raft log can offer is S+1 and entriesToApply's contiguity check is satisfied rather than tripped. (6) For an on-disk state machine the opened data index is kept as a separate on-disk index, so a machine that reopens ahead of the snapshot keeps its own data: the batched apply path converts entries at or below the opened index into applied placeholders without calling the user update, the single-entry path turns them into no-ops, and subsequent entries are executed normally. The two mechanisms therefore agree on where replay starts, and the placeholder rule covers the region where the state machine is ahead of the snapshot but the raft log is not.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The anchor agreement depends on both sides reading the same stored snapshot: replayLog records it before the peer is built, and the recovery reads it again after the node is created. They are the same entry only because an uninitialised node cannot take a snapshot, which is enforced by the snapshot status path rather than by the anchor code itself.",
+        "The on-disk placeholder rule is not uniform across entry kinds: configuration-change entries are handled before the on-disk index check and are therefore re-applied to the in-memory membership even when they fall at or below the opened index, so the idempotence of that region rests on the membership object accepting the same change twice, not on the placeholder rule.",
+        "The state-loading gate panics instead of recovering when the persisted commit is outside the stored range, so a logdb whose state and entries disagree stops the node at startup; this is an integrity refusal, not a repair path, and it is outside the normal restart history the claim covers.",
+        "The front branch of the range query returns the snapshot index with an entry count of zero when the snapshot index equals the logdb's maximum index, which means the whole replay in that case is empty; the claim about a first replayed entry applies only when entries beyond the snapshot exist."
+      ],
+      "limitations": [
+        "Source reading only: no restart was executed in this pass, so the coupling and the placeholder rule are not measured.",
+        "The trace assumes a snapshot store and a logdb that agree about the most recent snapshot; a store whose files were removed or replaced while logdb metadata survives is not traced, and the reader's own out-of-date result would end node creation instead of advancing the frontier.",
+        "Only the batched apply path is traced in detail for the on-disk placeholder rule; the single-entry path is covered through its dispatch check and the no-op branch, and session-registration and session-unregistration entries at or below the opened index are not traced here.",
+        "On-disk data restoration beyond the opened index, the offload/reload path that reopens a state machine in a running node, and the witness and observer variants of startup are outside this trace."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

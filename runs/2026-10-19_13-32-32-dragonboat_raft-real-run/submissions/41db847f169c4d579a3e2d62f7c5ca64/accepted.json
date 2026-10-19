@@ -1,0 +1,79 @@
+{
+  "rationale": "Eighty-fourth pass: sharpen the consequence that the reopened snapshot question now turns on. The previous account said a recovered panic would leave the apply loop skipping the cluster; reading the status checks shows that this holds without qualification only for a state machine that does not support concurrent snapshotting, where processSaveStatus reports the cluster busy on every pass while the saving flag is set and no completion exists. For a concurrent state machine the same function lets the apply loop continue, and the busy-snapshotting predicate additionally requires the task channel to be busy, so a stuck saving flag suppresses further snapshot saves through the save handler's own busy check rather than through the apply loop. Recording that distinction keeps the reopened question's stated consequence proportionate and gives the eventual launcher resolution the right comparison points.",
+  "sources": [
+    {
+      "id": "node_busy_snapshotting",
+      "file": "node.go",
+      "start_line": 1258,
+      "end_line": 1264,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "9bf8b80283c042d1b383e211c89c1701-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "node_save_snapshot_required",
+        "node_save_and_dosave",
+        "node_process_save_status",
+        "node_busy_snapshotting",
+        "request_pending_snapshot_apply",
+        "engine_ssworker_handle",
+        "engine_apply_loop_status",
+        "engine_error_injection_recover",
+        "engine_worker_launch",
+        "node_save_done",
+        "snapshotstate_notify_status"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "defect_claim": null,
+      "rationale": "Current claim: the control flow around a periodic snapshot save is traced and the non-fatal outcomes are settled, but the conclusion that a hard save error cannot strand the snapshot duty depends on a link the captured target does not contain, so the claim stays conditional and the defect judgment stays withdrawn. Basis: (1) saveSnapshotRequired advances the requested snapshot index only when it actually requests a snapshot, and it suppresses further periodic requests while the node reports itself busy snapshotting, so the requested index alone cannot suppress later attempts. (2) On every non-fatal path node.save returns nil, node.saveDone stores a completed save task through notifySnapshotStatus and signals the apply worker, and the apply worker's processStatusTransition calls processSaveStatus, which clears the saving flag before handling the next task; this covers the soft-error and abort-class returns and does not depend on any launcher. (3) A hard error is different: ssWorker.save calls panic(err) and neither the worker body nor anything else in the target recovers it, so the panic leaves the worker function. What happens next is decided by the launcher the syncutil stopper supplies from the pinned goutils dependency, which is not part of the captured snapshot. (4) The two outcomes differ in consequence. If the launcher lets the panic end the process, the node never runs with a stale saving flag. If it recovers the panic and only that goroutine dies, the process keeps running with the saving flag set and no completion ever recorded, and the effect then depends on the state machine: for a state machine without concurrent snapshot support, processSaveStatus reports the cluster busy on every pass because the completion is missing and concurrentSnapshot is false, so the apply loop skips that cluster's tasks and application stops; for a state machine with concurrent snapshot support the same function lets the apply loop continue, and the residue is narrower but still real, because every later save task is refused by the save handler while the saving flag is set and the periodic snapshot duty is lost even though application continues. (5) The busy-snapshotting predicate does not rescue either case: it combines the saving or recovering flag with a busy state machine task channel, so once the worker is gone the task channel is empty and the predicate stops reporting busy, but that only means a new save would be requested and then refused, not that the flag clears. (6) The evidence does not choose between the terminating and recovering outcomes, so the earlier refutation stays withdrawn and the question remains open pending the launcher behavior.",
+      "answers": {
+        "9bf8b80283c042d1b383e211c89c1701-gap-1": {
+          "explanation": "Reopened. The earlier resolution rested on the process ending at the save panic. The panic itself and the absence of any recover inside the target are established, but the launcher that decides whether the process ends is dependency code outside the captured snapshot. Under the terminating outcome the node cannot continue with the saving flag set. Under a recovering launcher the node keeps running with the flag set and no completion: a state machine without concurrent snapshot support then has its apply loop skip the cluster on every pass, while a concurrent one keeps applying but has every later save refused, so the snapshot duty is lost either way. The gap is unresolved until the launcher behavior is established.",
+          "resolved": false
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-0",
+          "revision": 1,
+          "assertion": "Hard save errors are returned to the caller of node.save, while abort-class and soft errors are handled inside doSave."
+        },
+        {
+          "entry_id": "9bf8b80283c042d1b383e211c89c1701-knowledge-1",
+          "revision": 1,
+          "assertion": "The periodic snapshot trigger depends on SnapshotEntries, the snapshot index, the requested index and the busy-snapshotting check."
+        },
+        {
+          "entry_id": "599c7a85d804468187c5a652986302d1-knowledge-1",
+          "revision": 1,
+          "assertion": "Non-fatal save outcomes complete through saveDone and processSaveStatus, clearing the saving flag without depending on the launcher."
+        }
+      ],
+      "counterevidence": [
+        "A hard save error bypasses the pendingSnapshot.apply report for that request, so a user-requested snapshot never receives a rejected or aborted result on that path; only the process ending prevents that from becoming a live stuck request.",
+        "The saving flag is cleared only by the apply worker when it sees a completion, so a recovered panic would leave the flag set on a node that is still serving requests; the earlier refutation would then become the suspected liveness defect rather than merely an error-reporting gap.",
+        "The severity is not uniform: a state machine without concurrent snapshot support stops applying entries entirely once the flag is stuck, while a concurrent one keeps applying and only loses its snapshot duty, so a launcher-related finding would need that qualification rather than a single node-wide stall claim.",
+        "The busy-snapshotting predicate combines a flag with a busy task channel, so a worker that died leaves the predicate false even though the saving flag is set; that is why the periodic trigger is not the mechanism that blocks recovery, and why the residue lands in the apply status check and the save handler's busy refusal instead.",
+        "The non-fatal paths are independent of the launcher and remain settled: the soft-error, abort-class and already-up-to-date returns all reach saveDone and clear the flag."
+      ],
+      "limitations": [
+        "The deciding link, the goroutine launcher in the pinned goutils dependency, is outside the captured snapshot and is not used as target evidence.",
+        "No execution of a failing save was performed in this pass; the account remains a source argument.",
+        "Does not cover a Save implementation that blocks without returning, or storage faults handled outside node.doSave.",
+        "Does not quantify how much log growth could accumulate before a later eligible periodic snapshot under either concurrency variant if the node did keep running with the flag set."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

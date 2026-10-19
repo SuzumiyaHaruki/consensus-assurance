@@ -153,6 +153,7 @@ def test_preflight_is_readonly_and_predicts_execution(tmp_path, monkeypatch):
 
 
 def test_source_only_answer_and_exact_noop_keep_cost_without_revisions(tmp_path):
+    prompts = []
     def answer(state):
         q = state['investigations'][0]['id']
         return {'rationale': 'Existing sources explain this local branch',
@@ -163,9 +164,25 @@ def test_source_only_answer_and_exact_noop_keep_cost_without_revisions(tmp_path)
     def finish(state):
         assert state['current_submission']['no_change']
         assert len(state['interpretations']) == 1 and state['investigations'][0]['version'] == 2
+        actual = json.loads(prompts[-1].split('Current work (controller records):\n', 1)[1])
+        ordinary = operation_summary(e.state, e.root)
+        assert actual['next'] != ordinary['next']
+        assert actual['operation_id'] == ordinary['operation_id']
+        assert actual['necessary_gaps'] == ordinary['necessary_gaps']
+        assert actual['reselection']['questions'] == ordinary['reselection']['questions']
         return stop(state)
 
     e, repo = engine_for(tmp_path, [first, answer, answer, finish])
+    investigate = e.agent.investigate
+    def completed_turn(runner, prompt, *args):
+        prompts.append(prompt)
+        check, session, result = investigate(runner, prompt, *args)
+        check.pending_action_id = runner.active_action_id
+        check.ended_at = '2026-01-01T00:00:01+00:00'
+        check.parameters.update(agent_turn_completed=bool(result), agent_tool_events=0,
+            agent_diagnostic=dict(message='', transport_failure=False, session_unavailable=False))
+        return check, session, result
+    e.agent.investigate = completed_turn
     state = e.start(repo)
     assert state.usage == {'agent_calls': 4} and not state.experiments
     assert len(list((e.root / 'submissions').glob('*/raw.json'))) == 3

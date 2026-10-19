@@ -1,0 +1,94 @@
+{
+  "rationale": "Fifty-second pass: interpret the witness-reporting experiment. The receipt executed the focused harness and produced the discriminating pair the question named: a stored witness record came back with reported_is_witness=false even though the same node's config says it is a witness, while an otherwise identical observer record's role flag came back unchanged. That isolates the omission to the witness flag in node.getClusterInfo, whose rebuilt value is the only source of the elements in NodeHostInfo.ClusterInfoList. This pass records the explanation as a client-contract defect with a narrow, stated impact, and stores the rebuild behavior and the observed values as durable knowledge.",
+  "knowledge": [
+    {
+      "ref": "@ki_cluster_info_witness_omission",
+      "kind": "behavior",
+      "statement": "node.notifyConfigChange computes both role flags from the replicated membership (isObserver from the Observers map, isWitness from the Witnesses map) and stores them in the node's atomic ClusterInfo. node.getClusterInfo rebuilds the value it returns from that record: it copies ClusterID, NodeID, IsObserver, ConfigChangeIndex and Nodes, recomputes IsLeader from the current raft peer and StateMachineType from the local state machine, and never assigns IsWitness; its no-record branch also leaves IsWitness false and sets Pending. Because node.getClusterInfo is the only producer of the elements of NodeHostInfo.ClusterInfoList, the public ClusterInfo.IsWitness returned by NodeHost.GetNodeHostInfo is false for every cluster, including a node whose stored record lists it as a witness.",
+      "conditions": "A node's cluster summary is read through node.getClusterInfo, reached from NodeHost.getClusterInfo and NodeHost.GetNodeHostInfo; the stored record was written by node.notifyConfigChange for a membership that lists the local node in Witnesses, or no record has been stored yet and the Pending branch applies.",
+      "source_ids": [
+        "node_notify_config_change",
+        "node_get_cluster_info",
+        "nodehost_cluster_info_type",
+        "nodehost_get_nodehost_info",
+        "nodehost_cluster_info_list"
+      ],
+      "executions": {
+        "df751474c61249939d500ad57df6586c": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "ref": "@ki_cluster_info_witness_observed",
+      "kind": "fact",
+      "statement": "In the fixed object-level harness, a node whose config.IsWitness is true and whose stored cluster record has IsWitness true reported reported_is_witness=false, reported_is_observer=false, config_index 7, node_count 3 and pending=false; a control node whose stored record instead has IsObserver true reported reported_is_observer=true with config_index 9 and node_count 2; and a witness-configured node with no stored record reported pending=true, config_index 0 and reported_is_witness=false.",
+      "conditions": "Single execution of TestAssuranceClusterInfoWitnessFlag in the root dragonboat package, calling node.getClusterInfo on nodes that hold a native in-memory state machine and a nil raft peer; the stored ClusterInfo records are supplied directly rather than written by node.notifyConfigChange, and no nodehost, transport, membership or client invocation participates.",
+      "source_ids": [
+        "node_get_cluster_info",
+        "node_notify_config_change"
+      ],
+      "executions": {
+        "df751474c61249939d500ad57df6586c": [
+          0,
+          1,
+          2
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "03eb05eb157543c6b294ebf5194c17b1-question-0",
+      "experiment_id": "03eb05eb157543c6b294ebf5194c17b1-experiment",
+      "source_ids": [
+        "node_notify_config_change",
+        "node_get_cluster_info",
+        "nodehost_cluster_info_type",
+        "nodehost_get_nodehost_info",
+        "nodehost_cluster_info_list",
+        "nodehost_sync_get_cluster_membership"
+      ],
+      "executions": {
+        "df751474c61249939d500ad57df6586c": [
+          0,
+          1,
+          2
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "Current claim: the per-cluster summary returned to a client never identifies a witness node as a witness, and the omission is specific to that flag rather than to the rebuild as a whole. The retained receipt df751474c61249939d500ad57df6586c executed TestAssuranceClusterInfoWitnessFlag and passed with three parsed events. Event 0 'witness_record' stored a record with IsWitness true on a node whose config.IsWitness is also true and recorded reported_is_witness=false while config_index 7, node_count 3 and pending=false came through unchanged. Event 1 'observer_record' came from an otherwise identical stored record with IsObserver true and recorded reported_is_observer=true, so the rebuild does carry the other role flag. Event 2 'pending_record' on a witness-configured node with no stored record recorded pending=true and reported_is_witness=false. The source accounts for exactly this pattern: node.notifyConfigChange derives both flags from the membership's Observers and Witnesses maps and stores them (node.go:1496-1518), while node.getClusterInfo copies ClusterID, NodeID, IsObserver, ConfigChangeIndex and Nodes, recomputes IsLeader and StateMachineType, and assigns no IsWitness (node.go:1520-1540). node.getClusterInfo is the only producer of NodeHostInfo.ClusterInfoList (nodehost.go:1835-1847), which NodeHost.GetNodeHostInfo returns to callers (nodehost.go:1418-1437), and no other code writes ClusterInfo.IsWitness. The field is documented as indicating whether this is a witness node without actual log (nodehost.go:163-188), so for a witness node the returned value contradicts the documented meaning of the field it fills: a management caller enumerating clusters through GetNodeHostInfo cannot tell a witness from a full voting member. Scope of the defect: it is a reporting defect on a public client contract, not a consensus defect. Witness behaviour itself is decided from config.IsWitness and from the raft and membership witness sets, so proposal, read and config-change rejection on a witness, quorum accounting and commit decisions are unaffected, and nothing in the captured tree consumes ClusterInfo.IsWitness. The harm is confined to callers that rely on the summary field: tooling that enumerates ClusterInfoList to count data-bearing replicas would count a witness as a data copy, which matters because the captured witness contract states that a witness replicates no entries and holds no state machine. The information is not lost from the API, since NodeHost.SyncGetClusterMembership returns a Membership whose Witnesses map names the witnesses (nodehost.go:633-668), so a caller consulting membership can still identify the witness role.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_cluster_info_witness_omission",
+          "revision": 1,
+          "assertion": "node.getClusterInfo rebuilds the caller-visible summary without copying IsWitness, so the public field is false on both branches."
+        },
+        {
+          "entry_id": "@ki_cluster_info_witness_observed",
+          "revision": 1,
+          "assertion": "A stored witness record read back as reported_is_witness=false while an observer record kept its role flag."
+        }
+      ],
+      "counterevidence": [
+        "NodeHost.SyncGetClusterMembership returns the public Membership type with a Witnesses map, so callers that consult membership rather than the summary can still identify which nodes are witnesses.",
+        "No captured consumer reads ClusterInfo.IsWitness, and internal witness enforcement uses config.IsWitness and the raft membership, so the misreported field changes no decision, request result or stored data.",
+        "The pending branch fills its other fields correctly (cluster ID, node ID, state machine type, pending flag), so the observation is not evidence of a generally broken rebuild."
+      ],
+      "limitations": [
+        "The stored cluster record is supplied directly by the harness; that node.notifyConfigChange writes IsWitness true for a witness membership is established by reading node.go:1496-1518, not by executing the producer against a real membership.",
+        "NodeHost.GetNodeHostInfo is not invoked end to end; the path from it through NodeHost.getClusterInfo to node.getClusterInfo is traced in source only, and no live witness NodeHost cluster participates.",
+        "The harness node has a nil raft peer, so the leader flag is always false and any interaction between witness reporting and leadership reporting is not exercised.",
+        "One execution, one schedule; the function under test is a pure rebuild of stored state, so repetition is not expected to change the observation."
+      ]
+    }
+  ],
+  "investigations": [
+    {
+      "id": "03eb05eb157543c6b294ebf5194c17b1-question-0",
+      "disposition": "explained"
+    }
+  ]
+}

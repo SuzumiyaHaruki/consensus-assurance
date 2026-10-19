@@ -1,0 +1,133 @@
+{
+  "rationale": "Eighty-first pass: examine the durability ordering behind a granted vote, the one decision in this target whose loss to a crash could let a node vote twice in the same term. The trace follows the vote handler, the state that records the vote, the outgoing message buffer, the engine's fixed pass order around the raft state write, and the routing rule that decides which message kinds leave before that write. The finding is protective: a vote grant only changes raft state and appends a response to the buffer, the engine persists the raft state before sending any message that is not a free-order replicate or ping, and the persisted state written with the update carries the term and vote. Recording this as a Behavior and a source-only, defect-refuting account, with the storage layer's own durability contract and the cache short-circuit kept as limits rather than assumed.",
+  "sources": [
+    {
+      "id": "raft_vote_grant",
+      "file": "internal/raft/raft.go",
+      "start_line": 1543,
+      "end_line": 1563,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_raft_state",
+      "file": "internal/raft/raft.go",
+      "start_line": 429,
+      "end_line": 435,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_message_buffer",
+      "file": "internal/raft/raft.go",
+      "start_line": 663,
+      "end_line": 667,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_message_routing",
+      "file": "node.go",
+      "start_line": 969,
+      "end_line": 1004,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logdb_save_raft_state",
+      "file": "internal/logdb/db.go",
+      "start_line": 179,
+      "end_line": 200,
+      "kind": "code_observation"
+    },
+    {
+      "id": "logdb_save_state_cache",
+      "file": "internal/logdb/db.go",
+      "start_line": 299,
+      "end_line": 320,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@vote_durability_before_response",
+      "question": "When a node grants its vote in a term, is the resulting term-and-vote state persisted before the vote response can leave the node, so that a crash cannot let the same node grant a different vote in the same term, and which outgoing message kinds bypass that ordering?",
+      "source_ids": [
+        "raft_vote_grant",
+        "raft_raft_state",
+        "raft_message_buffer",
+        "node_message_routing",
+        "logdb_save_raft_state",
+        "engine_process_steps_order",
+        "node_process_raft_update"
+      ],
+      "hypothesis": "Granting a vote only sets the raft vote field and appends a response to the outgoing message buffer; nothing is sent from the raft layer directly. The engine writes the raft state for the whole batch of updates before it calls the node's message-sending step, and the only message kinds sent earlier are replicate and ping messages. The update carries the raft state whenever term, vote or commit changed, so the granted vote is in the write that precedes the response.",
+      "discriminator": "Whether a granted vote can produce an outbound message that is routed before the raft state write, or a state write that omits the vote; the free-order replicate path and the state cache short-circuit are the two places where either could fail.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_vote_durability_ordering",
+      "kind": "behavior",
+      "statement": "handleNodeRequestVote decides a vote from the vote-freedom and log-up-to-date predicates, and on a grant it records the candidate in the raft vote field and clears the election tick; in both cases it only appends a RequestVoteResp to the raft message buffer, because the raft send helper appends to that buffer rather than transmitting. The raft state that the update reports is the triple of term, vote and commit, and the peer includes it in an update whenever it differs from the state recorded at the last commit. The engine collects the updates, offers the fast-apply subset, sends only free-order messages - replicate and ping - and processes ready-to-read, dropped entries and dropped indexes, then writes the raft state of every update in the batch in one logdb write, and only afterwards calls the node's raft-update step, which is where every other message, the vote response included, is handed to the transport. The logdb state write skips an empty state and a state the write-batch cache already holds, and otherwise puts the marshalled term, vote and commit into the same batch as the entries before committing it.",
+      "conditions": "A node in follower, candidate, observer or witness state receives a vote request, and the engine is processing the batch of raft updates that contains the resulting response.",
+      "source_ids": [
+        "raft_vote_grant",
+        "raft_raft_state",
+        "raft_message_buffer",
+        "node_message_routing",
+        "logdb_save_raft_state",
+        "logdb_save_state_cache",
+        "engine_process_steps_order",
+        "node_process_raft_update"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@vote_durability_before_response",
+      "experiment_id": null,
+      "source_ids": [
+        "raft_vote_grant",
+        "raft_raft_state",
+        "raft_message_buffer",
+        "node_message_routing",
+        "logdb_save_raft_state",
+        "logdb_save_state_cache",
+        "engine_process_steps_order",
+        "node_process_raft_update",
+        "raft_load_state_gate"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim for this question: a granted vote is persisted before its response leaves the node, so a crash in that window cannot leave the node free to grant a different vote in the same term, and the suspicion of a vote-durability gap is refuted for the traced paths. Basis, in the order the response travels. (1) The vote handler makes its decision and, on a grant, records the candidate in the raft vote field; whether it grants or rejects, it only appends a response to the raft message buffer, because the raft send helper appends and never transmits. So the vote is decided, and its response exists, entirely in raft memory at the end of the step. (2) The engine's batch order puts the raft state write ahead of every non-free-order message: it collects updates, offers the fast-apply subset, sends free-order messages and processes ready-to-read and dropped work, writes the raft state of all updates in one logdb write batch, and only then calls each node's raft-update step, which sends the remaining messages through the transport. A vote response is not a replicate or ping, so it cannot take the earlier path. (3) The state written at that point is the raft state of the same update batch, and it is included whenever it differs from the state recorded at the last commit; granting a vote changes the vote field (and possibly the term), so the update carries it and the logdb puts the marshalled term, vote and commit into the write batch next to the entries. (4) The write batch is committed as a unit before returning, so the ordering that the transport observes is: state write returns, then the response is handed over. (5) On a restart the persisted state is loaded back through the state-loading gate, which restores term and vote alongside the commit index, so the recovered node continues to see the vote it granted. (6) The free-order exception is deliberate and narrow: replicate and ping messages carry no decision of the node's own that a lost write could contradict, and sending them before the write is what lets a leader's replication reach followers without waiting for its own disk. The durable decision itself - the vote - is never in that class.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The guarantee is conditional on the logdb write returning only after the batch is durable; the target requires the write to succeed and treats an error as fatal, but the fsync contract is the storage layer's, not the engine's, so the ordering shown here is necessary and not by itself sufficient for durability across a power loss.",
+        "The state write is short-circuited when the write-batch cache already holds the same state, so the guarantee rests on that cache being updated only for states that were actually committed; a cache updated before commit would collapse the ordering for a repeated state.",
+        "Free-order replicate messages do leave before the raft state write, so a crash in that window can leave a follower holding entries that the sender never persisted; this is the documented section 10.2.1 pattern rather than a vote issue, but it means the pass order is not uniformly write-first.",
+        "A rejection response is sent under the same ordering even though it changes nothing that needs durability, so the ordering protects the grant case only when the grant actually changed the state; an unchanged state produces no new state write."
+      ],
+      "limitations": [
+        "Source reading only: no crash or restart was executed against a vote in this pass, so the ordering is established from the call structure rather than measured.",
+        "The logdb implementation's durability behaviour, its write-batch commit path and the state cache's update point are used as preconditions and are not traced here.",
+        "The transport is assumed to hand a message to a peer only when the node calls it; asynchronous transport queues that could reorder or drop messages are outside this trace.",
+        "Joint configurations, witness vote responses and the interaction of a vote grant with a concurrent configuration change are not part of this account."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -1,0 +1,280 @@
+{
+  "rationale": "First substantive pass on the captured dragonboat snapshot. The turn traced one concrete pending duty across the decision/authority axes: a ReadIndex request that is outstanding inside the raft layer when the leader loses authority (check-quorum step-down or any state transition). Sources establish the admission rule (no committed entry in the current term -> dropped), the quorum confirmation path (heartbeat responses keyed by SystemCtx, leader counted implicitly), the fact that reset() installs a fresh readIndex and therefore discards registered contexts with no DroppedReadIndexes notification, that a deposed leader cannot process heartbeat responses (no follower HeartbeatResp handler, term check), and that the node layer terminates never-indexed batches as RequestTimeout from the per-request deadline path driven by normal event-loop iterations. No execution was run this turn; the account is source-only and the remaining open point (remote requester whose ctx is confirmed but whose ReadIndexResp/ReadyToRead is never emitted because the leader reset first) is registered as an investigation discriminator and an unresolved gap.",
+  "sources": [
+    {
+      "id": "raft_leader_readindex",
+      "file": "internal/raft/raft.go",
+      "start_line": 1662,
+      "end_line": 1696,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_heartbeat_resp",
+      "file": "internal/raft/raft.go",
+      "start_line": 1728,
+      "end_line": 1741,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_readindex_confirm",
+      "file": "internal/raft/raft.go",
+      "start_line": 1771,
+      "end_line": 1790,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_checkquorum_stepdown",
+      "file": "internal/raft/raft.go",
+      "start_line": 1608,
+      "end_line": 1615,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_reset_replaces_readindex",
+      "file": "internal/raft/raft.go",
+      "start_line": 1003,
+      "end_line": 1025,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_candidate_readindex_dropped",
+      "file": "internal/raft/raft.go",
+      "start_line": 1998,
+      "end_line": 2012,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_report_dropped_readindex",
+      "file": "internal/raft/raft.go",
+      "start_line": 2064,
+      "end_line": 2078,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_follower_handler_map",
+      "file": "internal/raft/raft.go",
+      "start_line": 2116,
+      "end_line": 2129,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_term_check",
+      "file": "internal/raft/raft.go",
+      "start_line": 1430,
+      "end_line": 1478,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_readindex_confirm_core",
+      "file": "internal/raft/readindex.go",
+      "start_line": 30,
+      "end_line": 116,
+      "kind": "code_observation"
+    },
+    {
+      "id": "peer_handle_response_filter",
+      "file": "internal/raft/peer.go",
+      "start_line": 185,
+      "end_line": 196,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_read_admission",
+      "file": "node.go",
+      "start_line": 414,
+      "end_line": 426,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_handle_events",
+      "file": "node.go",
+      "start_line": 1132,
+      "end_line": 1166,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_tick",
+      "file": "node.go",
+      "start_line": 1478,
+      "end_line": 1492,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_dropped_readindexes",
+      "file": "node.go",
+      "start_line": 1021,
+      "end_line": 1026,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_pending_readindex_applied_gc",
+      "file": "request.go",
+      "start_line": 908,
+      "end_line": 954,
+      "kind": "code_observation"
+    },
+    {
+      "id": "request_dropped_timeout",
+      "file": "request.go",
+      "start_line": 403,
+      "end_line": 414,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@readindex_authority_loss",
+      "question": "When a leader loses authority (check-quorum step-down or another raft state transition) while a ReadIndex request is registered in the raft readIndex queue, does the request retain a legal terminal outcome in the node layer, and can a stale heartbeat confirmation from the deposed leader wrongly complete it?",
+      "source_ids": [
+        "raft_leader_readindex",
+        "raft_heartbeat_resp",
+        "raft_readindex_confirm",
+        "raft_checkquorum_stepdown",
+        "raft_reset_replaces_readindex",
+        "raft_follower_handler_map",
+        "raft_term_check",
+        "raft_readindex_confirm_core",
+        "peer_handle_response_filter",
+        "node_read_admission",
+        "node_handle_events",
+        "node_tick",
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout"
+      ],
+      "hypothesis": "reset() discards registered read contexts without emitting DroppedReadIndexes, so a request registered before the step-down can only be terminated by the node-layer deadline as RequestTimeout; a deposed leader cannot complete the request from stale heartbeat responses because follower state has no HeartbeatResp handler and lower-term messages are dropped.",
+      "discriminator": "Whether a remote requester's ReadIndexResp (or leader-local ReadyToRead) can fail to be emitted when confirmation and reset race in the same event batch, so the batch stays unindexed until its deadline, and whether any node-layer observation shows a terminal result other than RequestTimeout in that window.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@ki_readindex_admission",
+      "kind": "behavior",
+      "statement": "handleLeaderReadIndex rejects a ReadIndex request before registration when the leader has no committed entry at its current term: it appends the request's SystemCtx to droppedReadIndexes through reportDroppedReadIndex and returns without calling readIndex.addRequest; only a single-node quorum path bypasses the check and answers locally.",
+      "conditions": "Node is in leader state, the voting quorum is larger than one, and the request arrives before any entry of the leader's current term has been committed.",
+      "source_ids": [
+        "raft_leader_readindex",
+        "raft_report_dropped_readindex",
+        "node_dropped_readindexes"
+      ]
+    },
+    {
+      "ref": "@ki_readindex_quorum_confirm",
+      "kind": "behavior",
+      "statement": "A registered read context is completed only when the leader has collected quorum-1 matching heartbeat responses; the leader's own participation is implicit (len(confirmed)+1 is compared with the current quorum), and completing a context also releases every earlier queued context with the later, larger index before sending ReadIndexResp or adding ReadyToRead.",
+      "conditions": "Multi-node voting quorum; heartbeats carrying the same nonzero SystemCtx; heartbeat responses reaching handleReadIndexLeaderConfirmation through an entry in remotes, observers or witnesses.",
+      "source_ids": [
+        "raft_leader_readindex",
+        "raft_heartbeat_resp",
+        "raft_readindex_confirm",
+        "raft_readindex_confirm_core"
+      ]
+    },
+    {
+      "ref": "@ki_reset_discards_readindex",
+      "kind": "behavior",
+      "statement": "Every raft state transition (becomeFollower, becomeFollowerKE, becomeObserver, becomeWitness, becomeCandidate, becomeLeader, including the check-quorum step-down) calls reset(), which replaces r.readIndex with a new empty instance; contexts registered in the previous instance disappear and no DroppedReadIndexes entry is produced by this path, because droppedReadIndexes is appended only by reportDroppedProposal/reportDroppedReadIndex rejection paths.",
+      "conditions": "A ReadIndex request was registered by the leader, and before its quorum confirmation the node performs any state transition or loses quorum under CheckQuorum.",
+      "source_ids": [
+        "raft_reset_replaces_readindex",
+        "raft_checkquorum_stepdown",
+        "raft_report_dropped_readindex",
+        "raft_readindex_confirm_core"
+      ]
+    },
+    {
+      "ref": "@ki_deposed_leader_no_confirm",
+      "kind": "behavior",
+      "statement": "After a node leaves leader state, heartbeat responses cannot confirm a read context: the follower handler map has no HeartbeatResp entry, so defaultHandle performs no action, and onMessageTermNotMatched drops messages whose term is below the local term (sending only a NoOP hint back when the leader-message/CheckQuorum corner case applies).",
+      "conditions": "Leader has stepped down to follower/candidate/observer state, and a HeartbeatResp carrying a read context arrives afterwards with term equal to or lower than the node's term.",
+      "source_ids": [
+        "raft_follower_handler_map",
+        "raft_term_check",
+        "raft_checkquorum_stepdown"
+      ]
+    },
+    {
+      "ref": "@ki_fact_readindex_timeout_completion",
+      "kind": "fact",
+      "statement": "A ReadIndex request whose SystemCtx was registered but never confirmed or indexed receives no explicit dropped/rejected result from the raft layer and is terminated as RequestTimeout by the node layer: pendingReadIndex.applied and pendingReadIndex.gc mark requests whose deadline has passed, and applied is driven by ordinary event-loop iterations that include LocalTick batches, with the SystemCtx High value bounding batch retention.",
+      "conditions": "The caller supplied a nonzero read-index timeout; the node's event loop continues to process messages (LocalTick included, also when quiesced); no later ready-to-read index for the same context arrives.",
+      "source_ids": [
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout",
+        "node_handle_events",
+        "node_tick",
+        "raft_reset_replaces_readindex"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@readindex_authority_loss",
+      "question": "If the leader confirms a context in the same event batch in which it resets (step-down), is the ReadIndexResp for a remote requester guaranteed to be emitted from the pre-reset batch, or can the requester be left with an unindexed batch that only its deadline terminates?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@readindex_authority_loss",
+      "source_ids": [
+        "raft_leader_readindex",
+        "raft_heartbeat_resp",
+        "raft_readindex_confirm",
+        "raft_checkquorum_stepdown",
+        "raft_reset_replaces_readindex",
+        "raft_candidate_readindex_dropped",
+        "raft_report_dropped_readindex",
+        "raft_follower_handler_map",
+        "raft_term_check",
+        "raft_readindex_confirm_core",
+        "peer_handle_response_filter",
+        "node_read_admission",
+        "node_handle_events",
+        "node_tick",
+        "node_dropped_readindexes",
+        "request_pending_readindex_applied_gc",
+        "request_dropped_timeout"
+      ],
+      "conclusion": "explained",
+      "defect_claim": null,
+      "rationale": "Current conclusion: a ReadIndex request outstanding when the leader loses authority keeps a legal, bounded terminal path, and a deposed leader cannot complete it from stale confirmations, although the terminal result is RequestTimeout rather than an explicit dropped result. Basis: (1) the leader only registers a read context after it has a committed entry at its current term (internal/raft/raft.go:1662-1696), otherwise it reports the context in droppedReadIndexes and node.processDroppedReadIndexes forwards that to pendingReadIndex.dropped (node.go:1021-1026); (2) registration is followed immediately by heartbeats carrying that context, and confirmation needs quorum-1 matching responses plus the leader's implicit count, at which point earlier contexts are released with the later index and either a local ReadyToRead is added or a ReadIndexResp is sent (raft.go:1728-1741, 1771-1790; readindex.go:30-116); (3) every state transition, including the CheckQuorum step-down at raft.go:1608-1615, runs reset() which installs a fresh readIndex (raft.go:1003-1025), so registered contexts are discarded without any DroppedReadIndexes entry; (4) after the step-down the node cannot confirm them from heartbeat responses, because follower state has no HeartbeatResp handler (raft.go:2116-2129) and lower-term messages are dropped (raft.go:1430-1478), and Peer.Handle additionally ignores responses from unknown peers (peer.go:185-196); (5) consequently the node-layer batch keeps index 0 and is terminated by pendingReadIndex.applied/gc as RequestTimeout once the caller-supplied deadline passes, which is reached from ordinary event-loop iterations because LocalTick messages make handleEvents report an event and call pendingReadIndexes.applied (node.go:1132-1166, 1478-1492; request.go:908-954, 403-414). Counterevidence considered: handleCandidateReadIndex reports the same context twice (raft.go:1998-2012 plus reportDroppedReadIndex), but pendingReadIndex.dropped deletes the batch on the first delivery, so the duplicate result is a no-op rather than a double notification; and handleFollowerReadIndexResp does set the leader id and add a ready-to-read, but only for a context the leader confirmed before the transition, so it does not resurrect authority for a discarded context. Limitations: this account is source-only for this revision and rests on the node event loop being driven while the request is pending; it does not measure how long the timeout path takes, does not claim the timeout code is the most useful client-visible result, and does not cover the same-batch confirmation/reset race named in the registered gap.",
+      "knowledge": [
+        {
+          "entry_id": "@ki_readindex_admission",
+          "revision": 1,
+          "assertion": "Leader rejects ReadIndex without a committed current-term entry and reports the context as dropped."
+        },
+        {
+          "entry_id": "@ki_readindex_quorum_confirm",
+          "revision": 1,
+          "assertion": "Quorum-1 heartbeat confirmations plus the leader complete a context and release earlier contexts with the later index."
+        },
+        {
+          "entry_id": "@ki_reset_discards_readindex",
+          "revision": 1,
+          "assertion": "reset() replaces the readIndex instance and discards registered contexts without a dropped notification."
+        },
+        {
+          "entry_id": "@ki_deposed_leader_no_confirm",
+          "revision": 1,
+          "assertion": "A node that left leader state has no HeartbeatResp handler, so stale confirmations cannot complete a read context."
+        },
+        {
+          "entry_id": "@ki_fact_readindex_timeout_completion",
+          "revision": 1,
+          "assertion": "Never-indexed read batches are terminated as RequestTimeout by the node-layer deadline path driven by event-loop iterations."
+        }
+      ],
+      "counterevidence": [
+        "handleCandidateReadIndex appends the same SystemCtx twice (explicit append after reportDroppedReadIndex), but the second pendingReadIndex.dropped call finds no batch and is a no-op, so this does not create a double client notification.",
+        "handleFollowerReadIndexResp sets the leader id and adds a ready-to-read from a ReadIndexResp (raft.go:1955-1963), which is a legitimate completion only for a context the leader confirmed while it still held authority."
+      ],
+      "limitations": [
+        "Source-only account for this revision; no CheckRun receipt backs it.",
+        "Assumes the node event loop keeps processing LocalTick messages while the read request is pending; a stalled engine or stopped node is outside the stated conditions.",
+        "Does not quantify how late the timeout-based completion is relative to the confirmation-based path, nor whether client-visible RequestTimeout should be replaced by a dropped result.",
+        "Same-batch confirmation/reset ordering remains open as the registered gap."
+      ]
+    }
+  ]
+}

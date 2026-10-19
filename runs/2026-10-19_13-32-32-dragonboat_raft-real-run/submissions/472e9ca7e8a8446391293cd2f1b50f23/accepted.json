@@ -1,0 +1,114 @@
+{
+  "rationale": "Twenty-second pass: open a bounded-liveness question at the intersection of quiesce and snapshot progress. Sources show that a quiesced node advances only its election tick, so the leader's periodic work (heartbeat generation, check quorum, and the pending snapshot ack timeout) does not run while quiesced, whereas snapshot acks themselves arrive as ordinary messages. The question is whether an in-flight chunked snapshot can therefore wait indefinitely for a resend decision when the follower stops acknowledging and nothing else wakes the cluster. The behavior is recorded and the question is left open with a concrete discriminator; no defect is claimed.",
+  "sources": [
+    {
+      "id": "raft_quiesced_tick",
+      "file": "internal/raft/raft.go",
+      "start_line": 632,
+      "end_line": 638,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_leader_tick_snapshot_ack",
+      "file": "internal/raft/raft.go",
+      "start_line": 600,
+      "end_line": 631,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft_check_pending_snapshot_ack",
+      "file": "internal/raft/raft.go",
+      "start_line": 1832,
+      "end_line": 1861,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_tick_quiesce_branch",
+      "file": "node.go",
+      "start_line": 1478,
+      "end_line": 1492,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@quiesced_snapshot_progress",
+      "question": "While a cluster is quiesced, can an in-flight snapshot transfer stall indefinitely because the leader's pending-snapshot ack timeout and heartbeat work run only from leaderTick, which quiesced nodes skip, and what event restarts that work?",
+      "source_ids": [
+        "raft_quiesced_tick",
+        "raft_leader_tick_snapshot_ack",
+        "raft_check_pending_snapshot_ack",
+        "node_tick_quiesce_branch"
+      ],
+      "hypothesis": "Quiesced ticks only advance the election tick, so a lost snapshot acknowledgement is not detected while the cluster is quiesced; the transfer resumes only when cluster activity wakes the node from quiesce and leaderTick runs again.",
+      "discriminator": "Which events exit quiesce on the leader and the follower in this scenario, and whether the follower's snapshot retry logic or the transport reconnect path provides an independent resend without a leader tick.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_quiesced_tick_scope",
+      "kind": "behavior",
+      "statement": "A quiesced node runs quiescedTick, which only increments the election tick (and resizes the in-memory log on entry), so leader-specific periodic work does not run: no heartbeat generation, no check-quorum step-down decision, and no pending snapshot acknowledgement timeout. Snapshot status messages themselves still arrive as ordinary messages and are handled through the normal message path.",
+      "conditions": "Cluster quiesce enabled and entered; node ticks while in quiesced state.",
+      "source_ids": [
+        "raft_quiesced_tick",
+        "raft_leader_tick_snapshot_ack",
+        "raft_check_pending_snapshot_ack",
+        "node_tick_quiesce_branch"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@quiesced_snapshot_progress",
+      "question": "Does any component other than leaderTick (follower-side retry, transport reconnect, or a new incoming message) cause a stalled in-flight snapshot to be retried while the cluster stays quiesced?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@quiesced_snapshot_progress",
+      "experiment_id": null,
+      "source_ids": [
+        "raft_quiesced_tick",
+        "raft_leader_tick_snapshot_ack",
+        "raft_check_pending_snapshot_ack",
+        "node_tick_quiesce_branch"
+      ],
+      "executions": {},
+      "conclusion": "unresolved",
+      "defect_claim": null,
+      "rationale": "Current state: the mechanism is partly traced; whether a stalled snapshot resumes without external activity is not established. A quiesced node's tick path calls quiescedTick, which increments the election tick and resizes the in-memory log on entry but does not run leaderTick (raft.go:632-638; node.go:1478-1492). leaderTick is where heartbeats are generated, where check quorum is raised, and where checkPendingSnapshotAck is called to force a snapshot status decision when acknowledgements stop (raft.go:600-631, 1832-1861). SnapshotStatus messages are ordinary messages, so acknowledgements that do arrive are still processed and can clear the remote's snapshot state; the open question is the case where acknowledgements stop, because the timeout that would move the remote out of snapshot state is tick-driven. The candidate outcomes are: the transfer resumes when any cluster activity exits quiesce and leaderTick runs (bounded by activity, so a deployment property rather than a defect), or some independent retry path exists and no stall is possible. Until that is traced, the account stays unresolved with no defect claim.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "@ki_quiesced_tick_scope",
+          "revision": 1,
+          "assertion": "Quiesced ticks skip leaderTick, so heartbeat, check-quorum and snapshot-ack timeout work does not run while quiesced."
+        }
+      ],
+      "counterevidence": [
+        "Quiesce is an opt-in bandwidth optimisation, so a transfer that waits for the next activity may be an accepted consequence rather than a defect."
+      ],
+      "limitations": [
+        "Source reading only; neither the follower-side snapshot retry path nor transport reconnect behaviour has been traced.",
+        "Does not establish how long a cluster can stay quiesced with a stalled transfer."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

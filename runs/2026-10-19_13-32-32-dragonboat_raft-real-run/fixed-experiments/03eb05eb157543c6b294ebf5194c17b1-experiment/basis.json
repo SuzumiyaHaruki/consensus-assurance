@@ -1,0 +1,68 @@
+{
+  "id": "03eb05eb157543c6b294ebf5194c17b1-experiment",
+  "investigation_id": "03eb05eb157543c6b294ebf5194c17b1-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package dragonboat\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/lni/dragonboat/v3/config\"\n\t\"github.com/lni/dragonboat/v3/internal/rsm\"\n\t\"github.com/lni/dragonboat/v3/internal/vfs\"\n)\n\n// assuranceClusterInfoNode builds a node that carries the role flag a witness\n// node is started with and a local state machine whose only use here is to\n// report the state machine type. The raft peer is left nil, so the leader flag\n// is reported as not leader.\nfunc assuranceClusterInfoNode(t *testing.T, isWitness bool) *node {\n\tt.Helper()\n\tfs := vfs.GetTestFS()\n\tcfg := config.Config{ClusterID: 1, NodeID: 2, IsWitness: isWitness}\n\tn := &node{\n\t\tclusterID:    1,\n\t\tnodeID:       2,\n\t\tconfig:       cfg,\n\t\tinitializedC: make(chan struct{}),\n\t}\n\tn.sm = rsm.NewStateMachine(\n\t\trsm.NewNativeSM(cfg, &rsm.InMemStateMachine{}, nil),\n\t\tnil, cfg, &testDummyNodeProxy{}, fs)\n\treturn n\n}\n\n// TestAssuranceClusterInfoWitnessFlag checks whether the per-cluster summary\n// returned to a client reports a witness node as a witness. node.getClusterInfo\n// rebuilds a ClusterInfo from the atomic record that node.notifyConfigChange\n// stores; that record carries both the observer and the witness flag computed\n// from the replicated membership. The witness case stores exactly such a\n// record on a node whose own config says it is a witness, and the observer case\n// stores an equivalent record for an observer as a control.\nfunc TestAssuranceClusterInfoWitnessFlag(t *testing.T) {\n\twitness := assuranceClusterInfoNode(t, true)\n\twitness.clusterInfo.Store(&ClusterInfo{\n\t\tClusterID:         1,\n\t\tNodeID:            2,\n\t\tIsLeader:          false,\n\t\tIsObserver:        false,\n\t\tIsWitness:         true,\n\t\tConfigChangeIndex: 7,\n\t\tNodes:             map[uint64]string{1: \"a1\", 2: \"a2\", 3: \"a3\"},\n\t})\n\twci := witness.getClusterInfo()\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"witness_record\\\",\\\"stored_is_witness\\\":%t,\\\"node_config_is_witness\\\":%t,\\\"reported_is_witness\\\":%t,\\\"reported_is_observer\\\":%t,\\\"config_index\\\":%d,\\\"node_count\\\":%d,\\\"pending\\\":%t}\\n\",\n\t\ttrue, witness.isWitness(), wci.IsWitness, wci.IsObserver,\n\t\twci.ConfigChangeIndex, len(wci.Nodes), wci.Pending)\n\n\tobserver := assuranceClusterInfoNode(t, false)\n\tobserver.clusterInfo.Store(&ClusterInfo{\n\t\tClusterID:         1,\n\t\tNodeID:            2,\n\t\tIsLeader:          false,\n\t\tIsObserver:        true,\n\t\tIsWitness:         false,\n\t\tConfigChangeIndex: 9,\n\t\tNodes:             map[uint64]string{1: \"a1\", 2: \"a2\"},\n\t})\n\toci := observer.getClusterInfo()\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"observer_record\\\",\\\"stored_is_observer\\\":%t,\\\"reported_is_observer\\\":%t,\\\"reported_is_witness\\\":%t,\\\"config_index\\\":%d,\\\"node_count\\\":%d,\\\"pending\\\":%t}\\n\",\n\t\ttrue, oci.IsObserver, oci.IsWitness,\n\t\toci.ConfigChangeIndex, len(oci.Nodes), oci.Pending)\n\n\tpending := assuranceClusterInfoNode(t, true)\n\tpci := pending.getClusterInfo()\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"pending_record\\\",\\\"node_config_is_witness\\\":%t,\\\"reported_is_witness\\\":%t,\\\"pending\\\":%t,\\\"config_index\\\":%d}\\n\",\n\t\tpending.isWitness(), pci.IsWitness, pci.Pending, pci.ConfigChangeIndex)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceClusterInfoWitnessFlag"
+      ],
+      "features": [],
+      "default_features": true,
+      "all_features": false,
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "node_notify_config_change",
+      "node_get_cluster_info",
+      "nodehost_get_nodehost_info",
+      "nodehost_cluster_info_list"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Read back the per-node cluster summary that feeds NodeHostInfo.ClusterInfoList: one node holding a stored record that marks the local node as a witness, one control node holding an otherwise identical record that marks it as an observer, and one witness node whose record is still absent.",
+      "assumptions": [
+        "The stored records are supplied directly with the role flags that node.notifyConfigChange (node.go:1496-1518) writes when the replicated membership lists the local node in Witnesses or Observers; that producer is established by reading the code, not by running it here.",
+        "Each node carries a native in-memory state machine so the summary can report a state machine type, and its raft peer is left nil so the leader flag resolves to false; leader state does not affect the witness flag.",
+        "The stored member address maps and config change indexes are arbitrary but distinct per case, and are read back only to show which parts of the stored record survive the rebuild."
+      ],
+      "excluded": [
+        "NodeHost.GetNodeHostInfo and a live witness NodeHost cluster; the path from that method to node.getClusterInfo is read from source.",
+        "node.notifyConfigChange execution, which would require a state machine whose membership already lists the local node as a witness."
+      ],
+      "parameters": {}
+    },
+    "prefix": "A node is built with cluster ID 1, node ID 2 and a native in-memory state machine, and with config.IsWitness set for the witness cases. A ClusterInfo record with IsWitness true, three member addresses and config change index 7 is stored in the node's atomic cluster record, then node.getClusterInfo is called and its role flags, config change index, member count and pending flag are reported. The same read is repeated for an observer-flagged node whose stored record has IsObserver true, config change index 9 and two members, and for a witness node with no stored record.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "b961633ee3874799b5847afdeeff74f3",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "03eb05eb157543c6b294ebf5194c17b1",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

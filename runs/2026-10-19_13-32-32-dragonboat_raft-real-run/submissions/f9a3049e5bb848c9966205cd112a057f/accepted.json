@@ -1,0 +1,110 @@
+{
+  "rationale": "Sixty-third pass: check a recovery premise that the exactly-once work depends on but never examined. The session decisions recorded earlier prevent a retried series from being applied twice while the process holds the session table; if a snapshot captured only the user payload, a node restored from that snapshot would forget which series it had already answered and the retry would be applied again. Reading the snapshot save path, the session manager serialisation and the recovery path settles it: the session table is serialised into the snapshot metadata ahead of the user payload and is restored before the payload on recovery, with the witness snapshot being the deliberate exception because a witness keeps no sessions. The pass records the mechanism and an explained negative.",
+  "sources": [
+    {
+      "id": "rsm_get_ss_meta",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 608,
+      "end_line": 635,
+      "kind": "code_observation"
+    },
+    {
+      "id": "sessionmanager_save_load",
+      "file": "internal/rsm/sessionmanager.go",
+      "start_line": 127,
+      "end_line": 135,
+      "kind": "code_observation"
+    },
+    {
+      "id": "snapshotter_recover_sessions",
+      "file": "snapshotter.go",
+      "start_line": 150,
+      "end_line": 183,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm_witness_snapshot_empty_session",
+      "file": "internal/rsm/snapshotio.go",
+      "start_line": 129,
+      "end_line": 152,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@snapshot_session_restore",
+      "question": "Does a snapshot capture the client-session state together with the user payload, and does recovery restore those sessions before the payload, so that a retried series after restoring a snapshot is still recognised as already applied?",
+      "source_ids": [
+        "rsm_get_ss_meta",
+        "sessionmanager_save_load",
+        "snapshotter_recover_sessions",
+        "rsm_witness_snapshot_empty_session"
+      ],
+      "hypothesis": "The replicated state machine serialises its session manager into the snapshot metadata alongside the membership and the payload, and the snapshotter restores those sessions from the snapshot stream before invoking the user state machine's recover, so session identity survives snapshot install and restart.",
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@ki_snapshot_includes_sessions",
+      "kind": "behavior",
+      "statement": "When a snapshot is taken, the replicated state machine builds the snapshot metadata with the applied index and term, the membership, the request, the compression type and a session buffer filled by the session manager's save call, so the client-session table is part of the snapshot stream ahead of the user payload. On recovery the snapshotter opens the snapshot, decompresses it and restores the sessions from that stream before it hands the same stream to the user state machine's recover, so a node that installs or restarts from a snapshot knows which client series it has already answered. The witness snapshot is the deliberate exception: it is written with an empty session table because a witness holds no state machine and no client sessions.",
+      "conditions": "A snapshot is saved by a non-witness node and later restored by the same node at restart or installed on a follower; the session manager is the one belonging to the node's replicated state machine.",
+      "source_ids": [
+        "rsm_get_ss_meta",
+        "sessionmanager_save_load",
+        "snapshotter_recover_sessions",
+        "rsm_witness_snapshot_empty_session"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@snapshot_session_restore",
+      "experiment_id": null,
+      "source_ids": [
+        "rsm_get_ss_meta",
+        "sessionmanager_save_load",
+        "snapshotter_recover_sessions",
+        "rsm_witness_snapshot_empty_session"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "Current claim: the session state is part of the snapshot and is restored ahead of the user payload, so the exactly-once guarantees recorded for the session decisions survive snapshot install and restart. The save path builds the snapshot metadata with the applied index and term, the membership, the request, the state machine type and compression type, plus a session buffer, and it fills that buffer by asking the session manager to save its sessions into it (statemachine.go:608-635). The session manager's save and load methods are thin wrappers over the LRU session table's own serialisation (sessionmanager.go:127-135), so the serialised form is the same table that the decision logic consults when a retried series arrives. The recovery path matches in the opposite direction and in the right order: the snapshotter opens the snapshot file, reads the header, wraps the stream in a decompressor, restores the sessions from that stream, and only then calls the user state machine's recover on the remaining stream before validating the payload (snapshotter.go:150-183). A node restored from a snapshot therefore still recognises a retried series as already applied rather than applying it twice. The one case that deliberately omits session state is the witness snapshot, which is written with an empty session table because a witness has no state machine and no client sessions (snapshotio.go:129-152); witness nodes reject proposals, reads, configuration changes and snapshot requests, so no client series can depend on session state there. Two bounds on the account: the trace covers the default snapshot path rather than each state machine variant, and it establishes that the sessions are written and read in the same order rather than exercising a real restore.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "@ki_snapshot_includes_sessions",
+          "revision": 1,
+          "assertion": "The snapshot carries the session table and recovery restores it before the user payload, so session identity survives a snapshot."
+        }
+      ],
+      "counterevidence": [
+        "The witness snapshot contains an empty session table, which is correct only because witness nodes cannot receive client proposals or session-managed entries; a non-witness node must never take that path.",
+        "The restore path validates the payload only after both the sessions and the payload have been consumed, so a corrupted snapshot can leave the session table populated in memory before the validation failure is detected."
+      ],
+      "limitations": [
+        "Source trace only: no snapshot was taken, shrunk, transferred or restored for this question, and no receipt is cited.",
+        "Only the default non-streaming save path was traced; concurrent snapshots and streaming installs reuse the same metadata builder but were not re-read here.",
+        "Whether a partially restored session table could be used before the validation result is handled depends on the caller of the recover routine, which this account does not trace."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}
