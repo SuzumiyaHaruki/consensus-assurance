@@ -1,0 +1,229 @@
+{
+  "rationale": "Record the queue lifetime that bounds the defect. becomeCandidate, becomeLeader and the follower transition all run reset, which replaces readIndex with a fresh queue, clears votes, the pending configuration flag and any leader transfer, and rebuilds the remote maps. A confirmation arriving in a later term therefore finds no pending request for an earlier context, so the stranded read cannot be recovered by re-election and can only end at the caller's deadline; the account now states that explicitly. The conclusion, defect claim and receipts are unchanged.",
+  "sources": [
+    {
+      "id": "raft-reset-clears-readindex",
+      "file": "internal/raft/raft.go",
+      "start_line": 1003,
+      "end_line": 1021,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft-role-transitions",
+      "file": "internal/raft/raft.go",
+      "start_line": 963,
+      "end_line": 1002,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@readindex-queue-reset-on-role-change",
+      "kind": "behavior",
+      "statement": "raft.reset replaces r.readIndex with a fresh readIndex, clears the vote and votes map, clears the pending configuration-change flag, aborts any leader transfer and rebuilds the remote, observer and witness maps. becomeCandidate, becomeLeader and the follower transition all call reset, so a pending ReadIndex request is dropped by any role transition, and a HeartbeatResp carrying its context in a later term cannot confirm it.",
+      "conditions": "The node performs a raft role transition through becomeFollower, becomeCandidate or becomeLeader while a ReadIndex request is pending.",
+      "source_ids": [
+        "raft-reset-clears-readindex",
+        "raft-role-transitions",
+        "readindex-confirm"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "827f420be72d403f9a804a543fac77cc-question-0",
+      "experiment_id": "79a0cadfd8b94b3ea070c6cce62864ee-experiment",
+      "source_ids": [
+        "readindex-confirm-handler",
+        "readindex-confirm",
+        "readindex-test-context",
+        "pending-read-addready",
+        "pending-read-applied",
+        "pending-read-gc",
+        "follower-readindexresp",
+        "node-process-ready",
+        "node-readindex-admission",
+        "systemctx-identity",
+        "leader-readindex-admission",
+        "observer-readindex-forward",
+        "follower-readindex-forward",
+        "leader-tick-heartbeat-timing",
+        "leader-periodic-heartbeat-ctx",
+        "readindex-peep-newest",
+        "follower-heartbeat-echo"
+      ],
+      "executions": {
+        "c2848ac1c82f442ba305267049bbb53b": [
+          2,
+          3,
+          4
+        ],
+        "55e578441ac24bde9e837485d2c078a6": [
+          1,
+          2
+        ],
+        "c414588b5bc24b189d3df3217e37d7b7": [
+          1
+        ],
+        "4e011b84ec9241da9022ce3b300b5948": [
+          1
+        ],
+        "bd58e3e83a83442492b148168e817c4c": [
+          0,
+          2,
+          3,
+          6,
+          7
+        ],
+        "fd3bd783d0054290aca9005634a6d6f4": [
+          2,
+          3,
+          4,
+          6,
+          7,
+          8
+        ],
+        "220792eabe8f4577b5f7c8590b167498": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "9217afa8b6c945cfa1405355963f9613": [
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The conclusion is a violated requirement and a bounded client-completion defect for remote ReadIndex requests whenever the leader confirms a later queued context before an earlier one. The source cause is that handleReadIndexLeaderConfirmation returns every earlier queued request but builds each remote reply from the confirming heartbeat's Hint and HintHigh instead of that request's s.ctx, while readIndex.confirm deletes the earlier queue entry and the receiving node's pendingReadIndex associates a batch only when the response SystemCtx equals the registered key. That ordering needs no artificial message reordering: while a read is pending, the leader's periodic heartbeat carries the newest queued context because peepCtx returns the last queued context, followers echo the hint, and handleLeaderHeartbeatResp confirms it, so a confirmation produced by a periodic heartbeat confirms the newest pending request and returns every earlier queued request under that context. The receipts cover four requesters and both a harness-chosen and a tick-driven confirmation. In the follower receipt, node 2's admitted context {101,1002} is answered with node 3's later context {202,2003} at log index 4, and node 2's batch stays at index zero after the real ready index 4 is applied; the late confirmation of node 2's own context produces no context-correct reply. The logical-deadline receipt keeps that ordering and shows no completion before the 50-tick deadline, RequestTimeout at tick 51, and removal of the stale batch. The observer-endpoint receipt closes the link that the earlier leader-side observer receipt left open: a real observer peer forwards its own generated context to the real leader, voter 3's later context is confirmed first, the reply addressed to observer 4 carries voter 3's context at log index 4, the observer's real handler emits a ReadyToRead carrying that later context at index 4, and the observer's admitted batch stays at index zero without completing, even after the late own-context confirmation. The tick-driven receipt shows the same substitution under ordinary operation instead of harness-selected delivery: with two queued follower reads, one leader tick makes the periodic heartbeat carry the newest context, the reply to the earlier requester carries that newest context at index 4, and its batch stays at index zero. The shared-confirmation receipt locates the fault within the reply construction rather than in confirmation or index selection: one broadcast carrying the later local context returns an earlier remote read and the later leader-local read, the local requester's ready-to-read result carries its own context and completes at index 4, and the remote requester is answered with the local context and stays at index zero. The multi-requester receipt widens that from one stranded request to a batch: with three remote reads queued from two nodes and one tick-driven confirmation, the earliest and middle requests stay at index zero while only the newest completes, so one node's later read succeeds while its own earlier read does not. The three controls complete when the admitted context is confirmed first or is the only queued context: the follower control's reply carries its context and its read completes at batch index 4, the observer control's reply carries the observer's context and its read completes, and the single-read tick control carries that read's own context and completes at batch index 4. Because every measured reply carries a later committed index and the ready index equals the applied index, no stale read value or safety violation is established; the established consequence is that an affected client read cannot complete until its deadline even though the leader had a completed confirmation and the node applied a valid ready index. The observer case shows the defect reaches a non-voting client endpoint through the observer's own forwarding and consumer rather than only the leader's outbound message.",
+      "answers": {
+        "c5d2bc4029e5466da5475db36708ef10-gap-0": {
+          "explanation": "The leader-side observer experiment has one comparison: the reply the leader addresses to observer 4 must carry the context observer 4 admitted, witnessed by its event 1 where observer 4's admitted context is answered with voter 3's context at the leader's log index 1. Revision 2 of knowledge 68dce962924a4244bd9688bff78649ed-knowledge-1 keeps the behavior statement that produced that witness and replaces only the claim that observer-originated reads were never executed; its conditions now name both receipts that exercise the path, including 4e011b84ec9241da9022ce3b300b5948 itself, so the experiment's premise is explicitly covered by the corrected revision. Nothing in that comparison depended on the observer's local consumer, which this experiment never claimed to measure.",
+          "resolved": true
+        },
+        "c5d2bc4029e5466da5475db36708ef10-gap-1": {
+          "explanation": "The main experiment involves only voters 1, 2 and 3: node 2 and node 3 issue the queued ReadIndex requests, and its comparisons concern the reply context delivered to node 2 and the completion of node 2's pending batch. Revision 2 of the observer entry changes only when that observer-specific entry applies and adds two observer receipts as its execution basis; the follower premises the main comparison relies on are separate unrevised entries, namely that readIndex.confirm returns earlier queued requests with their own contexts, that remote replies are built from the confirming heartbeat context, and that an unmatched SystemCtx leaves a batch at index zero. The corrected entry is not a premise of the main comparison, so its witness and conclusion are unaffected.",
+          "resolved": true
+        }
+      },
+      "knowledge": [
+        {
+          "entry_id": "827f420be72d403f9a804a543fac77cc-knowledge-0",
+          "revision": 1,
+          "assertion": "The confirming context returns earlier queued requests while preserving each request's own SystemCtx."
+        },
+        {
+          "entry_id": "827f420be72d403f9a804a543fac77cc-knowledge-1",
+          "revision": 1,
+          "assertion": "Remote replies are tagged with the confirming heartbeat context instead of the queued request's context."
+        },
+        {
+          "entry_id": "827f420be72d403f9a804a543fac77cc-knowledge-2",
+          "revision": 1,
+          "assertion": "A response with a nonmatching SystemCtx leaves the original pending batch at index zero and cannot complete it."
+        },
+        {
+          "entry_id": "083048b436e74eaa9a8ec611b31527e4-knowledge-0",
+          "revision": 1,
+          "assertion": "The exercised later-confirmation ordering produced a mismatched reply context and left the earlier read batch unready after the ready index was applied."
+        },
+        {
+          "entry_id": "1457862374ac4b5bbba3c0e3588dbb50-knowledge-0",
+          "revision": 1,
+          "assertion": "The sequential-confirmation control completed when the admitted context was confirmed first."
+        },
+        {
+          "entry_id": "cd8b5340c6da42b49b1358c1b1420aa6-knowledge-0",
+          "revision": 1,
+          "assertion": "The logical-deadline case returned RequestTimeout at tick 51 and removed the stale batch."
+        },
+        {
+          "entry_id": "68dce962924a4244bd9688bff78649ed-knowledge-1",
+          "revision": 2,
+          "assertion": "Observer-originated ReadIndex requests enter the same leader queue and pending-read response path, and that path is now measured at both the leader-side reply and the observer's own consumer."
+        },
+        {
+          "entry_id": "84ba0b5abd3a42c5866eb46354c561b5-knowledge-0",
+          "revision": 1,
+          "assertion": "The observer leader-side reply carried the later confirming context rather than the observer's admitted context."
+        },
+        {
+          "entry_id": "c5d2bc4029e5466da5475db36708ef10-knowledge-1",
+          "revision": 1,
+          "assertion": "The observer's admitted read stayed at index zero and did not complete under the later-first ordering, while the control confirming its own context first completed with batch index 4."
+        },
+        {
+          "entry_id": "8420e4f5cc10498fb94a60b7164953e0-knowledge-0",
+          "revision": 1,
+          "assertion": "A periodic heartbeat carries the newest queued context, so its first confirmation returns every earlier queued request under that context."
+        },
+        {
+          "entry_id": "0c41b53ca9664389a263aeb22cf02f59-knowledge-0",
+          "revision": 1,
+          "assertion": "The leader tick with two queued reads produced a heartbeat carrying the newest context, and the earlier requester's reply carried that context while its batch stayed at index zero, whereas the single-read tick control completed."
+        },
+        {
+          "entry_id": "1b22863df6ca4ab494e10d414d8da2f0-knowledge-0",
+          "revision": 1,
+          "assertion": "Under one confirmation the local requester's ready-to-read result carried its own context and completed, while the earlier remote requester's reply carried the local context and its batch stayed at index zero."
+        },
+        {
+          "entry_id": "dc14f87bbcf8482b80c41b887e4a0b95-knowledge-0",
+          "revision": 1,
+          "assertion": "With three remote reads queued and one tick-driven confirmation, both earlier reads stayed at index zero while only the newest completed."
+        },
+        {
+          "entry_id": "9652c745a742422d9a1d90eeb6852356-knowledge-0",
+          "revision": 2,
+          "assertion": "Only sending members addressed by the hint-carrying heartbeat can return it: votingMembers() covers remotes and witnesses, observers receive a zero context, and a response from a sender outside every role map is dropped at admission before confirmation."
+        },
+        {
+          "entry_id": "@readindex-queue-reset-on-role-change",
+          "revision": 1,
+          "assertion": "Every raft role transition replaces the pending ReadIndex queue, so a confirmation in a later leadership term cannot complete a request left behind by an earlier one."
+        }
+      ],
+      "counterevidence": [
+        "The source path that constructs the remote reply uses m.Hint and m.HintHigh; no re-tagging occurs between that send and the receiving node's consumer in any measured case.",
+        "The follower, tick-driven and shared-confirmation replies carried log index 4 and the ready index was 4, and the observer-endpoint reply also carried index 4; the leader-side observer receipt answered with its own committed index 1. No execution shows a stale committed index or stale application state.",
+        "The late confirmation of the earlier admitted context produced zero context-correct replies and completion remained zero in both the follower and observer cases.",
+        "The sequential, observer and single-read controls complete with the admitted context, so the failure is not a general inability of the harness, the observer forwarding path, the tick path or the pending-read consumer to complete.",
+        "The timeout receipt shows a client timeout and cleanup, not a successful stale read; it measures the bounded endpoint without establishing a safety violation.",
+        "In the observer-endpoint case the real handler did emit a ReadyToRead at index 4 and that index was applied, so the failure is the missing context association rather than an absent ready signal or an unapplied index.",
+        "The observer-endpoint case registers node 4 as an observer through Peer.ApplyConfigChange rather than a proposed membership entry, so it does not establish that a fully replicated observer join changes this path.",
+        "The tick-driven receipt measures one confirmation produced by a single leader tick with two queued reads; it does not establish how often a periodic heartbeat is the confirming one across other schedules, and the harness still decides which follower receives that heartbeat first.",
+        "In the shared-confirmation receipt the local requester completes under the same confirmation and index, which narrows the defect to the remote reply branch rather than the confirmation or index-selection logic.",
+        "The multi-requester receipt completes the newest read under the same confirmation and index, so the stranding depends on a request preceding the confirming context rather than on the node, the confirmation or the batch itself."
+      ],
+      "limitations": [
+        "The ILogDB is test-only and in-memory; disk failure, restart, snapshots, and real transport delay were not exercised.",
+        "The main test applies the returned ready index synchronously; the companion timeout receipt measures the logical deadline at tick 51, not wall-clock scheduling.",
+        "The observer-endpoint receipt exercises a real observer raft peer and the node-level pending-read registry, but not NodeHost request plumbing or the transport, and the observer membership was applied directly to each voter instead of through a committed configuration change.",
+        "The controls hold only for their exercised first-context ordering; they do not establish safety or completion for all schedules.",
+        "The observed wrong reply context is a correlation defect; it is not by itself evidence that the returned read index is stale or that a wrong data value was read.",
+        "The observer-endpoint case measures one observer and one ordering; other membership layouts and concurrent observers were not measured.",
+        "The tick-driven case runs one leader tick with two queued reads and one single-read control; it samples neither a range of heartbeat timings nor larger read batches.",
+        "The multi-requester case queues three reads from two nodes; it does not sample larger batches, independent concurrent streams on one node, or other confirmation orders.",
+        "The leader discards its pending ReadIndex queue on every role transition, so the measured non-completion is bounded by the caller's deadline and a later term cannot repair the same request; recovery depends on the client reissuing the read, which is not exercised here."
+      ],
+      "joint_history": "The follower, sequential-control, and logical-deadline receipts come from the same three-peer in-process harness family; the leader-side observer receipt uses real internal Raft handlers for voters {1,2,3} with observer 4; the observer-endpoint receipt pairs the same three-peer leader with a real observer raft peer plus the node-level pending-read registry; the tick-driven and shared-confirmation receipts reuse that same harness file and add a periodic-heartbeat case and a local-versus-remote case. All seven experiments sit under the same ReadIndex question and exercise the same leader-side confirmation path. The follower case and the observer, tick-driven, shared-confirmation and timeout cases queue an earlier remote context before a later context that the leader confirms first; the follower and observer controls confirm the admitted context first, and the tick control queues a single read. The observer-endpoint receipt supplies the observer local consumer and completion that the leader-side receipt left unmeasured, the tick-driven receipt supplies the periodic-heartbeat confirmation that the earlier accounts had only traced from source, and the shared-confirmation receipt adds a leader-local requester so the reply branch that strands the earlier read can be isolated.",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

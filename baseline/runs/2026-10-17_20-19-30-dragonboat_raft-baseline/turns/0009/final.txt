@@ -1,0 +1,21 @@
+This pass closed the last executable coverage gap — the transport package, including TLS.
+
+**What was blocking it**
+
+The captured tree's transport tests iterate `mutualTLSValues := []bool{true, false}`, so the first iteration tries to load `tests/localhost.key`, which the snapshot does not ship. That panic aborted the whole test binary, so every test after `TestMessageCanBeSent` — snapshot sending, streaming, connection-failure handling, circuit breakers — never ran, even on the non-TLS path.
+
+**What I did (diagnostic copies only; captured source untouched)**
+
+- In `audit/diag-transport/`, first disabled the TLS setup so every test ran on the non-TLS path: the **whole transport package passes** (13 s).
+- Then generated a fresh CA + `localhost` server/client certificate into the copy's `tests/` directory (`audit/gencert.go`) and restored the TLS setup: the **whole transport package, including all mutual-TLS variants, passes** (14 s).
+- Ran both the transport suite (with TLS) and `internal/raft`, `internal/rsm`, `internal/logdb`, `internal/server` under `-race`: all green.
+- Re-ran the final default matrix (`raft, rsm, logdb, server, tools, client, config, raftpb, .`): all green.
+
+**Finding set unchanged**
+
+- F1: `(*nodeUser).ReadIndex` in [nodehost.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/nodehost.go:2063) never marks the cluster step-ready — ~one RTT extra latency and deterministic `RequestTimeout` for one-RTT timeouts, while `NodeHost.ReadIndex` with the same timeout completes (causality confirmed in `audit/diag`).
+- F2: `handleCandidateReadIndex` in [raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/raft.go:1998) records a dropped ReadIndex twice, visible through exported `Peer.GetUpdate`.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) now states that no executable coverage gap remains for buildable code (only rocksdb-backed packages cannot build offline), and inventories the new diagnostic copies, cert generator, tests and command log. Implementation remains byte-identical to `../source`.
+
+Remaining useful work is source-only: a mutant-style sweep of the root package for further sibling-method deviations like Finding 1, and re-reading the rocksdb-specific LogDB/plugin code that cannot be executed here.

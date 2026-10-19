@@ -519,15 +519,12 @@ def operation_summary(state, root):
         for change, prior, value, fields in sorted(text_updates,key=lambda item:item[1] is None):
             change['text_changes'] = text_changes(prior,value,fields,prose)
         summary['account_guidance'] = (
-            'Text changes show literal edits, not inferred claims or semantic dependence. Ranges are zero-based, '
+            'Text changes show literal edits, not semantic dependence. Ranges are zero-based, '
             'end-exclusive character offsets into the text or JSON array (indent=2, ensure_ascii=False). '
             'Two parts omit the intervening characters. '
             'Empty text changes concern only the displayed fields, not all submission changes. Full previous/current '
-            'records retain omitted content. Saving knowledge does not strengthen its evidence. '
-            'Old and new reasons include removed citations. Other current citations and historical locators are '
-            'review candidates, not automatically affected conclusions; event overlap alone does not establish impact. '
-            'Correct identified premises and uses, preserving independent support. Withdrawing a witness does not '
-            'refute the question. Unrecorded code reuse remains for investigation. No separate confirmation is required.')
+            'records retain omitted content; old/new citation locators include removed references. '
+            'Citation overlap alone does not establish impact.')
     summary['questions'] = [record_preview({'id':q.id, 'version':q.version, 'question_state':'current',
         'question':q.question, 'hypothesis':q.hypothesis, 'disposition':q.disposition, 'parent_id':q.parent_id,
         'discriminator':q.discriminator, 'knowledge':[u.model_dump() for u in q.knowledge],
@@ -538,20 +535,12 @@ def operation_summary(state, root):
         question['execution'] = execution_feedback(state, root, fixed, check)
     summary['necessary_gaps'] = necessary_gaps
     summary['reselection'] = reselection_view(state)
-    action = ('For a disputed or strengthened inference, use fixed code and saved observations to inspect the decisive '
-        'intervention, observation-producing path, relevant exposure or contradicted passage, whichever could change '
-        'that judgment. Use a focused experiment where needed to distinguish remaining explanations. Replace affected current '
-        'explanations and correct identified uses, preserving independent findings; no separate review submission is needed. '
-        if executed or changes or knowledge_changes or corrections else '')
     summary['next'] = (
         'The unchanged submission is already retained; this call still consumed time and a model turn. '
-        if current.get('no_change') else '') + action + (
-        'Choose and undertake the next action that can change a judgment, using overall source understanding '
-        'and the allocation: resolve a consequential premise or measurement, continue valuable construction, '
-        'or pursue an independent sourced lead. Saved receipts can answer multiple applicable questions; '
-        'missing citations are not a queue to clear. Research.json retains every execution and its citation index. '
-        'After a local answer, reconsider the available directions rather than inherit the last experiment; '
-        'a question may remain unresolved while attention moves elsewhere. No separate selection submission is needed.')
+        if current.get('no_change') else '') + (
+        'Use current results, necessary gaps, source understanding and allocation to undertake useful investigation '
+        'or correction, reconsidering directions after a local answer. Follow audit-method.md; research.json provides '
+        'global navigation and receipt locators, and state.json retains full records and history.')
     return summary
 
 

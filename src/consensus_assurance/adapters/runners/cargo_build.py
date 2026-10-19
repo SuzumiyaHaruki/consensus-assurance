@@ -7,6 +7,7 @@ import shutil
 import stat
 import time
 from pathlib import Path
+from urllib.parse import quote
 from .experiment import clean_environment, sandbox_command, run_experiment
 from .process import output
 from ..storage.files import digest, write_json
@@ -15,6 +16,21 @@ from ...core.types import CheckRun, ExecutionStatus, uid, now
 
 VIEW = Path('/tmp/consensus-cargo')
 PROBE = '#[test]\nfn assurance_build_ready() { assert!(cfg!(test)); }\n'
+
+
+def feature_selection(command):
+    return {'features':command[command.index('--features')+1].split(',') if '--features' in command else [],
+        'default_features':'--no-default-features' not in command,'all_features':'--all-features' in command}
+
+
+def input_path(command):
+    manifest=Path(command[command.index('--manifest-path')+1]);target=command[command.index('--test')+1]
+    path=Path('build-inputs/targets')/manifest.parent/target
+    selection=feature_selection(command)
+    if selection['features'] or not selection['default_features'] or selection['all_features']:
+        path=path/'variants'/('default' if selection['default_features'] else 'no-default')/('all' if selection['all_features'] else 'named')
+        for feature in selection['features']:path=path/('feature='+quote(feature,safe=''))
+    return path/'basis.json'
 
 
 def cache_directory(adapter, root):
@@ -210,13 +226,15 @@ def verify(adapter,root,snapshot_id,deadline=None):
         basis=json.loads(path.read_text())
         lock=root/basis['lock']['record']
         if (basis['snapshot_id']!=snapshot_id or basis['source_files']!=source_files or basis['source_modes']!=source_modes or basis['tools']!=tools
-                or basis['policy']!=policy(adapter) or lock.is_symlink() or not lock.is_file()
+                or basis['policy']!=policy(adapter,basis.get('feature_selection')) or lock.is_symlink() or not lock.is_file()
                 or digest(lock.read_bytes())!=basis['lock']['digest']):
             raise ValueError('Cargo build inputs or tools changed; start a new run; cached results cannot be reused')
 
 
-def policy(adapter):
-    return {'profile':'test','feature_selection':'No extra feature flags; original dependency and dev-dependency unification applies',
+def policy(adapter,selection=None):
+    selection=selection or feature_selection([])
+    label='No extra feature flags' if selection==feature_selection([]) else 'Explicit captured-crate feature selection'
+    return {'profile':'test','feature_selection':label+'; original dependency and dev-dependency unification applies',
         'offline':True,'locked':True,'jobs':2,'cargo':str(adapter.cargo),'rustc':str(adapter.cargo.parent/'rustc'),
         'target_selection':'rustc host unless overridden by captured Cargo configuration; compiler artifact paths retained',
         'rustdoc':str(adapter.cargo.parent/'rustdoc'),'sandbox_source':str(VIEW),
@@ -230,19 +248,21 @@ class PreparationFailed(Exception):
 
 def build_inputs(adapter,root,state,read):
     """Read bounded preparation metadata, never validate tools or materialize a seed."""
-    selected=[(adapter.package,adapter.harness_filename)]
+    commands=[adapter.experiment_command()]
     for artifact in state.experiments:
         harness = artifact.basis.harness
         if harness.kind == 'rust_test':
-            selected.append((harness.execution_package or adapter.package, artifact.harness_filename))
-    paths={p.relative_to(root) for p in (root/'build-inputs/targets').glob('**/basis.json')}
-    for package,filename in selected:
-        command=adapter.experiment_command(package,filename)
-        paths.add(Path('build-inputs/targets')/Path(command[command.index('--manifest-path')+1]).parent/Path(filename).stem/'basis.json')
+            commands.append(adapter.experiment_command(harness.execution_package or adapter.package,artifact.harness_filename,
+                features=harness.features,default_features=harness.default_features,all_features=harness.all_features))
+    paths={p.relative_to(root):None for p in (root/'build-inputs/targets').glob('**/basis.json')}
+    for command in commands:paths[input_path(command)]=command
     result=[]
     for path in sorted(paths):
-        basis=read(str(path));manifest=str(path.parent.parent.relative_to('build-inputs/targets')/'Cargo.toml')
-        target=path.parent.name;compilations=[];preparations=[]
+        basis=read(str(path));command=paths[path]
+        manifest=basis['manifest'] if basis else command[command.index('--manifest-path')+1]
+        target=basis['test_target'] if basis else command[command.index('--test')+1]
+        selection=basis.get('feature_selection',feature_selection(command or [])) if basis else feature_selection(command)
+        compilations=[];preparations=[]
         basis_digest=digest((root/path).read_bytes()) if basis else None
         for saved in sorted((root/path).parent.glob('*-seed.json')):
             name=str(saved.relative_to(root));receipt=read(name)
@@ -261,13 +281,15 @@ def build_inputs(adapter,root,state,read):
             params=check.parameters
             same=params.get('build_inputs')==str(path) or (
                 params.get('execution_package') is not None and params.get('harness_filename') is not None and
-                str(Path(params['execution_package'])/'Cargo.toml')==manifest and Path(params['harness_filename']).stem==target)
+                str(Path(params['execution_package'])/'Cargo.toml')==manifest and Path(params['harness_filename']).stem==target
+                and feature_selection(check.command)==selection)
             if same and params.get('preparation_failure'):
                 preparations.append((check.started_at or '',{'record':f'logs/{check.id}/check.json',
                     'stage':params['preparation_stage'],'status':check.status.value,'failure_record':f'logs/{params["preparation_failure"]}/check.json'}))
         latest=max(preparations,key=lambda p:p[0])[1] if preparations else None
         if latest and 'failure_record' in latest:status='preparation_failed'
         result.append({'record':str(path) if basis else None,'manifest':manifest,'test_target':target,
+            'feature_selection':selection,
             'resolved_features':basis.get('resolved_features'),'feature_evidence':basis.get('feature_evidence'),
             'compilations':compilations,'status':status,'latest_preparation':latest})
     return result
@@ -298,9 +320,8 @@ def inputs(adapter,runner,snapshot_id,command,deadline):
     cache_directory(adapter,root)
     if not source.is_dir():raise ValueError('Cargo preparation requires the retained source snapshot')
     manifest=command[command.index('--manifest-path')+1];target=command[command.index('--test')+1]
-    package=Path(manifest).parent
-    folder=root/'build-inputs/targets'/package/target
-    record=folder/'basis.json'
+    selection=feature_selection(command)
+    record=root/input_path(command)
     verify(adapter,root,snapshot_id,deadline)
     if record.exists():return record,json.loads(record.read_text())
     work=root/'.execution/cargo-preparation'/uid()/'workspace'
@@ -318,17 +339,19 @@ def inputs(adapter,runner,snapshot_id,command,deadline):
         (work/lock_path).write_bytes(saved_lock.read_bytes())
     elif not (work/lock_path).exists():
         run(['generate-lockfile','--offline','--manifest-path',manifest],'cargo_lock_prepare')
-    metadata=run(['metadata','--locked','--offline','--format-version','1','--manifest-path',manifest],'cargo_metadata')
+    metadata=run(['metadata','--locked','--offline','--format-version','1','--manifest-path',manifest,
+        *adapter.feature_flags(**selection)],'cargo_metadata')
     resolved=json.loads(Path(metadata.stdout).read_text())
     selected=next(p for p in resolved['packages'] if p['manifest_path']==str(VIEW/manifest))
     node=next(n for n in resolved['resolve']['nodes'] if n['id']==selected['id'])
     if not saved_lock.exists():
         saved_lock.parent.mkdir(parents=True,exist_ok=True);saved_lock.write_bytes((work/lock_path).read_bytes())
     basis={'snapshot_id':snapshot_id,'source_files':capture(source).files,'manifest':manifest,'test_target':target,
+        'feature_selection':selection,
         'workspace_manifest':str(workspace_manifest),'package_id':selected['id'],'package_name':selected['name'],
         'lock':{'path':str(lock_path),'record':str(saved_lock.relative_to(root)),
             'origin':lock_origin,'digest':digest(saved_lock.read_bytes())},
-        'tools':tool_inputs(adapter,deadline),'policy':policy(adapter),'metadata_check':metadata.id,
+        'tools':tool_inputs(adapter,deadline),'policy':policy(adapter,selection),'metadata_check':metadata.id,
         'resolved_features':node['features'],'feature_evidence':'metadata resolution; selected test compilation is recorded separately',
         'preparation_checks':stages,'prepared_at':now()}
     basis['source_modes']={p:(source/p).stat().st_mode & 0o777 for p in basis['source_files']}
@@ -398,7 +421,7 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
     executed=[c for c in prior if c.action==action and c.cwd==str(workspace.resolve()) and c.snapshot_id==snapshot_id]
     if len(executed)>1:raise ValueError('Multiple target receipts in one Cargo action; execution ownership is unresolved')
     if executed:
-        expected=runner.root/'build-inputs/targets'/Path(command[command.index('--manifest-path')+1]).parent/command[command.index('--test')+1]/'basis.json'
+        expected=runner.root/input_path(command)
         if not expected.is_file():raise ValueError('Saved Cargo execution lost its fixed build inputs; cannot reconstruct them for result reuse')
     record=None;basis=None
     try:

@@ -1,0 +1,66 @@
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/memstore/src/lib.rs	2026-10-18 11:44:44.745367316 +0800
++++ memstore/src/lib.rs	2026-10-18 12:56:06.783961121 +0800
+@@ -113,6 +113,8 @@
+     DelayBuildingSnapshot,
+     BuildSnapshot,
+     PurgeLog,
++    /// AUDIT-ONLY: block `install_snapshot()` before it touches the state machine.
++    InstallSnapshot,
+ }
+ 
+ /// An in-memory storage system implementing the `RaftStorage` trait.
+@@ -149,6 +151,9 @@
+     /// [`begin_receiving_snapshot()`]: openraft::RaftStorage::begin_receiving_snapshot
+     panic_on_begin_receiving_snapshot: AtomicBool,
+ 
++    /// AUDIT-ONLY: when set, `apply_to_state_machine()` panics.
++    panic_on_apply: AtomicBool,
++
+     /// When set, [`limited_get_log_entries()`] returns an empty result for a non-empty range,
+     /// simulating a store that violates the API contract.
+     ///
+@@ -174,6 +179,7 @@
+             snapshot_idx: Arc::new(Mutex::new(0)),
+             current_snapshot,
+             panic_on_begin_receiving_snapshot: AtomicBool::new(false),
++            panic_on_apply: AtomicBool::new(false),
+             return_empty_limited_get: AtomicBool::new(false),
+         }
+     }
+@@ -209,6 +215,11 @@
+         self.panic_on_begin_receiving_snapshot.store(panic, Ordering::Relaxed);
+     }
+ 
++    /// AUDIT-ONLY: make the next `apply_to_state_machine()` panic.
++    pub fn set_panic_on_apply(&self, panic: bool) {
++        self.panic_on_apply.store(panic, Ordering::Relaxed);
++    }
++
+     /// Make `limited_get_log_entries()` return an empty result for a non-empty range, simulating
+     /// a store that violates the API contract.
+     ///
+@@ -462,6 +473,10 @@
+         &mut self,
+         entries: &[Entry<TypeConfig>],
+     ) -> Result<Vec<ClientResponse>, StorageError<MemNodeId>> {
++        if self.panic_on_apply.load(Ordering::Relaxed) {
++            panic!("injected state machine worker panic in apply");
++        }
++
+         let mut res = Vec::with_capacity(entries.len());
+ 
+         let mut sm = self.sm.write().await;
+@@ -510,6 +525,13 @@
+         meta: &SnapshotMeta<MemNodeId, ()>,
+         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+     ) -> Result<(), StorageError<MemNodeId>> {
++        // AUDIT-ONLY injection point: keep the install pending to observe what
++        // RaftCore does in between.
++        if let Some(d) = self.get_blocking(&BlockOperation::InstallSnapshot) {
++            tracing::info!(?d, "blocking snapshot install");
++            tokio::time::sleep(d).await;
++        }
++
+         tracing::info!(
+             { snapshot_size = snapshot.get_ref().len() },
+             "decoding snapshot for installation"

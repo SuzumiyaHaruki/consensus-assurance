@@ -1,0 +1,24 @@
+This pass found a fourth (minor) defect and removed a flaky assertion from one of the audit tests.
+
+**Finding 4 (new, executed, minor): the exported channel transport factory cannot be used**
+
+`plugin/chan/chan.go` exports `ChanTransportFactory` implementing `config.TransportFactory` for test use. Its `Create` produces a working `ChanTransport`, but `Validate` panics ("not suppose to be called") — and `NodeHostConfig.Validate` calls exactly that validator for `RaftAddress` (`config/config.go:551-554` via `GetRaftAddressValidator`), so `NewNodeHost` with this factory panics before anything can start:
+
+```
+zz_audit_chantransport_test.go:50: NewNodeHost with the exported ChanTransportFactory panicked: not suppose to be called
+--- FAIL: TestAuditChanTransportFactoryIsUsable
+```
+
+Upstream's own tests work around it by defining their own factory with a real `Validate` (`nodehost_test.go:770-780`), which confirms the transport itself is fine once wrapped. A one-line fix (`return len(addr) > 0`) in the fix-verification copy makes the test pass.
+
+**Test robustness**
+
+`TestAuditLeaderTransfer` failed 1/20 in a full-suite run because it asserted synchronously that the deposed leader already knew the new leader; a deposed leader legitimately reports "no leader" until the new leader's first heartbeat. The check now polls, and 20/20 consecutive runs pass.
+
+**State**
+
+Four findings, all reproduced on the unmodified tree and all resolved by minimal patches in `audit/diag-fixes/` (which is fully green for the audit suite, race mode included):
+
+- F1 `(*nodeUser).ReadIndex` misses the engine wakeup · F2 duplicated dropped-ReadIndex record · F3 `Update.HasUpdate` ignores `DroppedReadIndexes` · F4 channel transport factory panics from `Validate`.
+
+The audit now stands at 24 tests (19 passing negative results, 5 deliberate reproductions). [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) (645 lines) carries the findings, evidence, fix verification, reviewed-areas catalogue, inventory and command log; the implementation remains byte-identical to `../source`.

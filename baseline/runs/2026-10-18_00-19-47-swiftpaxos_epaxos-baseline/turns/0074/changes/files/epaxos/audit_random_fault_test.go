@@ -1,0 +1,294 @@
+package epaxos
+
+import (
+	"math/rand"
+	"os"
+	"strconv"
+	"testing"
+
+	"github.com/imdea-software/swiftpaxos/state"
+)
+
+func randomFaultHasChosen(inst *Instance, cmd state.Command) bool {
+	return inst != nil && len(inst.Cmds) == 1 &&
+		inst.Cmds[0].K == cmd.K && string(inst.Cmds[0].V) == string(cmd.V)
+}
+
+func randomFaultIsNOOP(inst *Instance) bool {
+	return inst != nil && len(inst.Cmds) == 1 && inst.Cmds[0].Op == state.NONE
+}
+
+// Investigation, excluded from TestAudit: randomized initial message drops,
+// then recovery from a replica that lacks the proposed value.  Classify the
+// result as PASS, SKIP (no value chosen), LOSS, or DIVERGENCE.
+func TestInvestigationRandomFaultCampaign(t *testing.T) {
+	chosen := state.Command{Op: state.PUT, K: 7, V: state.Value("chosen")}
+	passed, skipped, lost, diverged := 0, 0, 0, 0
+	seeds := int64(100)
+	if v := os.Getenv("AUDIT_FAULT_SEEDS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			t.Fatalf("AUDIT_FAULT_SEEDS=%q: want a positive integer", v)
+		}
+		seeds = n
+	}
+	for seed := int64(1); seed <= seeds; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		c := newAuditCluster(5)
+		c.drop = func(from, to int32, code uint8) bool { return rng.Intn(100) < 20 }
+		c.propose(0, 1, chosen)
+		if err := c.run(100000); err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+
+		hadChosen := false
+		for i := 0; i < 5; i++ {
+			if randomFaultHasChosen(c.instance(i, 0, 0), chosen) {
+				hadChosen = true
+			}
+		}
+		if !hadChosen {
+			skipped++
+			t.Logf("seed %d: SKIP (no replica has the proposed value)", seed)
+			continue
+		}
+
+		recoverer := -1
+		for i := 1; i < 5; i++ {
+			if !randomFaultHasChosen(c.instance(i, 0, 0), chosen) {
+				recoverer = i
+				break
+			}
+		}
+		if recoverer == -1 {
+			passed++
+			t.Logf("seed %d: PASS (all replicas already hold the value)", seed)
+			continue
+		}
+
+		c.drop = nil
+		c.reps[recoverer].crtInstance[0] = 0
+		c.reps[recoverer].startRecoveryForInstance(0, 0)
+		if err := c.run(100000); err != nil {
+			t.Fatalf("seed %d recovery: %v", seed, err)
+		}
+
+		putCount, noopCount, otherCount := 0, 0, 0
+		for i := 0; i < 5; i++ {
+			inst := c.instance(i, 0, 0)
+			if inst == nil || inst.Status != COMMITTED {
+				continue
+			}
+			switch {
+			case randomFaultHasChosen(inst, chosen):
+				putCount++
+			case randomFaultIsNOOP(inst):
+				noopCount++
+			default:
+				otherCount++
+			}
+		}
+		t.Logf("seed %d recoverer %d: put=%d noop=%d other=%d", seed, recoverer, putCount, noopCount, otherCount)
+		if otherCount > 0 || (putCount > 0 && noopCount > 0) {
+			for i := 0; i < 5; i++ {
+				inst := c.instance(i, 0, 0)
+				if inst != nil {
+					t.Logf("seed %d replica %d: status=%d cmds=%v", seed, i, inst.Status, inst.Cmds)
+				}
+			}
+			diverged++
+			t.Errorf("seed %d: DIVERGENCE (put=%d noop=%d other=%d)", seed, putCount, noopCount, otherCount)
+		} else if putCount == 0 && noopCount > 0 {
+			lost++
+			t.Errorf("seed %d: LOSS (chosen value replaced by NOOP on all committed replicas)", seed)
+		} else if putCount > 0 {
+			passed++
+		} else {
+			skipped++
+		}
+	}
+	t.Logf("random fault campaign (%d seeds): pass=%d skip=%d loss=%d divergence=%d",
+		seeds, passed, skipped, lost, diverged)
+}
+
+// Deterministic isolation of the campaign's mixed-value divergence at seed 57.
+func TestInvestigationRandomFaultSeed57(t *testing.T) {
+	const seed = int64(57)
+	rng := rand.New(rand.NewSource(seed))
+	c := newAuditCluster(5)
+	c.drop = func(from, to int32, code uint8) bool { return rng.Intn(100) < 20 }
+	chosen := state.Command{Op: state.PUT, K: 7, V: state.Value("chosen")}
+	c.propose(0, 1, chosen)
+	if err := c.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		inst := c.instance(i, 0, 0)
+		if inst == nil {
+			t.Logf("pre-recovery replica %d: no instance", i)
+			continue
+		}
+		t.Logf("pre-recovery replica %d: status=%d bal=%d vbal=%d cmds=%v",
+			i, inst.Status, inst.bal, inst.vbal, inst.Cmds)
+	}
+	recoverer := -1
+	for i := 1; i < 5; i++ {
+		if !randomFaultHasChosen(c.instance(i, 0, 0), chosen) {
+			recoverer = i
+			break
+		}
+	}
+	if recoverer == -1 {
+		t.Fatal("seed 57 did not select a recoverer")
+	}
+	t.Logf("recoverer=%d", recoverer)
+
+	c.drop = nil
+	c.reps[recoverer].crtInstance[0] = 0
+	c.reps[recoverer].startRecoveryForInstance(0, 0)
+	if err := c.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	put, noop := 0, 0
+	for i := 0; i < 5; i++ {
+		inst := c.instance(i, 0, 0)
+		if inst == nil {
+			t.Logf("post-recovery replica %d: no instance", i)
+			continue
+		}
+		t.Logf("post-recovery replica %d: status=%d cmds=%v", i, inst.Status, inst.Cmds)
+		if inst.Status == COMMITTED {
+			if randomFaultHasChosen(inst, chosen) {
+				put++
+			} else if randomFaultIsNOOP(inst) {
+				noop++
+			}
+		}
+	}
+	t.Logf("seed 57 final: put=%d noop=%d", put, noop)
+	if put == 0 || noop == 0 {
+		t.Errorf("seed 57 did not reproduce the mixed divergence: put=%d noop=%d", put, noop)
+	}
+}
+
+// Seeds 266/277/428 of the extended campaign end with one replica holding the
+// PUT and four holding NOOP, a different split from seed 57.  Re-run seed 266
+// with pre/post status so the split can be reviewed directly.
+func TestInvestigationRandomFaultSeed266(t *testing.T) {
+	const seed = int64(266)
+	rng := rand.New(rand.NewSource(seed))
+	c := newAuditCluster(5)
+	c.drop = func(from, to int32, code uint8) bool { return rng.Intn(100) < 20 }
+	chosen := state.Command{Op: state.PUT, K: 7, V: state.Value("chosen")}
+	c.propose(0, 1, chosen)
+	if err := c.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		inst := c.instance(i, 0, 0)
+		if inst == nil {
+			t.Logf("pre-recovery replica %d: no instance", i)
+			continue
+		}
+		t.Logf("pre-recovery replica %d: status=%d bal=%d vbal=%d cmds=%v",
+			i, inst.Status, inst.bal, inst.vbal, inst.Cmds)
+	}
+	recoverer := -1
+	for i := 1; i < 5; i++ {
+		if !randomFaultHasChosen(c.instance(i, 0, 0), chosen) {
+			recoverer = i
+			break
+		}
+	}
+	if recoverer == -1 {
+		t.Fatal("seed 266 did not select a recoverer")
+	}
+	t.Logf("recoverer=%d", recoverer)
+
+	c.drop = nil
+	c.reps[recoverer].crtInstance[0] = 0
+	c.reps[recoverer].startRecoveryForInstance(0, 0)
+	if err := c.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	put, noop := 0, 0
+	for i := 0; i < 5; i++ {
+		inst := c.instance(i, 0, 0)
+		if inst == nil {
+			t.Logf("post-recovery replica %d: no instance", i)
+			continue
+		}
+		t.Logf("post-recovery replica %d: status=%d cmds=%v", i, inst.Status, inst.Cmds)
+		if inst.Status == COMMITTED {
+			if randomFaultHasChosen(inst, chosen) {
+				put++
+			} else if randomFaultIsNOOP(inst) {
+				noop++
+			}
+		}
+	}
+	t.Logf("seed 266 final: put=%d noop=%d", put, noop)
+	if put == 0 || noop == 0 {
+		t.Errorf("seed 266 did not reproduce the mixed divergence: put=%d noop=%d", put, noop)
+	}
+}
+
+// Seed 706 is the first 2-PUT/3-NOOP split seen in the 1,000-seed sweep.
+func TestInvestigationRandomFaultSeed706(t *testing.T) {
+	const seed = int64(706)
+	rng := rand.New(rand.NewSource(seed))
+	c := newAuditCluster(5)
+	c.drop = func(from, to int32, code uint8) bool { return rng.Intn(100) < 20 }
+	chosen := state.Command{Op: state.PUT, K: 7, V: state.Value("chosen")}
+	c.propose(0, 1, chosen)
+	if err := c.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		inst := c.instance(i, 0, 0)
+		if inst == nil {
+			t.Logf("pre-recovery replica %d: no instance", i)
+			continue
+		}
+		t.Logf("pre-recovery replica %d: status=%d bal=%d vbal=%d seq=%d cmds=%v",
+			i, inst.Status, inst.bal, inst.vbal, inst.Seq, inst.Cmds)
+	}
+	recoverer := -1
+	for i := 1; i < 5; i++ {
+		if !randomFaultHasChosen(c.instance(i, 0, 0), chosen) {
+			recoverer = i
+			break
+		}
+	}
+	if recoverer == -1 {
+		t.Fatal("seed 706 did not select a recoverer")
+	}
+	t.Logf("recoverer=%d", recoverer)
+
+	c.drop = nil
+	c.reps[recoverer].crtInstance[0] = 0
+	c.reps[recoverer].startRecoveryForInstance(0, 0)
+	if err := c.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	put, noop := 0, 0
+	for i := 0; i < 5; i++ {
+		inst := c.instance(i, 0, 0)
+		if inst == nil {
+			t.Logf("post-recovery replica %d: no instance", i)
+			continue
+		}
+		t.Logf("post-recovery replica %d: status=%d cmds=%v", i, inst.Status, inst.Cmds)
+		if inst.Status == COMMITTED {
+			if randomFaultHasChosen(inst, chosen) {
+				put++
+			} else if randomFaultIsNOOP(inst) {
+				noop++
+			}
+		}
+	}
+	t.Logf("seed 706 final: put=%d noop=%d", put, noop)
+	if put == 0 || noop == 0 {
+		t.Errorf("seed 706 did not reproduce the mixed divergence: put=%d noop=%d", put, noop)
+	}
+}

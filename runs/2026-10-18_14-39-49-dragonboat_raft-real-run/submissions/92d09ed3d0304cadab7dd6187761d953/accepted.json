@@ -1,0 +1,130 @@
+{
+  "rationale": "Open the recovery and resynchronization mechanism, which the audit had not yet examined, with a concrete safety question: can a snapshot restore leave a node's raft membership stale relative to the log it accepts, so an absent node is still counted in quorum or a restored role change is lost? The captured paths answer no. restore aborts on an out-of-date snapshot, refuses to downgrade the local node's role, and replaces the log's committed and processed positions; restoreRemotes rebuilds all three role maps from the snapshot membership rather than merging them, and the running follower reaches that replacement through the state machine's Recover task, during whose window the committed index already exceeds the applied index so the election gate blocks campaigning. Record it as a refuted suspicion with the ordering argument and its residual limits.",
+  "sources": [
+    {
+      "id": "raft-restore-guard",
+      "file": "internal/raft/raft.go",
+      "start_line": 447,
+      "end_line": 478,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft-restore-remotes",
+      "file": "internal/raft/raft.go",
+      "start_line": 480,
+      "end_line": 525,
+      "kind": "code_observation"
+    },
+    {
+      "id": "raft-log-restore",
+      "file": "internal/raft/logentry.go",
+      "start_line": 395,
+      "end_line": 399,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node-restore-remotes",
+      "file": "node.go",
+      "start_line": 294,
+      "end_line": 318,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node-push-snapshot",
+      "file": "node.go",
+      "start_line": 605,
+      "end_line": 621,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rsm-recover-restores-remotes",
+      "file": "internal/rsm/statemachine.go",
+      "start_line": 240,
+      "end_line": 256,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@snapshot-restore-membership-consistency",
+      "question": "Can a snapshot restore leave a node's raft membership stale relative to the restored log, so that a node absent from the snapshot is still counted in quorum or a restored role change is lost?",
+      "source_ids": [
+        "raft-restore-guard",
+        "raft-restore-remotes",
+        "raft-log-restore",
+        "node-restore-remotes",
+        "node-push-snapshot",
+        "rsm-recover-restores-remotes",
+        "election-apply-gate",
+        "applied-vs-committed-check"
+      ],
+      "hypothesis": "restore updates the log and committed index before the role maps are replaced, and restoreRemotes rebuilds the maps from the snapshot membership, so a window or a merge could leave the membership inconsistent with the restored log.",
+      "discriminator": "",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@snapshot-restore-replaces-membership",
+      "kind": "behavior",
+      "statement": "raft.restore rejects a snapshot whose index does not exceed the committed index, panics when the local node would become an observer or witness, and otherwise lets the log replace its state and set the committed and processed positions to the snapshot index. restoreRemotes then recreates the remotes, observers and witnesses maps from the snapshot membership, promoting a local observer to follower when the snapshot lists it as a full member, panicking on a witness promotion, and stepping a leader down when the snapshot no longer contains it. A running node reaches restoreRemotes through the state machine's Recover task, which the node schedules from pushSnapshot after applying the snapshot to its logs.",
+      "conditions": "A node receives or recovers from a snapshot whose index exceeds its committed index, and the node's surrounding state machine runs the scheduled Recover task.",
+      "source_ids": [
+        "raft-restore-guard",
+        "raft-restore-remotes",
+        "raft-log-restore",
+        "node-restore-remotes",
+        "node-push-snapshot",
+        "rsm-recover-restores-remotes"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@snapshot-restore-membership-consistency",
+      "experiment_id": null,
+      "source_ids": [
+        "raft-restore-guard",
+        "raft-restore-remotes",
+        "raft-log-restore",
+        "node-restore-remotes",
+        "node-push-snapshot",
+        "rsm-recover-restores-remotes",
+        "election-apply-gate",
+        "applied-vs-committed-check"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "defect_claim": "refuted",
+      "rationale": "The suspicion is refuted for the captured restore paths. raft.restore first rejects a snapshot whose index does not exceed the committed index, so a stale snapshot cannot move the log backward, and it refuses to convert the local node into an observer or witness. When the snapshot is accepted, the log sets its committed and processed positions to the snapshot index, and restoreRemotes then rebuilds all three role maps from the snapshot membership with fresh map allocations rather than merging them, so a node absent from the snapshot is no longer present in remotes, observers or witnesses and cannot be counted in a later quorum; a leader that the snapshot removes steps down. The running-follower path reaches that replacement indirectly: the node applies the snapshot to its logs and schedules a Recover task, and the state machine calls RestoreRemotes for that snapshot when it runs the task. During the interval between the log restore and that task, the raft committed index already equals the snapshot index while the applied index still lags, and handleNodeElection refuses to campaign while the committed index exceeds the applied index, so the node cannot use the interim membership to start an election. The remaining exposure is the supervisor's own ordering rather than a raft merge: the membership maps are replaced only when the state machine completes Recover, which the captured code schedules immediately after applying the snapshot.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "restore writes the log positions before restoreRemotes replaces the role maps, so the two are not atomic with respect to each other; the refutation relies on the election gate closing the resulting window for a non-leader.",
+        "A leader that receives a snapshot-derived membership steps down only when the snapshot no longer contains it; the captured paths do not exercise a leader that is asked to install a snapshot while remaining a member.",
+        "The role-map replacement happens in the state machine's Recover task, so its promptness depends on that task being run by the surrounding node."
+      ],
+      "limitations": [
+        "This is a source-only account; no snapshot install, recovery or restart execution is retained for it.",
+        "Snapshot corruption, a storage layer that returns a snapshot inconsistent with its recorded membership, and operator-supplied snapshots are excluded.",
+        "The account covers the membership maps and the election gate; it does not re-derive log-matching safety for the appended entries that follow a restore.",
+        "Only the single-node view is traced; how peers react to a member that restored a different snapshot is not examined."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

@@ -428,6 +428,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
         harness = Harness(kind=engine.implementation.harness_kind, source=inputs.read(request.harness_path),
             files={name: inputs.read(path) for name, path in request.files.items()},
             execution_package=request.execution_package, test_names=request.test_names, prerequisites=request.prerequisites,
+            features=request.features, default_features=request.default_features, all_features=request.all_features,
             semantic_changes=request.semantic_changes)
         basis = ExperimentBasis(harness=harness, source_ids=request.source_ids, anchors=request.anchors,
             scope=request.scope, prefix=request.prefix, requirement=request.requirement,

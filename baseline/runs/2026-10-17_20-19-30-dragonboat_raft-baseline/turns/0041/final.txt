@@ -1,0 +1,26 @@
+This pass found a sixth — and the most serious availability — defect: a malformed network frame kills the NodeHost.
+
+**Finding 6: crafted message batch crashes the process**
+
+`MessageBatch.Unmarshal` pre-sizes its request slice with `messageCount`, which re-parses field headers from untrusted data without the overflow/bounds checks the main parser performs (no `shift >= 64` guard, no `msglen < 0` check, no `postIndex` bounds check). A 10-byte varint whose top bit lands in the sign position yields a negative length, then a negative index:
+
+```
+MessageBatch.Unmarshal panicked: runtime error: index out of range [-9223372036854775797]
+```
+
+It is reachable from the network: `internal/transport/tcp.go`'s `serveConn` reads a frame (magic number, header CRC, payload CRC — none of which are secrets) and calls `batch.Unmarshal(buf)` with no recover; the deployment-ID/bin-version checks happen only afterwards. A standalone reproduction (`audit/tools/e2ecrash`) sends a 15-byte frame to a running NodeHost and the process dies:
+
+```
+panic: runtime error: index out of range [-9223372036854775797]
+  raftpb.(*MessageBatch).messageCount  raft_optimized.go:1022
+  raftpb.(*MessageBatch).Unmarshal     raft_optimized.go:1107
+  internal/transport.(*TCP).serveConn
+```
+
+Expected behaviour is rejection with an error, which the main parser already does ("proto: negative length found during unmarshaling"); adding the same guards to `messageCount` in `audit/diag-fixes/` makes the unit reproduction pass. Severity is availability only — no log or state corruption — but any peer that can reach the Raft port can kill the process in the default non-TLS configuration.
+
+**State**
+
+Six findings: F1 `(*nodeUser).ReadIndex` wakeup, F2 duplicated dropped-ReadIndex record, F3 `Update.HasUpdate` ignores `DroppedReadIndexes`, F4 channel-transport factory panics, F5 logger cache ignores the monkey flag, F6 malformed-batch panic. All are reproduced on the unmodified tree; all are fixed in `audit/diag-fixes/`.
+
+29 audit tests (22 negative results, 7 deliberate reproductions). [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) (800 lines) documents all six with evidence, fix verification and the full inventory. The audited tree remains byte-identical to `../source`.

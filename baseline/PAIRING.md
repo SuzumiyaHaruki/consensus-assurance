@@ -6,7 +6,7 @@ baseline 保持 [task.md](task.md) 的普通自主调查；CA 保留自己的研
 
 | 条件 | 当前做法 |
 |---|---|
-| 输入 | 同一干净目标提交、模块、工具链、默认 features 与依赖；每次独立捕获源码、新会话、新工作区 |
+| 输入 | 同一干净目标提交、模块、工具链、初始 features 与依赖；双方可显式选择目标支持的 feature 组合并记录实际构建条件；每次独立捕获源码、新会话、新工作区 |
 | 模型 | 配对采用同一模型、provider、档位及 catalog；CA 显式 `codex_profile: single_agent` |
 | 原生能力 | 共同 `common_settings()`；保留普通 shell、工具发现及原生压缩，关闭自动 skills/plugins/memory/hooks 和子 Agent |
 | 执行 | 普通 shell 禁网；baseline `isolated_exec` 与 CA 固定执行均在独立网络中允许同次调用内的 localhost、线程及子进程 |

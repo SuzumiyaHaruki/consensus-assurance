@@ -1,0 +1,206 @@
+{
+  "rationale": "Advance the audit on an executable, scheduling-independent relationship: the runtime's decided-stream cursor advances one step per element returned by read_decided_suffix, but the core collapses a trimmed prefix into a single element. A new investigation is registered and a focused two-node in-process probe is requested to establish the core's returned shape (and the resulting cursor replay) from actual retained execution.",
+  "sources": [
+    {
+      "id": "core_read_suffix",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 89,
+      "end_line": 157,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_entry_type",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 159,
+      "end_line": 177,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_compacted_entry",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 197,
+      "end_line": 202,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rt_decided_sub",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 123,
+      "end_line": 132,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rt_push_sub",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 279,
+      "end_line": 296,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rt_push_all",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 301,
+      "end_line": 340,
+      "kind": "code_observation"
+    },
+    {
+      "id": "rt_subscribe_api",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 262,
+      "end_line": 281,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@decided_sub_cursor",
+      "question": "When a DecidedSub starts below the compacted index, does its per-element cursor arithmetic stay index-aligned with read_decided_suffix, or does it re-deliver already-emitted entries on later pushes?",
+      "source_ids": [
+        "core_read_suffix",
+        "core_entry_type",
+        "core_compacted_entry",
+        "rt_decided_sub",
+        "rt_push_sub",
+        "rt_push_all",
+        "rt_subscribe_api"
+      ],
+      "hypothesis": "The core returns one Trimmed/Snapshotted element in place of the whole trimmed prefix, so the vector is shorter than decided-from. push_to_sub increments next_idx once per element and push_to_all_subs assumes entries[i] is the entry at min_next+i, so after a catch-up that crosses a compaction boundary the cursor lands short of decided and later pushes re-deliver the entries after the compacted index, violating the documented in-order decided stream that applications use to apply entries once.",
+      "discriminator": "The actual element count and kinds of read_decided_suffix(from) for from below versus at the compacted index on a real trimmed log, and the first later push computed from the resulting cursor.",
+      "disposition": "active"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@decided_sub_cursor",
+      "source_ids": [
+        "core_read_suffix",
+        "core_entry_type",
+        "core_compacted_entry",
+        "rt_decided_sub",
+        "rt_push_sub",
+        "rt_push_all",
+        "rt_subscribe_api"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Source reading gives a concrete mechanism. In InternalStorage::read, when from is below the compacted index the result is one create_compacted_entry element followed by one element per entry from compacted_idx to the requested end, so for from < compacted_idx the vector has fewer elements than decided_idx - from; the Trimmed(t)/Snapshotted variant is a marker for the whole trimmed prefix, not one index. The runtime stores only next_idx per subscriber, increments it once per element pushed (push_to_sub and push_to_all_subs), and push_to_all_subs computes start = sub.next_idx - min_next assuming one element per index. A subscription or catch-up at from < compacted therefore ends with next_idx = from + 1 + (decided - compacted), short of decided, and the next push re-reads from that cursor and re-sends entries after the compacted index. subscribe_decided accepts any from and documents a single in-order stream; nothing rejects or compensates for a compacted starting index. The retained execution is needed to pin the core's returned shape (element count and kinds) and the resulting replay; the claim remains unresolved until that receipt is associated.",
+      "counterevidence": [
+        "If the caller only ever subscribes at or above the compacted index, read_decided_suffix returns exactly one element per index and the cursor arithmetic is aligned; the defect is limited to a starting or lagging cursor below compaction.",
+        "A Trimmed/Snapshotted marker is a documented LogEntry variant, so delivering it is not itself wrong; the defect is the cursor advance that treats the marker as one index."
+      ],
+      "limitations": [
+        "omnipaxos_runtime is not a dev-dependency of the omnipaxos test target, so the actor itself cannot be compiled or run from the assurance harness; only the core read shape can be executed here.",
+        "The probe reproduces the actor's cursor arithmetic over real core outputs; that reproduction is a reconstruction of source logic, not an execution of the runtime crate.",
+        "The scenario uses in-memory storage without snapshots and a single compaction point; snapshot-based compaction and concurrent multi-subscriber reads are not exercised."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@decided_sub_cursor",
+    "harness_path": "omnipaxos/tests/assurance_generated.rs",
+    "files": {},
+    "source_ids": [
+      "core_read_suffix",
+      "core_entry_type",
+      "core_compacted_entry",
+      "rt_push_sub",
+      "rt_push_all"
+    ],
+    "scope": {
+      "description": "Two real OmniPaxos instances (pids 1 and 2) in one process, MemoryStorage, batch_size 1, no snapshots; node 1 becomes leader via try_become_leader, six entries are appended and decided, then the leader trims to index 4. The probe records read_decided_suffix(1) and (4) shapes and replays the actor's cursor arithmetic from source over those real outputs.",
+      "assumptions": [
+        "All messages produced by either instance are delivered synchronously to their addressed node until no message remains (reliable, ordered, no loss).",
+        "Only local calls append, try_become_leader and trim drive the run; no ticks, so BLE elections do not occur.",
+        "Trim(4) is accepted because the leader's minimum accepted index is 6 for both nodes."
+      ],
+      "excluded": [
+        "Network faults, reconnect handling, snapshots, batching, reconfiguration and concurrent client calls."
+      ],
+      "parameters": {
+        "nodes": [
+          1,
+          2
+        ],
+        "entries": 6,
+        "trim_idx": 4
+      }
+    },
+    "prefix": "Build both nodes from ClusterConfig {configuration_id:1, nodes:[1,2]} and default ServerConfig with pid 1/2 and MemoryStorage. Pump until quiescent, call node1.try_become_leader(), pump until leader state is (pid 1, Accept). Append Value(1..=6) with a full pump after each append so every entry is decided on both nodes. Call node1.trim(Some(4)) and pump; node 2 applies the forwarded Trim(4). Emit CA_EVENT ready (leader_is_1_accept, decided, decided_peer, compacted), then suffix_shape events for from=1 and from=4 (from, decided, compacted, len, decided_minus_from, kinds, tokens), then cursor_replay: start cursor at 1, apply push_to_sub's for-each-element next_idx += 1 to read_decided_suffix(cursor), then apply one later push_to_all_subs read from the resulting cursor with start=0, and report catchup_tokens, cursor_after_catchup, next_push_tokens, delivered_values, duplicate_values, duplicates, decided.",
+    "comparisons": [
+      {
+        "event": "suffix_shape",
+        "identity_fields": [
+          "from"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "len",
+          "op": "eq",
+          "value": 3
+        },
+        "applicability_conditions": [
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "Requesting from index 1 below compacted 4 returns the compacted marker plus the two remaining entries, so len is 3 while decided_minus_from is 5."
+      },
+      {
+        "event": "suffix_shape",
+        "identity_fields": [
+          "from"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "len",
+          "op": "eq",
+          "value": 2
+        },
+        "applicability_conditions": [
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 4
+          }
+        ],
+        "description": "Requesting from the compacted boundary itself returns one element per remaining index (len 2)."
+      },
+      {
+        "event": "cursor_replay",
+        "identity_fields": [
+          "start_from"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "duplicates",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The per-element cursor after catch-up is short of decided, so the next push re-delivers entries 5 and 6."
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "ready",
+        "event": "ready",
+        "conditions": [
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 6
+          },
+          {
+            "field": "compacted",
+            "op": "eq",
+            "value": 4
+          }
+        ]
+      }
+    ],
+    "test_names": [
+      "decided_suffix_collapses_trimmed_prefix"
+    ]
+  }
+}

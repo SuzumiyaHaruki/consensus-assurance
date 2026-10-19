@@ -1,0 +1,150 @@
+{
+  "id": "84e0053ba3d1476391e92e2ceac40c44-experiment",
+  "investigation_id": "84e0053ba3d1476391e92e2ceac40c44-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "rust_test",
+      "source": "//! Focused probe: can a new leader's AcceptSync lower the decided index of a\n//! follower that had already decided a later entry?\n//!\n//! Five real OmniPaxos instances run in one process with in-memory storage and\n//! an explicit message pump. Messages are dropped or delayed selectively to\n//! build the state: entry 5 is decided with a majority, two acceptors never see\n//! the Decide, a new leader is elected by those lagging nodes, and the follower\n//! that did see index 4 as Decided promises only after that leader's prepare\n//! quorum is complete.\n\nuse omnipaxos::{\n    messages::{sequence_paxos::PaxosMsg, Message},\n    storage::{Entry, NoSnapshot},\n    util::LogEntry,\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, PartialEq)]\nstruct Value(u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\n\nfn build_node(pid: u64) -> Node {\n    let cluster = ClusterConfig {\n        configuration_id: 1,\n        nodes: vec![1, 2, 3, 4, 5],\n        flexible_quorum: None,\n    };\n    let server = ServerConfig {\n        pid,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: cluster,\n        server_config: server,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"node build failed\")\n}\n\nfn collect(nodes: &mut [Node], q: &mut Vec<Message<Value>>) {\n    for n in nodes.iter_mut() {\n        let mut out = Vec::new();\n        n.take_outgoing_messages(&mut out);\n        q.extend(out);\n    }\n}\n\nfn route<F>(nodes: &mut [Node], q: &mut Vec<Message<Value>>, mut keep: F)\nwhere\n    F: FnMut(&Message<Value>) -> bool,\n{\n    let all = std::mem::take(q);\n    let mut kept = Vec::new();\n    for m in all {\n        if keep(&m) {\n            let to = m.get_receiver() as usize;\n            nodes[to - 1].handle_incoming(m);\n        } else {\n            kept.push(m);\n        }\n    }\n    *q = kept;\n}\n\nfn purge<F>(q: &mut Vec<Message<Value>>, drop_if: F)\nwhere\n    F: Fn(&Message<Value>) -> bool,\n{\n    q.retain(|m| !drop_if(m));\n}\n\nfn settle(nodes: &mut [Node], q: &mut Vec<Message<Value>>) {\n    for _ in 0..2000 {\n        collect(nodes, q);\n        if q.is_empty() {\n            return;\n        }\n        route(nodes, q, |_| true);\n    }\n    panic!(\"message pump did not quiesce\");\n}\n\nfn is_acceptdecide_to(m: &Message<Value>, to: u64) -> bool {\n    matches!(m, Message::SequencePaxos(p) if p.to == to && matches!(p.msg, PaxosMsg::AcceptDecide(_)))\n}\n\nfn is_decide_to(m: &Message<Value>, to: u64) -> bool {\n    matches!(m, Message::SequencePaxos(p) if p.to == to && matches!(p.msg, PaxosMsg::Decide(_)))\n}\n\nfn entry_status(e: Option<LogEntry<Value>>) -> &'static str {\n    match e {\n        Some(LogEntry::Decided(_)) => \"decided\",\n        Some(LogEntry::Undecided(_)) => \"undecided\",\n        Some(LogEntry::Trimmed(_)) => \"trimmed\",\n        Some(LogEntry::Snapshotted(_)) => \"snapshotted\",\n        Some(LogEntry::StopSign(_, _)) => \"stopsign\",\n        None => \"none\",\n    }\n}\n\nfn emit(line: String) {\n    println!(\"CA_EVENT {}\", line);\n}\n\nfn run_probe() {\n    let mut nodes: Vec<Node> = (1..=5).map(build_node).collect();\n    let mut q: Vec<Message<Value>> = Vec::new();\n    settle(&mut nodes, &mut q);\n\n    // Node 1 becomes leader with all five nodes connected.\n    nodes[0].try_become_leader();\n    settle(&mut nodes, &mut q);\n\n    // Entries 1..=4 are decided everywhere.\n    for i in 1..=4u64 {\n        nodes[0].append(Value(i)).expect(\"append failed\");\n        settle(&mut nodes, &mut q);\n    }\n\n    // Entry 5: accept on 2, 3 and 5 (not 4); the leader decides with 1,2,3,5;\n    // only node 5 receives the Decide, so 2 and 3 accept 5 but stay decided=4.\n    nodes[0].append(Value(5)).expect(\"append 5 failed\");\n    collect(&mut nodes, &mut q);\n    route(&mut nodes, &mut q, |m| !is_acceptdecide_to(m, 4));\n    settle(&mut nodes, &mut q);\n    collect(&mut nodes, &mut q);\n    route(&mut nodes, &mut q, |m| {\n        !is_decide_to(m, 2) && !is_decide_to(m, 3) && !is_decide_to(m, 4)\n    });\n\n    let before_decided = nodes[4].get_decided_idx();\n    let before_status = entry_status(nodes[4].read(4));\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"ready\\\",\\\"phase\\\":\\\"before\\\",\\\"node\\\":5,\\\"decided\\\":{},\\\"entry_status\\\":\\\"{}\\\",\\\"decided_leader1\\\":{},\\\"decided_node2\\\":{},\\\"accepted_node2\\\":{}}}\",\n        before_decided,\n        before_status,\n        nodes[0].get_decided_idx(),\n        nodes[1].get_decided_idx(),\n        nodes[1].get_accepted_idx()\n    ));\n\n    // Cut node 1 permanently; node 2 becomes leader with promises from 3 and 4.\n    let touches_1 = |m: &Message<Value>| m.get_sender() == 1 || m.get_receiver() == 1;\n    nodes[1].try_become_leader();\n    collect(&mut nodes, &mut q);\n    purge(&mut q, touches_1);\n    let mut held: Vec<Message<Value>> = Vec::new();\n    route(&mut nodes, &mut q, |m| {\n        if m.get_receiver() == 5 {\n            held.push(m.clone());\n            false\n        } else {\n            true\n        }\n    });\n    settle(&mut nodes, &mut q);\n    // Node 2 is now in Accept with promises from 3 and 4; its AcceptSync to\n    // those two is delivered, but their Accepted(5) replies are held back.\n    collect(&mut nodes, &mut q);\n    route(&mut nodes, &mut q, |_| true);\n    collect(&mut nodes, &mut q);\n    let held_acks = std::mem::take(&mut q);\n\n    // Deliver the delayed Prepare to node 5 and let it promise in Accept phase.\n    for m in held.drain(..) {\n        let to = m.get_receiver() as usize;\n        nodes[to - 1].handle_incoming(m);\n    }\n    settle(&mut nodes, &mut q);\n\n    let after_decided = nodes[4].get_decided_idx();\n    let after_status = entry_status(nodes[4].read(4));\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"late_sync\\\",\\\"phase\\\":\\\"after_sync\\\",\\\"node\\\":5,\\\"decided\\\":{},\\\"decided_before\\\":{},\\\"entry_status\\\":\\\"{}\\\",\\\"decided_leader2\\\":{},\\\"regressed\\\":{}}}\",\n        after_decided,\n        before_decided,\n        after_status,\n        nodes[1].get_decided_idx(),\n        after_decided < before_decided\n    ));\n\n    // Deliver the held Accepted(5) replies so the new leader re-decides index 5.\n    for m in held_acks {\n        let to = m.get_receiver() as usize;\n        nodes[to - 1].handle_incoming(m);\n    }\n    settle(&mut nodes, &mut q);\n\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"late_sync\\\",\\\"phase\\\":\\\"after_redecide\\\",\\\"node\\\":5,\\\"decided\\\":{},\\\"entry_status\\\":\\\"{}\\\",\\\"decided_leader2\\\":{}}}\",\n        nodes[4].get_decided_idx(),\n        entry_status(nodes[4].read(4)),\n        nodes[1].get_decided_idx()\n    ));\n}\n\n#[test]\nfn late_promise_sync_regresses_decided() {\n    run_probe();\n}\n",
+      "files": {},
+      "execution_package": "./omnipaxos",
+      "test_names": [
+        "late_promise_sync_regresses_decided"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "before",
+          "event": "ready",
+          "conditions": [
+            {
+              "field": "phase",
+              "op": "eq",
+              "value": "before",
+              "reference": null
+            },
+            {
+              "field": "node",
+              "op": "eq",
+              "value": 5,
+              "reference": null
+            },
+            {
+              "field": "decided",
+              "op": "eq",
+              "value": 5,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "core_sync_log",
+      "core_handle_acceptsync",
+      "core_promise_accept",
+      "core_send_accsync",
+      "core_majority_promises",
+      "core_handle_decide",
+      "docs_decided"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Five real OmniPaxos instances (pids 1..5) in one process, MemoryStorage, batch_size 1. Node 1 leads and decides entries 1..4 everywhere; entry 5 is accepted by 1,2,3,5 and decided by 1 after 1,2,3,5 accept, but the Decide reaches only node 5. Node 1 is then cut, node 2 is elected with promises from 3 and 4 only, and node 5's delayed Prepare makes it promise in Accept phase. Node 5's decided index and the status of the entry at index 4 are sampled before, immediately after the AcceptSync, and after the new leader re-decides.",
+      "assumptions": [
+        "Messages are delivered synchronously to their addressed node when routed; omitted messages are dropped, which the library's own resend and prepare-request paths are designed to repair.",
+        "Holding one Accepted(5) reply from nodes 3 and 4 while node 5 promises models slow acknowledgement, not a Byzantine or corrupted message.",
+        "No ticks are called, so leadership is obtained only through try_become_leader and BLE elections do not occur."
+      ],
+      "excluded": [
+        "Snapshots, flexible quorums, batching, reconfiguration and more than one delayed promise."
+      ],
+      "parameters": {
+        "nodes": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "decided_entries_before_new_leader": 5,
+        "leader": 2,
+        "delayed_promiser": 5
+      }
+    },
+    "prefix": "Build nodes 1..5 from ClusterConfig {configuration_id:1, nodes:[1,2,3,4,5]} with MemoryStorage and settle. node1.try_become_leader(); settle so all five promise. Append Value(1..=4) with settle after each. Append Value(5): drain, deliver the AcceptDecide to every follower except node 4, settle, then deliver the Decide for index 5 only to node 5 so nodes 2 and 3 accept 5 but remain decided=4. Emit late_sync phase=before for node 5 (decided, status of read(4), leader1 decided, node2 decided/accepted). Purge all traffic to or from node 1, call node2.try_become_leader(), hold node 2's Prepare addressed to node 5, settle so nodes 3 and 4 promise and node 2 enters Accept and sends AcceptSync; deliver those AcceptSyncs and hold the Accepted(5) replies. Deliver the held Prepare to node 5, settle so its late Promise reaches node 2 and node 2 answers with AcceptSync carrying its decided index. Emit late_sync phase=after_sync (decided, decided_before, entry status, leader2 decided, regressed). Then deliver the held Accepted(5) replies, settle, and emit late_sync phase=after_redecide.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "late_sync",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "before",
+        "assertion": {
+          "field": "regressed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_sync",
+            "reference": null
+          }
+        ],
+        "description": "After the AcceptSync, node 5's decided index is lower than before and the same index reads as undecided."
+      },
+      {
+        "event": "late_sync",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "before",
+        "assertion": {
+          "field": "decided",
+          "op": "eq",
+          "value": 5,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_redecide",
+            "reference": null
+          }
+        ],
+        "description": "After the new leader re-decides, node 5 is back at decided 5, so the same entry was observed decided, undecided and decided again."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "afb1c6e7238c40e7bfd92dfc1dcdedac",
+  "configuration": {
+    "backend": "cargo",
+    "target": {
+      "expected_module": null,
+      "variant": "omnipaxos",
+      "analysis_roots": [],
+      "execution_package": "omnipaxos",
+      "harness_path": "omnipaxos/tests/assurance_generated.rs"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+    }
+  },
+  "harness_filename": "omnipaxos/tests/assurance_generated.rs",
+  "operation_id": "84e0053ba3d1476391e92e2ceac40c44",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

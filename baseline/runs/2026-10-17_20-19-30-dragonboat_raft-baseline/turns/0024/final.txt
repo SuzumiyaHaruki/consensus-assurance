@@ -1,0 +1,17 @@
+This pass made the audit suite race-safe and investigated the one anomaly that surfaced under `-race`.
+
+**Race-aware harness**
+
+Adopted the upstream `pto`/`lpto` convention: audit tests now use a helper that returns an RTT-based timeout with 20 s of slack when the race detector is active (except the Finding-1 one-tick/two-tick boundary tests, which must keep exact RTT timeouts). With that, the fixed copy (`audit/diag-fixes/`) passes the entire audit suite under `-race` — `internal/raft`, `raftpb` and the root package, 12.6 s.
+
+**Investigated anomaly: 32 MB across two nodes under `-race`**
+
+It did not commit within 180 s, while it commits in ~1 s without `-race` and a 32 MB single-node proposal takes ~4 s under `-race`. The logs show the cause: the follower campaigns repeatedly and drops the leader's `Replicate`/`Heartbeat` as term-mismatched, because processing a 32 MB entry under race instrumentation takes longer than the test's election timeout (RTT 10 ms, ElectionRTT 10 → 100–190 ms). That is a configuration/throughput interaction amplified by the race detector, not a logic defect — in production the RTT and election timeout must be scaled to entry sizes. Recorded as an executed observation in the report; the harness now runs the 8 MB cross-node case under `-race`.
+
+**State**
+
+- Findings unchanged: F1 (`(*nodeUser).ReadIndex` misses the engine wakeup), F2 (`handleCandidateReadIndex` records a dropped ReadIndex twice), F3 (`pb.Update.HasUpdate` ignores dropped read indexes) — all reproduced on the unmodified tree, all fixed in `audit/diag-fixes/` with no regressions.
+- Audited tree's root audit run after the timeout change: 13 PASS, 1 FAIL (the F1 reproduction, as intended).
+- Implementation byte-identical to `../source`; 10 audit test files; report now 573 lines.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) records the race-aware setup, the large-entry observation and the enlarged fix-verification result.

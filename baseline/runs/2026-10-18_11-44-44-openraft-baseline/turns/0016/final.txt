@@ -1,0 +1,25 @@
+F9 is now confirmed; the audit has nine findings, all with executed reproductions. The five-check audit integration suite and the full `tests` package pass.
+
+| Severity | Finding |
+|---|---|
+| High | Snapshot install persists the log purge before the state-machine install completes; a crash leaves an unrecoverable state and restart panics. |
+| Medium | Documented-valid `PartialSuccess(None)` panics the leader in debug builds. |
+| Low/Medium | `purge_batch_size = 0` underflows at `calc_purge_upto()`'s `purge_end - 1`. |
+| Medium | `snapshot_max_chunk_size = 0` makes `Chunked::send_snapshot()` send zero-byte chunks forever. |
+| Low/Medium | Blocking `add_learner()` returns `Ok` after a leadership change while the learner is still not caught up. |
+| Low/Medium | `heartbeat_interval = 0` is accepted and leaves the tick loop unthrottled. |
+| Low/Medium | `install_snapshot_timeout = 0` is accepted and every snapshot RPC times out immediately. |
+| Low/Medium | `QuitLeader` does not stop replication tasks; a deposed leader keeps sending a snapshot. |
+| Low/Medium | `Raft::shutdown()` returns while the state-machine worker is still running; the SM can change afterward. |
+
+F9’s reproducer is [t11_shutdown_sm_worker.rs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/tests/tests/audit/t11_shutdown_sm_worker.rs). A delayed snapshot install is pending when `shutdown()` is called; after shutdown returns, the worker completes the install and the store changes:
+
+```
+SM applied after shutdown: before=None, after=Some(LogId { leader_id: LeaderId { term: 1, node_id: 0 }, index: 6 }), snapshot=LogId { leader_id: LeaderId { term: 1, node_id: 0 }, index: 6 }
+```
+
+`Raft::shutdown` joins RaftCore but leaves the SM worker’s `JoinHandle` detached, so a caller that closes or reuses the store can race with an in-flight apply/install. The report records the lifecycle basis and remediation (join or cancel the worker before returning).
+
+I also stabilized the earlier flaky harnesses: F2 now uses a non-blocking learner add, and F8 uses a controlled new-leader-to-learner partition; both pass repeatedly and in the full suite.
+
+Artifacts: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/report.md), [audit/repro](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/repro), [audit/logs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/logs), and [audit/diagnostics](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/diagnostics). Verification: five audit integration tests, the full `tests` package, 194 default-library tests, 205 `generic-snapshot-data` tests, and the release build all pass.

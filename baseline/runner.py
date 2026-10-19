@@ -14,7 +14,7 @@ from pathlib import Path
 
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.storage.snapshot import (
-    EXCLUDED_DIRS, sensitive_file, fixed_submodules,
+    EXCLUDED_DIRS, sensitive_file, fixed_submodules, screened_digest,
 )
 
 from .codex import Codex
@@ -165,11 +165,12 @@ def file_inventory(root, *, exclude=WORK_EXCLUDED):
                     or name.endswith(".lock.tmp")):
                 excluded[rel] = "private or transient file"
                 continue
-            data = path.read_bytes()
-            if sensitive_file(path,data):
-                excluded[rel] = "credential-like content"
+            identity = screened_digest(path)
+            if isinstance(identity, str):
+                excluded[rel] = identity
                 continue
-            files[rel] = {"digest": digest(data), "mode": stat.S_IMODE(info.st_mode), "size": len(data)}
+            checksum, size = identity
+            files[rel] = {"digest": checksum, "mode": stat.S_IMODE(info.st_mode), "size": size}
     return files, excluded
 
 
@@ -179,7 +180,13 @@ def save_changes(work, folder, previous):
     for name in changed:
         destination = folder / "files" / name
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(work / name, destination)
+        source = work / name
+        info = source.stat()
+        # Retain exact bytes without expanding preallocated test logs onto disk.
+        if info.st_blocks * 512 < info.st_size:
+            subprocess.run(["cp", "--sparse=always", "--", str(source), str(destination)], check=True)
+        else:
+            shutil.copyfile(source, destination)
         destination.chmod(actual[name]["mode"])
     write_json(folder / "manifest.json", {"changed": changed, "deleted": sorted(previous.keys() - actual.keys()),
                                           "excluded": excluded, "basis": "previous retained turn, initially source",
@@ -252,7 +259,13 @@ def loop(config, root, source, target, client, deadline, record):
         result.setdefault("timeout_limit", "total_seconds" if remaining <= config.budget.agent_turn_timeout else "agent_turn_timeout")
         result["ended_at"] = now()
         result["run_elapsed_seconds"] = time.monotonic() - start
+        write_json(folder / "result.json", result)
+        record["turns"].append({"number": number, "status": result["status"], "session_id": result.get("session_id"),
+                                "tool_events": result.get("tool_events", 0), "path": str(folder.relative_to(root))})
+        write_json(root / "run.json", record)
+        archive_start = time.monotonic()
         actual = save_changes(root / "work", folder / "changes", previous)
+        result["archive_seconds"] = time.monotonic() - archive_start
         if 'report.md' not in actual:
             report_version = None
         elif actual['report.md'] != previous.get('report.md'):
@@ -261,8 +274,6 @@ def loop(config, root, source, target, client, deadline, record):
             record['last_completed_report'] = report_version
         previous = actual
         write_json(folder / "result.json", result)
-        record["turns"].append({"number": number, "status": result["status"], "session_id": result.get("session_id"),
-                                "tool_events": result.get("tool_events", 0), "path": str(folder.relative_to(root))})
         session = result.get("session_id")
         write_json(root / "run.json", record)
         if result.get("continuable_timeout") and result["timeout_limit"] == "agent_turn_timeout":

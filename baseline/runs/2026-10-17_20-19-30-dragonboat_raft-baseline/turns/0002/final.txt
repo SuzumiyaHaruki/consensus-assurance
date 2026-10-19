@@ -1,0 +1,23 @@
+This pass added execution coverage in the previously unexercised areas and strengthened the second finding.
+
+**What ran this turn**
+
+- The whole `internal/...` suite in the isolated network namespace. Non-TLS transport tests (chunk assembly, chunk writer, registry, circuit breaker, initial message, in-memory send limits) all pass. The mutual-TLS variants cannot run: the captured tree ships `internal/transport/tests/localhost.crt` and `test-root-ca.crt` but not `localhost.key`, so those tests abort on file-open. That is a packaging limitation, now recorded in the report as blocked scope rather than an implementation failure.
+- Reviewed config defaults/validation, `rsm` offload/encoded/files/snapshot-io, and logdb sharding + compaction paths. No defect found in those.
+
+**Finding 2 strengthened**
+
+`TestAuditPeerUpdateDroppedReadIndexes` now drives the exported path: `raft.Launch` → tick a 3-node peer into candidate state → deliver one `ReadIndex` → inspect `Peer.GetUpdate`. The duplicate reaches the public update boundary:
+
+```
+zz_audit_repro_test.go:76: one dropped ReadIndex produced 2 records in pb.Update:
+    [{Low:11 High:22} {Low:11 High:22}]
+```
+
+So the defect is observable from the root package through `internal/raft`'s exported `Peer`, not just from raft internals. Finding 1 is unchanged: `(*nodeUser).ReadIndex` omits the engine wakeup, ~1 RTT added latency, and a one-RTT timeout deterministically times out on a healthy cluster while `NodeHost.ReadIndex` completes; the isolated copy with the one-line wakeup passes, confirming causality.
+
+**Artifacts**
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) now contains both findings with expected/actual behavior, necessary conditions, executed outputs, the transport/TLS blocker, the abridged command log, and unresolved work. Reproductions live in [zz_audit_nodeuser_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/zz_audit_nodeuser_test.go) and [zz_audit_repro_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/zz_audit_repro_test.go), behind the `dragonboat_audit` tag so the default suite stays green (verified: default `internal/raft` run still passes). The implementation remains byte-identical to `../source`.
+
+Remaining useful work: the TLS handshake path of `internal/transport/tcp.go` (blocked), `tools/import.go` end-to-end repair scenario, and a mutant-style sweep of the root package for further deviations from sibling-method patterns like F1.

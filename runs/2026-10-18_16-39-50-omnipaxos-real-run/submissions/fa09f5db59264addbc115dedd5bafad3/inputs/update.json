@@ -1,0 +1,88 @@
+{
+  "rationale": "The extra nodes settle the last factual question and change the severity of the finding. Nodes 1, 2 and 5 each report accepted 38 and decided 38 with a StopSign at index 37, while nodes 3 and 4 report accepted 37 with a StopSign at index 36 and nothing at index 37. The same StopSign therefore occupies different log indices on different nodes, which is a real divergence at index 36 rather than a purely local progress problem, and node 4's decided index of 38 points past the 37 positions it holds. The earlier zero divergence count was an artifact of the harness comparison, as its limitation predicted. This update records the divergence and restates the interpretation as a safety as well as progress defect.",
+  "knowledge": [
+    {
+      "ref": "@run13_stopsign_at_different_index",
+      "kind": "fact",
+      "statement": "At the end of seeded run 13, nodes 1, 2 and 5 each report accepted 38 with the entry at index 37 being a StopSign, while nodes 3 and 4 report accepted 37 with the entry at index 36 a StopSign and index 37 absent. Node 3 is decided 37 and node 4 is decided 38 while holding only 37 positions. The StopSign therefore sits one index later on nodes 1, 2 and 5 than on nodes 3 and 4, so the logs diverge at index 36, and node 4's decided index exceeds the length of its own log.",
+      "conditions": "Five OmniPaxos instances, MemoryStorage, unit batch, no snapshots; seed 0xbe5466cf34e90c6c, reconfigure at action 450 with 20 percent out-of-order loss, then 150 fair-delivery rounds; accepted and decided indices and the entry kinds at indices 35, 36 and 37 are read once at the end for all five nodes.",
+      "source_ids": [
+        "core_stopsign_decided",
+        "core_handle_acceptsync",
+        "core_create_log_sync",
+        "core_handle_accepted",
+        "core_is_chosen"
+      ],
+      "executions": {
+        "e1e4cc9b542f4103956704ed02db5618": [
+          1
+        ]
+      }
+    }
+  ],
+  "investigations": [
+    {
+      "id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "hypothesis": "The reconfiguration StopSign can be accepted at different log indices by different nodes after a lossy reconfiguration, producing divergent log prefixes. A node that places the StopSign one index earlier holds one fewer entry and stops accepting at that position, while nodes that placed it later continue to 38. A leader from the shorter group can still decide 38 by counting follower-reported accepted indices, even though its own log holds only 37 positions, and its Decides are the stalled follower's next expected sequence messages, so handle_decide clamps that follower's decided index instead of reconnecting.",
+      "knowledge": [
+        {
+          "entry_id": "@run13_stopsign_at_different_index",
+          "revision": 1,
+          "assertion": "Final observed state: the StopSign is at index 37 on nodes 1, 2 and 5 (accepted 38) and at index 36 on nodes 3 and 4 (accepted 37), so the logs diverge at index 36, and node 4 decides 38 while holding only 37 positions."
+        },
+        {
+          "entry_id": "54119cbd5ccb4c3e8e6a68ddde8947e3-knowledge-0",
+          "revision": 1,
+          "assertion": "Its comparison of nodes 3 and 4 remains accurate, but it was scoped to those two nodes; extending the read to nodes 1, 2 and 5 shows the StopSign at a different index there."
+        },
+        {
+          "entry_id": "ac2f20a6139f448da592f87489e93e7a-knowledge-0",
+          "revision": 1,
+          "assertion": "Explains how node 4 reaches decided 38 with accepted 37: handle_accepted counts follower-reported accepted indices from the longer group and sets the decided index without a matching local entry."
+        }
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "experiment_id": "556314c45cc24856bc8cf9af2ca47421-experiment",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_check_msg_status",
+        "core_handle_sequence_num",
+        "core_send_accsync",
+        "core_handle_acceptsync",
+        "core_stopsign_decided",
+        "core_create_log_sync",
+        "core_promise_meta_order",
+        "core_majority_promises",
+        "core_handle_accepted",
+        "core_is_chosen",
+        "core_sync_log"
+      ],
+      "executions": {
+        "e1e4cc9b542f4103956704ed02db5618": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The executed receipts show a genuine log divergence together with a leader decided index beyond its own log. Receipt e1e4cc9b542f4103956704ed02db5618 ran randomized_reconfig_diagnose_lag (exit 0, test passed); both declared comparisons are complete and violated, convergence because decided ended at 38,38,37,38,38 and the invariant because p4_gap, node 4's decided minus accepted index, is 1. The same event records nodes 1, 2 and 5 at accepted 38 and decided 38 with a StopSign at index 37, and nodes 3 and 4 at accepted 37 with a StopSign at index 36 and index 37 absent. The same reconfiguration marker therefore occupies index 36 on one group and index 37 on the other, which means the logs diverge at index 36 and the two groups hold different numbers of preceding entries. Node 4 is decided 38 while holding only 37 positions, so its decided index points past the end of its own log, which handle_accepted permits by taking a follower-reported accepted index from the longer group once is_chosen counts a quorum. Node 3, decided 37 with accepted 37, receives the Decides with sequence counters 2 and 3 as its next expected messages; handle_decide clamps decided to its accepted index, no PrepareReq is sent, no AcceptStopSign is offered because it already accepted one, and repeated Decides reuse a consumed sequence number, so it stays behind for the whole 150-round window. The zero divergence figure that earlier receipts reported is an artifact of the comparison helper, which keeps only Decided(Value) entries and compares the shorter of two prefixes: a StopSign at a different index and a prefix-length difference are both invisible to it. This run therefore shows both a safety-relevant divergence in the log layout and the progress loss that follows from it, rather than a pure progress problem.",
+      "counterevidence": [
+        "A follower that genuinely missed the AcceptStopSign can still recover: in the constructed clean-miss run the periodic Decide was sequence-ahead, the follower reconnected, and an AcceptSync repaired it.",
+        "A leadership change, or an external reconnected() call, leads to Prepare/Promise/AcceptSync, which gives the follower a fresh sequence and a log sync from the new leader.",
+        "The earlier zero divergence count is not counterevidence of agreement; it is an artifact of a comparison that ignores StopSign entries and prefix lengths."
+      ],
+      "limitations": [
+        "Indices and kinds are sampled once at the end, so the receipt does not show when the two groups placed the StopSign at different indices.",
+        "The entry kind at index 36 on nodes 1, 2 and 5 was not read; the divergence there is inferred from their StopSign sitting at index 37 while node 3 has it at 36.",
+        "Node 3's inbound trace is capped at twelve messages after the lossy phase, and Promises to node 4 are recorded only when delivered and only up to forty entries.",
+        "Five nodes, MemoryStorage, unit batch, no snapshots and no next configuration started; flexible quorums, batching and snapshot-based sync are unexercised."
+      ]
+    }
+  ]
+}

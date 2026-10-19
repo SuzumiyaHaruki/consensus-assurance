@@ -1,0 +1,13 @@
+I picked up the peer-message trust boundary again and found a cheaper variant of the same failure class.
+
+**F11 — one forged `Heartbeat` kills a follower**
+
+The follower's `handleHeartbeatMessage` passes the leader's `Commit` straight into `entryLog.commitTo`, which panics when the value is beyond `lastIndex()`. The Replicate path clamps (`commitTo(min(lastIdx, m.Commit))`); the heartbeat path never did. A `Heartbeat` needs no anchor index and no log-term match — only `Term >= r.term` and a known `From` — so a single frame is enough, and the same shape is sent by an ordinary leader whose match tracking is ahead of a follower's actual log.
+
+Evidence produced this turn:
+
+- [zz_audit_forgedheartbeat_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/zz_audit_forgedheartbeat_test.go) — fails with `forged Heartbeat panicked: invalid commitTo index 1000000, lastIndex() 3`; the in-range control passes.
+- [e2ereplicate](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/audit/tools/e2ereplicate/main.go) now has a `heartbeat` mode: one forged frame against a live three-node cluster panics at `commitTo → handleHeartbeatMessage → stepWorkerMain` ([log](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/audit/cover/f11/e2e_heartbeat_stderr.txt)).
+- Fix verified in `audit/diag-fixes/`: clamp to `lastIndex()`, which matches etcd and the sibling Replicate handler. The two new tests and upstream `TestHandleHeartbeat` pass, the full fixed raft suite is green, and the identical frame now leaves the cluster running.
+
+The report is updated throughout: F11 in the summary table, a full finding section with the panic stack and fix, the reproduction inventory, fix-verification snippet, and command log. The matrix is now 38 audit tests — 24 passing, 14 deliberate repro failures (root 20, raft 12, raftpb 3, transport 2, logger 1). The audited implementation remains byte-identical to `../source`; only build-tagged tests, harnesses and logs were added.

@@ -29,6 +29,66 @@ def test_cargo_preparation_retains_lock_origin(tmp_path,rust_workspace,upstream_
     assert not engine.state.checks and not engine.state.usage.get('experiments')
 
 
+def test_cargo_feature_variants_and_repeat_keep_exact_build_inputs(tmp_path,rust_workspace):
+    import shutil
+    from support.audit import cargo_engine, stop
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.adapters.storage.snapshot import capture
+    if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
+    manifest=rust_workspace/'sample/Cargo.toml'
+    manifest.write_text(manifest.read_text()+'[features]\ndefault=["base"]\nbase=[]\nextra=["increment/alternate"]\nspare=[]\n')
+    source='''#[test] fn measured() {
+        println!("CA_EVENT {{\\"event\\":\\"variant\\",\\"base\\":{},\\"extra\\":{},\\"spare\\":{},\\"value\\":{}}}",
+            cfg!(feature="base"), cfg!(feature="extra"), cfg!(feature="spare"), sample::step(2, 3));
+    }
+    #[test] fn unselected() { panic!("must not run"); }
+    '''
+    variants=[({},[True,False,False,3]),({'features':['extra']},[True,True,False,4]),
+        ({'features':['extra'],'default_features':False},[False,True,False,4]),
+        ({'all_features':True},[True,True,True,4])]
+    def submit(index):
+        def step(state):
+            selection,_=variants[index]
+            request=dict(investigation_id=state['investigations'][0]['id'] if index else '@q',
+                harness_path='check.rs',source_ids=['code'],scope={'description':'Captured feature variant'},
+                prefix='Call the original public API under the selected Cargo features.',
+                test_names=['measured'],**selection)
+            sub={'rationale':'Observe the actual selected build','experiment':request}
+            if index:
+                request.update(previous_id=state['experiments'][-1]['id'],revision_reason='Select a different supported feature combination')
+            else:
+                sub.update(sources=[dict(id='code',file='sample/src/lib.rs',start_line=1,end_line=3,kind='code_observation')],
+                    investigations=[dict(ref='@q',question='Which public behavior does this feature selection execute?',source_ids=['code'])])
+            return sub,{'check.rs':source}
+        return step
+    def repeat(state):
+        return {'rationale':'Repeat the saved extra-feature experiment','repeat_experiment_id':state['experiments'][1]['id']}, {
+            'check.rs':'invalid Rust; drafts must not change a repeat',
+            'selection.json':'{"all_features":true}'}
+    engine,repo=cargo_engine(tmp_path,rust_workspace,[*(submit(i) for i in range(4)),repeat,stop],tmp_path/'shared-seeds')
+    engine.config.budget.experiments=5;engine.config.budget.total_seconds=180
+    original=capture(repo).files
+    state=engine.start(repo)
+    checks=[c for c in state.checks if c.action=='experiment']
+    assert len(state.experiments)==4 and len(checks)==5,state.stop_reason
+    assert all(c.outcome=='tests_passed' for c in checks),[(c.reason,Path(c.stderr).read_text()) for c in checks]
+    observed=[[e[k] for k in ('base','extra','spare','value')] for c in checks for e in extract_events(c)]
+    assert observed==[value for _,value in variants]+[variants[1][1]]
+    assert len({c.parameters['build_inputs'] for c in checks})==4
+    assert checks[1].parameters['seed_record']==checks[-1].parameters['seed_record']
+    assert checks[1].experiment_id==checks[-1].experiment_id
+    feedback=json.loads((engine.root/'research.json').read_text())['build_inputs']
+    for artifact,check in zip(state.experiments,checks):
+        selected={key:getattr(artifact.basis.harness,key) for key in ('features','default_features','all_features')}
+        basis=json.loads((engine.root/check.parameters['build_inputs']).read_text())
+        view=next(item for item in feedback if item['record']==check.parameters['build_inputs'])
+        assert basis['feature_selection']==view['feature_selection']==selected
+        assert all(f in basis['resolved_features'] for f in selected['features'])
+        assert check.parameters['lock_unchanged'] and check.parameters['changed_target_files']==[]
+    assert len(list((tmp_path/'shared-seeds').glob('*/ready.json')))==4
+    assert capture(repo).files==original and not (repo/'Cargo.lock').exists()
+
+
 def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspace):
     import shutil
     from consensus_assurance.core.config import TargetConfig

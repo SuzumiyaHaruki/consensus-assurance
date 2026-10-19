@@ -1,0 +1,221 @@
+{
+  "id": "04c52ef2e70d4e699f5716a5c57500ba-experiment",
+  "investigation_id": "7e17be3eac204967962a1e20e3dfc907-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"testing\"\n\n\tpb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\nfunc emitObserverAssuranceEvent(t *testing.T, event map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"failed to marshal assurance event: %v\", err)\n\t}\n\tt.Logf(\"CA_EVENT %s\", b)\n}\n\nfunc TestAssuranceObserverReadIndexReplyContext(t *testing.T) {\n\tr := newTestRaft(1, []uint64{1, 2, 3}, 5, 1, NewTestLogDB())\n\tr.becomeFollower(1, NoLeader)\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\tr.remotes[2].tryUpdate(r.log.lastIndex())\n\tif !r.tryCommit() {\n\t\tt.Fatal(\"failed to commit the leader no-op in its current term\")\n\t}\n\tr.addObserver(4)\n\n\tctxA := pb.SystemCtx{Low: 101, High: 1002}\n\tctxB := pb.SystemCtx{Low: 202, High: 2003}\n\tr.Handle(pb.Message{\n\t\tFrom:     4,\n\t\tTo:       1,\n\t\tType:     pb.ReadIndex,\n\t\tHint:     ctxA.Low,\n\t\tHintHigh: ctxA.High,\n\t})\n\tr.Handle(pb.Message{\n\t\tFrom:     3,\n\t\tTo:       1,\n\t\tType:     pb.ReadIndex,\n\t\tHint:     ctxB.Low,\n\t\tHintHigh: ctxB.High,\n\t})\n\tif len(r.readIndex.pending) != 2 {\n\t\tt.Fatalf(\"expected two pending requests, got %d\", len(r.readIndex.pending))\n\t}\n\temitObserverAssuranceEvent(t, map[string]interface{}{\n\t\t\"event\":      \"observer_readindex_requested\",\n\t\t\"request_id\": \"observer-read-A\",\n\t\t\"node_id\":    uint64(4),\n\t\t\"leader_id\":  uint64(1),\n\t\t\"ctx_low\":    ctxA.Low,\n\t\t\"ctx_high\":   ctxA.High,\n\t})\n\n\tr.msgs = nil\n\tr.Handle(pb.Message{\n\t\tFrom:     3,\n\t\tTo:       1,\n\t\tType:     pb.HeartbeatResp,\n\t\tHint:     ctxB.Low,\n\t\tHintHigh: ctxB.High,\n\t})\n\tvar observerReply *pb.Message\n\tfor i := range r.msgs {\n\t\tif r.msgs[i].Type == pb.ReadIndexResp && r.msgs[i].To == 4 {\n\t\t\tobserverReply = &r.msgs[i]\n\t\t\tbreak\n\t\t}\n\t}\n\tif observerReply == nil {\n\t\tt.Fatal(\"no ReadIndex response was produced for observer 4\")\n\t}\n\temitObserverAssuranceEvent(t, map[string]interface{}{\n\t\t\"event\":              \"observer_readindex_reply\",\n\t\t\"request_id\":         \"observer-read-A\",\n\t\t\"reply_to\":           observerReply.To,\n\t\t\"trigger_from\":       uint64(3),\n\t\t\"trigger_ctx_low\":    ctxB.Low,\n\t\t\"trigger_ctx_high\":   ctxB.High,\n\t\t\"response_ctx_low\":   observerReply.Hint,\n\t\t\"response_ctx_high\":  observerReply.HintHigh,\n\t\t\"response_log_index\": observerReply.LogIndex,\n\t\t\"pending_after\":      len(r.readIndex.pending),\n\t})\n}\n\n// TestAssuranceUnknownSenderCannotConfirmReadIndex checks both admission layers\n// for a ReadIndex confirmation: the Peer response filter and the leader's remote\n// lookup. A heartbeat response from a node absent from every role map must not\n// contribute a confirmation, while a known voter's response must confirm.\nfunc TestAssuranceUnknownSenderCannotConfirmReadIndex(t *testing.T) {\n\tr := newTestRaft(1, []uint64{1, 2, 3}, 5, 1, NewTestLogDB())\n\tr.becomeFollower(1, NoLeader)\n\tr.becomeCandidate()\n\tr.becomeLeader()\n\tr.remotes[2].tryUpdate(r.log.lastIndex())\n\tif !r.tryCommit() {\n\t\tt.Fatal(\"failed to commit the leader no-op in its current term\")\n\t}\n\tp := &Peer{raft: r}\n\tctx := pb.SystemCtx{Low: 101, High: 1002}\n\tp.Handle(pb.Message{\n\t\tFrom:     2,\n\t\tTo:       1,\n\t\tType:     pb.ReadIndex,\n\t\tHint:     ctx.Low,\n\t\tHintHigh: ctx.High,\n\t})\n\tqueued := len(r.readIndex.pending)\n\temitObserverAssuranceEvent(t, map[string]interface{}{\n\t\t\"event\":      \"readindex_queued\",\n\t\t\"request_id\": \"node2-read-A\",\n\t\t\"node_id\":    uint64(2),\n\t\t\"ctx_low\":    ctx.Low,\n\t\t\"queued\":     queued,\n\t})\n\n\t// A response from a node that is in no role map, delivered through the Peer\n\t// admission path.\n\tr.msgs = nil\n\tp.Handle(pb.Message{\n\t\tFrom:     4,\n\t\tTo:       1,\n\t\tType:     pb.HeartbeatResp,\n\t\tHint:     ctx.Low,\n\t\tHintHigh: ctx.High,\n\t})\n\temitObserverAssuranceEvent(t, map[string]interface{}{\n\t\t\"event\":         \"unknown_sender_peer_path\",\n\t\t\"request_id\":    \"node2-read-A\",\n\t\t\"sender\":        uint64(4),\n\t\t\"pending_after\": len(r.readIndex.pending),\n\t\t\"replies_after\": len(r.msgs),\n\t})\n\n\t// The same response handed straight to the raft state machine, bypassing the\n\t// Peer filter, so only the leader's remote lookup can reject it.\n\tr.msgs = nil\n\tr.Handle(pb.Message{\n\t\tFrom:     4,\n\t\tTo:       1,\n\t\tType:     pb.HeartbeatResp,\n\t\tHint:     ctx.Low,\n\t\tHintHigh: ctx.High,\n\t})\n\temitObserverAssuranceEvent(t, map[string]interface{}{\n\t\t\"event\":         \"unknown_sender_raft_path\",\n\t\t\"request_id\":    \"node2-read-A\",\n\t\t\"sender\":        uint64(4),\n\t\t\"pending_after\": len(r.readIndex.pending),\n\t\t\"replies_after\": len(r.msgs),\n\t})\n\n\t// A known voter's response must confirm the same context.\n\tr.msgs = nil\n\tp.Handle(pb.Message{\n\t\tFrom:     3,\n\t\tTo:       1,\n\t\tType:     pb.HeartbeatResp,\n\t\tHint:     ctx.Low,\n\t\tHintHigh: ctx.High,\n\t})\n\treplies := 0\n\tfor _, m := range r.msgs {\n\t\tif m.Type == pb.ReadIndexResp && m.To == 2 {\n\t\t\treplies++\n\t\t}\n\t}\n\temitObserverAssuranceEvent(t, map[string]interface{}{\n\t\t\"event\":         \"known_voter_response\",\n\t\t\"request_id\":    \"node2-read-A\",\n\t\t\"sender\":        uint64(3),\n\t\t\"pending_after\": len(r.readIndex.pending),\n\t\t\"replies_to_2\":  replies,\n\t})\n}\n",
+      "files": {},
+      "execution_package": "./internal/raft",
+      "test_names": [
+        "TestAssuranceUnknownSenderCannotConfirmReadIndex"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "read_queued",
+          "event": "readindex_queued",
+          "conditions": [
+            {
+              "field": "request_id",
+              "op": "eq",
+              "value": "node2-read-A",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "peer-response-filter",
+      "lw-remote-lookup",
+      "leader-heartbeat-resp",
+      "readindex-confirm",
+      "leader-readindex-admission"
+    ],
+    "anchors": [
+      {
+        "material_id": "peer-response-filter",
+        "symbol": "Peer.Handle",
+        "start_line": 184,
+        "end_line": 196,
+        "anchor": {
+          "source_ids": [
+            "peer-response-filter"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "peer-response-filter",
+          "start_line": 185,
+          "end_line": 185,
+          "symbol": "Peer.Handle"
+        }
+      },
+      {
+        "material_id": "lw-remote-lookup",
+        "symbol": "lw",
+        "start_line": 2079,
+        "end_line": 2092,
+        "anchor": {
+          "source_ids": [
+            "lw-remote-lookup"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "lw-remote-lookup",
+          "start_line": 2079,
+          "end_line": 2079,
+          "symbol": "lw"
+        }
+      },
+      {
+        "material_id": "leader-heartbeat-resp",
+        "symbol": "handleLeaderHeartbeatResp",
+        "start_line": 1728,
+        "end_line": 1740,
+        "anchor": {
+          "source_ids": [
+            "leader-heartbeat-resp"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "leader-heartbeat-resp",
+          "start_line": 1728,
+          "end_line": 1728,
+          "symbol": "handleLeaderHeartbeatResp"
+        }
+      },
+      {
+        "material_id": "readindex-confirm",
+        "symbol": "readIndex.confirm",
+        "start_line": 77,
+        "end_line": 116,
+        "anchor": {
+          "source_ids": [
+            "readindex-confirm"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "readindex-confirm",
+          "start_line": 77,
+          "end_line": 78,
+          "symbol": "readIndex.confirm"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Admission of ReadIndex confirmations. A leader with voters {1,2,3} queues one follower read and then receives the same confirming heartbeat response twice from node 4, which is in no role map, once through the Peer admission path and once directly at the raft state machine; a response from voter 3 follows.",
+      "assumptions": [
+        "The leader is a real raft state machine built by the package test helper with committed membership {1,2,3} and a committed no-op in its current term.",
+        "Node 4 is absent from the leader's remotes, observers and witnesses maps, which is the state left by any transition that removed it from every role.",
+        "The Peer admission path and the raft state machine are both exercised with the same response, so each layer is measured separately.",
+        "The confirming responses carry the queued context in Hint and HintHigh and are delivered with a zero term, as heartbeat responses are.",
+        "Production code is unchanged."
+      ],
+      "excluded": [
+        "The case does not execute a configuration change; it starts from the post-transition role maps directly.",
+        "No transport, persistence or restart path is exercised.",
+        "A forged response from a node that is still a current voter is not covered."
+      ],
+      "parameters": {}
+    },
+    "prefix": "The harness builds a leader for voters {1,2,3}, commits a current-term no-op, queues one ReadIndex request from node 2 under context {101,1002}, and records the queue length. It then delivers a HeartbeatResp carrying that context from node 4 through a Peer value, records the queue length and emitted replies, and repeats the same delivery directly at the raft state machine to bypass the Peer filter. Finally it delivers the same response from voter 3 through the Peer and records the queue length and the number of ReadIndex replies addressed to node 2.",
+    "requirement": "A ReadIndex confirmation must count only responses from nodes the leader currently admits in its role maps: a response from a node absent from every role map must leave the pending request unconfirmed, while a current voter's response must confirm it.",
+    "responsibility": "Peer.Handle filters response messages from senders outside the role maps, and the leader's remote lookup in lw resolves the responding remote before handleLeaderHeartbeatResp can pass the hint to readIndex.confirm. The experiment exercises those real layers and changes only which sender supplies the response.",
+    "comparisons": [
+      {
+        "event": "unknown_sender_peer_path",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "read_queued",
+        "assertion": {
+          "field": "pending_after",
+          "op": "eq",
+          "value": null,
+          "reference": "read_queued.queued"
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "sender",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ],
+        "description": "A response from a node outside every role map, delivered through the Peer, must not change the pending queue."
+      },
+      {
+        "event": "unknown_sender_raft_path",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "read_queued",
+        "assertion": {
+          "field": "pending_after",
+          "op": "eq",
+          "value": null,
+          "reference": "read_queued.queued"
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "sender",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ],
+        "description": "The same response handed straight to the raft state machine must also leave the pending queue unchanged."
+      },
+      {
+        "event": "known_voter_response",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "read_queued",
+        "assertion": {
+          "field": "replies_to_2",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "sender",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "A current voter's response must confirm the queued context and produce a reply for the requester."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "0917893e9a6d4b5f8bf6b7752319db78",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "internal/raft/assurance_generated_test.go",
+  "operation_id": "04c52ef2e70d4e699f5716a5c57500ba",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

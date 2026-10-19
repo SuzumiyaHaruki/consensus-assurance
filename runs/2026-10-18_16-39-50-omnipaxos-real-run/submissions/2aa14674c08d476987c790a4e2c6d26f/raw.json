@@ -1,0 +1,105 @@
+{
+  "rationale": "The previous receipt left the StopSign-resync mechanism inferred rather than isolated: a lossy randomized run showed node 3 stuck one entry behind after 150 fair-delivery rounds, and source reading explained it, but the probe did not record which message node 3 missed or which repair messages the leader sent afterwards. This experiment constructs that state directly and records the message trace. Node 5 misses the leader's AcceptStopSign and the leader's first Decide for the resulting StopSign decision; elections are disabled with a 1000-tick timeout so only the periodic resend can act. If the leader's resend reuses the missed AcceptStopSign's sequence number, the follower treats it as the expected next message, accepts it, and clamps its decided index to its own accepted index; the probe counts every Decide, Prepare, AcceptSync and AcceptStopSign addressed to node 5 across 150 ticks so the receipt distinguishes that clamp from a sequence-break recovery.",
+  "sources": [
+    {
+      "id": "core_check_msg_status",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 380,
+      "end_line": 391,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_handle_sequence_num",
+      "file": "omnipaxos/src/sequence_paxos/follower.rs",
+      "start_line": 229,
+      "end_line": 238,
+      "kind": "code_observation"
+    }
+  ],
+  "experiment": {
+    "investigation_id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+    "harness_path": "omnipaxos/tests/assurance_generated.rs",
+    "test_names": [
+      "decided_stopsign_only_decide_is_resent"
+    ],
+    "source_ids": [
+      "core_resend_leader",
+      "core_send_decide",
+      "core_update_decided_clamp",
+      "core_handle_acceptsync",
+      "core_send_accsync",
+      "core_stopsign_decided",
+      "core_check_msg_status",
+      "core_handle_sequence_num"
+    ],
+    "scope": {
+      "description": "Five OmniPaxos instances over MemoryStorage with an explicit message pump. Node 1 is made leader with try_become_leader, appends and decides entries 1..2 on every node, then reconfigures to configuration_id 2. The AcceptStopSign addressed to node 5 and the leader's subsequent Decide addressed to node 5 are discarded; all other traffic is delivered until quiescent. Every node is then ticked 150 times with election_tick_timeout 1000 and resend_message_tick_timeout 100, delivering all messages, so only tick-driven resends can reach node 5.",
+      "assumptions": [
+        "Node 5 has already accepted and decided entries 1..2 before the reconfiguration, so its only missing log position is the StopSign.",
+        "Discarding the AcceptStopSign and the first Decide to node 5 models a follower that misses both the StopSign acceptance and the initial decision notice while remaining connected and promised to the leader.",
+        "election_tick_timeout 1000 keeps leadership stable across the 150 ticks, and resend_message_tick_timeout 100 guarantees at least one leader resend inside that window."
+      ],
+      "excluded": [
+        "Leadership changes, reconnected() calls, snapshots, trimming, batching, flexible quorums and starting the next configuration."
+      ],
+      "parameters": {
+        "nodes": 5,
+        "entries_before_reconfigure": 2,
+        "ticks": 150,
+        "election_tick_timeout": 1000,
+        "resend_message_tick_timeout": 100
+      }
+    },
+    "prefix": "Fresh harness functions build_node_slow_election (same five-node configuration_id 1 cluster, election_tick_timeout 1000, resend_message_tick_timeout 100), is_stopsign_to, settle_without_stopsign_to and decide_seq; the test decided_stopsign_only_decide_is_resent settles the empty cluster, calls try_become_leader on node 1, appends Value(1) and Value(2) with a full settle after each, emits the ready event, calls reconfigure to configuration_id 2, then settles while discarding AcceptStopSign and Decide messages addressed to pid 5. It then ticks every node 150 times, counts Decide/Prepare/AcceptSync/AcceptStopSign messages addressed to pid 5 in the queue before delivering them, and emits after_resend with node 5 accepted/decided/leader/promise state, the leader's decided index, decision_gap, and those message counts and the last Decide sequence counter.",
+    "prerequisites": [
+      {
+        "alias": "ready",
+        "event": "ready",
+        "conditions": [
+          {
+            "field": "run",
+            "op": "eq",
+            "value": 14
+          },
+          {
+            "field": "n5_accepted",
+            "op": "eq",
+            "value": 2
+          },
+          {
+            "field": "n5_decided",
+            "op": "eq",
+            "value": 2
+          },
+          {
+            "field": "n5_accept",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "after_resend",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "decision_gap",
+          "op": "eq",
+          "value": 0
+        },
+        "applicability_conditions": [
+          {
+            "field": "n5_decides",
+            "op": "ne",
+            "value": 0
+          }
+        ],
+        "description": "Bounded convergence after the decision: a follower that had accepted entries 1..2 and missed only the StopSign is at the leader's decided index after 150 ticks, during which the leader resent at least one Decide to it."
+      }
+    ]
+  }
+}

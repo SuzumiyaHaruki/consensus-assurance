@@ -1,0 +1,22 @@
+This turn found a different class of defect — a liveness bug in the experimental quiesce feature — plus a positive characterisation of the same feature.
+
+**F13 — quiesce turns a leader failure into an indefinite write outage**
+
+I first added a two-node live quiesce test. It passes and shows the feature working: both nodes log `entered quiesce`, a `SyncRead` logs `exited from quiesce, msg type ReadIndex`, and a later proposal commits and is visible on the other node.
+
+The follow-up found the gap. `handleReadIndex` and `handleConfigChange` call `n.qs.record(...)`; `handleProposals` does not. While quiesced, `Peer.QuiescedTick` only bumps `electionTick` and never checks `timeForElection`. So if the leader of an idle cluster dies:
+
+- the survivors never wake on a client write (no `record`),
+- they never campaign (quiesced tick),
+- every retried write is forwarded to the dead leader and times out — indefinitely, until an unrelated read or config change wakes the cluster.
+
+Evidence:
+
+```
+--- FAIL: TestAuditProposeAfterLeaderLossWhileQuiesced
+    cluster did not recover after losing quiesced leader 1: timeout
+```
+
+with the log showing all three nodes entering quiesce and no election afterwards ([vuln.log](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/audit/cover/f13/vuln.log)). Adding `n.qs.record(pb.Propose)` in `handleProposals` makes the survivor exit quiesce, campaign and win; the same test passes on the fixed copy, as do the F1 and F9 root audit tests.
+
+Both tests are in [zz_audit_quiesce_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/zz_audit_quiesce_test.go) (build-tagged, like the rest), and the report has the F13 summary row, a full finding section, inventory entry, fix snippet and command log. The matrix is now 40 audit tests: 25 passing (including the new quiesce characterisation) and 15 deliberate repro failures. The audited implementation remains byte-identical to `../source`.

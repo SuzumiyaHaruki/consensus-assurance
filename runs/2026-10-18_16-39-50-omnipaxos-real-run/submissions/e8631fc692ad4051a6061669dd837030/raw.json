@@ -1,0 +1,94 @@
+{
+  "rationale": "The is_reconfigured record changes the diagnosis. Node 3 reports holding an accepted StopSign (n3_reconfig 1) at accepted 37 and decided 37, while leader 4 reports no StopSign (n4_reconfig 0) at accepted 37 but decided 38. The follower therefore did not miss the AcceptStopSign: it holds the reconfiguration marker, and the leader is the node whose log lacks it and which has moved past it. The zero-divergence figure no longer means the nodes agree at the reconfiguration position, because the harness's decided-prefix check keeps only Decided(Value) entries and compares the shorter of two prefixes, so a StopSign on one node and a value on another are never compared. This update records that state, revises the question's hypothesis from a missing AcceptStopSign to a leader/follower split over the marker, and restates the interpretation accordingly.",
+  "knowledge": [
+    {
+      "ref": "@n3_stopsign_n4_none",
+      "kind": "fact",
+      "statement": "At the end of the seeded run 13, node 3 reports is_reconfigured Some with accepted 37 and decided 37, while node 4 reports is_reconfigured None with accepted 37 and decided 38. Node 3 received Decides with sequence counters 2 and 3 after its AcceptSync with counter 1 and both left its decided index at 37, while node 4's decided index is 38. In convergence round 3 node 4 received StopSign-bearing Promises from nodes 1, 2 and 5 at accept round 1 and accepted index 37, and its own accepted index rose from 0 to 37 in that round.",
+      "conditions": "Five OmniPaxos instances, MemoryStorage, unit batch, no snapshots; seed 0xbe5466cf34e90c6c, reconfigure at action 450 with 20 percent out-of-order loss, then 150 fair-delivery rounds; is_reconfigured is sampled once at the end and Promises only when delivered to pid 4.",
+      "source_ids": [
+        "core_stopsign_decided",
+        "core_create_log_sync",
+        "core_handle_acceptsync",
+        "core_promise_meta_order",
+        "core_majority_promises",
+        "core_is_chosen"
+      ],
+      "executions": {
+        "0e06c0331f8448d9a612c351d19edf74": [
+          1
+        ]
+      }
+    }
+  ],
+  "investigations": [
+    {
+      "id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "hypothesis": "A follower that holds an accepted StopSign can be left behind when the current leader does not hold that StopSign and has decided positions beyond it. The follower's accepted index ends at the StopSign's position, the leader's Decides are the follower's next expected sequence messages, and handle_decide clamps the decided index to the follower's accepted index instead of triggering a reconnection. Because the StopSign is already accepted, the periodic resend path offers no AcceptStopSign, and the follower stays behind for as long as that leader remains.",
+      "knowledge": [
+        {
+          "entry_id": "@n3_stopsign_n4_none",
+          "revision": 1,
+          "assertion": "Node 3 holds an accepted StopSign at accepted 37 and decided 37 while leader 4 holds none at accepted 37 but decided 38, so the stall is a leader/follower split over the reconfiguration marker rather than a follower that missed the AcceptStopSign."
+        },
+        {
+          "entry_id": "4cc7f78767ce4f7faf35e567df5ff1ca-knowledge-0",
+          "revision": 1,
+          "assertion": "Shows that node 4's prepare quorum did contain StopSign-bearing promises in round 3 and that its accepted index rose to 37, so whatever removed or prevented the marker happened through the sync path rather than a missing promise."
+        },
+        {
+          "entry_id": "2a48beb76c9b4540a90caf5ff3727aac-knowledge-0",
+          "revision": 1,
+          "assertion": "The max-merge ordering hazard remains real in general but is not the explanation here: the StopSign-bearing promises were the greatest ones delivered."
+        },
+        {
+          "entry_id": "ac2f20a6139f448da592f87489e93e7a-knowledge-0",
+          "revision": 1,
+          "assertion": "Applies: leader 4 decided 38 while its own accepted index was 37, so the decision came from follower-reported accepted indices."
+        }
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "experiment_id": "b6c965b246ab4daeb6f924c46cd069cf-experiment",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_check_msg_status",
+        "core_handle_sequence_num",
+        "core_send_accsync",
+        "core_handle_acceptsync",
+        "core_stopsign_decided",
+        "core_create_log_sync",
+        "core_promise_meta_order",
+        "core_majority_promises",
+        "core_handle_accepted",
+        "core_is_chosen"
+      ],
+      "executions": {
+        "0e06c0331f8448d9a612c351d19edf74": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The executed receipts identify the stall as a split over the reconfiguration marker. Receipt 0e06c0331f8448d9a612c351d19edf74 ran randomized_reconfig_diagnose_lag (exit 0, test passed); its comparison (converged_all true, gated on progressed and reconfigured) is complete and violated on event 1, which reports decided 38,38,37,38,38 after 150 fair-delivery rounds. The same event now records node 3 with is_reconfigured Some, accepted 37 and decided 37, and node 4 with is_reconfigured None, accepted 37 and decided 38. Node 3 is therefore not a follower that missed the AcceptStopSign: its log ends in the accepted StopSign, which is why its accepted index stops at 37. The leader is the node whose log lacks the marker while its decided index has moved past that position, and its decision at 38 is consistent with handle_accepted counting follower-reported accepted indices through is_chosen rather than reading its own log. Node 3's inbound trace remains prepare:0-0>0-0|prepare:0-0>0-0|prepare:0-0>0-0|promise:0-0>0-0|promise:0-0>0-0|promise:0-0>0-0|accsync1:0-0>37-0|decide2:37-0>37-37|decide3:37-37>37-37: the AcceptSync raised it to accepted 37 and the two Decides, being the immediate successors of that sync's sequence counter, were accepted as expected messages and clamped decided to 37. Since the StopSign is already accepted, resend_messages_leader's StopSign branch does not offer an AcceptStopSign, and repeated Decides reuse a consumed sequence number, so nothing repairs the follower while leader 4 remains. The promise record shows that leader 4's prepare quorum did contain StopSign-bearing promises in round 3 and that its accepted index rose from 0 to 37 then, so the marker was not absent from the promises; the sync path that left the leader without it is the remaining open link. The zero divergence count must not be read as agreement at the marker position: the harness builds each node's decided values by keeping only Decided(Value) entries and compares the shorter of two prefixes, so a StopSign on one node and a value on another are never compared and length differences are ignored.",
+      "counterevidence": [
+        "A follower that genuinely missed the AcceptStopSign can still recover: in the constructed clean-miss run the periodic Decide was sequence-ahead, the follower reconnected, and an AcceptSync repaired it.",
+        "A leadership change, or an external reconnected() call, leads to Prepare/Promise/AcceptSync, which gives the follower a fresh sequence and a log sync from the new leader.",
+        "Leader 4's prepare quorum did receive StopSign-bearing Promises in round 3, so the absence of the marker in its log is not explained by the promises never carrying one.",
+        "The zero divergence count is a limitation of the comparison helper, not evidence that the nodes agree at the reconfiguration position."
+      ],
+      "limitations": [
+        "is_reconfigured is sampled only at the end of the run, so the receipt does not show when leader 4 lost or failed to adopt the marker, nor which sync carried the StopSign-free log.",
+        "Node 3's inbound trace is capped at twelve messages after the lossy phase, and Promises to node 4 are recorded only when delivered and only up to forty entries.",
+        "The divergence check keeps only Decided(Value) entries and compares the shorter prefix, so it cannot detect a StopSign-versus-value disagreement or a length difference at the reconfiguration position.",
+        "Five nodes, MemoryStorage, unit batch, no snapshots and no next configuration started; flexible quorums, batching and snapshot-based sync are unexercised."
+      ]
+    }
+  ]
+}

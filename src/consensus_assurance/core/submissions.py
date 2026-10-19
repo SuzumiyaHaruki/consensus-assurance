@@ -1,6 +1,6 @@
 """One file-backed update; existing references are explicit, new batch names start with @."""
 from typing import Literal
-from pydantic import Field, StrictInt
+from pydantic import Field, StrictBool, StrictInt, StrictStr
 from .types import Record, KnowledgeUse, GapAnswer
 from .types import EventComparison, EventRequirement, FailureAttribution
 from .types import Scope, SourceAnchor, TestNames
@@ -71,6 +71,9 @@ class ExperimentRequest(Record):
     execution_package: str | None = None
     test_names: TestNames | None = Field(default=None,
         description="Exact Go top-level TestAssurance names (including their subtests), or full Rust test names; omit to run all generated tests. Selection does not exclude other code from compilation or initialization.")
+    features: list[StrictStr] = Field(default_factory=list, description="Rust only: explicit Cargo feature names, including dependency/feature selectors; no command-line flags.")
+    default_features: StrictBool = Field(default=True, description="Rust only: false selects Cargo --no-default-features.")
+    all_features: StrictBool = Field(default=False, description="Rust only: enable all features declared by the selected crate.")
     source_ids: list[str] = Field(min_length=1)
     anchors: list[SourceAnchor] = []
     scope: Scope

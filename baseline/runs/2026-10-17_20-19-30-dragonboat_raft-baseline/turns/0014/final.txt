@@ -1,0 +1,21 @@
+This pass closed the last source-only question — whether the two LogDB backends and their durability settings agree.
+
+**What I checked**
+
+- **pebble vs rocksdb `IKVStore` semantics**: iteration bounds with `inc` (`<= lk` when inclusive, `< lk` otherwise) are identical; both treat a missing key as an empty value (pebble ignores `ErrNotFound`, `gorocksdb.Get` returns a nil slice with no error), which is the convention the logdb layer's `len(data) == 0` checks rely on; delete-range and compaction semantics match.
+- **Durability**: the default pebble store uses `pebble.WriteOptions{Sync: true}` and honours `WALDir`; the rocksdb store uses `SetUseFsync(true)`, synced write options and the WAL directory. No `DisableWAL`-style setting anywhere. Committed raft state is fsynced in both backends.
+
+That resolves the apparent rocksdb/pebble discrepancy I was chasing (rocksdb's `Get` does not surface "not found" as an error, because the C API returns a null value with `cErr == NULL`). No defect.
+
+**Also this pass**
+
+- Recorded the sequential-testing requirement in the report: the root package and `internal/transport` share fixed ports and `singleNodeHostTestDir`, so a parallel `go test` across packages produces spurious failures; run one package at a time, both pass.
+- Moved the audit scanners into `audit/tools/<name>/main.go` so `go build ./...` and `go vet ./...` stay clean for the module (the nested `audit/diag*` copies are separate modules and excluded).
+
+**State**
+
+- Findings unchanged: F1 (`(*nodeUser).ReadIndex` misses the engine wakeup), F2 (`handleCandidateReadIndex` records a dropped ReadIndex twice), F3 (`pb.Update.HasUpdate` ignores dropped read indexes).
+- Default `internal/raft` and `internal/logdb` pass; the audit-tagged raft run has exactly three failing tests, matching F2 (two) and F3 (one), with F1 failing in the root package as documented.
+- Implementation byte-identical to `../source`.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) is updated with the backend/durability comparison, the sequential-testing note and the tooling layout. With that, every buildable component has been executed and every unbuildable one (rocksdb bindings, `logdb/tee`, `plugin*`) has been reviewed at source level.

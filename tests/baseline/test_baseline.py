@@ -109,12 +109,17 @@ def test_source_capture_commit_cleanliness_and_links(tmp_path):
     ({"error": "quota exceeded"}, "external_error"), ({"error": "stream disconnected"}, "external_error"),
     ({"final": "RUN_BLOCKED: Access is unavailable."}, "run_blocked"),
     ({"final": 'The retained output says "I cannot assist with this request."'}, "completed"),
-    ({"final": None}, "external_blocker_needs_review"), ({"completed": False}, "external_blocker_needs_review"),
-    ({"identity": "00000000-0000-4000-8000-000000000002"}, "session_mismatch")])
+    ({"final": None}, "completed"), ({"final": ""}, "completed"),
+    ({"completed": False}, "external_blocker_needs_review"),
+    ({"completed": False, "final": ""}, "external_blocker_needs_review"),
+    ({"error": "stream disconnected", "final": ""}, "external_error"),
+    ({"identity": "00000000-0000-4000-8000-000000000002"}, "session_mismatch"),
+    ({"identity": "changed", "final": ""}, "session_mismatch")])
 def test_native_events_and_only_top_level_errors(tmp_path, kwargs, status):
     result = codex.decode(tmp_path, events(tmp_path, **kwargs), SESSION)
     assert result["status"] == status
     assert result["usage_semantics"] == "unverified_do_not_sum"
+    assert result["final_present"] == bool(kwargs.get("final", "Partial handoff."))
 
 
 @pytest.mark.parametrize("ending,status", [("recovered", "completed"), ("failed", "external_error"),
@@ -150,13 +155,14 @@ def test_non_json_and_startup_failure_are_retained(tmp_path):
 
 @pytest.mark.parametrize('identity', ['opaque/session-1', '', None, 42])
 def test_session_identity_is_opaque_and_exact(tmp_path, identity):
-    result = codex.decode(tmp_path, events(tmp_path, identity=identity), identity)
+    result = codex.decode(tmp_path, events(tmp_path, identity=identity, final=""), identity)
     assert result['status'] == ('completed' if identity == 'opaque/session-1' else 'external_blocker_needs_review')
 
 
 @pytest.mark.parametrize('event', [{'type':'refusal'}, {'type':'item.completed','item':{'type':'refusal'}}])
-def test_native_refusal_still_stops_a_completed_turn(tmp_path, event):
-    result = events(tmp_path)
+@pytest.mark.parametrize('final', ['Partial handoff.', ''])
+def test_native_refusal_still_stops_a_completed_turn(tmp_path, event, final):
+    result = events(tmp_path, final=final)
     with (tmp_path/'stdout.jsonl').open('a') as stream:stream.write(json.dumps(event)+'\n')
     assert codex.decode(tmp_path, result)['status'] == 'external_blocker_needs_review'
 
@@ -223,9 +229,46 @@ def test_delta_deletions_modes_and_unsafe_files(tmp_path):
     assert (tmp_path / "safe/files/keep").read_text() == "after"
 
 
+def test_archive_retains_sparse_evidence_and_screens_its_tail(tmp_path):
+    work, changes = tmp_path / 'work', tmp_path / 'changes'
+    report = work / 'target/surefire-reports/result.txt'
+    report.parent.mkdir(parents=True)
+    report.write_text('Tests run: 1, Failures: 0\n')
+    payload = work / 'target/observation.bin'
+    private = work / 'target/output.bin'
+    for path, tail in [(payload, b'observation'), (private, b'api_key="synthetic-value"')]:
+        with path.open('wb') as stream:
+            stream.write(b'header')
+            stream.seek(16 * 1024 * 1024)
+            stream.write(tail)
+    result = runner.save_changes(work, changes, {})
+    retained = changes / 'files/target/observation.bin'
+    assert retained.read_bytes() == payload.read_bytes()
+    assert retained.stat().st_blocks < retained.stat().st_size // 512 // 2
+    assert (changes / 'files/target/surefire-reports/result.txt').read_text() == report.read_text()
+    assert 'target/output.bin' not in result and not (changes / 'files/target/output.bin').exists()
+    assert json.loads((changes / 'manifest.json').read_text())['excluded']['target/output.bin'] == 'credential-like content'
+
+
+def test_archive_scan_memory_is_bounded(tmp_path):
+    for name in ('first.log', 'second.log'):
+        with (tmp_path / name).open('wb') as stream:
+            stream.truncate(128 * 1024 * 1024)
+    subprocess.run([sys.executable, '-c', '''
+import resource, sys
+from pathlib import Path
+from baseline.runner import file_inventory
+resource.setrlimit(resource.RLIMIT_AS, (192 * 1024 * 1024,) * 2)
+files, excluded = file_inventory(Path(sys.argv[1]))
+assert not excluded and len(files) == 2
+assert all(info['size'] == 128 * 1024 * 1024 for info in files.values())
+''', str(tmp_path)], cwd=PROJECT, check=True, capture_output=True, timeout=30)
+
+
 class ScriptedClient:
     instances = []
     statuses = ["completed", "completed", "completed"]
+    final = "Partial handoff."
 
     def __init__(self, config, root, target, deadline):
         self.root, self.calls = root, []
@@ -256,7 +299,7 @@ class ScriptedClient:
             assert 'work/.runtime is disposable' in prompt
         self.calls.append((timeout, session))
         (self.root / "work/report.md").write_text(f"report {index + 1}")
-        result = events(folder, tool_failure=True)
+        result = events(folder, tool_failure=True, final=self.final)
         result["status"] = self.statuses[index]
         return codex.decode(folder, result, session)
 
@@ -266,11 +309,13 @@ class ScriptedClient:
     (["completed", "timeout", "completed"], "agent_call_limit", 3, "report 3"),
     (["completed", "cancelled"], "cancelled", 2, "report 1"),
     (["external_error"], "external_error", 1, None)])
-def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop, turns, report):
+@pytest.mark.parametrize('final', ['Partial handoff.', ''])
+def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop, turns, report, final):
     c = configuration(tmp_path)
     class Client(ScriptedClient):
         pass
     Client.statuses = statuses
+    Client.final = final
     result = runner.run(c, load_target(c), client_factory=Client)
     assert result["stop"] == stop
     root = Path(result["run_dir"])
@@ -286,6 +331,23 @@ def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop,
         assert (root/'work/reproduction'/name).read_bytes() == (root/'turns/0001/changes/files/reproduction'/name).read_bytes()
     assert (root / "run.json").stat().st_mode & 0o200
     assert (root / f"turns/{turns:04d}/changes/files/report.md").exists()
+    assert json.loads((root / 'turns/0001/result.json').read_text())['archive_seconds'] >= 0
+
+
+def test_completed_turn_is_recorded_before_interrupted_archiving(tmp_path, monkeypatch):
+    def interrupted(work, folder, previous):
+        root = work.parent
+        assert json.loads((folder.parent / 'result.json').read_text())['status'] == 'completed'
+        record = json.loads((root / 'run.json').read_text())
+        assert len(record['turns']) == 1 and record['last_completed_report'] is None
+        raise KeyboardInterrupt
+    monkeypatch.setattr(runner, 'save_changes', interrupted)
+    config = configuration(tmp_path)
+    result = runner.run(config, load_target(config), client_factory=ScriptedClient)
+    root = Path(result['run_dir'])
+    assert result['stop'] == 'cancelled' and not (root / 'turns/0001/changes').exists()
+    assert (root / 'work/report.md').read_text() == 'report 1'
+    assert json.loads((root / 'run.json').read_text())['last_completed_report'] is None
 
 
 @pytest.mark.parametrize('during_execution', [False, True])

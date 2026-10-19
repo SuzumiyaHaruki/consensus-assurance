@@ -1,0 +1,32 @@
+The split-brain consequence is now reproduced end to end through ordinary cluster operations, not only hand-built stores.
+
+Sequence:
+
+1. Start a one-voter cluster A and take a snapshot.
+2. Add voters B and C, commit the new `{A,B,C}` configuration, and apply commands.
+3. Shut down A.
+4. Let B/C elect under the current configuration.
+5. Restart A partitioned, with its old `{A}` snapshot.
+
+A elected from the stale snapshot membership while B/C elected under the current membership. Both committed commands at the same index and term:
+
+```text
+index=16 A(term=3,data="real-stale",commit=16)
+         BC(term=3,data="real-current",commit=16)
+```
+
+This violates Raft’s Log Matching Property and election safety. It reproduced consistently in three runs. Evidence is in `audit_results/finding1_real_cluster_conflict.txt` and `audit_results/real_cluster_conflict_run{1,2,3}.txt`.
+
+The lower-severity observations remain:
+
+- Commit-index persistence lags when commits advance without a new append.
+- `CommitIndex()` can be below `AppliedIndex()` after a restart with a lagging snapshot.
+- `LogCache` does not forward `CommitTrackingLogStore`.
+
+The report, tests, script, and outputs are updated:
+
+- [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_16-03-24-hashicorp_raft-baseline/work/report.md)
+- [audit_restore_committed_config_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_16-03-24-hashicorp_raft-baseline/work/audit_restore_committed_config_test.go)
+- [reproduce_audit.sh](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_16-03-24-hashicorp_raft-baseline/work/reproduce_audit.sh)
+
+The two root causes remain the committed-configuration scan skip during `RestoreCommittedLogs` restart and the `fsmMutateCh` startup deadlock. The membership defect is now clearly a safety issue, not merely an availability or reporting problem.

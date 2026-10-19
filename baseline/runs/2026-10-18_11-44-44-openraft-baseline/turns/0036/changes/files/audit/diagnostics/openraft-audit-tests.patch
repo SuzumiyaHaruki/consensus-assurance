@@ -1,0 +1,1189 @@
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/config/config_test.rs openraft/src/config/config_test.rs
+--- ../source/openraft/src/config/config_test.rs	2026-10-18 11:44:44.746367371 +0800
++++ openraft/src/config/config_test.rs	2026-10-18 13:37:28.759955354 +0800
+@@ -4,6 +4,38 @@
+ use crate::Config;
+ use crate::SnapshotPolicy;
+ 
++use std::ops::Deref;
++use std::panic::AssertUnwindSafe;
++
++struct St<R>(R);
++
++impl<R> Deref for St<R> {
++    type Target = R;
++
++    fn deref(&self) -> &R {
++        &self.0
++    }
++}
++
++/// `SnapshotPolicy::LogsSinceLast` adds an unvalidated `u64` to the snapshot
++/// index. The parser accepts `u64::MAX`, and the addition overflows on every
++/// commit once a snapshot exists.
++#[test]
++fn audit_snapshot_policy_max_threshold_overflow() -> anyhow::Result<()> {
++    let config = Config::build(&["foo", "--snapshot-policy=since_last:18446744073709551615"])?;
++    assert_eq!(SnapshotPolicy::LogsSinceLast(u64::MAX), config.snapshot_policy);
++
++    let mut st = crate::RaftState::<u64, (), crate::TokioInstant>::default();
++    st.snapshot_meta.last_log_id = Some(crate::testing::log_id(1, 1, 1));
++    let st = St(st);
++
++    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
++        SnapshotPolicy::LogsSinceLast(u64::MAX).should_snapshot(&st)
++    }));
++    assert!(res.is_err(), "expected snapshot index + u64::MAX to overflow");
++    Ok(())
++}
++
+ #[test]
+ fn test_config_defaults() {
+     let cfg = Config::default();
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/core/tick.rs openraft/src/core/tick.rs
+--- ../source/openraft/src/core/tick.rs	2026-10-18 11:44:44.748367482 +0800
++++ openraft/src/core/tick.rs	2026-10-18 12:37:18.631332606 +0800
+@@ -200,4 +200,25 @@
+ 
+         Ok(())
+     }
++
++    /// AUDIT-ONLY: a zero heartbeat interval is accepted by the config parser
++    /// and makes the tick loop emit without any delay.
++    #[tokio::test]
++    async fn audit_zero_interval_busy_loops() {
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        let th = Tick::<TickUTConfig>::spawn(Duration::ZERO, tx, true);
++
++        TickUTConfig::sleep(Duration::from_millis(100)).await;
++
++        let mut n = 0;
++        while rx.try_recv().is_ok() {
++            n += 1;
++        }
++        eprintln!("zero-interval ticks in 100ms: {}", n);
++        // A normal 50ms heartbeat interval would produce about 2 ticks in this
++        // window.  The zero interval is limited only by the runtime scheduler.
++        assert!(n > 20, "expected a busy tick loop, got only {} ticks", n);
++
++        let _ = th.shutdown();
++    }
+ }
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/engine/mod.rs openraft/src/engine/mod.rs
+--- ../source/openraft/src/engine/mod.rs	2026-10-18 11:44:44.755367870 +0800
++++ openraft/src/engine/mod.rs	2026-10-18 12:25:26.581035449 +0800
+@@ -40,6 +40,8 @@
+ #[cfg(test)]
+ mod tests {
+     mod append_entries_test;
++    mod audit_log_id_list_test;
++    mod audit_purge_batch_zero_test;
+     mod elect_test;
+     mod handle_vote_req_test;
+     mod handle_vote_resp_test;
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/engine/tests/audit_log_id_list_test.rs openraft/src/engine/tests/audit_log_id_list_test.rs
+--- ../source/openraft/src/engine/tests/audit_log_id_list_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/engine/tests/audit_log_id_list_test.rs	2026-10-18 12:00:42.862297675 +0800
+@@ -0,0 +1,176 @@
++//! Audit-only randomized model test for `LogIdList`.
++//!
++//! Not part of the captured implementation. It checks the compressed key-log-id
++//! representation against a plain `Vec<LogId>` model under append, truncate and
++//! purge operations.
++
++use crate::engine::LogIdList;
++use crate::testing::log_id;
++use crate::LogId;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++#[derive(Default)]
++struct Model {
++    /// All non-purged logs, consecutive, ordered by index.
++    logs: Vec<LogId<u64>>,
++    /// Log id returned at the purged boundary, if any.
++    purged_upto: Option<LogId<u64>>,
++}
++
++impl Model {
++    fn last_index(&self) -> Option<u64> {
++        self.logs.last().map(|x| x.index).or(self.purged_upto.map(|x| x.index))
++    }
++
++    fn get(&self, index: u64) -> Option<LogId<u64>> {
++        if let Some(p) = self.purged_upto {
++            if index <= p.index {
++                return (index == p.index).then_some(p);
++            }
++        }
++        self.logs.iter().find(|x| x.index == index).cloned()
++    }
++
++    fn first(&self) -> Option<LogId<u64>> {
++        self.purged_upto.or_else(|| self.logs.first().cloned())
++    }
++
++    fn last(&self) -> Option<LogId<u64>> {
++        self.logs.last().cloned().or(self.purged_upto)
++    }
++
++    fn append(&mut self, lid: LogId<u64>) {
++        if let Some(last) = self.logs.last() {
++            assert!(lid.index > last.index, "test bug: non-monotonic append {lid:?} after {last:?}");
++        }
++        self.logs.push(lid);
++    }
++
++    fn truncate(&mut self, at: u64) {
++        if let Some(p) = self.purged_upto {
++            assert!(at > p.index, "test bug: truncate {at} into purged region {}", p.index);
++        }
++        self.logs.retain(|x| x.index < at);
++    }
++
++    fn purge(&mut self, upto: LogId<u64>) {
++        self.logs.retain(|x| x.index > upto.index);
++        self.purged_upto = Some(upto);
++    }
++}
++
++fn check(ids: &LogIdList<u64>, m: &Model, ctx: &str) {
++    let last = m.last_index();
++
++    for i in 0..last.map(|x| x + 3).unwrap_or(0) {
++        assert_eq!(
++            m.get(i),
++            ids.get(i),
++            "{ctx}: get({i}) mismatch; keys: {:?}, logs: {:?}, purged: {:?}",
++            ids.key_log_ids(),
++            m.logs,
++            m.purged_upto
++        );
++    }
++
++    assert_eq!(m.first(), ids.first().cloned(), "{ctx}: first; keys: {:?}", ids.key_log_ids());
++    assert_eq!(m.last(), ids.last().cloned(), "{ctx}: last; keys: {:?}", ids.key_log_ids());
++
++    for k in ids.key_log_ids() {
++        assert_eq!(Some(k.clone()), ids.get(k.index), "{ctx}: key log id not reachable via get: {k}");
++    }
++}
++
++#[test]
++fn audit_log_id_list_random_ops() {
++    for seed in 0..60 {
++        let mut rng = Lcg(seed);
++        let mut ids = LogIdList::<u64>::default();
++        let mut m = Model::default();
++        let mut next_index = 0u64;
++        let mut term = 1u64;
++
++        for step in 0..400 {
++            let op = if next_index == 0 { 0 } else { rng.below(8) };
++            let ctx = format!("seed {seed} step {step} op {op}");
++
++            match op {
++                // append one log with a random leader id
++                0 | 1 => {
++                    if rng.below(4) == 0 {
++                        term += 1;
++                    }
++                    let lid = log_id(term, 1, next_index);
++                    ids.append(lid);
++                    m.append(lid);
++                    next_index += 1;
++                }
++                // append a batch by the same leader
++                2 | 3 => {
++                    term += 1;
++                    let n = 1 + rng.below(4);
++                    let batch = (0..n).map(|k| log_id(term, 1, next_index + k)).collect::<Vec<_>>();
++                    ids.extend_from_same_leader(&batch);
++                    for lid in &batch {
++                        m.append(*lid);
++                    }
++                    next_index += n;
++                }
++                // append a batch with mixed leaders
++                4 => {
++                    let n = 1 + rng.below(4);
++                    let batch = (0..n)
++                        .map(|k| {
++                            if rng.below(2) == 0 {
++                                term += 1;
++                            }
++                            log_id(term, 1, next_index + k)
++                        })
++                        .collect::<Vec<_>>();
++                    ids.extend(&batch);
++                    for lid in &batch {
++                        m.append(*lid);
++                    }
++                    next_index += n;
++                }
++                // truncate: delete logs at and after `at`
++                5 | 6 => {
++                    let lower = m.purged_upto.map(|x| x.index + 1).unwrap_or(0);
++                    if next_index <= lower {
++                        continue;
++                    }
++                    let at = lower + rng.below(next_index - lower);
++                    ids.truncate(at);
++                    m.truncate(at);
++                    next_index = at;
++                }
++                // purge upto an existing log id
++                7 => {
++                    let lower = m.purged_upto.map(|x| x.index).unwrap_or(0);
++                    if next_index <= lower {
++                        continue;
++                    }
++                    let idx = lower + rng.below(next_index - lower);
++                    let lid = m.get(idx).expect("log exists");
++                    ids.purge(&lid);
++                    m.purge(lid);
++                }
++                _ => unreachable!(),
++            }
++
++            check(&ids, &m, &ctx);
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/engine/tests/audit_purge_batch_zero_test.rs openraft/src/engine/tests/audit_purge_batch_zero_test.rs
+--- ../source/openraft/src/engine/tests/audit_purge_batch_zero_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/engine/tests/audit_purge_batch_zero_test.rs	2026-10-18 13:35:47.310994865 +0800
+@@ -0,0 +1,85 @@
++//! Audit-only reproduction: `calc_purge_upto()` subtracts one from
++//! `purge_end` without handling `purge_end == 0`.  A zero purge batch is
++//! accepted by `Config::validate()`, and a snapshot at index 0 with
++//! `max_in_snapshot_log_to_keep > 0` makes `purge_end` zero.
++
++use std::panic::AssertUnwindSafe;
++
++use crate::engine::testing::UTConfig;
++use crate::engine::Engine;
++use crate::engine::LogIdList;
++use crate::CommittedLeaderId;
++use crate::Config;
++use crate::LogId;
++
++fn log_id(term: u64, index: u64) -> LogId<u64> {
++    LogId::<u64> {
++        leader_id: CommittedLeaderId::new(term, 0),
++        index,
++    }
++}
++
++#[test]
++fn audit_calc_purge_upto_zero_batch() {
++    let mut eng = Engine::<UTConfig>::default();
++    eng.state.enable_validation(false);
++    eng.state.log_ids = LogIdList::new(vec![log_id(0, 0), log_id(1, 1)]);
++
++    // A snapshot covers index 0; keeping two logs means purge_end == 0.
++    eng.state.snapshot_meta.last_log_id = Some(log_id(0, 0));
++    eng.config.max_in_snapshot_log_to_keep = 2;
++    eng.config.purge_batch_size = 0;
++
++    let res = std::panic::catch_unwind(AssertUnwindSafe(|| eng.log_handler().calc_purge_upto()));
++    assert!(
++        res.is_err(),
++        "expected the unguarded purge_end - 1 to underflow, got {:?}",
++        res.ok()
++    );
++}
++
++#[test]
++fn audit_config_accepts_zero_limits() -> anyhow::Result<()> {
++    let config = Config::build(&[
++        "foo",
++        "--purge-batch-size=0",
++        "--snapshot-max-chunk-size=0",
++        "--heartbeat-interval=0",
++        "--install-snapshot-timeout=0",
++    ])?;
++    assert_eq!(0, config.purge_batch_size);
++    assert_eq!(0, config.snapshot_max_chunk_size);
++    assert_eq!(0, config.heartbeat_interval);
++    assert_eq!(0, config.install_snapshot_timeout);
++    Ok(())
++}
++
++/// The same unchecked add is used to compare the next purge index with the
++/// batch size. `Config::validate()` accepts `purge_batch_size = u64::MAX`, and
++/// any non-empty purged prefix makes `last_purged.next_index() + batch_size`
++/// overflow.
++#[test]
++fn audit_calc_purge_upto_max_batch_overflow() {
++    let config = Config {
++        purge_batch_size: u64::MAX,
++        ..Default::default()
++    };
++    assert!(config.validate().is_ok(), "Config::validate accepts u64::MAX");
++
++    let mut eng = Engine::<UTConfig>::default();
++    eng.state.enable_validation(false);
++    eng.state.log_ids = LogIdList::new(vec![log_id(1, 1), log_id(1, 5)]);
++    eng.state.purged_next = 2;
++    eng.state.snapshot_meta.last_log_id = Some(log_id(1, 5));
++    eng.config.max_in_snapshot_log_to_keep = 0;
++    eng.config.purge_batch_size = u64::MAX;
++
++    let res = std::panic::catch_unwind(AssertUnwindSafe(|| eng.log_handler().calc_purge_upto()));
++    let payload = res.expect_err("debug builds must detect the overflowing batch comparison");
++    let msg = payload
++        .downcast_ref::<String>()
++        .cloned()
++        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
++        .unwrap_or_default();
++    assert!(msg.contains("overflow"), "unexpected panic message: {msg}");
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/membership/audit_membership_transition_test.rs openraft/src/membership/audit_membership_transition_test.rs
+--- ../source/openraft/src/membership/audit_membership_transition_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/membership/audit_membership_transition_test.rs	2026-10-18 13:19:35.928965051 +0800
+@@ -0,0 +1,208 @@
++//! Audit-only randomized model test for membership transitions.
++//!
++//! Checks `Membership::change` against a small model: the intermediate
++//! config must be coherent with the current config and with the goal, the
++//! goal must be reachable in one more step, and `retain=false` must remove
++//! only old voters absent from the new voter set.
++
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++
++use maplit::btreeset;
++
++use crate::quorum::Coherent;
++use crate::quorum::Joint;
++use crate::ChangeMembers;
++use crate::Membership;
++
++type M = Membership<u64, ()>;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++fn all_nodes() -> BTreeMap<u64, ()> {
++    (0..6).map(|i| (i, ())).collect()
++}
++
++fn union(configs: &[BTreeSet<u64>]) -> BTreeSet<u64> {
++    configs.iter().flatten().cloned().collect()
++}
++
++fn to_joint(configs: &[BTreeSet<u64>]) -> Joint<u64, Vec<u64>, Vec<Vec<u64>>> {
++    Joint::from(configs.iter().map(|c| c.iter().cloned().collect::<Vec<_>>()).collect::<Vec<_>>())
++}
++
++fn goal_vec(goal: &BTreeSet<u64>) -> Vec<u64> {
++    goal.iter().cloned().collect()
++}
++
++fn expected_configs(current: &[BTreeSet<u64>], goal: &BTreeSet<u64>) -> Vec<BTreeSet<u64>> {
++    if current.iter().any(|c| c == goal) {
++        vec![goal.clone()]
++    } else {
++        vec![current.last().unwrap().clone(), goal.clone()]
++    }
++}
++
++fn subset(rng: &mut Lcg, universe: &[u64]) -> BTreeSet<u64> {
++    universe.iter().filter(|_| rng.below(2) == 0).cloned().collect()
++}
++
++fn non_empty_subset(rng: &mut Lcg, universe: &[u64]) -> BTreeSet<u64> {
++    for _ in 0..100 {
++        let s = subset(rng, universe);
++        if !s.is_empty() {
++            return s;
++        }
++    }
++    btreeset! { universe[0] }
++}
++
++fn map_of(set: &BTreeSet<u64>) -> BTreeMap<u64, ()> {
++    set.iter().map(|x| (*x, ())).collect()
++}
++
++#[test]
++fn audit_membership_change_model() {
++    let universe = [0u64, 1, 2, 3, 4, 5];
++
++    for seed in 0..30 {
++        let mut rng = Lcg(seed);
++        let mut current = if seed % 2 == 0 {
++            vec![btreeset! {0u64, 1, 2}]
++        } else {
++            vec![btreeset! {0u64, 1, 2}, btreeset! {2u64, 3, 4}]
++        };
++
++        for step in 0..200 {
++            let m = M::new(current.clone(), all_nodes());
++            let retain = rng.below(2) == 0;
++            let kind = rng.below(8);
++            let old_voters = union(&current);
++            let last = current.last().unwrap().clone();
++
++            let (change, goal, expected_nodes) = match kind {
++                0 => {
++                    let goal = non_empty_subset(&mut rng, &universe);
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::ReplaceAllVoters(goal.clone()), goal, nodes)
++                }
++                1 => {
++                    let add = subset(&mut rng, &universe);
++                    let goal = last.union(&add).cloned().collect::<BTreeSet<_>>();
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::AddVoterIds(add), goal, nodes)
++                }
++                2 => {
++                    let add = subset(&mut rng, &universe);
++                    let goal = last.union(&add).cloned().collect::<BTreeSet<_>>();
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::AddVoters(map_of(&add)), goal, nodes)
++                }
++                3 => {
++                    let rem = non_empty_subset(&mut rng, &last.iter().cloned().collect::<Vec<_>>());
++                    let goal = last.difference(&rem).cloned().collect::<BTreeSet<_>>();
++                    if goal.is_empty() {
++                        continue;
++                    }
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::RemoveVoters(rem), goal, nodes)
++                }
++                4 => {
++                    let add = subset(&mut rng, &universe);
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::AddNodes(map_of(&add)), last.clone(), nodes)
++                }
++                5 => {
++                    let learner = universe.iter().find(|x| !old_voters.contains(x)).cloned();
++                    let mut nodes = old_voters.clone();
++                    if let Some(l) = learner {
++                        nodes.insert(l);
++                    }
++                    let expected = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::SetNodes(map_of(&nodes)), last.clone(), expected)
++                }
++                6 => {
++                    let learners = all_nodes().into_keys().filter(|x| !old_voters.contains(x)).collect::<BTreeSet<_>>();
++                    if learners.is_empty() {
++                        continue;
++                    }
++                    let rem = non_empty_subset(&mut rng, &learners.iter().cloned().collect::<Vec<_>>());
++                    let expected = all_nodes().into_keys().filter(|x| !rem.contains(x)).collect::<BTreeSet<_>>();
++                    (ChangeMembers::RemoveNodes(rem), last.clone(), expected)
++                }
++                7 => {
++                    let learner = universe.iter().find(|x| !old_voters.contains(x)).cloned();
++                    let mut nodes = old_voters.clone();
++                    if let Some(l) = learner {
++                        nodes.insert(l);
++                    }
++                    let expected = nodes.clone();
++                    (ChangeMembers::ReplaceAllNodes(map_of(&nodes)), last.clone(), expected)
++                }
++                _ => unreachable!(),
++            };
++
++            // Node-only changes leave the voter configs untouched.  Only a
++            // voter change goes through `next_coherent`/`find_coherent`.
++            let expected_cfg = if kind < 4 {
++                expected_configs(&current, &goal)
++            } else {
++                current.clone()
++            };
++            let mut want_nodes = expected_nodes;
++
++            // Voter changes with retain=false remove old voters that are absent
++            // from the new voter set.
++            if kind < 4 && !retain {
++                let new_voters = union(&expected_cfg);
++                want_nodes.retain(|x| !old_voters.contains(x) || new_voters.contains(x));
++            }
++
++            let got = m
++                .change(change.clone(), retain)
++                .unwrap_or_else(|e| panic!("seed {seed} step {step} kind {kind}: change failed: {e:?}"));
++
++            assert_eq!(
++                expected_cfg,
++                got.get_joint_config().clone(),
++                "seed {seed} step {step} kind {kind} retain {retain}"
++            );
++            assert!(
++                to_joint(&current).is_coherent_with(&to_joint(&expected_cfg)),
++                "seed {seed} step {step}: current and intermediate are not coherent"
++            );
++            assert!(
++                to_joint(&expected_cfg).is_coherent_with(&goal_vec(&goal)),
++                "seed {seed} step {step}: intermediate and goal are not coherent"
++            );
++
++            if kind < 4 && expected_cfg.len() > 1 {
++                let converged = got
++                    .clone()
++                    .change(ChangeMembers::ReplaceAllVoters(goal.clone()), true)
++                    .expect("convergence change failed");
++                assert_eq!(
++                    vec![goal.clone()],
++                    converged.get_joint_config().clone(),
++                    "seed {seed} step {step}: did not converge in one step"
++                );
++            }
++
++            let got_nodes = got.nodes().map(|(id, _)| *id).collect::<BTreeSet<_>>();
++            assert_eq!(want_nodes, got_nodes, "seed {seed} step {step} kind {kind} retain {retain}: nodes");
++
++            current = got.get_joint_config().clone();
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/membership/mod.rs openraft/src/membership/mod.rs
+--- ../source/openraft/src/membership/mod.rs	2026-10-18 11:44:44.758368036 +0800
++++ openraft/src/membership/mod.rs	2026-10-18 13:18:59.783559210 +0800
+@@ -11,6 +11,8 @@
+ #[cfg(test)]
+ mod effective_membership_test;
+ #[cfg(test)]
++mod audit_membership_transition_test;
++#[cfg(test)]
+ mod membership_test;
+ 
+ pub use effective_membership::EffectiveMembership;
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/network/snapshot_transport.rs openraft/src/network/snapshot_transport.rs
+--- ../source/openraft/src/network/snapshot_transport.rs	2026-10-18 11:44:44.760368146 +0800
++++ openraft/src/network/snapshot_transport.rs	2026-10-18 12:40:27.902630126 +0800
+@@ -575,6 +575,136 @@
+         assert_eq!(net.received_offset, vec![0, 1, 2, 0, 1, 2]);
+     }
+ 
++    /// AUDIT-ONLY: `snapshot_max_chunk_size = 0` is accepted by the config
++    /// parser, but makes `send_snapshot` send zero-byte chunks forever: the
++    /// offset never advances and `done` can never become true for a non-empty
++    /// snapshot.
++    #[tokio::test]
++    async fn audit_chunk_size_zero_loops_forever() {
++        let mut net = Network {
++            received_offset: vec![],
++            // Never trigger the SnapshotMismatch branch.
++            match_cnt: 0,
++        };
++
++        let mut opt = RPCOption::new(Duration::from_millis(100));
++        opt.snapshot_chunk_size = Some(0);
++        let cancel = futures::future::pending();
++
++        let res = tokio::time::timeout(
++            Duration::from_millis(100),
++            Chunked::send_snapshot(
++                &mut net,
++                Vote::new(1, 0),
++                Snapshot::<UTConfig>::new(
++                    SnapshotMeta {
++                        last_log_id: None,
++                        last_membership: StoredMembership::default(),
++                        snapshot_id: "audit-0".to_string(),
++                    },
++                    Box::new(Cursor::new(vec![1, 2, 3])),
++                ),
++                cancel,
++                opt,
++            ),
++        )
++        .await;
++
++        eprintln!(
++            "audit_chunk_size_zero: {} zero-byte chunks in 100ms, offsets[..8]={:?}",
++            net.received_offset.len(),
++            &net.received_offset[..net.received_offset.len().min(8)]
++        );
++        assert!(res.is_err(), "expected send_snapshot to make no progress with chunk size 0");
++        assert!(
++            net.received_offset.len() > 1,
++            "expected repeated zero-byte chunks, got offsets: {:?}",
++            net.received_offset
++        );
++        assert!(
++            net.received_offset.iter().all(|x| *x == 0),
++            "offset should never advance: {:?}",
++            net.received_offset
++        );
++    }
++
++    /// AUDIT-ONLY: `install_snapshot_timeout = 0` is accepted by config and
++    /// every install-snapshot RPC is immediately timed out.
++    struct AuditSlowNetwork {
++        calls: u64,
++    }
++
++    impl<C> RaftNetwork<C> for AuditSlowNetwork
++    where C: RaftTypeConfig<NodeId = u64>
++    {
++        async fn append_entries(
++            &mut self,
++            _rpc: AppendEntriesRequest<C>,
++            _option: RPCOption,
++        ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
++            unimplemented!()
++        }
++
++        async fn vote(
++            &mut self,
++            _rpc: VoteRequest<C::NodeId>,
++            _option: RPCOption,
++        ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
++            unimplemented!()
++        }
++
++        async fn full_snapshot(
++            &mut self,
++            _vote: Vote<C::NodeId>,
++            _snapshot: Snapshot<C>,
++            _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
++            _option: RPCOption,
++        ) -> Result<SnapshotResponse<C::NodeId>, StreamingError<C, Fatal<C::NodeId>>> {
++            unimplemented!()
++        }
++
++        async fn install_snapshot(
++            &mut self,
++            rpc: InstallSnapshotRequest<C>,
++            _option: RPCOption,
++        ) -> Result<
++            InstallSnapshotResponse<C::NodeId>,
++            RPCError<C::NodeId, C::Node, RaftError<C::NodeId, InstallSnapshotError>>,
++        > {
++            self.calls += 1;
++            sleep(Duration::from_millis(10)).await;
++            Ok(InstallSnapshotResponse { vote: rpc.vote })
++        }
++    }
++
++    #[tokio::test]
++    async fn audit_install_snapshot_timeout_zero() {
++        let mut net = AuditSlowNetwork { calls: 0 };
++        let mut opt = RPCOption::new(Duration::ZERO);
++        opt.snapshot_chunk_size = Some(16);
++        let cancel = futures::future::pending();
++
++        let res = Chunked::send_snapshot(
++            &mut net,
++            Vote::new(1, 0),
++            Snapshot::<UTConfig>::new(
++                SnapshotMeta {
++                    last_log_id: None,
++                    last_membership: StoredMembership::default(),
++                    snapshot_id: "audit-timeout".to_string(),
++                },
++                Box::new(Cursor::new(vec![1, 2, 3])),
++            ),
++            cancel,
++            opt,
++        )
++        .await;
++
++        eprintln!("zero install-snapshot timeout result is_err={}, calls={}", res.is_err(), net.calls);
++        assert!(res.is_err(), "expected the zero install_snapshot_timeout to fail the RPC");
++        assert!(net.calls <= 1, "the RPC should not be retried by send_snapshot: {}", net.calls);
++    }
++
+     struct RetryNetwork {
+         received_offset: Vec<u64>,
+         fail_offset: u64,
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/progress/audit_vec_progress_test.rs openraft/src/progress/audit_vec_progress_test.rs
+--- ../source/openraft/src/progress/audit_vec_progress_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/progress/audit_vec_progress_test.rs	2026-10-18 12:00:07.398397201 +0800
+@@ -0,0 +1,106 @@
++//! Audit-only randomized model test for `VecProgress`.
++//!
++//! Not part of the captured implementation. It compares the incremental quorum
++//! scan against a brute-force recomputation of the greatest value granted by a
++//! quorum, for uniform and joint quorum sets.
++
++use std::collections::BTreeMap;
++
++use crate::progress::Progress;
++use crate::progress::VecProgress;
++use crate::quorum::Joint;
++use crate::quorum::QuorumSet;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++fn model_granted<QS: QuorumSet<u64>>(qs: &QS, values: &BTreeMap<u64, u64>, default_v: u64) -> u64 {
++    let mut candidates = values.values().cloned().collect::<Vec<_>>();
++    candidates.push(default_v);
++    candidates.sort_unstable();
++    candidates.dedup();
++
++    for v in candidates.into_iter().rev() {
++        let ids = values.iter().filter(|(_, x)| **x >= v).map(|(id, _)| *id).collect::<Vec<_>>();
++        if qs.is_quorum(ids.iter()) {
++            return v;
++        }
++    }
++    default_v
++}
++
++fn run<QS>(n: u64, qs: QS, seed: u64, steps: usize)
++where
++    QS: QuorumSet<u64> + Clone + std::fmt::Debug + 'static,
++{
++    let ids = (0..n).collect::<Vec<_>>();
++    let mut rng = Lcg(seed);
++    let mut p = VecProgress::<u64, u64, u64, QS>::new(qs.clone(), [], 0);
++    let mut values = ids.iter().map(|i| (*i, 0u64)).collect::<BTreeMap<_, _>>();
++
++    for step in 0..steps {
++        let id = rng.below(n);
++        let cur = values[&id];
++        let new_v = cur + rng.below(4);
++        let got = *p.update(&id, new_v).map_err(|e| *e).unwrap();
++        values.insert(id, new_v);
++
++        let want = model_granted(&qs, &values, 0);
++        assert_eq!(want, got, "step {step}: id {id} -> {new_v}, quorum: {qs:?}, values: {values:?}");
++
++        // All voter values greater than granted must stay sorted descending.
++        let granted = got;
++        let above = p
++            .iter()
++            .take(n as usize)
++            .map(|(_, v)| *v)
++            .filter(|v| *v > granted)
++            .collect::<Vec<_>>();
++        let mut sorted = above.clone();
++        sorted.sort_unstable_by(|a, b| b.cmp(a));
++        assert_eq!(sorted, above, "step {step}: values above granted are not sorted: {values:?}");
++    }
++}
++
++#[test]
++fn audit_vec_progress_uniform_majority() {
++    for n in 1..=9 {
++        for seed in 0..20 {
++            run(n, (0..n).collect::<Vec<u64>>(), seed, 300);
++        }
++    }
++}
++
++#[test]
++fn audit_vec_progress_joint_majority() {
++    // Joint quorum: majority of {0,1,2} AND majority of {1,2,3,4}.
++    let qs = Joint::from(vec![vec![0u64, 1, 2], vec![1u64, 2, 3, 4]]);
++    for seed in 0..50 {
++        let ids = [0u64, 1, 2, 3, 4];
++        let n = ids.len() as u64;
++        let mut rng = Lcg(seed);
++        let mut p = VecProgress::<u64, u64, u64, _>::new(qs.clone(), [], 0);
++        let mut values = ids.iter().map(|i| (*i, 0u64)).collect::<BTreeMap<_, _>>();
++
++        for step in 0..500 {
++            let id = rng.below(n);
++            let cur = values[&id];
++            let new_v = cur + rng.below(5);
++            let got = *p.update(&id, new_v).map_err(|e| *e).unwrap();
++            values.insert(id, new_v);
++
++            let want = model_granted(&qs, &values, 0);
++            assert_eq!(want, got, "step {step}: id {id} -> {new_v}, values: {values:?}");
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/progress/entry/audit_next_send_test.rs openraft/src/progress/entry/audit_next_send_test.rs
+--- ../source/openraft/src/progress/entry/audit_next_send_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/progress/entry/audit_next_send_test.rs	2026-10-18 13:33:14.031920311 +0800
+@@ -0,0 +1,205 @@
++//! Audit-only randomized simulation for replication liveness.
++//!
++//! `ProgressEntry::next_send()` must make progress until the follower reaches
++//! the leader's last log id.  This model feeds back successful and conflicting
++//! responses and checks that `Inflight::None` is returned only when the
++//! follower is caught up.
++
++use crate::progress::entry::ProgressEntry;
++use crate::progress::Inflight;
++use crate::raft_state::LogStateReader;
++use crate::CommittedLeaderId;
++use crate::LogId;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++fn log_id(index: u64) -> LogId<u64> {
++    LogId {
++        leader_id: CommittedLeaderId::new(1, 1),
++        index,
++    }
++}
++
++struct LogState {
++    last: LogId<u64>,
++    snapshot: LogId<u64>,
++    purge_upto: LogId<u64>,
++    purged: Option<LogId<u64>>,
++}
++
++impl LogState {
++    fn new(last_index: u64, purge_upto: u64, snapshot: u64) -> Self {
++        Self {
++            last: log_id(last_index),
++            snapshot: log_id(snapshot),
++            purge_upto: log_id(purge_upto),
++            purged: if purge_upto == 0 { None } else { Some(log_id(purge_upto - 1)) },
++        }
++    }
++}
++
++impl LogStateReader<u64> for LogState {
++    fn get_log_id(&self, index: u64) -> Option<LogId<u64>> {
++        if let Some(p) = self.purged {
++            if index <= p.index {
++                return None;
++            }
++        }
++        if index <= self.last.index {
++            Some(log_id(index))
++        } else {
++            None
++        }
++    }
++
++    fn last_log_id(&self) -> Option<&LogId<u64>> {
++        Some(&self.last)
++    }
++
++    fn committed(&self) -> Option<&LogId<u64>> {
++        Some(&self.last)
++    }
++
++    fn io_applied(&self) -> Option<&LogId<u64>> {
++        Some(&self.last)
++    }
++
++    fn io_snapshot_last_log_id(&self) -> Option<&LogId<u64>> {
++        Some(&self.snapshot)
++    }
++
++    fn io_purged(&self) -> Option<&LogId<u64>> {
++        self.purged.as_ref()
++    }
++
++    fn snapshot_last_log_id(&self) -> Option<&LogId<u64>> {
++        Some(&self.snapshot)
++    }
++
++    fn purge_upto(&self) -> Option<&LogId<u64>> {
++        Some(&self.purge_upto)
++    }
++
++    fn last_purged_log_id(&self) -> Option<&LogId<u64>> {
++        self.purged.as_ref()
++    }
++}
++
++#[test]
++fn audit_next_send_makes_progress() {
++    for seed in 0..300 {
++        let mut rng = Lcg(seed);
++        let last_index = rng.below(30);
++        let purge_upto = if last_index == 0 { 0 } else { rng.below(last_index + 1) };
++        let snapshot = purge_upto + rng.below(last_index - purge_upto + 1);
++        let max_entries = 1 + rng.below(8);
++        let state = LogState::new(last_index, purge_upto, snapshot);
++
++        let mut pe = ProgressEntry::empty(last_index + 1);
++        let mut caught_up = false;
++
++        for step in 0..300 {
++            let action = match pe.next_send(&state, max_entries) {
++                Ok(x) => Ok(x.clone()),
++                Err(x) => Err(x.clone()),
++            };
++
++            match action {
++                Ok(Inflight::Logs { id, log_id_range }) => {
++                    assert!(log_id_range.prev < log_id_range.last, "empty logs inflight");
++
++                    // A conflict is possible only when the probed prev is ahead
++                    // of the already-known matching point; otherwise it would
++                    // be a follower-log reversion, which is not a supported
++                    // response here.
++                    let can_conflict = log_id_range.prev > pe.matching;
++                    if can_conflict && rng.below(2) == 0 {
++                        let prev = log_id_range.prev.clone().unwrap();
++                        pe.update_conflicting(Some(id), prev.index).unwrap();
++                    } else {
++                        pe.update_matching(id, log_id_range.last.clone()).unwrap();
++                    }
++                }
++                Ok(Inflight::Snapshot { id, last_log_id }) => {
++                    let snap = last_log_id.expect("the model always has a snapshot");
++                    pe.update_matching(id, Some(snap)).unwrap();
++                }
++                Ok(Inflight::None) | Err(Inflight::None) => {
++                    if pe.matching == state.last_log_id().cloned() {
++                        caught_up = true;
++                        break;
++                    }
++                    panic!(
++                        "seed {seed} step {step}: next_send made no progress while follower is behind; \
++                         matching: {:?}, searching_end: {}, last: {:?}, purge_upto: {:?}, snapshot: {:?}",
++                        pe.matching,
++                        pe.searching_end,
++                        state.last_log_id(),
++                        state.purge_upto(),
++                        state.snapshot_last_log_id()
++                    );
++                }
++                Err(other) => panic!("seed {seed} step {step}: unexpected existing inflight: {other:?}"),
++            }
++        }
++
++        assert!(
++            caught_up || pe.matching == state.last_log_id().cloned(),
++            "seed {seed}: follower did not converge, matching: {:?}, last: {:?}",
++            pe.matching,
++            state.last_log_id()
++        );
++    }
++}
++
++/// `Config::validate()` only rejects `max_payload_entries == 0`, so
++/// `u64::MAX` reaches `ProgressEntry::next_send()` unchanged. The range end
++/// is computed as `start + max_entries` without a checked/saturating add.
++#[test]
++fn audit_next_send_max_entries_overflow() {
++    let config = crate::Config {
++        max_payload_entries: u64::MAX,
++        ..Default::default()
++    };
++    assert!(
++        config.validate().is_ok(),
++        "Config::validate must be shown to accept u64::MAX"
++    );
++
++    let state = LogState::new(10, 0, 0);
++    let mut pe = ProgressEntry::empty(11);
++
++    if cfg!(debug_assertions) {
++        // Debug builds detect the overflow and panic the replication task.
++        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _ = pe.next_send(&state, u64::MAX);
++        }));
++        let payload = res.expect_err("debug builds must detect the overflowing range end");
++        let msg = payload
++            .downcast_ref::<String>()
++            .cloned()
++            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
++            .unwrap_or_default();
++        assert!(msg.contains("overflow"), "unexpected panic message: {msg}");
++    } else {
++        // Release builds wrap; `end < start`, `Inflight::logs()` degrades to
++        // `None`, and the leader reports no work although the follower is
++        // still 10 entries behind.
++        let res = pe.next_send(&state, u64::MAX);
++        assert!(
++            matches!(res, Ok(Inflight::None)),
++            "release build must be shown to stop replicating, got {res:?}"
++        );
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/progress/entry/mod.rs openraft/src/progress/entry/mod.rs
+--- ../source/openraft/src/progress/entry/mod.rs	2026-10-18 11:44:44.760368146 +0800
++++ openraft/src/progress/entry/mod.rs	2026-10-18 13:21:35.031362822 +0800
+@@ -313,3 +313,5 @@
+ 
+ #[cfg(test)]
+ mod tests;
++#[cfg(test)]
++mod audit_next_send_test;
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/progress/mod.rs openraft/src/progress/mod.rs
+--- ../source/openraft/src/progress/mod.rs	2026-10-18 11:44:44.761368202 +0800
++++ openraft/src/progress/mod.rs	2026-10-18 11:59:59.277961916 +0800
+@@ -8,6 +8,8 @@
+ #[cfg(feature = "bench")]
+ #[cfg(test)]
+ mod bench;
++#[cfg(test)]
++mod audit_vec_progress_test;
+ pub(crate) mod entry;
+ pub(crate) mod inflight;
+ 
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/raft_state/membership_state/audit_update_committed_test.rs openraft/src/raft_state/membership_state/audit_update_committed_test.rs
+--- ../source/openraft/src/raft_state/membership_state/audit_update_committed_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/raft_state/membership_state/audit_update_committed_test.rs	2026-10-18 13:25:18.286271698 +0800
+@@ -0,0 +1,117 @@
++//! Audit-only randomized model for `MembershipState::update_committed`.
++//!
++//! Inputs model a real snapshot:
++//! - `c` is the newest membership entry covered by the snapshot, so its index
++//!   is `>=` the committed membership index and `<= snapshot_last_index`;
++//! - the local `effective` membership may be newer than the snapshot
++//!   (uncommitted), in which case the snapshot must not replace it;
++//! - if the effective membership is covered by the snapshot, its backing log
++//!   entry is purged, so `c` must become both effective and committed.
++//!
++//! Checks: resulting effective/committed memberships, the `changed` signal,
++//! and that the committed membership log id never regresses.
++
++use std::collections::BTreeSet;
++use std::sync::Arc;
++
++use crate::testing::log_id;
++use crate::EffectiveMembership;
++use crate::Membership;
++use crate::MembershipState;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++fn mem(n: u64) -> Membership<u64, ()> {
++    let set = (1..=n).collect::<BTreeSet<_>>();
++    Membership::new(vec![set], None)
++}
++
++fn eff(index: u64, m: Membership<u64, ()>) -> Arc<EffectiveMembership<u64, ()>> {
++    // Term grows with the index, as in a real log.
++    Arc::new(EffectiveMembership::new(Some(log_id(1 + index / 3, 1, index)), m))
++}
++
++#[test]
++fn audit_update_committed_model() {
++    for seed in 0..2000 {
++        let mut rng = Lcg(seed);
++        let snap = 1 + rng.below(12);
++
++        // Committed membership and committed index both lie within the snapshot.
++        let committed_idx = rng.below(snap + 1);
++        let committed_mem_idx = rng.below(committed_idx + 1);
++
++        // The local effective membership may be newer than the snapshot, or be
++        // covered by it.  The snapshot holds the newest membership entry it
++        // covers (`c`), so its index is `>=` the effective index when the
++        // effective entry is covered, and `<` it otherwise.
++        let effective_idx = committed_idx + rng.below(16 - committed_idx);
++        let c_idx = if effective_idx <= snap {
++            effective_idx + rng.below(snap - effective_idx + 1)
++        } else {
++            committed_mem_idx + rng.below(snap - committed_mem_idx + 1)
++        };
++
++        let committed_m = mem(1 + rng.below(3));
++        let effective_m = mem(1 + rng.below(3));
++        let mut c_m = mem(1 + rng.below(3));
++        // The same log id can only carry one membership.
++        if c_idx == committed_mem_idx {
++            c_m = committed_m.clone();
++        }
++
++        let committed = eff(committed_mem_idx, committed_m);
++        let effective = eff(effective_idx, effective_m);
++        let c = eff(c_idx, c_m);
++
++        let mut state = MembershipState::<u64, ()>::new(committed.clone(), effective.clone());
++        let old_committed_log_id = state.committed().log_id().clone();
++
++        let changed = state.update_committed(c.clone(), snap);
++        let purged = effective_idx <= snap;
++
++        let expected_effective = if purged { c.clone() } else { effective.clone() };
++        // `c` is the newest membership covered by the snapshot and is at least
++        // as new as the old committed membership.
++        let expected_committed = c.clone();
++        let expected_changed = purged && c.membership() != effective.membership();
++
++        assert_eq!(
++            expected_effective.as_ref(),
++            state.effective().as_ref(),
++            "seed {seed}: effective; committed_idx {committed_idx}, committed_mem_idx {committed_mem_idx}, \
++             effective_idx {effective_idx}, c_idx {c_idx}, snap {snap}"
++        );
++        assert_eq!(
++            expected_committed.as_ref(),
++            state.committed().as_ref(),
++            "seed {seed}: committed; committed_idx {committed_idx}, committed_mem_idx {committed_mem_idx}, \
++             effective_idx {effective_idx}, c_idx {c_idx}, snap {snap}"
++        );
++        assert_eq!(expected_changed, changed.is_some(), "seed {seed}: changed signal");
++        if let Some(x) = changed {
++            assert_eq!(
++                expected_effective.as_ref(),
++                x.as_ref(),
++                "seed {seed}: returned effective membership"
++            );
++        }
++        assert!(
++            state.committed().log_id() >= &old_committed_log_id,
++            "seed {seed}: committed membership log id regressed from {:?} to {:?}",
++            old_committed_log_id,
++            state.committed().log_id()
++        );
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' ../source/openraft/src/raft_state/membership_state/mod.rs openraft/src/raft_state/membership_state/mod.rs
+--- ../source/openraft/src/raft_state/membership_state/mod.rs	2026-10-18 11:44:44.764368368 +0800
++++ openraft/src/raft_state/membership_state/mod.rs	2026-10-18 13:23:54.308138552 +0800
+@@ -15,6 +15,8 @@
+ mod change_handler_test;
+ #[cfg(test)]
+ mod membership_state_test;
++#[cfg(test)]
++mod audit_update_committed_test;
+ 
+ pub(crate) use change_handler::ChangeHandler;
+ 

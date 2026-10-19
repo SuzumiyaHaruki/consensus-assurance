@@ -1,0 +1,124 @@
+{
+  "rationale": "Receipt 1a9292879a5642519ee6306b6376e255 finally exercises the target path: after the delayed Prepare and a Promise handled in Accept phase, node 5 applies an AcceptSync carrying the new leader's decided 4, its decided index drops from 5 to 4, read(4) changes from Decided(Value(5)) to Undecided(Value(5)), and it returns to 5 when the new leader re-decides. This update asserts the core visibility defect, promotes the executed observation, answers the three open gaps, and marks the question explained.",
+  "sources": [],
+  "investigations": [
+    {
+      "id": "84e0053ba3d1476391e92e2ceac40c44-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@decided_regression_observed",
+      "kind": "fact",
+      "statement": "On the executed five-node run, node 5 had decided through index 5 and read index 4 as Decided(Value(5)); after the new leader's AcceptSync it reported decided 4 and read index 4 as Undecided(Value(5)); after the new leader re-decided index 5 it reported decided 5 and read index 4 as Decided(Value(5)) again. The same log index was therefore observed Decided, Undecided and Decided with unchanged value.",
+      "conditions": "Five OmniPaxos instances (pids 1..5), ClusterConfig {configuration_id:1, nodes:[1,2,3,4,5]}, MemoryStorage, batch_size 1, no snapshots. Entry 5 is accepted by 1,2,3,5 and decided by leader 1, but the Decide reaches only node 5; nodes 2 and 3 stay decided 4 with accepted 5. Node 1 is then cut, node 2 is elected with promises from 3 and 4 only (decided 4), and node 5's Prepare is delivered only after node 2 is in Accept, so its Promise is handled by handle_promise_accept and answered with an AcceptSync carrying decided 4.",
+      "source_ids": [
+        "core_sync_log",
+        "core_handle_acceptsync",
+        "core_promise_accept",
+        "core_send_accsync",
+        "core_majority_promises"
+      ],
+      "executions": {
+        "1a9292879a5642519ee6306b6376e255": [
+          0,
+          1,
+          2
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@late_promise_sync_path",
+      "kind": "behavior",
+      "statement": "A new leader's decided index is the maximum decided index among the promises that formed its prepare quorum (handle_majority_promises -> get_max_decided_idx). A follower whose Promise arrives after that quorum is answered by handle_promise_accept with send_accsync stamped with the leader's current decided index, and handle_acceptsync passes that value to sync_log, which assigns it to the decided index without comparing it to the follower's existing value. A follower that had already learned a later decision therefore loses decided progress until the new leader re-accepts and re-decides the entry.",
+      "conditions": "Majority quorum with five nodes; at least one member of the new leader's prepare quorum accepted the entry without deciding it; the more-informed follower is delayed past the quorum; no snapshots involved in the sync.",
+      "source_ids": [
+        "core_majority_promises",
+        "core_send_accsync",
+        "core_promise_accept",
+        "core_handle_acceptsync",
+        "core_sync_log",
+        "core_handle_decide"
+      ],
+      "executions": {
+        "1a9292879a5642519ee6306b6376e255": [
+          1
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "84e0053ba3d1476391e92e2ceac40c44-question-0",
+      "experiment_id": "423b10df284a4783b577202d1d0242ba-experiment",
+      "source_ids": [
+        "core_sync_log",
+        "core_handle_acceptsync",
+        "core_promise_accept",
+        "core_send_accsync",
+        "core_majority_promises",
+        "core_handle_decide",
+        "docs_decided"
+      ],
+      "executions": {
+        "1a9292879a5642519ee6306b6376e255": [
+          0,
+          1,
+          2
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The question is answered by a completed witness. Receipt 1a9292879a5642519ee6306b6376e255 ran late_promise_sync_regresses_decided (exit 0, test passed) and its single comparison (regressed eq true, applicability phase=after_sync) is complete and holds, evaluating event 1. Event 0 establishes the premise: leader 1 decided 5, node 2 decided 4 with accepted 5, and node 5 decided 5 with index 4 reading decided. Event 1 shows node 5 at decided 4 while its leader (node 2) is in Accept at decided 4, with entry_status undecided, regressed true, promise/acceptsync/accepted flags all true, node 5 in Accept and its promise at ballot n=2,pid=2; event 2 shows node 5 back at decided 5 with index 4 decided after the new leader re-decided. The mechanism is the one the source predicted: the new leader's decided index came from the promises it held when its prepare quorum formed (max 4), its AcceptSync to the late promiser carried that 4, and sync_log assigned it without comparing it to node 5's existing 5. Node 5 had already read index 4 as Decided, so the same entry changed status to Undecided and then back to Decided. That contradicts the documented guarantee that a decided entry is not reverted and is safe to apply (docs/omnipaxos/log.md), and an application applying Decided entries as it observes them can apply the same entry twice; a client polling get_decided_idx observes it going backwards. The decided value at the index is preserved and the new leader re-decides after its accept quorum acknowledges, so this is a decision-visibility and consumption defect, not a divergence of decided values, and the regression window is bounded by one accept round.",
+      "answers": {
+        "f48a2678152a46b987d08e37826d2ca5-gap-1": {
+          "explanation": "Yes. The corrected run shows promise_seen=true, acceptsync_seen=true and n5_accepted_reply=true; the AcceptSync carried node 2's decided index 4 (event 1: decided_leader2=4) and node 5 applied it, moving to Accept (n5_accept=true) and dropping to decided 4. The earlier absence was caused by the probe withholding that message.",
+          "resolved": true
+        },
+        "9e2e871d737f4e6f829b8239c8cbc484-gap-2": {
+          "explanation": "Yes. After the Prepare was truly extracted from the queue, node 5 emitted a Promise, node 2 emitted an AcceptSync addressed to node 5, and node 5 emitted an Accepted reply, all observed in the corrected run.",
+          "resolved": true
+        },
+        "423b10df284a4783b577202d1d0242ba-gap-3": {
+          "explanation": "Yes. With true extraction the leader emitted an AcceptSync to the late promiser carrying its lower decided index (4) and the follower applied it: decided fell from 5 to 4, read(4) became Undecided(Value(5)), and after re-decision both returned to 5/Decided.",
+          "resolved": true
+        }
+      },
+      "knowledge": [],
+      "counterevidence": [
+        "If the delayed follower's Promise participates in the prepare quorum, its decided index enters the maximum and no regression occurs.",
+        "If every member of the prepare quorum had also received the earlier Decide, the leader's decided index already covers the entry and the sync lowers nothing.",
+        "The entry's value is never changed and the new leader re-decides the index, so this does not break agreement on values; it breaks the stability of the Decided status that applications rely on.",
+        "The three earlier runs of this probe were invalid constructions (delivered withheld messages, then re-queued them) and do not count as negative evidence."
+      ],
+      "limitations": [
+        "One delayed promiser, majority quorum, unit batch size, memory storage and no snapshots; flexible quorums, batching and snapshot-based sync are unexercised.",
+        "The regression is observed at a synchronous sample immediately after the AcceptSync; its duration is the interval until the new leader re-decides, which this run measures only by the third event.",
+        "The probe drives leadership with try_become_leader and delivers messages explicitly; it does not exercise BLE election timing or a real network."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

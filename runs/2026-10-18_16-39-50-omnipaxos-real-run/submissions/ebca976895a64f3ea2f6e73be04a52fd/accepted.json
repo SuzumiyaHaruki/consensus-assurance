@@ -1,0 +1,167 @@
+{
+  "rationale": "Cheap source-flagged compaction question worth a focused probe: LeaderState stores accepted indexes in a vector indexed by pid-1 sized to the largest pid, so a configuration with non-contiguous pids leaves placeholder zeros that get_min_all_accepted_idx includes; SequencePaxos::trim then compares the requested index against that minimum. A sparse three-node run is requested to see whether automatic trim is blocked even when every configured node has accepted the entry.",
+  "sources": [
+    {
+      "id": "core_min_all_accepted",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 186,
+      "end_line": 195,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_leader_state_layout",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 96,
+      "end_line": 112,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_trim_check",
+      "file": "omnipaxos/src/sequence_paxos/mod.rs",
+      "start_line": 141,
+      "end_line": 178,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_try_trim",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 414,
+      "end_line": 430,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@sparse_trim",
+      "question": "Does the leader's automatic trim compute the minimum accepted index over configured nodes, or do placeholder slots for absent pids force the minimum to 0 in sparse configurations?",
+      "source_ids": [
+        "core_min_all_accepted",
+        "core_leader_state_layout",
+        "core_trim_check",
+        "core_try_trim"
+      ],
+      "hypothesis": "LeaderState::with allocates accepted_indexes with max_pid entries initialized to 0 and indexes them by pid-1. For a configuration such as {1,2,5}, entries for pids 3 and 4 are never updated, so get_min_all_accepted_idx returns 0 even after all three configured nodes accept index 3. SequencePaxos::trim then rejects trim(Some(2)) with NotAllDecided(0) and trim(None) passes 0 to try_trim, compacting nothing, so automatic compaction never progresses.",
+      "discriminator": "A three-node {1,2,5} run with three decided entries: the leader's trim(Some(2)) outcome and reported minimum, and the compacted index after trim(None), compared with the minimum accepted index over the three configured nodes.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@sparse_trim",
+      "experiment_id": null,
+      "source_ids": [
+        "core_min_all_accepted",
+        "core_leader_state_layout",
+        "core_trim_check",
+        "core_try_trim"
+      ],
+      "executions": {},
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Source shows the mechanism but not the executed outcome. The leader's accepted_indexes vector is sized by the largest pid and initialized to zero; entries for pids absent from the configuration are never set because accepted indexes only arrive from that node's own Accepted messages. get_min_all_accepted_idx returns the minimum over the whole vector, so absent-pid placeholders pin it to 0. SequencePaxos::trim uses that minimum both as the default trim index and as the bound for an explicit trim index, so for a sparse configuration the leader would report NotAllDecided(0) and never compact, even though every configured node has accepted the entries. Because trim only affects local storage and the forwarded compaction message, this is a compaction/progress defect rather than a safety one. The probe measures the actual trim outcome and the configured nodes' accepted indexes to decide whether the mechanism is reached with real instances.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "If the implementation sized or interpreted the accepted-index vector only over configured pids, the minimum would be the true minimum and automatic trim would work; the probe distinguishes this.",
+        "The defect would not affect decision safety or agreement; it only leaves storage uncompacted.",
+        "A user can always pass an explicit trim index, but the same minimum check bounds it, so an explicit index above 0 is also rejected under the same mechanism."
+      ],
+      "limitations": [
+        "No execution receipt yet.",
+        "The probe uses majority quorum, unit batch size, memory storage and no snapshots.",
+        "Only one sparse layout ({1,2,5}) is exercised; the claim would generalize to any configuration with absent pids below the maximum, which the source argument covers."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@sparse_trim",
+    "harness_path": "omnipaxos/tests/assurance_generated.rs",
+    "files": {},
+    "execution_package": null,
+    "test_names": [
+      "sparse_pids_block_automatic_trim"
+    ],
+    "source_ids": [
+      "core_min_all_accepted",
+      "core_leader_state_layout",
+      "core_trim_check",
+      "core_try_trim"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three real OmniPaxos instances with pids 1, 2 and 5 in one ClusterConfig, MemoryStorage, batch_size 1. The cluster decides three entries, then the leader calls trim(Some(2)) and trim(None) and the probe records the outcome, the reported minimum in the error, and the compacted index afterwards.",
+      "assumptions": [
+        "All produced messages are delivered to their addressed node until none remain.",
+        "No ticks are called; leadership is obtained with try_become_leader."
+      ],
+      "excluded": [
+        "Snapshots, batching, flexible quorums, reconfiguration and crash recovery."
+      ],
+      "parameters": {
+        "pids": [
+          1,
+          2,
+          5
+        ],
+        "entries": 3,
+        "requested_trim": 2
+      }
+    },
+    "prefix": "Build pids 1, 2 and 5 with ClusterConfig {configuration_id:1, nodes:[1,2,5]} and settle. node1.try_become_leader(); settle. Append Value(1..=3) with a full settle after each. Emit setup with decided and all_accepted_min (minimum get_accepted_idx over the three configured nodes). Call trim(Some(2)) and record trim_ok, error_min (NotAllDecided value) and compacted_after_some; call trim(None) and record none_ok and compacted_after_none. Emit trim_result with requested, all_accepted_min, decided and those fields.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "",
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "setup",
+        "conditions": [
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "trim_result",
+        "identity_fields": [
+          "requested"
+        ],
+        "admission_alias": "setup",
+        "assertion": {
+          "field": "trim_ok",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "requested",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ],
+        "description": "Trim of an index accepted by every configured node should succeed; the predicate is expected to be violated if the sparse-pid placeholders pin the minimum to 0."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

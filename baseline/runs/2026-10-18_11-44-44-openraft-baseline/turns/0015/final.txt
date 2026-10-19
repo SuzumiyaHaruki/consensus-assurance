@@ -1,0 +1,24 @@
+F8 is now confirmed robustly; the audit has eight findings. The full `tests` package passes with all four audit integration tests, and the release build remains clean.
+
+| Severity | Finding |
+|---|---|
+| High | Snapshot install persists the log purge before the state-machine install completes; a crash leaves an unrecoverable state and restart panics. |
+| Medium | Documented-valid `PartialSuccess(None)` panics the leader in debug builds. |
+| Low/Medium | `purge_batch_size = 0` underflows at `calc_purge_upto()`'s `purge_end - 1`. |
+| Medium | `snapshot_max_chunk_size = 0` makes `Chunked::send_snapshot()` send zero-byte chunks forever. |
+| Low/Medium | Blocking `add_learner()` returns `Ok` after a leadership change while the learner is still not caught up. |
+| Low/Medium | `heartbeat_interval = 0` is accepted and leaves the tick loop unthrottled. |
+| Low/Medium | `install_snapshot_timeout = 0` is accepted and every snapshot RPC times out immediately. |
+| Low/Medium | `QuitLeader` does not stop replication tasks; a deposed leader keeps sending a snapshot. |
+
+F8’s reproducer is [t60_quit_leader_replication.rs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/tests/tests/audit/t60_quit_leader_replication.rs). It keeps a chunked snapshot from node 0 to a learner in flight, partitions the new leader from that learner, and forces node 1 to become leader. Even after node 0 becomes a Follower, its old snapshot task continues:
+
+```
+deposed leader 0 sent 228 InstallSnapshot chunks after step-down; sample=[(0, 2), (0, 2), ...]
+```
+
+`Command::QuitLeader` is documented as “No longer a leader. Clean up leader’s data.”, but its runtime arm only clears `leader_data`; the `replications` map and the in-flight snapshot task remain. This is a role/cleanup and resource defect rather than a demonstrated safety violation.
+
+I also stabilized the F2 harness: it now initializes a single-node leader and adds the learner non-blocking with quota 0, avoiding a fixture panic before the core’s fatal stop. The audit integration tests pass repeatedly and as part of the full package.
+
+Artifacts: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/report.md), [audit/repro](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/repro), [audit/logs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/logs), and [audit/diagnostics](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/diagnostics). The generated multi-gigabyte tracing log was removed; targeted logs and exact commands are retained.

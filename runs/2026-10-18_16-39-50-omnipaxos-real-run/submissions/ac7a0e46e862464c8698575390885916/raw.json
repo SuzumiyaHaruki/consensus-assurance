@@ -1,0 +1,90 @@
+{
+  "rationale": "The traced convergence run resolves the StopSign-resync question. The trace shows node 3 being synced to accepted 37 without the StopSign and then receiving only sequence-expected Decides, which clamp its decided index to 37 and never trigger reconnection, so the periodic Decide resends cannot repair a missing AcceptStopSign once that StopSign is decided. The companion clean-miss construction explains why the earlier probe repaired instead: there the Decide was sequence-ahead and the follower reconnected. The question is therefore explained with a conditional progress defect rather than the earlier unconditional 'no repair' claim.",
+  "knowledge": [
+    {
+      "ref": "@stopsign_resync_expected_decide",
+      "kind": "fact",
+      "statement": "In the seeded run 13 convergence phase, every Paxos message delivered to node 3 was, in order: three Prepares with no local change (accepted 0, decided 0), three Promises with no local change, AccSync with sequence counter 1 (accepted 0 -> 37, decided 0), Decide with counter 2 (decided 0 -> 37), and Decide with counter 3 (accepted 37, decided 37 unchanged). Node 3 sent zero PrepareReq during the 150 rounds, ended accepted 37/decided 37 following leader 4 with promise ballot n=2, while the other four nodes were at decided 38. No AcceptStopSign and no AcceptSync beyond the first one reached node 3.",
+      "conditions": "Five OmniPaxos instances, MemoryStorage, unit batch, no snapshots; seed 0xbe5466cf34e90c6c, 900 randomized actions at 20 percent out-of-order loss with a reconfigure proposed at action 450, then up to 150 rounds in which every message is delivered and every node ticked; every message addressed to pid 3 is delivered one at a time during convergence and only the first twelve Paxos messages are recorded in the trace.",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_check_msg_status",
+        "core_handle_sequence_num",
+        "core_send_accsync",
+        "core_handle_acceptsync",
+        "core_stopsign_decided"
+      ],
+      "executions": {
+        "c0f9c7117f564fd7a8b74b629988f177": [
+          1
+        ]
+      }
+    },
+    {
+      "ref": "@stopsign_resync_sequence_break_repairs",
+      "kind": "fact",
+      "statement": "In the constructed clean-miss run, node 5 entered the convergence phase with accepted 2 and decided 2, received Decide with sequence counter 7 (indices unchanged at accepted 2/decided 2), then received a Prepare and an AcceptSync with sequence counter 1, after which it was accepted 3 and decided 3 and all five nodes reported decided 3. No AcceptStopSign reached node 5 in that window. Because the leader only sends Prepare to a not-promised peer or in response to a PrepareReq, the unchanged Decide is read as a sequence break that made node 5 reconnect; the AcceptSync then repaired it. This shows the resend path can repair a missing AcceptStopSign when the resend is sequence-ahead of the follower.",
+      "conditions": "Five OmniPaxos instances, MemoryStorage, unit batch, no snapshots; election_tick_timeout 1000 and resend_message_tick_timeout 100; entries 1..2 decided everywhere, then a reconfigure whose AcceptStopSign and first Decide addressed to pid 5 are discarded, followed by 150 tick-driven rounds with all messages delivered and every message to pid 5 delivered individually.",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_check_msg_status",
+        "core_handle_sequence_num",
+        "core_handle_acceptsync",
+        "core_send_accsync"
+      ],
+      "executions": {
+        "90fd00b78ee24b638f0744983e830269": [
+          0,
+          1
+        ]
+      }
+    }
+  ],
+  "investigations": [
+    {
+      "id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "hypothesis": "A follower that missed the AcceptStopSign stays behind once that StopSign is decided if the leader's periodic Decides are the follower's next expected sequence messages. The leader then sends only the StopSign's Decide (resend_messages_leader switches from AcceptStopSign to Decide at stopsign_is_decided), the follower's Decided update clamps to its flushed accepted index, and no sequence gap triggers a reconnect. The stall is not universal: if the resend is sequence-ahead of the follower's expected next message, the follower detects the gap and the Prepare/AcceptSync exchange repairs it.",
+      "disposition": "explained"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "experiment_id": "cb633117b7084cd3b617cf408f273653-experiment",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_check_msg_status",
+        "core_handle_sequence_num",
+        "core_send_accsync",
+        "core_handle_acceptsync",
+        "core_stopsign_decided"
+      ],
+      "executions": {
+        "c0f9c7117f564fd7a8b74b629988f177": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The executed trace shows the stall and its mechanism. Receipt c0f9c7117f564fd7a8b74b629988f177 ran randomized_reconfig_diagnose_lag (exit 0, test passed); its declared comparison (converged_all true, gated on progressed and reconfigured) is complete and violated on event 1, which reports decided 38,38,37,38,38 after 150 fair-delivery rounds beyond the 100-tick resend timeout. The same event records node 3 at accepted 37, decided 37, leader pid 4, promise ballot n=2, zero PrepareReq and one Promise sent, with the inbound trace prepare:0-0>0-0|prepare:0-0>0-0|prepare:0-0>0-0|promise:0-0>0-0|promise:0-0>0-0|promise:0-0>0-0|accsync1:0-0>37-0|decide2:37-0>37-37|decide3:37-37>37-37. Node 3 is therefore brought from 0 to accepted 37 by an AcceptSync that carries no StopSign (create_log_sync always attaches the local StopSign, so the leader had not accepted it at that moment), and afterwards it sees only two Decides whose sequence counters are the immediate successors of that AcceptSync's counter. Because those Decides are the expected next messages, check_msg_status reports Expected and handle_decide runs update_decided_idx_and_get_accepted_idx, which flushes the batch and sets decided to the minimum of the carried decided index and the flushed accepted index; the first Decide moves decided 0 -> 37 and the second leaves it at 37. Node 3 never sends a PrepareReq and the leader never sends another AcceptStopSign, because resend_messages_leader sends AcceptStopSign only while stopsign_is_decided is false and otherwise repeats the StopSign's Decide with the last used sequence number, which is Outdated for node 3. The follower is therefore stuck one index behind for the whole convergence window. A companion construction (receipt 90fd00b78ee24b638f0744983e830269) explains why a missing AcceptStopSign does not always stall: there the single Decide was sequence-ahead of the follower, the follower reconnected, and the leader's AcceptSync carried the StopSign and repaired it. The defect is thus a bounded progress loss for the lagging follower, conditional on the leader's decision resends being sequence-expected; agreement is unaffected because no two nodes reported different values at any decided index.",
+      "counterevidence": [
+        "A missing AcceptStopSign does not always stall: in the constructed clean-miss run the periodic Decide was sequence-ahead and the follower reconnected, after which an AcceptSync repaired it.",
+        "A leadership change or an external reconnected() call leads to Prepare/Promise/AcceptSync, and create_log_sync attaches the StopSign, so those events repair the follower.",
+        "Agreement is unaffected: divergences stayed 0 and no node reported a different value at a decided index, so this is a progress/availability defect for one follower.",
+        "If the leader had accepted the StopSign before sending the AcceptSync to node 3, that sync would have carried it and node 3 would not have been left at accepted 37."
+      ],
+      "limitations": [
+        "One seeded schedule and one lagging follower; the trace records only the first twelve Paxos messages delivered to node 3 after the lossy phase, so later traffic (if any) is not shown, and node 3 is at accepted 0 at convergence start so its lossy-phase history is not traced.",
+        "The receipt does not record which leader accepted the StopSign or when, nor the log_sync content of the AcceptSync, so the ordering that produced an AcceptSync without the StopSign is inferred from indices and source paths rather than observed directly.",
+        "Five nodes, MemoryStorage, unit batch, no snapshots, no next configuration started; flexible quorums, batching and snapshot-based sync are unexercised."
+      ]
+    }
+  ]
+}

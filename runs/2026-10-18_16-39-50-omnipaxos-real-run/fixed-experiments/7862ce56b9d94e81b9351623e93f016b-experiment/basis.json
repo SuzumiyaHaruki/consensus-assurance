@@ -1,0 +1,407 @@
+{
+  "id": "7862ce56b9d94e81b9351623e93f016b-experiment",
+  "investigation_id": "93e6d663e93c42d7b68b91449efbcf31-question-0",
+  "version": 2,
+  "basis": {
+    "harness": {
+      "kind": "rust_test",
+      "source": "//! Focused probe: shape of `read_decided_suffix(from)` when `from` is below the\n//! compacted index, and the consequence for a consumer that advances one cursor\n//! step per returned element (the runtime actor's `DecidedSub` arithmetic in\n//! omnipaxos_runtime/src/actor.rs is reproduced here; the runtime crate itself\n//! is not linked into this test target).\n//!\n//! Two real OmniPaxos instances run in one process with in-memory storage and a\n//! synchronous message pump, so delivery, ordering and batching are exactly the\n//! ones the library sees from a network layer.\n\nuse omnipaxos::{\n    storage::{Entry, NoSnapshot},\n    util::LogEntry,\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, PartialEq)]\nstruct Value(u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\n\nfn build_node(pid: u64) -> Node {\n    let cluster = ClusterConfig {\n        configuration_id: 1,\n        nodes: vec![1, 2],\n        flexible_quorum: None,\n    };\n    let server = ServerConfig {\n        pid,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: cluster,\n        server_config: server,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"node build failed\")\n}\n\n/// Deliver every produced message to its addressed node until nothing is left.\nfn pump(nodes: &mut [Node]) {\n    for _ in 0..500 {\n        let mut moved = false;\n        for i in 0..nodes.len() {\n            let mut out = Vec::new();\n            nodes[i].take_outgoing_messages(&mut out);\n            for m in out {\n                let to = m.get_receiver();\n                assert!(to >= 1 && (to as usize) <= nodes.len(), \"bad receiver\");\n                nodes[(to as usize) - 1].handle_incoming(m);\n                moved = true;\n            }\n        }\n        if !moved {\n            return;\n        }\n    }\n    panic!(\"message pump did not quiesce\");\n}\n\nfn kind(e: &LogEntry<Value>) -> &'static str {\n    match e {\n        LogEntry::Decided(_) => \"decided\",\n        LogEntry::Undecided(_) => \"undecided\",\n        LogEntry::Trimmed(_) => \"trimmed\",\n        LogEntry::Snapshotted(_) => \"snapshotted\",\n        LogEntry::StopSign(_, _) => \"stopsign\",\n    }\n}\n\nfn token(e: &LogEntry<Value>) -> String {\n    match e {\n        LogEntry::Decided(Value(v)) => v.to_string(),\n        LogEntry::Undecided(Value(v)) => format!(\"u{}\", v),\n        LogEntry::Trimmed(t) => format!(\"T{}\", t),\n        _ => \"?\".to_string(),\n    }\n}\n\nfn emit(line: String) {\n    println!(\"CA_EVENT {}\", line);\n}\n\nfn run_probe() {\n    let mut nodes = vec![build_node(1), build_node(2)];\n    pump(&mut nodes);\n\n    // Make node 1 the leader through the public API and let it reach Accept.\n    nodes[0].try_become_leader();\n    pump(&mut nodes);\n\n    let leader_state = nodes[0].get_current_leader();\n\n    // Six decided entries, one at a time, each pump completing the round trip.\n    for i in 1..=6u64 {\n        nodes[0].append(Value(i)).expect(\"append failed\");\n        pump(&mut nodes);\n    }\n\n    let decided = nodes[0].get_decided_idx();\n    let decided_peer = nodes[1].get_decided_idx();\n\n    // The leader is allowed to trim up to the minimum accepted index.\n    nodes[0].trim(Some(4)).expect(\"leader trim failed\");\n    pump(&mut nodes);\n    let compacted = nodes[0].get_compacted_idx();\n\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"ready\\\",\\\"leader_is_1_accept\\\":{},\\\"decided\\\":{},\\\"decided_peer\\\":{},\\\"compacted\\\":{}}}\",\n        matches!(leader_state, Some((1, true))),\n        decided,\n        decided_peer,\n        compacted\n    ));\n\n    // Shape of the decided suffix for a consumer that starts below compaction.\n    for from in [1usize, 4usize] {\n        let suffix = nodes[0].read_decided_suffix(from);\n        match suffix {\n            Some(entries) => {\n                let kinds: Vec<&str> = entries.iter().map(kind).collect();\n                let tokens: Vec<String> = entries.iter().map(token).collect();\n                emit(format!(\n                    \"{{\\\"run\\\":1,\\\"event\\\":\\\"suffix_shape\\\",\\\"from\\\":{},\\\"decided\\\":{},\\\"compacted\\\":{},\\\"len\\\":{},\\\"decided_minus_from\\\":{},\\\"kinds\\\":\\\"{}\\\",\\\"tokens\\\":\\\"{}\\\"}}\",\n                    from,\n                    decided,\n                    compacted,\n                    entries.len(),\n                    decided.saturating_sub(from),\n                    kinds.join(\",\"),\n                    tokens.join(\",\")\n                ));\n            }\n            None => emit(format!(\n                \"{{\\\"run\\\":1,\\\"event\\\":\\\"suffix_shape\\\",\\\"from\\\":{},\\\"decided\\\":{},\\\"compacted\\\":{},\\\"len\\\":null}}\",\n                from, decided, compacted\n            )),\n        }\n    }\n\n    // Reproduce the actor's cursor arithmetic over the real outputs:\n    //   push_to_sub: for each element of read_decided_suffix(next_idx):\n    //                try_send(entry); next_idx += 1\n    //   push_to_all_subs: min_next = min(next_idx); read from min_next, then\n    //                for each sub: start = sub.next_idx - min_next; push\n    //                entries[start..], next_idx += 1 per pushed element.\n    let mut cursor = 1usize;\n    let mut delivered: Vec<u64> = Vec::new();\n    let mut catchup_tokens: Vec<String> = Vec::new();\n    if let Some(entries) = nodes[0].read_decided_suffix(cursor) {\n        for e in &entries {\n            catchup_tokens.push(token(e));\n            if let LogEntry::Decided(Value(v)) = e {\n                delivered.push(*v);\n            }\n            cursor += 1;\n        }\n    }\n    let cursor_after_catchup = cursor;\n    let mut next_push_tokens: Vec<String> = Vec::new();\n    if let Some(entries) = nodes[0].read_decided_suffix(cursor) {\n        for e in &entries {\n            next_push_tokens.push(token(e));\n            if let LogEntry::Decided(Value(v)) = e {\n                delivered.push(*v);\n            }\n            cursor += 1;\n        }\n    }\n    let mut duplicates: Vec<u64> = Vec::new();\n    for (i, v) in delivered.iter().enumerate() {\n        if delivered[..i].contains(v) && !duplicates.contains(v) {\n            duplicates.push(*v);\n        }\n    }\n    let dstr: Vec<String> = delivered.iter().map(|v| v.to_string()).collect();\n    let dupstr: Vec<String> = duplicates.iter().map(|v| v.to_string()).collect();\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"cursor_replay\\\",\\\"start_from\\\":1,\\\"catchup_tokens\\\":\\\"{}\\\",\\\"cursor_after_catchup\\\":{},\\\"next_push_from\\\":{},\\\"next_push_tokens\\\":\\\"{}\\\",\\\"delivered_values\\\":\\\"{}\\\",\\\"duplicate_values\\\":\\\"{}\\\",\\\"duplicates\\\":{},\\\"decided\\\":{}}}\",\n        catchup_tokens.join(\",\"),\n        cursor_after_catchup,\n        cursor_after_catchup,\n        next_push_tokens.join(\",\"),\n        dstr.join(\",\"),\n        dupstr.join(\",\"),\n        !duplicates.is_empty(),\n        decided\n    ));\n}\n\n#[test]\nfn decided_suffix_collapses_trimmed_prefix() {\n    run_probe();\n}\n",
+      "files": {},
+      "execution_package": "./omnipaxos",
+      "test_names": [
+        "decided_suffix_collapses_trimmed_prefix"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "ready",
+          "event": "ready",
+          "conditions": [
+            {
+              "field": "run",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "decided",
+              "op": "eq",
+              "value": 6,
+              "reference": null
+            },
+            {
+              "field": "compacted",
+              "op": "eq",
+              "value": 4,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "core_read_suffix",
+      "core_entry_type",
+      "core_compacted_entry",
+      "rt_push_sub",
+      "rt_push_all"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Same two-node in-process execution as the previous probe, repeated to obtain a properly admitted comparison: six decided entries, trim to 4, record read_decided_suffix(1) and (4) and replay the actor cursor arithmetic; all events carry run=1.",
+      "assumptions": [
+        "All produced messages are delivered synchronously to their addressed node until none remain.",
+        "No ticks are called, so BLE elections do not occur; leadership is obtained with try_become_leader.",
+        "Trim(4) is accepted because both nodes have accepted index 6."
+      ],
+      "excluded": [
+        "Network faults, snapshots, batching, reconfiguration, multiple subscribers."
+      ],
+      "parameters": {
+        "nodes": [
+          1,
+          2
+        ],
+        "entries": 6,
+        "trim_idx": 4,
+        "run": 1
+      }
+    },
+    "prefix": "Identical construction to the previous run: build nodes 1 and 2 from ClusterConfig {configuration_id:1, nodes:[1,2]} with MemoryStorage; pump; node1.try_become_leader(); pump to leader Accept; append Value(1..=6) with a full pump after each; node1.trim(Some(4)); pump. Emit CA_EVENT ready/run=1, suffix_shape/run=1 for from=1 and from=4, cursor_replay/run=1 as before.",
+    "requirement": null,
+    "responsibility": "",
+    "comparisons": [
+      {
+        "event": "suffix_shape",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "len",
+          "op": "eq",
+          "value": 3,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ],
+        "description": "From 1 below compacted 4, read_decided_suffix returns 3 elements for 5 indices."
+      },
+      {
+        "event": "suffix_shape",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "len",
+          "op": "eq",
+          "value": 2,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ],
+        "description": "From the compacted boundary, one element per remaining index."
+      },
+      {
+        "event": "cursor_replay",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "duplicates",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The per-element cursor after the catch-up is 4, so the next push re-delivers entries 5 and 6."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "afb1c6e7238c40e7bfd92dfc1dcdedac",
+  "configuration": {
+    "backend": "cargo",
+    "target": {
+      "expected_module": null,
+      "variant": "omnipaxos",
+      "analysis_roots": [],
+      "execution_package": "omnipaxos",
+      "harness_path": "omnipaxos/tests/assurance_generated.rs"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8"
+    }
+  },
+  "harness_filename": "omnipaxos/tests/assurance_generated.rs",
+  "operation_id": "7862ce56b9d94e81b9351623e93f016b",
+  "previous_id": "93e6d663e93c42d7b68b91449efbcf31-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "rust_test",
+        "source": "//! Focused probe: shape of `read_decided_suffix(from)` when `from` is below the\n//! compacted index, and the consequence for a consumer that advances one cursor\n//! step per returned element (the runtime actor's `DecidedSub` arithmetic in\n//! omnipaxos_runtime/src/actor.rs is reproduced here; the runtime crate itself\n//! is not linked into this test target).\n//!\n//! Two real OmniPaxos instances run in one process with in-memory storage and a\n//! synchronous message pump, so delivery, ordering and batching are exactly the\n//! ones the library sees from a network layer.\n\nuse omnipaxos::{\n    storage::{Entry, NoSnapshot},\n    util::LogEntry,\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, PartialEq)]\nstruct Value(u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\n\nfn build_node(pid: u64) -> Node {\n    let cluster = ClusterConfig {\n        configuration_id: 1,\n        nodes: vec![1, 2],\n        flexible_quorum: None,\n    };\n    let server = ServerConfig {\n        pid,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: cluster,\n        server_config: server,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"node build failed\")\n}\n\n/// Deliver every produced message to its addressed node until nothing is left.\nfn pump(nodes: &mut [Node]) {\n    for _ in 0..500 {\n        let mut moved = false;\n        for i in 0..nodes.len() {\n            let mut out = Vec::new();\n            nodes[i].take_outgoing_messages(&mut out);\n            for m in out {\n                let to = m.get_receiver();\n                assert!(to >= 1 && (to as usize) <= nodes.len(), \"bad receiver\");\n                nodes[(to as usize) - 1].handle_incoming(m);\n                moved = true;\n            }\n        }\n        if !moved {\n            return;\n        }\n    }\n    panic!(\"message pump did not quiesce\");\n}\n\nfn kind(e: &LogEntry<Value>) -> &'static str {\n    match e {\n        LogEntry::Decided(_) => \"decided\",\n        LogEntry::Undecided(_) => \"undecided\",\n        LogEntry::Trimmed(_) => \"trimmed\",\n        LogEntry::Snapshotted(_) => \"snapshotted\",\n        LogEntry::StopSign(_, _) => \"stopsign\",\n    }\n}\n\nfn token(e: &LogEntry<Value>) -> String {\n    match e {\n        LogEntry::Decided(Value(v)) => v.to_string(),\n        LogEntry::Undecided(Value(v)) => format!(\"u{}\", v),\n        LogEntry::Trimmed(t) => format!(\"T{}\", t),\n        _ => \"?\".to_string(),\n    }\n}\n\nfn emit(line: String) {\n    println!(\"CA_EVENT {}\", line);\n}\n\nfn run_probe() {\n    let mut nodes = vec![build_node(1), build_node(2)];\n    pump(&mut nodes);\n\n    // Make node 1 the leader through the public API and let it reach Accept.\n    nodes[0].try_become_leader();\n    pump(&mut nodes);\n\n    let leader_state = nodes[0].get_current_leader();\n\n    // Six decided entries, one at a time, each pump completing the round trip.\n    for i in 1..=6u64 {\n        nodes[0].append(Value(i)).expect(\"append failed\");\n        pump(&mut nodes);\n    }\n\n    let decided = nodes[0].get_decided_idx();\n    let decided_peer = nodes[1].get_decided_idx();\n\n    // The leader is allowed to trim up to the minimum accepted index.\n    nodes[0].trim(Some(4)).expect(\"leader trim failed\");\n    pump(&mut nodes);\n    let compacted = nodes[0].get_compacted_idx();\n\n    emit(format!(\n        \"{{\\\"event\\\":\\\"ready\\\",\\\"leader_is_1_accept\\\":{},\\\"decided\\\":{},\\\"decided_peer\\\":{},\\\"compacted\\\":{}}}\",\n        matches!(leader_state, Some((1, true))),\n        decided,\n        decided_peer,\n        compacted\n    ));\n\n    // Shape of the decided suffix for a consumer that starts below compaction.\n    for from in [1usize, 4usize] {\n        let suffix = nodes[0].read_decided_suffix(from);\n        match suffix {\n            Some(entries) => {\n                let kinds: Vec<&str> = entries.iter().map(kind).collect();\n                let tokens: Vec<String> = entries.iter().map(token).collect();\n                emit(format!(\n                    \"{{\\\"event\\\":\\\"suffix_shape\\\",\\\"from\\\":{},\\\"decided\\\":{},\\\"compacted\\\":{},\\\"len\\\":{},\\\"decided_minus_from\\\":{},\\\"kinds\\\":\\\"{}\\\",\\\"tokens\\\":\\\"{}\\\"}}\",\n                    from,\n                    decided,\n                    compacted,\n                    entries.len(),\n                    decided.saturating_sub(from),\n                    kinds.join(\",\"),\n                    tokens.join(\",\")\n                ));\n            }\n            None => emit(format!(\n                \"{{\\\"event\\\":\\\"suffix_shape\\\",\\\"from\\\":{},\\\"decided\\\":{},\\\"compacted\\\":{},\\\"len\\\":null}}\",\n                from, decided, compacted\n            )),\n        }\n    }\n\n    // Reproduce the actor's cursor arithmetic over the real outputs:\n    //   push_to_sub: for each element of read_decided_suffix(next_idx):\n    //                try_send(entry); next_idx += 1\n    //   push_to_all_subs: min_next = min(next_idx); read from min_next, then\n    //                for each sub: start = sub.next_idx - min_next; push\n    //                entries[start..], next_idx += 1 per pushed element.\n    let mut cursor = 1usize;\n    let mut delivered: Vec<u64> = Vec::new();\n    let mut catchup_tokens: Vec<String> = Vec::new();\n    if let Some(entries) = nodes[0].read_decided_suffix(cursor) {\n        for e in &entries {\n            catchup_tokens.push(token(e));\n            if let LogEntry::Decided(Value(v)) = e {\n                delivered.push(*v);\n            }\n            cursor += 1;\n        }\n    }\n    let cursor_after_catchup = cursor;\n    let mut next_push_tokens: Vec<String> = Vec::new();\n    if let Some(entries) = nodes[0].read_decided_suffix(cursor) {\n        for e in &entries {\n            next_push_tokens.push(token(e));\n            if let LogEntry::Decided(Value(v)) = e {\n                delivered.push(*v);\n            }\n            cursor += 1;\n        }\n    }\n    let mut duplicates: Vec<u64> = Vec::new();\n    for (i, v) in delivered.iter().enumerate() {\n        if delivered[..i].contains(v) && !duplicates.contains(v) {\n            duplicates.push(*v);\n        }\n    }\n    let dstr: Vec<String> = delivered.iter().map(|v| v.to_string()).collect();\n    let dupstr: Vec<String> = duplicates.iter().map(|v| v.to_string()).collect();\n    emit(format!(\n        \"{{\\\"event\\\":\\\"cursor_replay\\\",\\\"start_from\\\":1,\\\"catchup_tokens\\\":\\\"{}\\\",\\\"cursor_after_catchup\\\":{},\\\"next_push_from\\\":{},\\\"next_push_tokens\\\":\\\"{}\\\",\\\"delivered_values\\\":\\\"{}\\\",\\\"duplicate_values\\\":\\\"{}\\\",\\\"duplicates\\\":{},\\\"decided\\\":{}}}\",\n        catchup_tokens.join(\",\"),\n        cursor_after_catchup,\n        cursor_after_catchup,\n        next_push_tokens.join(\",\"),\n        dstr.join(\",\"),\n        dupstr.join(\",\"),\n        !duplicates.is_empty(),\n        decided\n    ));\n}\n\n#[test]\nfn decided_suffix_collapses_trimmed_prefix() {\n    run_probe();\n}\n",
+        "files": {},
+        "execution_package": "./omnipaxos",
+        "test_names": [
+          "decided_suffix_collapses_trimmed_prefix"
+        ],
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "ready",
+            "event": "ready",
+            "conditions": [
+              {
+                "field": "decided",
+                "op": "eq",
+                "value": 6,
+                "reference": null
+              },
+              {
+                "field": "compacted",
+                "op": "eq",
+                "value": 4,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "rust_test",
+        "source": "//! Focused probe: shape of `read_decided_suffix(from)` when `from` is below the\n//! compacted index, and the consequence for a consumer that advances one cursor\n//! step per returned element (the runtime actor's `DecidedSub` arithmetic in\n//! omnipaxos_runtime/src/actor.rs is reproduced here; the runtime crate itself\n//! is not linked into this test target).\n//!\n//! Two real OmniPaxos instances run in one process with in-memory storage and a\n//! synchronous message pump, so delivery, ordering and batching are exactly the\n//! ones the library sees from a network layer.\n\nuse omnipaxos::{\n    storage::{Entry, NoSnapshot},\n    util::LogEntry,\n    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,\n};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, PartialEq)]\nstruct Value(u64);\n\nimpl Entry for Value {\n    type Snapshot = NoSnapshot;\n}\n\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\n\nfn build_node(pid: u64) -> Node {\n    let cluster = ClusterConfig {\n        configuration_id: 1,\n        nodes: vec![1, 2],\n        flexible_quorum: None,\n    };\n    let server = ServerConfig {\n        pid,\n        ..Default::default()\n    };\n    OmniPaxosConfig {\n        cluster_config: cluster,\n        server_config: server,\n    }\n    .build(MemoryStorage::default())\n    .expect(\"node build failed\")\n}\n\n/// Deliver every produced message to its addressed node until nothing is left.\nfn pump(nodes: &mut [Node]) {\n    for _ in 0..500 {\n        let mut moved = false;\n        for i in 0..nodes.len() {\n            let mut out = Vec::new();\n            nodes[i].take_outgoing_messages(&mut out);\n            for m in out {\n                let to = m.get_receiver();\n                assert!(to >= 1 && (to as usize) <= nodes.len(), \"bad receiver\");\n                nodes[(to as usize) - 1].handle_incoming(m);\n                moved = true;\n            }\n        }\n        if !moved {\n            return;\n        }\n    }\n    panic!(\"message pump did not quiesce\");\n}\n\nfn kind(e: &LogEntry<Value>) -> &'static str {\n    match e {\n        LogEntry::Decided(_) => \"decided\",\n        LogEntry::Undecided(_) => \"undecided\",\n        LogEntry::Trimmed(_) => \"trimmed\",\n        LogEntry::Snapshotted(_) => \"snapshotted\",\n        LogEntry::StopSign(_, _) => \"stopsign\",\n    }\n}\n\nfn token(e: &LogEntry<Value>) -> String {\n    match e {\n        LogEntry::Decided(Value(v)) => v.to_string(),\n        LogEntry::Undecided(Value(v)) => format!(\"u{}\", v),\n        LogEntry::Trimmed(t) => format!(\"T{}\", t),\n        _ => \"?\".to_string(),\n    }\n}\n\nfn emit(line: String) {\n    println!(\"CA_EVENT {}\", line);\n}\n\nfn run_probe() {\n    let mut nodes = vec![build_node(1), build_node(2)];\n    pump(&mut nodes);\n\n    // Make node 1 the leader through the public API and let it reach Accept.\n    nodes[0].try_become_leader();\n    pump(&mut nodes);\n\n    let leader_state = nodes[0].get_current_leader();\n\n    // Six decided entries, one at a time, each pump completing the round trip.\n    for i in 1..=6u64 {\n        nodes[0].append(Value(i)).expect(\"append failed\");\n        pump(&mut nodes);\n    }\n\n    let decided = nodes[0].get_decided_idx();\n    let decided_peer = nodes[1].get_decided_idx();\n\n    // The leader is allowed to trim up to the minimum accepted index.\n    nodes[0].trim(Some(4)).expect(\"leader trim failed\");\n    pump(&mut nodes);\n    let compacted = nodes[0].get_compacted_idx();\n\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"ready\\\",\\\"leader_is_1_accept\\\":{},\\\"decided\\\":{},\\\"decided_peer\\\":{},\\\"compacted\\\":{}}}\",\n        matches!(leader_state, Some((1, true))),\n        decided,\n        decided_peer,\n        compacted\n    ));\n\n    // Shape of the decided suffix for a consumer that starts below compaction.\n    for from in [1usize, 4usize] {\n        let suffix = nodes[0].read_decided_suffix(from);\n        match suffix {\n            Some(entries) => {\n                let kinds: Vec<&str> = entries.iter().map(kind).collect();\n                let tokens: Vec<String> = entries.iter().map(token).collect();\n                emit(format!(\n                    \"{{\\\"run\\\":1,\\\"event\\\":\\\"suffix_shape\\\",\\\"from\\\":{},\\\"decided\\\":{},\\\"compacted\\\":{},\\\"len\\\":{},\\\"decided_minus_from\\\":{},\\\"kinds\\\":\\\"{}\\\",\\\"tokens\\\":\\\"{}\\\"}}\",\n                    from,\n                    decided,\n                    compacted,\n                    entries.len(),\n                    decided.saturating_sub(from),\n                    kinds.join(\",\"),\n                    tokens.join(\",\")\n                ));\n            }\n            None => emit(format!(\n                \"{{\\\"run\\\":1,\\\"event\\\":\\\"suffix_shape\\\",\\\"from\\\":{},\\\"decided\\\":{},\\\"compacted\\\":{},\\\"len\\\":null}}\",\n                from, decided, compacted\n            )),\n        }\n    }\n\n    // Reproduce the actor's cursor arithmetic over the real outputs:\n    //   push_to_sub: for each element of read_decided_suffix(next_idx):\n    //                try_send(entry); next_idx += 1\n    //   push_to_all_subs: min_next = min(next_idx); read from min_next, then\n    //                for each sub: start = sub.next_idx - min_next; push\n    //                entries[start..], next_idx += 1 per pushed element.\n    let mut cursor = 1usize;\n    let mut delivered: Vec<u64> = Vec::new();\n    let mut catchup_tokens: Vec<String> = Vec::new();\n    if let Some(entries) = nodes[0].read_decided_suffix(cursor) {\n        for e in &entries {\n            catchup_tokens.push(token(e));\n            if let LogEntry::Decided(Value(v)) = e {\n                delivered.push(*v);\n            }\n            cursor += 1;\n        }\n    }\n    let cursor_after_catchup = cursor;\n    let mut next_push_tokens: Vec<String> = Vec::new();\n    if let Some(entries) = nodes[0].read_decided_suffix(cursor) {\n        for e in &entries {\n            next_push_tokens.push(token(e));\n            if let LogEntry::Decided(Value(v)) = e {\n                delivered.push(*v);\n            }\n            cursor += 1;\n        }\n    }\n    let mut duplicates: Vec<u64> = Vec::new();\n    for (i, v) in delivered.iter().enumerate() {\n        if delivered[..i].contains(v) && !duplicates.contains(v) {\n            duplicates.push(*v);\n        }\n    }\n    let dstr: Vec<String> = delivered.iter().map(|v| v.to_string()).collect();\n    let dupstr: Vec<String> = duplicates.iter().map(|v| v.to_string()).collect();\n    emit(format!(\n        \"{{\\\"run\\\":1,\\\"event\\\":\\\"cursor_replay\\\",\\\"start_from\\\":1,\\\"catchup_tokens\\\":\\\"{}\\\",\\\"cursor_after_catchup\\\":{},\\\"next_push_from\\\":{},\\\"next_push_tokens\\\":\\\"{}\\\",\\\"delivered_values\\\":\\\"{}\\\",\\\"duplicate_values\\\":\\\"{}\\\",\\\"duplicates\\\":{},\\\"decided\\\":{}}}\",\n        catchup_tokens.join(\",\"),\n        cursor_after_catchup,\n        cursor_after_catchup,\n        next_push_tokens.join(\",\"),\n        dstr.join(\",\"),\n        dupstr.join(\",\"),\n        !duplicates.is_empty(),\n        decided\n    ));\n}\n\n#[test]\nfn decided_suffix_collapses_trimmed_prefix() {\n    run_probe();\n}\n",
+        "files": {},
+        "execution_package": "./omnipaxos",
+        "test_names": [
+          "decided_suffix_collapses_trimmed_prefix"
+        ],
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "ready",
+            "event": "ready",
+            "conditions": [
+              {
+                "field": "run",
+                "op": "eq",
+                "value": 1,
+                "reference": null
+              },
+              {
+                "field": "decided",
+                "op": "eq",
+                "value": 6,
+                "reference": null
+              },
+              {
+                "field": "compacted",
+                "op": "eq",
+                "value": 4,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "scope": {
+      "before": {
+        "description": "Two real OmniPaxos instances (pids 1 and 2) in one process, MemoryStorage, batch_size 1, no snapshots; node 1 becomes leader via try_become_leader, six entries are appended and decided, then the leader trims to index 4. The probe records read_decided_suffix(1) and (4) shapes and replays the actor's cursor arithmetic from source over those real outputs.",
+        "assumptions": [
+          "All messages produced by either instance are delivered synchronously to their addressed node until no message remains (reliable, ordered, no loss).",
+          "Only local calls append, try_become_leader and trim drive the run; no ticks, so BLE elections do not occur.",
+          "Trim(4) is accepted because the leader's minimum accepted index is 6 for both nodes."
+        ],
+        "excluded": [
+          "Network faults, reconnect handling, snapshots, batching, reconfiguration and concurrent client calls."
+        ],
+        "parameters": {
+          "nodes": [
+            1,
+            2
+          ],
+          "entries": 6,
+          "trim_idx": 4
+        }
+      },
+      "after": {
+        "description": "Same two-node in-process execution as the previous probe, repeated to obtain a properly admitted comparison: six decided entries, trim to 4, record read_decided_suffix(1) and (4) and replay the actor cursor arithmetic; all events carry run=1.",
+        "assumptions": [
+          "All produced messages are delivered synchronously to their addressed node until none remain.",
+          "No ticks are called, so BLE elections do not occur; leadership is obtained with try_become_leader.",
+          "Trim(4) is accepted because both nodes have accepted index 6."
+        ],
+        "excluded": [
+          "Network faults, snapshots, batching, reconfiguration, multiple subscribers."
+        ],
+        "parameters": {
+          "nodes": [
+            1,
+            2
+          ],
+          "entries": 6,
+          "trim_idx": 4,
+          "run": 1
+        }
+      }
+    },
+    "prefix": {
+      "before": "Build both nodes from ClusterConfig {configuration_id:1, nodes:[1,2]} and default ServerConfig with pid 1/2 and MemoryStorage. Pump until quiescent, call node1.try_become_leader(), pump until leader state is (pid 1, Accept). Append Value(1..=6) with a full pump after each append so every entry is decided on both nodes. Call node1.trim(Some(4)) and pump; node 2 applies the forwarded Trim(4). Emit CA_EVENT ready (leader_is_1_accept, decided, decided_peer, compacted), then suffix_shape events for from=1 and from=4 (from, decided, compacted, len, decided_minus_from, kinds, tokens), then cursor_replay: start cursor at 1, apply push_to_sub's for-each-element next_idx += 1 to read_decided_suffix(cursor), then apply one later push_to_all_subs read from the resulting cursor with start=0, and report catchup_tokens, cursor_after_catchup, next_push_tokens, delivered_values, duplicate_values, duplicates, decided.",
+      "after": "Identical construction to the previous run: build nodes 1 and 2 from ClusterConfig {configuration_id:1, nodes:[1,2]} with MemoryStorage; pump; node1.try_become_leader(); pump to leader Accept; append Value(1..=6) with a full pump after each; node1.trim(Some(4)); pump. Emit CA_EVENT ready/run=1, suffix_shape/run=1 for from=1 and from=4, cursor_replay/run=1 as before."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "suffix_shape",
+          "identity_fields": [
+            "from"
+          ],
+          "admission_alias": "ready",
+          "assertion": {
+            "field": "len",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "from",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ],
+          "description": "Requesting from index 1 below compacted 4 returns the compacted marker plus the two remaining entries, so len is 3 while decided_minus_from is 5."
+        },
+        {
+          "event": "suffix_shape",
+          "identity_fields": [
+            "from"
+          ],
+          "admission_alias": "ready",
+          "assertion": {
+            "field": "len",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "from",
+              "op": "eq",
+              "value": 4,
+              "reference": null
+            }
+          ],
+          "description": "Requesting from the compacted boundary itself returns one element per remaining index (len 2)."
+        },
+        {
+          "event": "cursor_replay",
+          "identity_fields": [
+            "start_from"
+          ],
+          "admission_alias": "ready",
+          "assertion": {
+            "field": "duplicates",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "The per-element cursor after catch-up is short of decided, so the next push re-delivers entries 5 and 6."
+        }
+      ],
+      "after": [
+        {
+          "event": "suffix_shape",
+          "identity_fields": [
+            "run"
+          ],
+          "admission_alias": "ready",
+          "assertion": {
+            "field": "len",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "from",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            }
+          ],
+          "description": "From 1 below compacted 4, read_decided_suffix returns 3 elements for 5 indices."
+        },
+        {
+          "event": "suffix_shape",
+          "identity_fields": [
+            "run"
+          ],
+          "admission_alias": "ready",
+          "assertion": {
+            "field": "len",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "from",
+              "op": "eq",
+              "value": 4,
+              "reference": null
+            }
+          ],
+          "description": "From the compacted boundary, one element per remaining index."
+        },
+        {
+          "event": "cursor_replay",
+          "identity_fields": [
+            "run"
+          ],
+          "admission_alias": "ready",
+          "assertion": {
+            "field": "duplicates",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [],
+          "description": "The per-element cursor after the catch-up is 4, so the next push re-delivers entries 5 and 6."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Every event now carries run=1 and all comparisons use identity_fields [run] with a readiness admission that also carries run, so prerequisite correlation is unambiguous; the probe logic, inputs and assertions are otherwise unchanged."
+}

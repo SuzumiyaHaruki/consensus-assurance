@@ -1,0 +1,112 @@
+{
+  "rationale": "The quorum-intersection puzzle left in the last revision has a cleaner source-level resolution. handle_majority_promises merges exactly one promise log, the one kept as max_promise_sync, and PromiseMetaData orders promises by accept round before accepted index; a promise from a follower with a later accept round but a shorter log therefore displaces a StopSign-bearing log from an earlier round. That explains how a leader whose prepare quorum intersects the StopSign holders can still have no StopSign when it syncs node 3, why it later decides 38 from followers' reported accepted indices through is_chosen, and why no StopSign traffic at all reaches node 3 afterwards: the resend branch is guarded by the leader's own get_stopsign(). This update records the merge-order behavior and restates the interpretation with that as the leading explanation, keeping the late-Promise path as an alternative.",
+  "sources": [
+    {
+      "id": "core_promise_meta_order",
+      "file": "omnipaxos/src/util.rs",
+      "start_line": 27,
+      "end_line": 52,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": [
+        {
+          "entry_id": "@promise_max_merge_drops_stopsign",
+          "revision": 1,
+          "assertion": "Leading source-consistent explanation for run 13: the single max promise log merged at the prepare quorum can omit a StopSign carried by a losing promise, leaving leader 4 without the StopSign when it synced node 3 and without any StopSign resend afterwards, while later Accepted replies from the StopSign holders still make 38 chosen."
+        },
+        {
+          "entry_id": "fec6f4b42e4a4db883941372afcd69a8-knowledge-0",
+          "revision": 1,
+          "assertion": "Alternative path to the same state: a Promise arriving after the quorum contributes no log_sync at all. The receipt does not record which promises leader 4 received, so this remains a source-level alternative rather than the established cause."
+        },
+        {
+          "entry_id": "ac2f20a6139f448da592f87489e93e7a-knowledge-0",
+          "revision": 1,
+          "assertion": "Explains how decided 38 can exist while the leader's own log ends at 37: is_chosen counts follower-reported accepted indices, so the decision does not require the leader to hold the StopSign."
+        }
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@promise_max_merge_drops_stopsign",
+      "kind": "behavior",
+      "statement": "set_promise keeps only the log_sync of the greatest PromiseMetaData seen while promises are collected, and PromiseMetaData compares by n_accepted first and accepted_idx second. handle_majority_promises then applies that single log_sync. A follower whose Promise carries a later accept round but a shorter log is therefore greater than a follower whose Promise carries an earlier round and a longer log including an accepted StopSign, and the longer log's StopSign is never merged into the leader. The leader can hold a prepare quorum that intersects the StopSign holders and still reach Phase::Accept without the StopSign, which also means resend_messages_leader's StopSign branch, guarded by get_stopsign(), stays inactive for that position.",
+      "conditions": "SequencePaxos leader collecting promises in Phase::Prepare; at least two promises differ in n_accepted or accepted_idx so only one wins the max comparison; the losing promise's log_sync is the only one containing the StopSign; no snapshots involved.",
+      "source_ids": [
+        "core_promise_meta_order",
+        "core_majority_promises",
+        "core_create_log_sync",
+        "core_resend_leader",
+        "core_handle_accepted",
+        "core_is_chosen"
+      ],
+      "executions": {},
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "b4ce39b510974e628f7333fe0525a25b-question-0",
+      "experiment_id": "cb633117b7084cd3b617cf408f273653-experiment",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_check_msg_status",
+        "core_handle_sequence_num",
+        "core_send_accsync",
+        "core_handle_acceptsync",
+        "core_stopsign_decided",
+        "core_create_log_sync",
+        "core_promise_meta_order",
+        "core_majority_promises",
+        "core_handle_accepted",
+        "core_is_chosen"
+      ],
+      "executions": {
+        "c0f9c7117f564fd7a8b74b629988f177": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The executed trace shows the stall and its mechanism. Receipt c0f9c7117f564fd7a8b74b629988f177 ran randomized_reconfig_diagnose_lag (exit 0, test passed); its declared comparison (converged_all true, gated on progressed and reconfigured) is complete and violated on event 1, which reports decided 38,38,37,38,38 after 150 fair-delivery rounds, well past the 100-tick resend timeout. The same event records node 3 at accepted 37, decided 37, leader pid 4, promise ballot n=2, zero PrepareReq and one Promise sent, with the inbound trace prepare:0-0>0-0|prepare:0-0>0-0|prepare:0-0>0-0|promise:0-0>0-0|promise:0-0>0-0|promise:0-0>0-0|accsync1:0-0>37-0|decide2:37-0>37-37|decide3:37-37>37-37. The AcceptSync with counter 1 raised node 3 from 0 to accepted 37 and left decided at 0, so it carried no StopSign; create_log_sync always attaches the leader's local StopSign, so leader 4 had none when it sent that sync. The two Decides carry counters 2 and 3, the immediate successors of that AcceptSync, so check_msg_status returns Expected for both and handle_decide runs update_decided_idx_and_get_accepted_idx: the first sets decided to min(carried decided index, flushed accepted index) = 37, the second leaves 37, and node 3 never sends a PrepareReq, so no reconnect or AcceptSync follows. No AcceptStopSign reaches node 3 at any point in the window. The leading explanation for how leader 4 could both lack the StopSign at accsync time and still decide 38 is the single max promise merge: set_promise keeps only the log_sync of the greatest PromiseMetaData, which compares n_accepted before accepted_idx, and handle_majority_promises applies only that log. A promise from a follower with a later accept round but a shorter log therefore displaces a StopSign-bearing promise, so the leader reaches Phase::Accept without the StopSign even though its prepare quorum intersects the StopSign holders. It can then still decide 38 because handle_accepted counts follower-reported accepted indices through is_chosen, and its AcceptSync to node 3 and its resend branch both operate from its own missing StopSign. A late Promise that is never merged is a second source-consistent path to the same state. Either way, the resulting Decide resends reuse sequence numbers node 3 has already consumed and are ignored, so the missing StopSign is never delivered and the follower stays one index behind for the whole convergence window. Agreement is unaffected because no two nodes reported different values at any decided index.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "A missing AcceptStopSign does not always stall: in the constructed clean-miss run the periodic Decide was sequence-ahead and the follower reconnected, after which an AcceptSync repaired it.",
+        "A leadership change, or an external reconnected() call, leads to Prepare/Promise/AcceptSync, and create_log_sync attaches the leader's current StopSign, so those events repair the follower.",
+        "Agreement is unaffected: divergences stayed 0 and no node reported a different value at a decided index, so this is a progress/availability defect for one follower.",
+        "If the max promise merge had selected a StopSign-bearing promise, the AcceptSync to node 3 would have carried the StopSign and no gap would have formed."
+      ],
+      "limitations": [
+        "One seeded schedule and one lagging follower; the trace records only the first twelve Paxos messages delivered to node 3 after the lossy phase, so node 3's lossy-phase history and any traffic beyond those messages are not shown.",
+        "The receipt does not record the promises leader 4 received, their PromiseMetaData, or the log_sync content of the AcceptSync, so the upstream selection between the max-merge and late-Promise explanations is inferred from the accepted indices, the trace and the source paths rather than observed directly.",
+        "Five nodes, MemoryStorage, unit batch, no snapshots and no next configuration started; flexible quorums, batching and snapshot-based sync are unexercised."
+      ],
+      "joint_history": "",
+      "failure_attribution": null
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

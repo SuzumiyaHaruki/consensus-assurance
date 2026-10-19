@@ -41,6 +41,8 @@ def test_snapshot_preserves_dirty_code_and_excludes_sensitive_files(tmp_path):
         ('key.py', 'api_key="not-a-real-key-for-testing"'),
         ('ordinary.go', 'ghp_' + 'x' * 24),
     ]],
+    *[('output.log', field + ' = "synthetic-value"', True)
+      for field in ('API_KEY', 'Api-Key', 'aPiKeY', 'ACCESS_TOKEN', 'Access-Token', 'aCcEsStOkEn', 'PaSsWoRd')],
     ('src/main/java/SecretReader.java','public class SecretReader { String read() { return System.getProperty("service.auth.password"); } }',False),
     ('src/main/java/Config.java','public class Config { static final String PASSWORD = "service.auth.password"; String read() { return System.getProperty(PASSWORD); } }',False),
     ('src/main/java/Config.java','public class Config { static final String PASSWORD = "service.auth.password"; }',True),
@@ -66,6 +68,37 @@ def test_source_screening_preserves_code_and_excludes_credentials(tmp_path, name
         assert not (destination / name).exists()
     else:
         assert (destination / name).read_bytes() == path.read_bytes()
+
+
+def test_streaming_credentials_match_whole_content_across_boundaries():
+    from consensus_assurance.adapters.storage.snapshot import SENSITIVE_CONTENT, sensitive_chunks
+    cases = [b'sk-' + b'x' * n for n in (19, 20)] + [b'ghp_' + b'x' * 20,
+        b'-----BEGIN ' + b'RSA ' * 40 + b'PRIVATE KEY',
+        b'-----BEGIN ' + b'A' * 200 + b'\nPRIVATE KEY',
+        b'API_KEY' + b' \t\n' * 80 + b':' + b' \t\n' * 80 + b'"abcdefgh',
+        b'-----BEGIN APIKEY' + b' ' * 200 + b'="abcdefgh',
+        b'apiKey="apiKey="abcdefgh', b'password="1234567', b'password="12345678']
+    for data in cases:
+        expected = bool(SENSITIVE_CONTENT.search(data))
+        for width in range(1, 65):
+            assert sensitive_chunks(data[i:i + width] for i in range(0, len(data), width)) == expected
+
+
+def test_large_java_keeps_strict_screening_without_unbounded_ast(tmp_path, monkeypatch):
+    from consensus_assurance.adapters.storage import snapshot
+    from consensus_assurance.adapters.storage.files import digest
+    monkeypatch.setattr(snapshot, 'MAX_SOURCE_BYTES', 64)
+    path = tmp_path / 'Config.java'
+    data = b'public class Config {}\n' + b'// ordinary content\n' * 10
+    path.write_bytes(data)
+    assert snapshot.screened_digest(path) == (digest(data), len(data))
+    for name, body in [('Config.java', data + b'// api_key="synthetic-value"'),
+                       ('SecretReader.java', data.replace(b'Config', b'SecretReader')),
+                       ('Config.java', b'public class Config { String PASSWORD = "service.auth.password"; '
+                                        b'String read() { return System.getProperty(PASSWORD); } }' + b' ' * 100)]:
+        path = tmp_path / name
+        path.write_bytes(body)
+        assert 'Java exception analysis is limited' in snapshot.screened_digest(path)
 
 
 def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path):

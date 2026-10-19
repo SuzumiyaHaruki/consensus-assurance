@@ -1,0 +1,15 @@
+This turn added one finding and closed two side questions.
+
+**F13 — quiesce turns a leader failure into an indefinite write outage** (main result)
+
+`handleReadIndex` and `handleConfigChange` record activity via `n.qs.record(...)`; `handleProposals` does not. While quiesced, `Peer.QuiescedTick` only advances `electionTick` and never checks `timeForElection`, so after the leader of an idle cluster dies the survivors neither wake on a write nor campaign — every retried write is forwarded to the dead leader and times out indefinitely. A read (or config change) does wake the cluster, which is why the symptom is writes-only.
+
+Reproduced with two new live tests in [zz_audit_quiesce_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/zz_audit_quiesce_test.go): a passing characterisation (nodes log `entered quiesce`, then `exited from quiesce, msg type ReadIndex`, read and subsequent write both succeed) and a failing leader-loss test (`cluster did not recover after losing quiesced leader 1: timeout`). Adding `n.qs.record(pb.Propose)` in `handleProposals` makes the survivor exit quiesce, campaign and win; the same test then passes in `audit/diag-fixes/`.
+
+**Negative results recorded**
+
+- `RequestLeaderTransfer(1, 0)` is already rejected with `ErrInvalidTarget` before raft's `handleLeaderTransfer` can panic — pinned by a passing test, so the public API boundary is safe here.
+- The fixed copy's upstream root package still passes in 39.6 s after the F12/F13 changes (regression check).
+- Noted (not a finding) that `NodeHost.Stop` panics on a second call without documenting it.
+
+The report now carries F13 in the summary table and as a full section, both new tests in the inventory, the fix snippet, command-log entries, and an updated matrix: 41 audit tests, 26 passing, 15 deliberate repro failures. The audited implementation remains byte-identical to `../source`.

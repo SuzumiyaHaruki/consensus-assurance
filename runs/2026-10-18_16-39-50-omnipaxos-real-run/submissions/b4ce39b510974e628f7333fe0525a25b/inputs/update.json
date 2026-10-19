@@ -1,0 +1,90 @@
+{
+  "rationale": "The diagnostic run identifies why one follower never converges after a decided StopSign. With rounds_run 150 (past the 100-tick resend timeout), node 3 stayed in Accept under leader 4 with promise ballot n=2 but its accepted and decided indices both remained 37 while the others were 38, and its accepted index changed only once during convergence. The source explains it: once stopsign_is_decided is true, resend_messages_leader only resends the StopSign Decide, but a Decide cannot advance a follower whose accepted index lacks the StopSign because update_decided_idx_and_get_accepted_idx clamps to the accepted index; the AcceptStopSign/entries are only resent while the StopSign is undecided, and AcceptSync is only sent on a fresh Promise. Under a stable leader, a follower that misses the AcceptStopSign therefore has no repair path. This is recorded as a new bounded-progress investigation with the executed witness.",
+  "sources": [
+    {
+      "id": "core_send_decide",
+      "file": "omnipaxos/src/sequence_paxos/leader.rs",
+      "start_line": 240,
+      "end_line": 255,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_update_decided_clamp",
+      "file": "omnipaxos/src/sequence_paxos/follower.rs",
+      "start_line": 142,
+      "end_line": 158,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@stopsign_resync_stall_observed",
+      "kind": "fact",
+      "statement": "In the seed 0xbe5466cf34e90c6c lossy reconfiguration stress with 150 fair-delivery convergence rounds, node 3 ended with accepted 37 and decided 37 while the other four nodes were at decided 38; node 3 was in the Accept phase following leader 4 with promise ballot n=2, and its accepted index changed only once during convergence. rounds_run was 150, beyond the 100-tick resend timeout.",
+      "conditions": "Five OmniPaxos instances, MemoryStorage, unit batch, no snapshots; reconfigure proposed at action 450 under 20 percent out-of-order loss; after the lossy phase every message is delivered and every node ticked each round for up to 150 rounds, stopping early only if all decided indices agree.",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_stopsign_decided",
+        "core_handle_acceptsync"
+      ],
+      "executions": {
+        "55a2acf5c61f4790a32f4db80073d0aa": [
+          1
+        ]
+      }
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@stopsign_resync_gap",
+      "question": "Can a follower that promised a stable leader but missed the AcceptStopSign recover after that StopSign becomes decided, or is it stuck behind with decided < accepted-by-others and no enabled repair?",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_stopsign_decided",
+        "core_handle_acceptsync",
+        "core_send_accsync"
+      ],
+      "hypothesis": "It is stuck. resend_messages_leader resends the StopSign Decide once stopsign_is_decided and resends AcceptStopSign only while the StopSign is undecided. send_decide resends with the last used sequence number, and even an accepted Decide cannot advance a follower whose accepted index is below the decision: update_decided_idx_and_get_accepted_idx clamps decided to the flushed accepted index, so the follower stays at its old decided value. AcceptSync, which would carry the missing StopSign and the leader's decided index, is sent only in response to a Promise, and a stable leader sends Prepare only to peers that are not promised. The follower therefore makes no progress until leadership changes or the user reconnects it.",
+      "discriminator": "The lagging follower's accepted index, decided index, leader view, phase and promise ballot after many fair-delivery rounds that exceed the resend timeout, together with the source paths that decide which repair message is sent in each StopSign state.",
+      "disposition": "active"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@stopsign_resync_gap",
+      "source_ids": [
+        "core_resend_leader",
+        "core_send_decide",
+        "core_update_decided_clamp",
+        "core_stopsign_decided",
+        "core_handle_acceptsync",
+        "core_send_accsync"
+      ],
+      "executions": {
+        "55a2acf5c61f4790a32f4db80073d0aa": [
+          0,
+          1
+        ]
+      },
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "The executed diagnostic shows non-convergence with an identified mechanism. Receipt 55a2acf5c61f4790a32f4db80073d0aa ran randomized_reconfig_diagnose_lag (exit 0, test passed). Event 1 reports appended 120, dropped 101, divergences 0 (agreement holds), reconfigured true, converged_all false, rounds_run 150, decided 38,38,37,38,38, and for node 3: n3_accepted 37, n3_decided 37, n3_leader_pid 4, n3_accept true, n3_promise_n 2, n3_accepted_changes 1. Node 3 is therefore a promised follower in the leader's Accept phase, yet it never received the StopSign entry (accepted stays 37) across 150 rounds that deliver every message and tick every node, which exceeds the default 100-tick resend interval. The source explains why the periodic resend does not repair it: resend_messages_leader sends send_decide for a decided StopSign and reserves send_accept_stopsign for the undecided case; send_decide reuses the last sequence number, and handle_decide's update path clamps the new decided index to the flushed accepted index (update_decided_idx_and_get_accepted_idx sets decided to min(new_decided_idx, new_accepted_idx)), so a Decide for index 38 cannot raise a follower whose accepted index is 37. AcceptSync, which carries the missing StopSign and the leader's decided index, is sent only in response to a Promise, and with node 3 already promised the stable leader never sends it a Prepare. Under the stated stable-leader condition, the result is a bounded progress defect for the sealed configuration: the follower remains at decided 37 and never reports the reconfiguration as decided, despite fair delivery and ticking, until leadership changes or the user reconnects it.",
+      "counterevidence": [
+        "If the follower does not miss the AcceptStopSign, or the StopSign is not yet decided, the leader's resend path sends AcceptStopSign and repairs it.",
+        "A leadership change causes a new Prepare and AcceptSync, which carries the StopSign and repairs the follower; the defect is bounded to a stable leader with no external reconnect.",
+        "Agreement is unaffected: no two nodes reported different values at any decided index, so this is a progress/availability defect for one follower.",
+        "The run ticks every node every round, which churns elections; the observed state nevertheless shows a stable leader view (pid 4, promise n=2) for the lagging node at the sample, so the non-progress is not explained by a single unticked node."
+      ],
+      "limitations": [
+        "One seeded schedule and one lagging follower; the stall is observed at one sample after 150 rounds, not continuously.",
+        "Five nodes, MemoryStorage, unit batch, no snapshots and no next configuration started.",
+        "The exact message that was lost (AcceptStopSign versus an AcceptDecide carrying the same entries) is not recorded by the probe; only the persistent accepted-index gap and the source repair paths are established."
+      ],
+      "joint_history": "The cited receipt was produced by experiment 067a1cf654cf4bf0a6c83019a5192cac-experiment, which is owned by the core decided-regression investigation, not by this new StopSign-resync question. It is reused here as the producer observation because the fixed harness, seed, lossy schedule, reconfigure step, 150-round convergence and node-3 sampling are exactly the construction this question needs; the agreement and monotonicity fields in the same event are independent observations of the same execution, and no other receipt is merged into this account."
+    }
+  ]
+}

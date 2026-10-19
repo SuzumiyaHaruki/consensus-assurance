@@ -1,0 +1,1725 @@
+{
+  "input": {
+    "rationale": "Checked whether the runtime's drop-oldest egress policy can discard client work under the documented safety rationale. The rationale says dropping is safe because OmniPaxos resends lost messages, but outgoing_buf also carries ProposalForward (plain appends issued on a follower) and runtime TaggedProposal/Assigned messages, which neither core nor runtime resends. Recorded as a behavior with its applicability condition (the caller must keep draining outgoing_messages; the drop only occurs past the buffer cap), not as a defect claim, since sustained non-draining is a documented caller duty.",
+    "sources": [
+      {
+        "id": "rt_egress_drop",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 237,
+        "end_line": 252,
+        "kind": "code_observation"
+      },
+      {
+        "id": "rt_trim_oldest",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 715,
+        "end_line": 721,
+        "kind": "code_observation"
+      },
+      {
+        "id": "rt_egress_config_doc",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 55,
+        "end_line": 63,
+        "kind": "document_statement"
+      },
+      {
+        "id": "rt_dispatch_undispatched",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 485,
+        "end_line": 520,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@egress_drop_covers_client_msgs",
+        "kind": "behavior",
+        "statement": "When the outgoing channel does not accept a message, messages accumulate in outgoing_buf; once its length exceeds the channel capacity (or max_outgoing_buffered), drain_outgoing_buf drops the oldest entries before retrying. The same buffer holds core protocol traffic pulled by flush_outgoing, including PaxosMsg::ProposalForward produced when a plain append is issued on a follower, and runtime control messages enqueued by try_dispatch_undispatched (TaggedProposal) and by Assigned replies. Core resends Promise/PrepareReq/Prepare/AcceptStopSign/StopSign-Decide but not ProposalForward, and the runtime does not resend TaggedProposal, so dropping those messages loses the corresponding client proposal (a tagged proposal then resolves only by timeout; a plain forwarded append is not retried at all). The configuration docs justify drop-oldest as safe because OmniPaxos tolerates lost messages, which covers protocol messages but not these client-origin ones.",
+        "conditions": "Runtime actor with outgoing channel backpressure sustained long enough for outgoing_buf to exceed its cap while client-origin messages are queued; the caller is expected to drain outgoing_messages continuously, so sustained non-draining is a caller-duty violation and bounds the applicability.",
+        "source_ids": [
+          "rt_egress_drop",
+          "rt_trim_oldest",
+          "rt_egress_config_doc",
+          "rt_dispatch_undispatched",
+          "core_forward_proposals"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "knowledge": [
+      {
+        "id": "3f84facd1a81451882518e32ee8be535-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Pending append_notify calls in the runtime actor are resolved in this order: Ok(idx) when the recorded assignment index is <= the actor's current decided index; Superseded when the assignment ballot is lower than the current promise ballot; Timeout when the deadline passed; otherwise the pending stays queued. The Ok arm is evaluated first and does not inspect the log or compare the entry stored at idx.",
+        "conditions": "omnipaxos_runtime actor, append_notify tracking enabled; pending entry has an assigned (idx, ballot) from local accept or a remote Assigned reply; drain_notifiers runs on each actor tick and after command handling.",
+        "source_ids": [
+          "actor_drain",
+          "actor_pending"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3f84facd1a81451882518e32ee8be535"
+      },
+      {
+        "id": "3f84facd1a81451882518e32ee8be535-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The runtime's test suite treats a successful append_notify as a claim that the caller's entry is decided at the returned index: the batching regression test reads the decided log back and asserts the value at the returned index equals the submitted entry, so a returned index holding a different value is a contract violation under the project's own expectation.",
+        "conditions": "The test environment's exercised conditions: 3-node runtime cluster with real transport, batching enabled, and a submitted append_notify entry; this is an individual test expectation plus the handle-level description, not a proof of a defect by itself.",
+        "source_ids": [
+          "test_ok_content",
+          "handle_contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3f84facd1a81451882518e32ee8be535"
+      },
+      {
+        "id": "3f84facd1a81451882518e32ee8be535-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The Superseded regression test demonstrates that an entry accepted only on the old leader can be genuinely lost and replaced at the same log index by a different value under the new leader, and that Superseded is the intended observable in that case; it also shows the origin node learns of the new higher-ballot leader.",
+        "conditions": "3-node runtime cluster, the elected leader's outgoing traffic is cut while its incoming traffic stays open; a new leader is elected by the other two nodes and a fresh entry is appended and decided at the old index.",
+        "source_ids": [
+          "test_superseded_replace",
+          "superseded_doc"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3f84facd1a81451882518e32ee8be535"
+      },
+      {
+        "id": "7862ce56b9d94e81b9351623e93f016b-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "With decided=6 and compacted=4 on the executed two-node log, read_decided_suffix(1) returned exactly [Trimmed(4), Decided(5), Decided(6)] (len 3) although decided-from is 5, while read_decided_suffix(4) returned [Decided(5), Decided(6)] (len 2). The trimmed prefix is represented by a single Trimmed element, so the returned vector length is not the number of requested log indices when the start is below the compacted index.",
+        "conditions": "Two OmniPaxos instances (pids 1,2) built from ClusterConfig {configuration_id:1, nodes:[1,2]}, MemoryStorage, batch_size 1, no snapshots; node 1 becomes leader via try_become_leader, appends Value(1..=6) with full message delivery after each append, then trims to 4 and the trim is forwarded to node 2; both nodes report decided 6.",
+        "source_ids": [
+          "core_read_suffix",
+          "core_entry_type",
+          "core_compacted_entry"
+        ],
+        "executions": {
+          "8572576b3ff04353ac08bce770a5ad51": [
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7862ce56b9d94e81b9351623e93f016b"
+      },
+      {
+        "id": "7862ce56b9d94e81b9351623e93f016b-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Applied to those real read_decided_suffix outputs, one cursor step per returned element (the actor's push_to_sub rule) leaves next_idx at 4 after the catch-up from 1, and the next push_to_all_subs read from 4 yields entries 5 and 6 again, so the delivered value sequence is 5,6,5,6 with duplicates of 5 and 6 while decided remains 6 and no new entry was decided.",
+        "conditions": "Same executed setup as @suffix_collapse_observed; the cursor replay reproduces omnipaxos_runtime/src/actor.rs push_to_sub (next_idx += 1 per element) and one subsequent push_to_all_subs read from the resulting cursor (start = 0 for a single subscriber). The replay is a reconstruction of the runtime source logic over executed core outputs, not an execution of the runtime crate.",
+        "source_ids": [
+          "rt_decided_sub",
+          "rt_push_sub",
+          "rt_push_all",
+          "rt_subscribe_api",
+          "core_read_suffix"
+        ],
+        "executions": {
+          "8572576b3ff04353ac08bce770a5ad51": [
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7862ce56b9d94e81b9351623e93f016b"
+      },
+      {
+        "id": "8bed726f16774b8aa00007cb68becf35-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed five-node run, node 5 had decided through index 5 and read index 4 as Decided(Value(5)); after the new leader's AcceptSync it reported decided 4 and read index 4 as Undecided(Value(5)); after the new leader re-decided index 5 it reported decided 5 and read index 4 as Decided(Value(5)) again. The same log index was therefore observed Decided, Undecided and Decided with unchanged value.",
+        "conditions": "Five OmniPaxos instances (pids 1..5), ClusterConfig {configuration_id:1, nodes:[1,2,3,4,5]}, MemoryStorage, batch_size 1, no snapshots. Entry 5 is accepted by 1,2,3,5 and decided by leader 1, but the Decide reaches only node 5; nodes 2 and 3 stay decided 4 with accepted 5. Node 1 is then cut, node 2 is elected with promises from 3 and 4 only (decided 4), and node 5's Prepare is delivered only after node 2 is in Accept, so its Promise is handled by handle_promise_accept and answered with an AcceptSync carrying decided 4.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_promise_accept",
+          "core_send_accsync",
+          "core_majority_promises"
+        ],
+        "executions": {
+          "1a9292879a5642519ee6306b6376e255": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8bed726f16774b8aa00007cb68becf35"
+      },
+      {
+        "id": "8bed726f16774b8aa00007cb68becf35-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "A new leader's decided index is the maximum decided index among the promises that formed its prepare quorum (handle_majority_promises -> get_max_decided_idx). A follower whose Promise arrives after that quorum is answered by handle_promise_accept with send_accsync stamped with the leader's current decided index, and handle_acceptsync passes that value to sync_log, which assigns it to the decided index without comparing it to the follower's existing value. A follower that had already learned a later decision therefore loses decided progress until the new leader re-accepts and re-decides the entry.",
+        "conditions": "Majority quorum with five nodes; at least one member of the new leader's prepare quorum accepted the entry without deciding it; the more-informed follower is delayed past the quorum; no snapshots involved in the sync.",
+        "source_ids": [
+          "core_majority_promises",
+          "core_send_accsync",
+          "core_promise_accept",
+          "core_handle_acceptsync",
+          "core_sync_log",
+          "core_handle_decide"
+        ],
+        "executions": {
+          "1a9292879a5642519ee6306b6376e255": [
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8bed726f16774b8aa00007cb68becf35"
+      },
+      {
+        "id": "030f3832d93a40fd9b111b694d9096e6-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "With a single lost Prepare and the public reconnected(2) call, node 5's decided index fell from 5 to 4 and read(4) changed from Decided(Value(5)) to Undecided(Value(5)) after the new leader's Accept-phase AcceptSync; after the new leader re-decided index 5, node 5 returned to decided 5 and Decided(Value(5)). The observed message sequence was PrepareReq from node 5, Prepare to node 5, Promise from node 5, AcceptSync to node 5 and an Accepted reply, with lost_prepare_count 1.",
+        "conditions": "Five OmniPaxos instances (pids 1..5), MemoryStorage, batch_size 1, no snapshots. Entry 5 is decided by leader 1 with nodes 1,2,3,5 accepting but the Decide reaching only node 5; node 2 is elected with promises from 3 and 4 (decided 4); the Prepare addressed to node 5 is dropped; the probe calls node5.reconnected(2) as the documented re-establish-connection entry point.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_promise_accept",
+          "core_send_accsync",
+          "core_majority_promises",
+          "docs_decided"
+        ],
+        "executions": {
+          "81fa48ede3814e47beddc84938133990": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "030f3832d93a40fd9b111b694d9096e6"
+      },
+      {
+        "id": "b05ed4eba0454480af172265aa519234-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Entries appended while this node is leader in Phase::Prepare are pushed to buffered_proposals. When the node later receives an AcceptSync (after promising a leader, whether in the prepare phase or in the accept phase), handle_acceptsync calls forward_buffered_proposals before switching to Phase::Accept; that call takes the whole buffer and forwards it to the current leader if there is no accepted StopSign. The buffered entries are therefore re-proposed rather than stranded when leadership moves away before the prepare quorum completes.",
+        "conditions": "SequencePaxos with no accepted StopSign; the node promises a subsequent leader and receives its AcceptSync; the forwarded ProposalForward is delivered to that leader (normal message delivery).",
+        "source_ids": [
+          "core_propose_entry",
+          "core_forward_buffered"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "b05ed4eba0454480af172265aa519234"
+      },
+      {
+        "id": "ccac9eafdc404a76b13f2019eb6da8eb-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed three-node configuration {1,2,5} with three decided entries and all_accepted_min 3, trim(Some(2)) returned NotAllDecided(0), the compacted index stayed 0, and a following trim(None) also left the compacted index at 0 while returning Ok.",
+        "conditions": "Three OmniPaxos instances pids 1, 2 and 5, ClusterConfig {configuration_id:1, nodes:[1,2,5]}, MemoryStorage, batch_size 1, no snapshots; node 1 elected with try_become_leader; three entries appended and fully delivered so every node reports decided 3 and accepted 3.",
+        "source_ids": [
+          "core_min_all_accepted",
+          "core_leader_state_layout",
+          "core_trim_check",
+          "core_try_trim"
+        ],
+        "executions": {
+          "fde347cf379748d7bd0a3b6b8deb1d8c": [
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ccac9eafdc404a76b13f2019eb6da8eb"
+      },
+      {
+        "id": "bbacedcf13a344e18fbbe2d2fb6cb3a7-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "SequencePaxos::snapshot passes its index to InternalStorage::try_snapshot, which accepts any index less than the local decided index (equal maps to the decided index without the StopSign) and rejects only indices greater than decided with UndecidedIndex. It performs trim, compacted-index and snapshot writes atomically and never consults the minimum accepted index. The snapshot API is therefore not affected by the sparse-pid placeholders that block trim, so a snapshot-capable Entry type can still compact a configuration such as {1,2,5}.",
+        "conditions": "A snapshot-capable Entry type (Snapshot::use_snapshots() true) and a snapshot index not greater than the node's decided index; the node may be a follower when local_only is true.",
+        "source_ids": [
+          "core_try_snapshot",
+          "core_snapshot_api",
+          "core_trim_check"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "bbacedcf13a344e18fbbe2d2fb6cb3a7"
+      },
+      {
+        "id": "8afe0dcec44c440ab1c4f57ac280b9e1-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed ten-entry, trim-to-five run, simulating the actor's fan-out with a trailing cursor at 1 and a fast cursor at 6 produced slow_stream T5,6,7,8,9,10,8,9,10 and fast_stream 10,8,9,10: the fast subscriber received entry 10 for the position where it expected the entry after cursor 6 (entry 7), then 8,9,10, so entries 7,8,9 were never delivered in order and entry 10 was delivered twice.",
+        "conditions": "Five OmniPaxos instances, ten decided entries, trim to 5, MemoryStorage, unit batch; two cursors simulated over real read_decided_suffix outputs with the actor's push_to_all_subs rule (min_next = min cursor, start = cursor - min_next, one cursor step per element). Channels and backpressure are not simulated.",
+        "source_ids": [
+          "core_read_suffix",
+          "core_entry_type",
+          "core_compacted_entry",
+          "rt_decided_sub",
+          "rt_push_all"
+        ],
+        "executions": {
+          "149052bc9a0d495985d41bd165deada3": [
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8afe0dcec44c440ab1c4f57ac280b9e1"
+      },
+      {
+        "id": "eea1a9e472404dbb99c96f3f453b2419-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed five-node run, node 5 reported is_reconfigured Some with decided 5 before the reconnect sync, is_reconfigured None with decided 4 immediately after the AcceptSync, and is_reconfigured None again after its decided index returned to 5 (decided_leader2 also 5).",
+        "conditions": "Five OmniPaxos instances, entries 1..4 decided everywhere, a reconfigure whose StopSign is accepted by 1,2,3,5 and decided only on node 5; node 1 cut, node 2 elected with promises from 3 and 4 at decided 4, node 5's Prepare lost and reconnected(2) driving PrepareReq/Prepare/Promise/AcceptSync.",
+        "source_ids": [
+          "core_stopsign_decided",
+          "core_is_reconfigured",
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync"
+        ],
+        "executions": {
+          "19867c5d7a784ca8afcec5890786dba3": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "eea1a9e472404dbb99c96f3f453b2419"
+      },
+      {
+        "id": "484c638fa4f94e68a460c9cc2ebf26c9-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed five-node run, node 5's accepted index was 5 with decided 5 and is_reconfigured true before the reconnect sync. After applying the AcceptSync it was accepted 6, decided 4, is_reconfigured false; after the new leader re-decided index 5 it was accepted 6, decided 5, is_reconfigured still false, and the comparison requiring accepted 5 at that point is violated.",
+        "conditions": "Five OmniPaxos instances; entries 1..4 decided everywhere; a reconfigure whose StopSign is accepted by 1,2,3,5 and decided only on node 5; node 1 cut; node 2 elected with promises from 3 and 4 at decided 4; node 5's Prepare lost and reconnected(2) driving PrepareReq/Prepare/Promise/AcceptSync with the StopSign in log_sync.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_stopsign_decided",
+          "core_is_reconfigured"
+        ],
+        "executions": {
+          "f6f4ac59f01a49deabefb3d8556e5d06": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "484c638fa4f94e68a460c9cc2ebf26c9"
+      },
+      {
+        "id": "7ffd95bb6c71444186da38a8eedef922-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the same executed five-node StopSign run, node 4 - which never accepted the StopSign before the sync - ended at decided 5, accepted 5 and is_reconfigured true after re-decision, while node 5, which had already accepted and decided the StopSign, ended at decided 5, accepted 6 and is_reconfigured false. The control comparison (node 4 reconfig true) holds; the comparison requiring accepted 5 on node 5 is violated.",
+        "conditions": "Five OmniPaxos instances; entries 1..4 decided; reconfigure to configuration_id 2; AcceptStopSign and Decide withheld from node 4, delivered to node 5; node 2 elected at decided 4; node 5 reconnects via reconnected(2); held Accepted replies then re-decide index 5.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_stopsign_decided",
+          "core_is_reconfigured"
+        ],
+        "executions": {
+          "603faa15c86645c6a56b0b9fadfc0751": [
+            3,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7ffd95bb6c71444186da38a8eedef922"
+      },
+      {
+        "id": "9e443944f57644feb8abd976dc44e6cb-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In both executed witnesses of the late-promise decided regression, the affected follower's decided index decreased from 5 to 4 while the value at index 4 stayed Value(5), and it returned to 5 after the new leader re-decided. The same defect therefore surfaces through three client-visible endpoints at once: get_decided_idx decreases, read(index 4) changes from Decided(Value(5)) to Undecided(Value(5)), and read_decided_suffix(from) for from <= 4 returns one fewer element until re-decision. No value at any decided index changed.",
+        "conditions": "Five OmniPaxos instances, entries accepted by 1,2,3,5 with the Decide delivered only to node 5, node 2 elected with promises from 3 and 4 at decided 4, and node 5 promising after that quorum (delayed Prepare in one run, lost Prepare plus reconnected(2) in the other).",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_majority_promises",
+          "core_handle_decide"
+        ],
+        "executions": {
+          "1a9292879a5642519ee6306b6376e255": [
+            0,
+            1,
+            2
+          ],
+          "81fa48ede3814e47beddc84938133990": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "9e443944f57644feb8abd976dc44e6cb"
+      },
+      {
+        "id": "09dbcecc828c48239e683c97347101cf-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "create_log_sync sends the StopSign in a separate log_sync field and starts the suffix at the follower's valid entries index, then sync_log sets accepted_idx to sync_idx + suffix length and adds one more when log_sync carries a StopSign. When sync_idx already covers the StopSign (the follower's accepted prefix includes it), accepted_idx becomes one greater than the follower's last log position. Since nothing may be appended after an accepted StopSign, decided can reach at most that last position and stopsign_is_decided (decided == accepted) can never become true for that follower. When sync_idx precedes the StopSign, the same +1 is correct and the follower ends consistent.",
+        "conditions": "SequencePaxos follower applying an AcceptSync whose log_sync carries a StopSign; the follower either already accepted that StopSign (sync_idx includes it; defect) or had not (sync_idx precedes it; correct). No snapshots involved.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_stopsign_decided",
+          "core_is_reconfigured"
+        ],
+        "executions": {
+          "603faa15c86645c6a56b0b9fadfc0751": [
+            1,
+            2,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "09dbcecc828c48239e683c97347101cf"
+      },
+      {
+        "id": "825ad7c125e5415bbc1e1f6c5d7c6bf9-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "append on a non-leader creates one ProposalForward message addressed to the current leader and moves the entries into it; the core keeps no copy for retry. resend_messages_follower resends only the cached Promise (Prepare phase) or PrepareReq (Recover), and resend_messages_leader resends Prepare, AcceptStopSign and the StopSign's Decide. A ProposalForward lost in transport, or received by a leader that fails before accepting it, is therefore not re-proposed by the core; the caller's transport and any application-level retry carry that duty. The runtime layer's TaggedProposal path does retry undispatched proposals on ticks, which is a separate, stronger contract.",
+        "conditions": "SequencePaxos with entries appended on a node that is not the leader and no accepted StopSign; the scheduled tick-driven resend paths only; transport loss or leader failure before acceptance.",
+        "source_ids": [
+          "core_forward_proposals",
+          "core_resend_follower",
+          "core_resend_leader"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "825ad7c125e5415bbc1e1f6c5d7c6bf9"
+      }
+    ],
+    "materials": [
+      {
+        "id": "actor_drain",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 200,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "\n    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_pending",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 58,
+        "end_line": 75,
+        "kind": "code_observation",
+        "text": "where\n    T: Entry,\n{\n    id: EntryId,\n    /// The entry, retained until dispatched (accepted locally or sent as a\n    /// `TaggedProposal`). While `Some`, `try_dispatch_undispatched` retries it\n    /// each tick — this is what lets `append_notify` be called before a\n    /// leader is known.\n    undispatched: Option<T>,\n    /// `(assigned_idx, ballot_at_assignment)`. `None` until either:\n    ///   (a) we accepted the entry ourselves as leader, or\n    ///   (b) we received `AsyncRuntimeMsg::Assigned` from the leader.\n    assigned: Option<(usize, Ballot)>,\n    deadline: Instant,\n    reply: oneshot::Sender<Result<usize, AppendError<T>>>,\n}\n\n/// What to do, once its index is known, for a write buffered in the shared",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_assigned",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 533,
+        "end_line": 546,
+        "kind": "code_observation",
+        "text": "                        }));\n                    }\n                } else if let Some(new_leader) = cur {\n                    // Leadership drifted since sender chose us. Hop the whole batch\n                    // forward, preserving the original `from` so the leader replies\n                    // to the true origin.\n                    self.enqueue_outgoing(Message::AsyncRuntime(AsyncRuntimeMessage {\n                        from: arm.from,\n                        to: new_leader,\n                        msg: AsyncRuntimeMsg::TaggedProposal { entries },\n                    }));\n                }\n                // Else: no leader; drop. Originators will timeout.\n            }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "handle_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 146,
+        "end_line": 160,
+        "kind": "interface_statement",
+        "text": "        timeout: Duration,\n    ) -> Result<usize, AppendError<T>> {\n        self.append_notify_inner(entry, Some(timeout)).await\n    }\n\n    async fn append_notify_inner(\n        &self,\n        entry: T,\n        timeout: Option<Duration>,\n    ) -> Result<usize, AppendError<T>> {\n        let (tx, rx) = oneshot::channel();\n        self.cmd_tx\n            .send(Command::AppendNotify {\n                entry,\n                timeout,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "superseded_doc",
+        "file": "omnipaxos_runtime/src/event.rs",
+        "start_line": 47,
+        "end_line": 58,
+        "kind": "interface_statement",
+        "text": "    Propose(ProposeErr<T>),\n    /// A leader change occurred after the entry was accepted at the given index but\n    /// before it was decided. This is a *heuristic*, not a certainty: a new leader is\n    /// required to adopt any value a majority-overlapping quorum may have already\n    /// accepted, so the entry can still end up decided at `log_entry_idx` under the\n    /// new ballot -- we just stop waiting rather than confirm it. Check\n    /// [`OmniPaxosHandle::read_decided_suffix`](super::OmniPaxosHandle::read_decided_suffix)\n    /// at that index if you need to know for sure before re-appending.\n    Superseded {\n        /// The log index the entry was assigned before the leader change.\n        log_entry_idx: usize,\n    },",
+        "content_digest": "c5ff151f7ee21767be3c8b53dba3aaf23deaafcf0d9188610b21ea1a6a9f9c8c"
+      },
+      {
+        "id": "test_ok_content",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 386,
+        "end_line": 398,
+        "kind": "test_expectation",
+        "text": "            }\n            tokio::time::sleep(Duration::from_millis(10)).await;\n        }\n    })\n    .await\n    .expect(\"index never decided\");\n    match decided.get(idx - 1) {\n        Some(LogEntry::Decided(v)) => {\n            assert_eq!(*v, entry_n, \"wrong entry decided at idx {idx}\")\n        }\n        other => panic!(\"expected a decided entry at idx {idx}, got {other:?}\"),\n    }\n}",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "test_superseded_replace",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 958,
+        "end_line": 980,
+        "kind": "test_expectation",
+        "text": "    let refill_idx = timeout(\n        Duration::from_secs(3),\n        new_leader_h.append_notify(TestEntry(99)),\n    )\n    .await\n    .expect(\"refill append_notify hung\")\n    .expect(\"refill append_notify should succeed on the new leader\");\n    assert_eq!(\n        refill_idx, idx,\n        \"expected the fresh entry to land at the same index the lost one was assigned\"\n    );\n\n    let decided = new_leader_h\n        .read_decided_suffix(0)\n        .await\n        .expect(\"no entries decided\");\n    match decided.get(idx - 1) {\n        Some(LogEntry::Decided(v)) => {\n            assert_eq!(\n                *v,\n                TestEntry(99),\n                \"idx {idx} should hold the refill entry, confirming the original was lost\"\n            );",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "core_read_suffix",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 89,
+        "end_line": 157,
+        "kind": "code_observation",
+        "text": "    /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.\n    pub(crate) fn read<R>(&self, r: R) -> StorageResult<Option<Vec<LogEntry<T>>>>\n    where\n        R: RangeBounds<usize>,\n    {\n        let from_idx = match r.start_bound() {\n            Bound::Included(i) => *i,\n            Bound::Excluded(e) => *e + 1,\n            Bound::Unbounded => 0,\n        };\n        let to_idx = match r.end_bound() {\n            Bound::Included(i) => *i + 1,\n            Bound::Excluded(e) => *e,\n            Bound::Unbounded => self.get_accepted_idx(),\n        };\n        if to_idx == 0 {\n            return Ok(None);\n        }\n        let compacted_idx = self.get_compacted_idx();\n        let accepted_idx = self.get_accepted_idx();\n        // use to_idx-1 when getting the entry type as to_idx is exclusive\n        let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {\n            Some(IndexEntry::Compacted) => {\n                return Ok(Some(vec![self.create_compacted_entry(compacted_idx)?]))\n            }\n            Some(from_type) => from_type,\n            _ => return Ok(None),\n        };\n        let from_type = match self.get_entry_type(from_idx, compacted_idx, accepted_idx)? {\n            Some(from_type) => from_type,\n            _ => return Ok(None),\n        };\n        match (from_type, to_type) {\n            (IndexEntry::Entry, IndexEntry::Entry) => {\n                Ok(Some(self.create_read_log_entries(from_idx, to_idx)?))\n            }\n            (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {\n                let mut entries = self.create_read_log_entries(from_idx, to_idx - 1)?;\n                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));\n                Ok(Some(entries))\n            }\n            (IndexEntry::Compacted, IndexEntry::Entry) => {\n                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);\n                let compacted = self.create_compacted_entry(compacted_idx)?;\n                entries.push(compacted);\n                let mut e = self.create_read_log_entries(compacted_idx, to_idx)?;\n                entries.append(&mut e);\n                Ok(Some(entries))\n            }\n            (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {\n                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);\n                let compacted = self.create_compacted_entry(compacted_idx)?;\n                entries.push(compacted);\n                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1)?;\n                entries.append(&mut e);\n                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));\n                Ok(Some(entries))\n            }\n            (IndexEntry::StopSign(ss), IndexEntry::StopSign(_)) => {\n                Ok(Some(vec![LogEntry::StopSign(\n                    ss,\n                    self.stopsign_is_decided(),\n                )]))\n            }\n            e => {\n                unimplemented!(\"{}\", format!(\"Unexpected read combination: {:?}\", e))\n            }\n        }\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_entry_type",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 159,
+        "end_line": 177,
+        "kind": "code_observation",
+        "text": "    fn get_entry_type(\n        &self,\n        idx: usize,\n        compacted_idx: usize,\n        accepted_idx: usize,\n    ) -> StorageResult<Option<IndexEntry>> {\n        if idx < compacted_idx {\n            Ok(Some(IndexEntry::Compacted))\n        } else if idx + 1 < accepted_idx {\n            Ok(Some(IndexEntry::Entry))\n        } else if idx + 1 == accepted_idx {\n            match self.get_stopsign() {\n                Some(ss) => Ok(Some(IndexEntry::StopSign(ss))),\n                _ => Ok(Some(IndexEntry::Entry)),\n            }\n        } else {\n            Ok(None)\n        }\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_compacted_entry",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 197,
+        "end_line": 202,
+        "kind": "code_observation",
+        "text": "    fn create_compacted_entry(&self, compacted_idx: usize) -> StorageResult<LogEntry<T>> {\n        self.storage.get_snapshot().map(|snap| match snap {\n            Some(s) => LogEntry::Snapshotted(SnapshottedEntry::with(compacted_idx, s)),\n            None => LogEntry::Trimmed(compacted_idx),\n        })\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "rt_decided_sub",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 123,
+        "end_line": 132,
+        "kind": "code_observation",
+        "text": "/// A single subscriber to the decided-log stream. `next_idx` is the next log\n/// index the actor must deliver; incremented on every successful `try_send`.\nstruct DecidedSub<T>\nwhere\n    T: Entry,\n{\n    next_idx: usize,\n    tx: async_channel::Sender<LogEntry<T>>,\n}\n",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_push_sub",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 279,
+        "end_line": 296,
+        "kind": "code_observation",
+        "text": "    fn push_to_sub(op: &mut OmniPaxos<T, B>, sub: &mut DecidedSub<T>) -> bool {\n        let decided = op.get_decided_idx();\n        if sub.next_idx >= decided {\n            return true;\n        }\n        let Some(entries) = op.read_decided_suffix(sub.next_idx) else {\n            return true;\n        };\n        for entry in entries {\n            match sub.tx.try_send(entry) {\n                Ok(()) => sub.next_idx += 1,\n                Err(async_channel::TrySendError::Full(_)) => return true,\n                Err(async_channel::TrySendError::Closed(_)) => return false,\n            }\n        }\n        true\n    }\n",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_push_all",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 301,
+        "end_line": 340,
+        "kind": "code_observation",
+        "text": "    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }\n\n    fn record_assignment(&mut self, id: EntryId, idx: usize, ballot: Ballot) {\n        for p in self.pending.iter_mut() {\n            if p.id == id {\n                p.assigned = Some((idx, ballot));\n                return;\n            }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_subscribe_api",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 262,
+        "end_line": 281,
+        "kind": "interface_statement",
+        "text": "    /// that emits [`LogEntry`]s in log order — both the backlog already decided\n    /// at subscription time and entries decided later.\n    ///\n    /// Each call creates an independent subscription with its own cursor;\n    /// multiple subscribers can coexist, up to [`RuntimeConfig::max_decided_subscribers`]\n    /// — beyond that, the returned receiver's channel is closed immediately\n    /// without delivering any entries. Dropping the receiver ends the\n    /// subscription; slow subscribers apply backpressure by causing the actor\n    /// to defer pushes rather than blocking the actor loop.\n    pub async fn subscribe_decided(&self, from: usize) -> async_channel::Receiver<LogEntry<T>> {\n        let (tx, rx) = async_channel::bounded(self.decided_channel_capacity);\n        // If the actor is gone, `rx` stays open but never receives — the\n        // caller's stream drops naturally when the sender is dropped here.\n        let _ = self\n            .cmd_tx\n            .send(Command::SubscribeDecided { from, tx })\n            .await;\n        rx\n    }\n",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "core_sync_log",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 313,
+        "end_line": 360,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn sync_log(\n        &mut self,\n        accepted_round: Ballot,\n        decided_idx: usize,\n        log_sync: Option<LogSync<T>>,\n    ) -> StorageResult<usize> {\n        self.state_cache.accepted_round = accepted_round;\n        self.state_cache.decided_idx = decided_idx;\n        let mut sync_txn: Vec<StorageOp<T>> = vec![\n            StorageOp::SetAcceptedRound(accepted_round),\n            StorageOp::SetDecidedIndex(decided_idx),\n        ];\n        if let Some(sync) = log_sync {\n            match sync.decided_snapshot {\n                Some(SnapshotType::Complete(c)) => {\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(c)));\n                }\n                Some(SnapshotType::Delta(d)) => {\n                    let mut snapshot = self.create_decided_snapshot()?;\n                    snapshot.merge(d);\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(snapshot)));\n                }\n                None => (),\n            }\n            self.state_cache.accepted_idx = sync.sync_idx + sync.suffix.len();\n            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));\n            match sync.stopsign {\n                Some(ss) => {\n                    self.state_cache.stopsign = Some(ss.clone());\n                    self.state_cache.accepted_idx += 1;\n                    sync_txn.push(StorageOp::SetStopsign(Some(ss)));\n                }\n                None if self.state_cache.stopsign.is_some() => {\n                    self.state_cache.stopsign = None;\n                    sync_txn.push(StorageOp::SetStopsign(None));\n                }\n                None => (),\n            }\n        }\n        self.storage.write_atomically(sync_txn)?;\n        Ok(self.state_cache.accepted_idx)\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_handle_acceptsync",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 53,
+        "end_line": 79,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "core_promise_accept",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 301,
+        "end_line": 314,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_promise_accept(&mut self, prom: Promise<T>, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        {\n            let (r, p) = &self.state;\n            debug!(\n                self.logger,\n                \"Self role {:?}, phase {:?}. Incoming message Promise Accept from {}\", r, p, from\n            );\n        }\n        if prom.n == self.leader_state.n_leader {\n            self.leader_state.set_promise(prom, from, false);\n            self.send_accsync(from);\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "core_send_accsync",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 150,
+        "end_line": 191,
+        "kind": "code_observation",
+        "text": "    fn send_accsync(&mut self, to: NodeId) {\n        let current_n = self.leader_state.n_leader;\n        let PromiseMetaData {\n            n_accepted: prev_round_max_promise_n,\n            accepted_idx: prev_round_max_accepted_idx,\n            ..\n        } = &self.leader_state.get_max_promise_meta();\n        let PromiseMetaData {\n            n_accepted: followers_promise_n,\n            accepted_idx: followers_accepted_idx,\n            pid,\n            ..\n        } = self.leader_state.get_promise_meta(to);\n        let followers_decided_idx = self\n            .leader_state\n            .get_decided_idx(*pid)\n            .expect(\"Received PromiseMetaData but not found in ld\");\n        // Follower can have valid accepted entries depending on which leader they were previously following\n        let followers_valid_entries_idx = if *followers_promise_n == current_n {\n            *followers_accepted_idx\n        } else if *followers_promise_n == *prev_round_max_promise_n {\n            *prev_round_max_accepted_idx.min(followers_accepted_idx)\n        } else {\n            followers_decided_idx\n        };\n        let log_sync = self.create_log_sync(followers_valid_entries_idx, followers_decided_idx);\n        self.leader_state.increment_seq_num_session(to);\n        let acc_sync = AcceptSync {\n            n: current_n,\n            seq_num: self.leader_state.next_seq_num(to),\n            decided_idx: self.get_decided_idx(),\n            log_sync,\n            #[cfg(feature = \"unicache\")]\n            unicache: self.internal_storage.get_unicache(),\n        };\n        let msg = Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to,\n            msg: PaxosMsg::AcceptSync(acc_sync),\n        });\n        self.outgoing.push(msg);\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "core_majority_promises",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 257,
+        "end_line": 285,
+        "kind": "code_observation",
+        "text": "    fn handle_majority_promises(&mut self) {\n        let max_promise_sync = self.leader_state.take_max_promise_sync();\n        let decided_idx = self.leader_state.get_max_decided_idx();\n        let mut new_accepted_idx = self\n            .internal_storage\n            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync)\n            .expect(WRITE_ERROR_MSG);\n        if !self.accepted_reconfiguration() {\n            if !self.buffered_proposals.is_empty() {\n                let entries = std::mem::take(&mut self.buffered_proposals);\n                new_accepted_idx = self\n                    .internal_storage\n                    .append_entries_without_batching(entries)\n                    .expect(WRITE_ERROR_MSG);\n            }\n            if let Some(ss) = self.buffered_stopsign.take() {\n                self.internal_storage\n                    .append_stopsign(ss)\n                    .expect(WRITE_ERROR_MSG);\n                new_accepted_idx = self.internal_storage.get_accepted_idx();\n            }\n        }\n        self.state = (Role::Leader, Phase::Accept);\n        self.leader_state\n            .set_accepted_idx(self.pid, new_accepted_idx);\n        for pid in self.leader_state.get_promised_followers() {\n            self.send_accsync(pid);\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "core_handle_decide",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 128,
+        "end_line": 138,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_decide(&mut self, dec: Decide) {\n        if self.check_valid_ballot(dec.n)\n            && self.state.1 == Phase::Accept\n            && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected\n        {\n            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx);\n            if let Some(idx) = new_accepted_idx {\n                self.reply_accepted(dec.n, idx);\n            }\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "docs_decided",
+        "file": "docs/omnipaxos/log.md",
+        "start_line": 23,
+        "end_line": 24,
+        "kind": "document_statement",
+        "text": "- `Decided(T)`: The entry is decided and guaranteed to not be reverted. It is thus safe to apply a decided entry to the application state. For instance, in our case, it is safe to update our key-value store when we read a `Decided(KeyValue)` entry.\n- `Undecided(T)`: The entry is NOT decided and might be removed from the log at a later time. However, it could be useful in applications that allow speculative execution for example.",
+        "content_digest": "49924ce2b143cecce202698b97376eb9eaa5e0612f9e083f5fe980abc27a418d"
+      },
+      {
+        "id": "core_propose_entry",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 359,
+        "end_line": 365,
+        "kind": "code_observation",
+        "text": "    fn propose_entry(&mut self, entry: T) {\n        match self.state {\n            (Role::Leader, Phase::Prepare) => self.buffered_proposals.push(entry),\n            (Role::Leader, Phase::Accept) => self.accept_entry_leader(entry),\n            _ => self.forward_proposals(vec![entry]),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_forward_buffered",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 53,
+        "end_line": 86,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }\n\n    fn forward_buffered_proposals(&mut self) {\n        let proposals = std::mem::take(&mut self.buffered_proposals);\n        if !proposals.is_empty() {\n            self.forward_proposals(proposals);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "core_min_all_accepted",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 186,
+        "end_line": 195,
+        "kind": "code_observation",
+        "text": "    pub fn get_min_all_accepted_idx(&self) -> &usize {\n        self.accepted_indexes\n            .iter()\n            .min()\n            .expect(\"Should be all initialised to 0!\")\n    }\n\n    pub fn reset_latest_accept_meta(&mut self) {\n        self.latest_accept_meta = vec![None; self.max_pid];\n    }",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      },
+      {
+        "id": "core_leader_state_layout",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 96,
+        "end_line": 112,
+        "kind": "code_observation",
+        "text": "    pub fn with(n_leader: Ballot, max_pid: usize, quorum: Quorum) -> Self {\n        Self {\n            n_leader,\n            promises_meta: vec![PromiseState::NotPromised; max_pid],\n            follower_seq_nums: vec![SequenceNumber::default(); max_pid],\n            accepted_indexes: vec![0; max_pid],\n            max_promise_meta: PromiseMetaData::default(),\n            max_promise_sync: None,\n            latest_accept_meta: vec![None; max_pid],\n            max_pid,\n            quorum,\n        }\n    }\n\n    fn pid_to_idx(pid: NodeId) -> usize {\n        (pid - 1) as usize\n    }",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      },
+      {
+        "id": "core_trim_check",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 141,
+        "end_line": 178,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn trim(&mut self, trim_idx: Option<usize>) -> Result<(), CompactionErr> {\n        match self.state {\n            (Role::Leader, _) => {\n                let min_all_accepted_idx = self.leader_state.get_min_all_accepted_idx();\n                let trimmed_idx = match trim_idx {\n                    Some(idx) if idx <= *min_all_accepted_idx => idx,\n                    None => {\n                        #[cfg(feature = \"logging\")]\n                        trace!(\n                            self.logger,\n                            \"No trim index provided, using min_las_idx: {:?}\",\n                            min_all_accepted_idx\n                        );\n                        *min_all_accepted_idx\n                    }\n                    _ => {\n                        return Err(CompactionErr::NotAllDecided(*min_all_accepted_idx));\n                    }\n                };\n                let result = self.internal_storage.try_trim(trimmed_idx);\n                if result.is_ok() {\n                    for pid in &self.peers {\n                        let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: *pid,\n                            msg,\n                        }));\n                    }\n                }\n                result.map_err(|e| {\n                    *e.downcast()\n                        .expect(\"storage error while trying to trim log\")\n                })\n            }\n            _ => Err(CompactionErr::NotCurrentLeader(self.get_current_leader())),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_try_trim",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 414,
+        "end_line": 430,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn try_trim(&mut self, idx: usize) -> StorageResult<()> {\n        let decided_idx = self.get_decided_idx();\n        let log_decided_idx = self.get_decided_idx_without_stopsign();\n        let new_compacted_idx = match idx.cmp(&decided_idx) {\n            Ordering::Less => idx,\n            Ordering::Equal => log_decided_idx,\n            Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,\n        };\n        if new_compacted_idx > self.get_compacted_idx() {\n            self.storage.write_atomically(vec![\n                StorageOp::Trim(new_compacted_idx),\n                StorageOp::SetCompactedIdx(new_compacted_idx),\n            ])?;\n            self.state_cache.compacted_idx = new_compacted_idx;\n        }\n        Ok(())\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_try_snapshot",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 432,
+        "end_line": 453,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn try_snapshot(&mut self, snapshot_idx: Option<usize>) -> StorageResult<()> {\n        let decided_idx = self.get_decided_idx();\n        let log_decided_idx = self.get_decided_idx_without_stopsign();\n        let new_compacted_idx = match snapshot_idx {\n            Some(i) => match i.cmp(&decided_idx) {\n                Ordering::Less => i,\n                Ordering::Equal => log_decided_idx,\n                Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,\n            },\n            None => log_decided_idx,\n        };\n        if new_compacted_idx > self.get_compacted_idx() {\n            let snapshot = self.create_snapshot(new_compacted_idx)?;\n            self.storage.write_atomically(vec![\n                StorageOp::Trim(new_compacted_idx),\n                StorageOp::SetCompactedIdx(new_compacted_idx),\n                StorageOp::SetSnapshot(Some(snapshot)),\n            ])?;\n            self.state_cache.compacted_idx = new_compacted_idx;\n        }\n        Ok(())\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_snapshot_api",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 184,
+        "end_line": 205,
+        "kind": "interface_statement",
+        "text": "    pub(crate) fn snapshot(\n        &mut self,\n        idx: Option<usize>,\n        local_only: bool,\n    ) -> Result<(), CompactionErr> {\n        let result = self.internal_storage.try_snapshot(idx);\n        if !local_only && result.is_ok() {\n            // since it is decided, it is ok even for a follower to send this\n            for pid in &self.peers {\n                let msg = PaxosMsg::Compaction(Compaction::Snapshot(idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: *pid,\n                    msg,\n                }));\n            }\n        }\n        result.map_err(|e| {\n            *e.downcast()\n                .expect(\"storage error while trying to snapshot log\")\n        })\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_stopsign_decided",
+        "file": "omnipaxos/src/storage/state_cache.rs",
+        "start_line": 123,
+        "end_line": 126,
+        "kind": "code_observation",
+        "text": "    // Returns whether a stopsign is decided\n    pub(super) fn stopsign_is_decided(&self) -> bool {\n        self.stopsign.is_some() && self.decided_idx == self.accepted_idx\n    }",
+        "content_digest": "aab4968f8afc4914329a9359253d14bb3fbb03dbb1ba8a683019eeda5d7303ac"
+      },
+      {
+        "id": "core_is_reconfigured",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 284,
+        "end_line": 290,
+        "kind": "code_observation",
+        "text": "    /// Returns whether this Sequence Paxos has been reconfigured\n    pub(crate) fn is_reconfigured(&self) -> Option<StopSign> {\n        match self.internal_storage.get_stopsign() {\n            Some(ss) if self.internal_storage.stopsign_is_decided() => Some(ss),\n            _ => None,\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_forward_proposals",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 371,
+        "end_line": 384,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn forward_proposals(&mut self, mut entries: Vec<T>) {\n        let leader = self.get_current_leader();\n        if leader > 0 && self.pid != leader {\n            let pf = PaxosMsg::ProposalForward(entries);\n            let msg = Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: leader,\n                msg: pf,\n            });\n            self.outgoing.push(msg);\n        } else {\n            self.buffered_proposals.append(&mut entries);\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_resend_follower",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 240,
+        "end_line": 269,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_follower(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Promise\n                match &self.cached_promise_message {\n                    Some(promise) => {\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: promise.n.pid,\n                            msg: PaxosMsg::Promise(promise.clone()),\n                        }));\n                    }\n                    None => {\n                        // Shouldn't be possible to be in prepare phase without having\n                        // cached the promise sent as a response to the prepare\n                        #[cfg(feature = \"logging\")]\n                        warn!(self.logger, \"In Prepare phase without a cached promise!\");\n                        self.state = (Role::Follower, Phase::Recover);\n                        self.send_preparereq_to_all_peers();\n                    }\n                }\n            }\n            Phase::Recover => {\n                // Resend PrepareReq\n                self.send_preparereq_to_all_peers();\n            }\n            Phase::Accept => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "core_resend_leader",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 371,
+        "end_line": 403,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_leader(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Accept => {\n                // Resend AcceptStopSign or StopSign's decide\n                if let Some(ss) = self.internal_storage.get_stopsign() {\n                    let decided_idx = self.internal_storage.get_decided_idx();\n                    for follower in self.leader_state.get_promised_followers() {\n                        if self.internal_storage.stopsign_is_decided() {\n                            self.send_decide(follower, decided_idx, true);\n                        } else if self.leader_state.get_accepted_idx(follower)\n                            != self.internal_storage.get_accepted_idx()\n                        {\n                            self.send_accept_stopsign(follower, ss.clone(), true);\n                        }\n                    }\n                }\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Recover => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "8124ecbeb5d1411eb7818602822db310",
+      "result": {
+        "submission": "update.json",
+        "summary": "Recorded a bounded behavior about the runtime's drop-oldest egress policy: outgoing_buf also carries client-origin messages (core ProposalForward from plain follower appends, runtime TaggedProposal and Assigned), and neither layer resends those, so past the buffer cap the oldest client proposal can be lost even though the configuration doc justifies dropping via OmniPaxos resend. Framed as a behavior with the caller's drain duty bounding applicability, not as a defect claim. Four source anchors added; all five explained findings and the protection records remain unchanged."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-3f84facd1a81451882518e32ee8be535": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-3f84facd1a81451882518e32ee8be535.json"
+      },
+      "submission-93e6d663e93c42d7b68b91449efbcf31": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-93e6d663e93c42d7b68b91449efbcf31.json"
+      },
+      "submission-7862ce56b9d94e81b9351623e93f016b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7862ce56b9d94e81b9351623e93f016b.json"
+      },
+      "submission-2318deef80994e8f8c04435040988c3d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-2318deef80994e8f8c04435040988c3d.json"
+      },
+      "submission-84e0053ba3d1476391e92e2ceac40c44": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-84e0053ba3d1476391e92e2ceac40c44.json"
+      },
+      "submission-7785c7a569d24ffdbebf0f66a0642e26": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7785c7a569d24ffdbebf0f66a0642e26.json"
+      },
+      "submission-f48a2678152a46b987d08e37826d2ca5": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-f48a2678152a46b987d08e37826d2ca5.json"
+      },
+      "submission-9e2e871d737f4e6f829b8239c8cbc484": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-9e2e871d737f4e6f829b8239c8cbc484.json"
+      },
+      "submission-423b10df284a4783b577202d1d0242ba": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-423b10df284a4783b577202d1d0242ba.json"
+      },
+      "submission-8bed726f16774b8aa00007cb68becf35": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-8bed726f16774b8aa00007cb68becf35.json"
+      },
+      "submission-7991d582dc2c45ddbd753e3b5febd887": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7991d582dc2c45ddbd753e3b5febd887.json"
+      },
+      "submission-030f3832d93a40fd9b111b694d9096e6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-030f3832d93a40fd9b111b694d9096e6.json"
+      },
+      "submission-b05ed4eba0454480af172265aa519234": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-b05ed4eba0454480af172265aa519234.json"
+      },
+      "submission-ebca976895a64f3ea2f6e73be04a52fd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-ebca976895a64f3ea2f6e73be04a52fd.json"
+      },
+      "submission-7d8e38448b6343c797fbe71f989b49b8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7d8e38448b6343c797fbe71f989b49b8.json"
+      },
+      "submission-2f52908fe4724376bc2faefa2c063596": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-2f52908fe4724376bc2faefa2c063596.json"
+      },
+      "submission-ccac9eafdc404a76b13f2019eb6da8eb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-ccac9eafdc404a76b13f2019eb6da8eb.json"
+      },
+      "submission-bbacedcf13a344e18fbbe2d2fb6cb3a7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-bbacedcf13a344e18fbbe2d2fb6cb3a7.json"
+      },
+      "submission-554d14cd05aa476ca61120017bd03dcd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-554d14cd05aa476ca61120017bd03dcd.json"
+      },
+      "submission-9cb73714a31e44fea433cb27c1d7bab7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-9cb73714a31e44fea433cb27c1d7bab7.json"
+      },
+      "submission-8afe0dcec44c440ab1c4f57ac280b9e1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-8afe0dcec44c440ab1c4f57ac280b9e1.json"
+      },
+      "submission-be0ae69c251945f891c1c9ff307608aa": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-be0ae69c251945f891c1c9ff307608aa.json"
+      },
+      "submission-eea1a9e472404dbb99c96f3f453b2419": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-eea1a9e472404dbb99c96f3f453b2419.json"
+      },
+      "submission-484c638fa4f94e68a460c9cc2ebf26c9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-484c638fa4f94e68a460c9cc2ebf26c9.json"
+      },
+      "submission-b175327d06fb4d368e1e2a79c51f55c8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-b175327d06fb4d368e1e2a79c51f55c8.json"
+      },
+      "submission-7ffd95bb6c71444186da38a8eedef922": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7ffd95bb6c71444186da38a8eedef922.json"
+      },
+      "submission-9e443944f57644feb8abd976dc44e6cb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-9e443944f57644feb8abd976dc44e6cb.json"
+      },
+      "submission-09dbcecc828c48239e683c97347101cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-09dbcecc828c48239e683c97347101cf.json"
+      },
+      "submission-c78f9e74184d4635afd9a929321d9483": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-c78f9e74184d4635afd9a929321d9483.json"
+      },
+      "submission-825ad7c125e5415bbc1e1f6c5d7c6bf9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-825ad7c125e5415bbc1e1f6c5d7c6bf9.json"
+      }
+    }
+  },
+  "after": {
+    "knowledge": [
+      {
+        "id": "3f84facd1a81451882518e32ee8be535-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Pending append_notify calls in the runtime actor are resolved in this order: Ok(idx) when the recorded assignment index is <= the actor's current decided index; Superseded when the assignment ballot is lower than the current promise ballot; Timeout when the deadline passed; otherwise the pending stays queued. The Ok arm is evaluated first and does not inspect the log or compare the entry stored at idx.",
+        "conditions": "omnipaxos_runtime actor, append_notify tracking enabled; pending entry has an assigned (idx, ballot) from local accept or a remote Assigned reply; drain_notifiers runs on each actor tick and after command handling.",
+        "source_ids": [
+          "actor_drain",
+          "actor_pending"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3f84facd1a81451882518e32ee8be535"
+      },
+      {
+        "id": "3f84facd1a81451882518e32ee8be535-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The runtime's test suite treats a successful append_notify as a claim that the caller's entry is decided at the returned index: the batching regression test reads the decided log back and asserts the value at the returned index equals the submitted entry, so a returned index holding a different value is a contract violation under the project's own expectation.",
+        "conditions": "The test environment's exercised conditions: 3-node runtime cluster with real transport, batching enabled, and a submitted append_notify entry; this is an individual test expectation plus the handle-level description, not a proof of a defect by itself.",
+        "source_ids": [
+          "test_ok_content",
+          "handle_contract"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3f84facd1a81451882518e32ee8be535"
+      },
+      {
+        "id": "3f84facd1a81451882518e32ee8be535-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The Superseded regression test demonstrates that an entry accepted only on the old leader can be genuinely lost and replaced at the same log index by a different value under the new leader, and that Superseded is the intended observable in that case; it also shows the origin node learns of the new higher-ballot leader.",
+        "conditions": "3-node runtime cluster, the elected leader's outgoing traffic is cut while its incoming traffic stays open; a new leader is elected by the other two nodes and a fresh entry is appended and decided at the old index.",
+        "source_ids": [
+          "test_superseded_replace",
+          "superseded_doc"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "3f84facd1a81451882518e32ee8be535"
+      },
+      {
+        "id": "7862ce56b9d94e81b9351623e93f016b-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "With decided=6 and compacted=4 on the executed two-node log, read_decided_suffix(1) returned exactly [Trimmed(4), Decided(5), Decided(6)] (len 3) although decided-from is 5, while read_decided_suffix(4) returned [Decided(5), Decided(6)] (len 2). The trimmed prefix is represented by a single Trimmed element, so the returned vector length is not the number of requested log indices when the start is below the compacted index.",
+        "conditions": "Two OmniPaxos instances (pids 1,2) built from ClusterConfig {configuration_id:1, nodes:[1,2]}, MemoryStorage, batch_size 1, no snapshots; node 1 becomes leader via try_become_leader, appends Value(1..=6) with full message delivery after each append, then trims to 4 and the trim is forwarded to node 2; both nodes report decided 6.",
+        "source_ids": [
+          "core_read_suffix",
+          "core_entry_type",
+          "core_compacted_entry"
+        ],
+        "executions": {
+          "8572576b3ff04353ac08bce770a5ad51": [
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7862ce56b9d94e81b9351623e93f016b"
+      },
+      {
+        "id": "7862ce56b9d94e81b9351623e93f016b-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Applied to those real read_decided_suffix outputs, one cursor step per returned element (the actor's push_to_sub rule) leaves next_idx at 4 after the catch-up from 1, and the next push_to_all_subs read from 4 yields entries 5 and 6 again, so the delivered value sequence is 5,6,5,6 with duplicates of 5 and 6 while decided remains 6 and no new entry was decided.",
+        "conditions": "Same executed setup as @suffix_collapse_observed; the cursor replay reproduces omnipaxos_runtime/src/actor.rs push_to_sub (next_idx += 1 per element) and one subsequent push_to_all_subs read from the resulting cursor (start = 0 for a single subscriber). The replay is a reconstruction of the runtime source logic over executed core outputs, not an execution of the runtime crate.",
+        "source_ids": [
+          "rt_decided_sub",
+          "rt_push_sub",
+          "rt_push_all",
+          "rt_subscribe_api",
+          "core_read_suffix"
+        ],
+        "executions": {
+          "8572576b3ff04353ac08bce770a5ad51": [
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7862ce56b9d94e81b9351623e93f016b"
+      },
+      {
+        "id": "8bed726f16774b8aa00007cb68becf35-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed five-node run, node 5 had decided through index 5 and read index 4 as Decided(Value(5)); after the new leader's AcceptSync it reported decided 4 and read index 4 as Undecided(Value(5)); after the new leader re-decided index 5 it reported decided 5 and read index 4 as Decided(Value(5)) again. The same log index was therefore observed Decided, Undecided and Decided with unchanged value.",
+        "conditions": "Five OmniPaxos instances (pids 1..5), ClusterConfig {configuration_id:1, nodes:[1,2,3,4,5]}, MemoryStorage, batch_size 1, no snapshots. Entry 5 is accepted by 1,2,3,5 and decided by leader 1, but the Decide reaches only node 5; nodes 2 and 3 stay decided 4 with accepted 5. Node 1 is then cut, node 2 is elected with promises from 3 and 4 only (decided 4), and node 5's Prepare is delivered only after node 2 is in Accept, so its Promise is handled by handle_promise_accept and answered with an AcceptSync carrying decided 4.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_promise_accept",
+          "core_send_accsync",
+          "core_majority_promises"
+        ],
+        "executions": {
+          "1a9292879a5642519ee6306b6376e255": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8bed726f16774b8aa00007cb68becf35"
+      },
+      {
+        "id": "8bed726f16774b8aa00007cb68becf35-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "A new leader's decided index is the maximum decided index among the promises that formed its prepare quorum (handle_majority_promises -> get_max_decided_idx). A follower whose Promise arrives after that quorum is answered by handle_promise_accept with send_accsync stamped with the leader's current decided index, and handle_acceptsync passes that value to sync_log, which assigns it to the decided index without comparing it to the follower's existing value. A follower that had already learned a later decision therefore loses decided progress until the new leader re-accepts and re-decides the entry.",
+        "conditions": "Majority quorum with five nodes; at least one member of the new leader's prepare quorum accepted the entry without deciding it; the more-informed follower is delayed past the quorum; no snapshots involved in the sync.",
+        "source_ids": [
+          "core_majority_promises",
+          "core_send_accsync",
+          "core_promise_accept",
+          "core_handle_acceptsync",
+          "core_sync_log",
+          "core_handle_decide"
+        ],
+        "executions": {
+          "1a9292879a5642519ee6306b6376e255": [
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8bed726f16774b8aa00007cb68becf35"
+      },
+      {
+        "id": "030f3832d93a40fd9b111b694d9096e6-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "With a single lost Prepare and the public reconnected(2) call, node 5's decided index fell from 5 to 4 and read(4) changed from Decided(Value(5)) to Undecided(Value(5)) after the new leader's Accept-phase AcceptSync; after the new leader re-decided index 5, node 5 returned to decided 5 and Decided(Value(5)). The observed message sequence was PrepareReq from node 5, Prepare to node 5, Promise from node 5, AcceptSync to node 5 and an Accepted reply, with lost_prepare_count 1.",
+        "conditions": "Five OmniPaxos instances (pids 1..5), MemoryStorage, batch_size 1, no snapshots. Entry 5 is decided by leader 1 with nodes 1,2,3,5 accepting but the Decide reaching only node 5; node 2 is elected with promises from 3 and 4 (decided 4); the Prepare addressed to node 5 is dropped; the probe calls node5.reconnected(2) as the documented re-establish-connection entry point.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_promise_accept",
+          "core_send_accsync",
+          "core_majority_promises",
+          "docs_decided"
+        ],
+        "executions": {
+          "81fa48ede3814e47beddc84938133990": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "030f3832d93a40fd9b111b694d9096e6"
+      },
+      {
+        "id": "b05ed4eba0454480af172265aa519234-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Entries appended while this node is leader in Phase::Prepare are pushed to buffered_proposals. When the node later receives an AcceptSync (after promising a leader, whether in the prepare phase or in the accept phase), handle_acceptsync calls forward_buffered_proposals before switching to Phase::Accept; that call takes the whole buffer and forwards it to the current leader if there is no accepted StopSign. The buffered entries are therefore re-proposed rather than stranded when leadership moves away before the prepare quorum completes.",
+        "conditions": "SequencePaxos with no accepted StopSign; the node promises a subsequent leader and receives its AcceptSync; the forwarded ProposalForward is delivered to that leader (normal message delivery).",
+        "source_ids": [
+          "core_propose_entry",
+          "core_forward_buffered"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "b05ed4eba0454480af172265aa519234"
+      },
+      {
+        "id": "ccac9eafdc404a76b13f2019eb6da8eb-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed three-node configuration {1,2,5} with three decided entries and all_accepted_min 3, trim(Some(2)) returned NotAllDecided(0), the compacted index stayed 0, and a following trim(None) also left the compacted index at 0 while returning Ok.",
+        "conditions": "Three OmniPaxos instances pids 1, 2 and 5, ClusterConfig {configuration_id:1, nodes:[1,2,5]}, MemoryStorage, batch_size 1, no snapshots; node 1 elected with try_become_leader; three entries appended and fully delivered so every node reports decided 3 and accepted 3.",
+        "source_ids": [
+          "core_min_all_accepted",
+          "core_leader_state_layout",
+          "core_trim_check",
+          "core_try_trim"
+        ],
+        "executions": {
+          "fde347cf379748d7bd0a3b6b8deb1d8c": [
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "ccac9eafdc404a76b13f2019eb6da8eb"
+      },
+      {
+        "id": "bbacedcf13a344e18fbbe2d2fb6cb3a7-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "SequencePaxos::snapshot passes its index to InternalStorage::try_snapshot, which accepts any index less than the local decided index (equal maps to the decided index without the StopSign) and rejects only indices greater than decided with UndecidedIndex. It performs trim, compacted-index and snapshot writes atomically and never consults the minimum accepted index. The snapshot API is therefore not affected by the sparse-pid placeholders that block trim, so a snapshot-capable Entry type can still compact a configuration such as {1,2,5}.",
+        "conditions": "A snapshot-capable Entry type (Snapshot::use_snapshots() true) and a snapshot index not greater than the node's decided index; the node may be a follower when local_only is true.",
+        "source_ids": [
+          "core_try_snapshot",
+          "core_snapshot_api",
+          "core_trim_check"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "bbacedcf13a344e18fbbe2d2fb6cb3a7"
+      },
+      {
+        "id": "8afe0dcec44c440ab1c4f57ac280b9e1-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed ten-entry, trim-to-five run, simulating the actor's fan-out with a trailing cursor at 1 and a fast cursor at 6 produced slow_stream T5,6,7,8,9,10,8,9,10 and fast_stream 10,8,9,10: the fast subscriber received entry 10 for the position where it expected the entry after cursor 6 (entry 7), then 8,9,10, so entries 7,8,9 were never delivered in order and entry 10 was delivered twice.",
+        "conditions": "Five OmniPaxos instances, ten decided entries, trim to 5, MemoryStorage, unit batch; two cursors simulated over real read_decided_suffix outputs with the actor's push_to_all_subs rule (min_next = min cursor, start = cursor - min_next, one cursor step per element). Channels and backpressure are not simulated.",
+        "source_ids": [
+          "core_read_suffix",
+          "core_entry_type",
+          "core_compacted_entry",
+          "rt_decided_sub",
+          "rt_push_all"
+        ],
+        "executions": {
+          "149052bc9a0d495985d41bd165deada3": [
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8afe0dcec44c440ab1c4f57ac280b9e1"
+      },
+      {
+        "id": "eea1a9e472404dbb99c96f3f453b2419-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed five-node run, node 5 reported is_reconfigured Some with decided 5 before the reconnect sync, is_reconfigured None with decided 4 immediately after the AcceptSync, and is_reconfigured None again after its decided index returned to 5 (decided_leader2 also 5).",
+        "conditions": "Five OmniPaxos instances, entries 1..4 decided everywhere, a reconfigure whose StopSign is accepted by 1,2,3,5 and decided only on node 5; node 1 cut, node 2 elected with promises from 3 and 4 at decided 4, node 5's Prepare lost and reconnected(2) driving PrepareReq/Prepare/Promise/AcceptSync.",
+        "source_ids": [
+          "core_stopsign_decided",
+          "core_is_reconfigured",
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync"
+        ],
+        "executions": {
+          "19867c5d7a784ca8afcec5890786dba3": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "eea1a9e472404dbb99c96f3f453b2419"
+      },
+      {
+        "id": "484c638fa4f94e68a460c9cc2ebf26c9-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "On the executed five-node run, node 5's accepted index was 5 with decided 5 and is_reconfigured true before the reconnect sync. After applying the AcceptSync it was accepted 6, decided 4, is_reconfigured false; after the new leader re-decided index 5 it was accepted 6, decided 5, is_reconfigured still false, and the comparison requiring accepted 5 at that point is violated.",
+        "conditions": "Five OmniPaxos instances; entries 1..4 decided everywhere; a reconfigure whose StopSign is accepted by 1,2,3,5 and decided only on node 5; node 1 cut; node 2 elected with promises from 3 and 4 at decided 4; node 5's Prepare lost and reconnected(2) driving PrepareReq/Prepare/Promise/AcceptSync with the StopSign in log_sync.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_stopsign_decided",
+          "core_is_reconfigured"
+        ],
+        "executions": {
+          "f6f4ac59f01a49deabefb3d8556e5d06": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "484c638fa4f94e68a460c9cc2ebf26c9"
+      },
+      {
+        "id": "7ffd95bb6c71444186da38a8eedef922-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the same executed five-node StopSign run, node 4 - which never accepted the StopSign before the sync - ended at decided 5, accepted 5 and is_reconfigured true after re-decision, while node 5, which had already accepted and decided the StopSign, ended at decided 5, accepted 6 and is_reconfigured false. The control comparison (node 4 reconfig true) holds; the comparison requiring accepted 5 on node 5 is violated.",
+        "conditions": "Five OmniPaxos instances; entries 1..4 decided; reconfigure to configuration_id 2; AcceptStopSign and Decide withheld from node 4, delivered to node 5; node 2 elected at decided 4; node 5 reconnects via reconnected(2); held Accepted replies then re-decide index 5.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_stopsign_decided",
+          "core_is_reconfigured"
+        ],
+        "executions": {
+          "603faa15c86645c6a56b0b9fadfc0751": [
+            3,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "7ffd95bb6c71444186da38a8eedef922"
+      },
+      {
+        "id": "9e443944f57644feb8abd976dc44e6cb-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In both executed witnesses of the late-promise decided regression, the affected follower's decided index decreased from 5 to 4 while the value at index 4 stayed Value(5), and it returned to 5 after the new leader re-decided. The same defect therefore surfaces through three client-visible endpoints at once: get_decided_idx decreases, read(index 4) changes from Decided(Value(5)) to Undecided(Value(5)), and read_decided_suffix(from) for from <= 4 returns one fewer element until re-decision. No value at any decided index changed.",
+        "conditions": "Five OmniPaxos instances, entries accepted by 1,2,3,5 with the Decide delivered only to node 5, node 2 elected with promises from 3 and 4 at decided 4, and node 5 promising after that quorum (delayed Prepare in one run, lost Prepare plus reconnected(2) in the other).",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_majority_promises",
+          "core_handle_decide"
+        ],
+        "executions": {
+          "1a9292879a5642519ee6306b6376e255": [
+            0,
+            1,
+            2
+          ],
+          "81fa48ede3814e47beddc84938133990": [
+            0,
+            1,
+            2
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "9e443944f57644feb8abd976dc44e6cb"
+      },
+      {
+        "id": "09dbcecc828c48239e683c97347101cf-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "create_log_sync sends the StopSign in a separate log_sync field and starts the suffix at the follower's valid entries index, then sync_log sets accepted_idx to sync_idx + suffix length and adds one more when log_sync carries a StopSign. When sync_idx already covers the StopSign (the follower's accepted prefix includes it), accepted_idx becomes one greater than the follower's last log position. Since nothing may be appended after an accepted StopSign, decided can reach at most that last position and stopsign_is_decided (decided == accepted) can never become true for that follower. When sync_idx precedes the StopSign, the same +1 is correct and the follower ends consistent.",
+        "conditions": "SequencePaxos follower applying an AcceptSync whose log_sync carries a StopSign; the follower either already accepted that StopSign (sync_idx includes it; defect) or had not (sync_idx precedes it; correct). No snapshots involved.",
+        "source_ids": [
+          "core_sync_log",
+          "core_handle_acceptsync",
+          "core_send_accsync",
+          "core_stopsign_decided",
+          "core_is_reconfigured"
+        ],
+        "executions": {
+          "603faa15c86645c6a56b0b9fadfc0751": [
+            1,
+            2,
+            3
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "09dbcecc828c48239e683c97347101cf"
+      },
+      {
+        "id": "825ad7c125e5415bbc1e1f6c5d7c6bf9-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "append on a non-leader creates one ProposalForward message addressed to the current leader and moves the entries into it; the core keeps no copy for retry. resend_messages_follower resends only the cached Promise (Prepare phase) or PrepareReq (Recover), and resend_messages_leader resends Prepare, AcceptStopSign and the StopSign's Decide. A ProposalForward lost in transport, or received by a leader that fails before accepting it, is therefore not re-proposed by the core; the caller's transport and any application-level retry carry that duty. The runtime layer's TaggedProposal path does retry undispatched proposals on ticks, which is a separate, stronger contract.",
+        "conditions": "SequencePaxos with entries appended on a node that is not the leader and no accepted StopSign; the scheduled tick-driven resend paths only; transport loss or leader failure before acceptance.",
+        "source_ids": [
+          "core_forward_proposals",
+          "core_resend_follower",
+          "core_resend_leader"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "825ad7c125e5415bbc1e1f6c5d7c6bf9"
+      },
+      {
+        "id": "8124ecbeb5d1411eb7818602822db310-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "When the outgoing channel does not accept a message, messages accumulate in outgoing_buf; once its length exceeds the channel capacity (or max_outgoing_buffered), drain_outgoing_buf drops the oldest entries before retrying. The same buffer holds core protocol traffic pulled by flush_outgoing, including PaxosMsg::ProposalForward produced when a plain append is issued on a follower, and runtime control messages enqueued by try_dispatch_undispatched (TaggedProposal) and by Assigned replies. Core resends Promise/PrepareReq/Prepare/AcceptStopSign/StopSign-Decide but not ProposalForward, and the runtime does not resend TaggedProposal, so dropping those messages loses the corresponding client proposal (a tagged proposal then resolves only by timeout; a plain forwarded append is not retried at all). The configuration docs justify drop-oldest as safe because OmniPaxos tolerates lost messages, which covers protocol messages but not these client-origin ones.",
+        "conditions": "Runtime actor with outgoing channel backpressure sustained long enough for outgoing_buf to exceed its cap while client-origin messages are queued; the caller is expected to drain outgoing_messages continuously, so sustained non-draining is a caller-duty violation and bounds the applicability.",
+        "source_ids": [
+          "rt_egress_drop",
+          "rt_trim_oldest",
+          "rt_egress_config_doc",
+          "rt_dispatch_undispatched",
+          "core_forward_proposals"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "8124ecbeb5d1411eb7818602822db310"
+      }
+    ],
+    "materials": [
+      {
+        "id": "actor_drain",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 200,
+        "end_line": 222,
+        "kind": "code_observation",
+        "text": "\n    fn drain_notifiers(&mut self) {\n        let decided = self.op.get_decided_idx();\n        let now = Instant::now();\n        let cur_ballot = self.op.get_promise();\n        let old = std::mem::take(&mut self.pending);\n        for p in old {\n            match p.assigned {\n                Some((idx, _)) if idx <= decided => {\n                    let _ = p.reply.send(Ok(idx));\n                }\n                Some((idx, ballot)) if ballot < cur_ballot => {\n                    let _ = p\n                        .reply\n                        .send(Err(AppendError::Superseded { log_entry_idx: idx }));\n                }\n                _ if now > p.deadline => {\n                    let _ = p.reply.send(Err(AppendError::Timeout));\n                }\n                _ => self.pending.push_back(p),\n            }\n        }\n    }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_pending",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 58,
+        "end_line": 75,
+        "kind": "code_observation",
+        "text": "where\n    T: Entry,\n{\n    id: EntryId,\n    /// The entry, retained until dispatched (accepted locally or sent as a\n    /// `TaggedProposal`). While `Some`, `try_dispatch_undispatched` retries it\n    /// each tick — this is what lets `append_notify` be called before a\n    /// leader is known.\n    undispatched: Option<T>,\n    /// `(assigned_idx, ballot_at_assignment)`. `None` until either:\n    ///   (a) we accepted the entry ourselves as leader, or\n    ///   (b) we received `AsyncRuntimeMsg::Assigned` from the leader.\n    assigned: Option<(usize, Ballot)>,\n    deadline: Instant,\n    reply: oneshot::Sender<Result<usize, AppendError<T>>>,\n}\n\n/// What to do, once its index is known, for a write buffered in the shared",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "actor_assigned",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 533,
+        "end_line": 546,
+        "kind": "code_observation",
+        "text": "                        }));\n                    }\n                } else if let Some(new_leader) = cur {\n                    // Leadership drifted since sender chose us. Hop the whole batch\n                    // forward, preserving the original `from` so the leader replies\n                    // to the true origin.\n                    self.enqueue_outgoing(Message::AsyncRuntime(AsyncRuntimeMessage {\n                        from: arm.from,\n                        to: new_leader,\n                        msg: AsyncRuntimeMsg::TaggedProposal { entries },\n                    }));\n                }\n                // Else: no leader; drop. Originators will timeout.\n            }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "handle_contract",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 146,
+        "end_line": 160,
+        "kind": "interface_statement",
+        "text": "        timeout: Duration,\n    ) -> Result<usize, AppendError<T>> {\n        self.append_notify_inner(entry, Some(timeout)).await\n    }\n\n    async fn append_notify_inner(\n        &self,\n        entry: T,\n        timeout: Option<Duration>,\n    ) -> Result<usize, AppendError<T>> {\n        let (tx, rx) = oneshot::channel();\n        self.cmd_tx\n            .send(Command::AppendNotify {\n                entry,\n                timeout,",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "superseded_doc",
+        "file": "omnipaxos_runtime/src/event.rs",
+        "start_line": 47,
+        "end_line": 58,
+        "kind": "interface_statement",
+        "text": "    Propose(ProposeErr<T>),\n    /// A leader change occurred after the entry was accepted at the given index but\n    /// before it was decided. This is a *heuristic*, not a certainty: a new leader is\n    /// required to adopt any value a majority-overlapping quorum may have already\n    /// accepted, so the entry can still end up decided at `log_entry_idx` under the\n    /// new ballot -- we just stop waiting rather than confirm it. Check\n    /// [`OmniPaxosHandle::read_decided_suffix`](super::OmniPaxosHandle::read_decided_suffix)\n    /// at that index if you need to know for sure before re-appending.\n    Superseded {\n        /// The log index the entry was assigned before the leader change.\n        log_entry_idx: usize,\n    },",
+        "content_digest": "c5ff151f7ee21767be3c8b53dba3aaf23deaafcf0d9188610b21ea1a6a9f9c8c"
+      },
+      {
+        "id": "test_ok_content",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 386,
+        "end_line": 398,
+        "kind": "test_expectation",
+        "text": "            }\n            tokio::time::sleep(Duration::from_millis(10)).await;\n        }\n    })\n    .await\n    .expect(\"index never decided\");\n    match decided.get(idx - 1) {\n        Some(LogEntry::Decided(v)) => {\n            assert_eq!(*v, entry_n, \"wrong entry decided at idx {idx}\")\n        }\n        other => panic!(\"expected a decided entry at idx {idx}, got {other:?}\"),\n    }\n}",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "test_superseded_replace",
+        "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+        "start_line": 958,
+        "end_line": 980,
+        "kind": "test_expectation",
+        "text": "    let refill_idx = timeout(\n        Duration::from_secs(3),\n        new_leader_h.append_notify(TestEntry(99)),\n    )\n    .await\n    .expect(\"refill append_notify hung\")\n    .expect(\"refill append_notify should succeed on the new leader\");\n    assert_eq!(\n        refill_idx, idx,\n        \"expected the fresh entry to land at the same index the lost one was assigned\"\n    );\n\n    let decided = new_leader_h\n        .read_decided_suffix(0)\n        .await\n        .expect(\"no entries decided\");\n    match decided.get(idx - 1) {\n        Some(LogEntry::Decided(v)) => {\n            assert_eq!(\n                *v,\n                TestEntry(99),\n                \"idx {idx} should hold the refill entry, confirming the original was lost\"\n            );",
+        "content_digest": "13fdf745d3924c22e735d2c63e4e59f46bb508d4864ac62f808f1cad8708881e"
+      },
+      {
+        "id": "core_read_suffix",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 89,
+        "end_line": 157,
+        "kind": "code_observation",
+        "text": "    /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.\n    pub(crate) fn read<R>(&self, r: R) -> StorageResult<Option<Vec<LogEntry<T>>>>\n    where\n        R: RangeBounds<usize>,\n    {\n        let from_idx = match r.start_bound() {\n            Bound::Included(i) => *i,\n            Bound::Excluded(e) => *e + 1,\n            Bound::Unbounded => 0,\n        };\n        let to_idx = match r.end_bound() {\n            Bound::Included(i) => *i + 1,\n            Bound::Excluded(e) => *e,\n            Bound::Unbounded => self.get_accepted_idx(),\n        };\n        if to_idx == 0 {\n            return Ok(None);\n        }\n        let compacted_idx = self.get_compacted_idx();\n        let accepted_idx = self.get_accepted_idx();\n        // use to_idx-1 when getting the entry type as to_idx is exclusive\n        let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {\n            Some(IndexEntry::Compacted) => {\n                return Ok(Some(vec![self.create_compacted_entry(compacted_idx)?]))\n            }\n            Some(from_type) => from_type,\n            _ => return Ok(None),\n        };\n        let from_type = match self.get_entry_type(from_idx, compacted_idx, accepted_idx)? {\n            Some(from_type) => from_type,\n            _ => return Ok(None),\n        };\n        match (from_type, to_type) {\n            (IndexEntry::Entry, IndexEntry::Entry) => {\n                Ok(Some(self.create_read_log_entries(from_idx, to_idx)?))\n            }\n            (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {\n                let mut entries = self.create_read_log_entries(from_idx, to_idx - 1)?;\n                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));\n                Ok(Some(entries))\n            }\n            (IndexEntry::Compacted, IndexEntry::Entry) => {\n                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);\n                let compacted = self.create_compacted_entry(compacted_idx)?;\n                entries.push(compacted);\n                let mut e = self.create_read_log_entries(compacted_idx, to_idx)?;\n                entries.append(&mut e);\n                Ok(Some(entries))\n            }\n            (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {\n                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);\n                let compacted = self.create_compacted_entry(compacted_idx)?;\n                entries.push(compacted);\n                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1)?;\n                entries.append(&mut e);\n                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));\n                Ok(Some(entries))\n            }\n            (IndexEntry::StopSign(ss), IndexEntry::StopSign(_)) => {\n                Ok(Some(vec![LogEntry::StopSign(\n                    ss,\n                    self.stopsign_is_decided(),\n                )]))\n            }\n            e => {\n                unimplemented!(\"{}\", format!(\"Unexpected read combination: {:?}\", e))\n            }\n        }\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_entry_type",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 159,
+        "end_line": 177,
+        "kind": "code_observation",
+        "text": "    fn get_entry_type(\n        &self,\n        idx: usize,\n        compacted_idx: usize,\n        accepted_idx: usize,\n    ) -> StorageResult<Option<IndexEntry>> {\n        if idx < compacted_idx {\n            Ok(Some(IndexEntry::Compacted))\n        } else if idx + 1 < accepted_idx {\n            Ok(Some(IndexEntry::Entry))\n        } else if idx + 1 == accepted_idx {\n            match self.get_stopsign() {\n                Some(ss) => Ok(Some(IndexEntry::StopSign(ss))),\n                _ => Ok(Some(IndexEntry::Entry)),\n            }\n        } else {\n            Ok(None)\n        }\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_compacted_entry",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 197,
+        "end_line": 202,
+        "kind": "code_observation",
+        "text": "    fn create_compacted_entry(&self, compacted_idx: usize) -> StorageResult<LogEntry<T>> {\n        self.storage.get_snapshot().map(|snap| match snap {\n            Some(s) => LogEntry::Snapshotted(SnapshottedEntry::with(compacted_idx, s)),\n            None => LogEntry::Trimmed(compacted_idx),\n        })\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "rt_decided_sub",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 123,
+        "end_line": 132,
+        "kind": "code_observation",
+        "text": "/// A single subscriber to the decided-log stream. `next_idx` is the next log\n/// index the actor must deliver; incremented on every successful `try_send`.\nstruct DecidedSub<T>\nwhere\n    T: Entry,\n{\n    next_idx: usize,\n    tx: async_channel::Sender<LogEntry<T>>,\n}\n",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_push_sub",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 279,
+        "end_line": 296,
+        "kind": "code_observation",
+        "text": "    fn push_to_sub(op: &mut OmniPaxos<T, B>, sub: &mut DecidedSub<T>) -> bool {\n        let decided = op.get_decided_idx();\n        if sub.next_idx >= decided {\n            return true;\n        }\n        let Some(entries) = op.read_decided_suffix(sub.next_idx) else {\n            return true;\n        };\n        for entry in entries {\n            match sub.tx.try_send(entry) {\n                Ok(()) => sub.next_idx += 1,\n                Err(async_channel::TrySendError::Full(_)) => return true,\n                Err(async_channel::TrySendError::Closed(_)) => return false,\n            }\n        }\n        true\n    }\n",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_push_all",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 301,
+        "end_line": 340,
+        "kind": "code_observation",
+        "text": "    fn push_to_all_subs(&mut self) {\n        if self.decided_subscribers.is_empty() {\n            return;\n        }\n        let cur = self.op.get_decided_idx();\n        let min_next = self\n            .decided_subscribers\n            .iter()\n            .map(|s| s.next_idx)\n            .min()\n            .expect(\"non-empty checked above\");\n        if min_next >= cur {\n            return;\n        }\n        // Read once, from the trailing sub's position. `entries[i]` is the log\n        // entry at position `min_next + i`.\n        let Some(entries) = self.op.read_decided_suffix(min_next) else {\n            return;\n        };\n        // Fan out; drop closed subscribers in place via retain_mut.\n        self.decided_subscribers.retain_mut(|sub| {\n            // sub.next_idx should always be >= min_next; guard defensively.\n            let start = sub.next_idx.saturating_sub(min_next);\n            for entry in entries.iter().skip(start) {\n                match sub.tx.try_send(entry.clone()) {\n                    Ok(()) => sub.next_idx += 1,\n                    Err(async_channel::TrySendError::Full(_)) => break,\n                    Err(async_channel::TrySendError::Closed(_)) => return false,\n                }\n            }\n            true\n        });\n    }\n\n    fn record_assignment(&mut self, id: EntryId, idx: usize, ballot: Ballot) {\n        for p in self.pending.iter_mut() {\n            if p.id == id {\n                p.assigned = Some((idx, ballot));\n                return;\n            }",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_subscribe_api",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 262,
+        "end_line": 281,
+        "kind": "interface_statement",
+        "text": "    /// that emits [`LogEntry`]s in log order — both the backlog already decided\n    /// at subscription time and entries decided later.\n    ///\n    /// Each call creates an independent subscription with its own cursor;\n    /// multiple subscribers can coexist, up to [`RuntimeConfig::max_decided_subscribers`]\n    /// — beyond that, the returned receiver's channel is closed immediately\n    /// without delivering any entries. Dropping the receiver ends the\n    /// subscription; slow subscribers apply backpressure by causing the actor\n    /// to defer pushes rather than blocking the actor loop.\n    pub async fn subscribe_decided(&self, from: usize) -> async_channel::Receiver<LogEntry<T>> {\n        let (tx, rx) = async_channel::bounded(self.decided_channel_capacity);\n        // If the actor is gone, `rx` stays open but never receives — the\n        // caller's stream drops naturally when the sender is dropped here.\n        let _ = self\n            .cmd_tx\n            .send(Command::SubscribeDecided { from, tx })\n            .await;\n        rx\n    }\n",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "core_sync_log",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 313,
+        "end_line": 360,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn sync_log(\n        &mut self,\n        accepted_round: Ballot,\n        decided_idx: usize,\n        log_sync: Option<LogSync<T>>,\n    ) -> StorageResult<usize> {\n        self.state_cache.accepted_round = accepted_round;\n        self.state_cache.decided_idx = decided_idx;\n        let mut sync_txn: Vec<StorageOp<T>> = vec![\n            StorageOp::SetAcceptedRound(accepted_round),\n            StorageOp::SetDecidedIndex(decided_idx),\n        ];\n        if let Some(sync) = log_sync {\n            match sync.decided_snapshot {\n                Some(SnapshotType::Complete(c)) => {\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(c)));\n                }\n                Some(SnapshotType::Delta(d)) => {\n                    let mut snapshot = self.create_decided_snapshot()?;\n                    snapshot.merge(d);\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(snapshot)));\n                }\n                None => (),\n            }\n            self.state_cache.accepted_idx = sync.sync_idx + sync.suffix.len();\n            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));\n            match sync.stopsign {\n                Some(ss) => {\n                    self.state_cache.stopsign = Some(ss.clone());\n                    self.state_cache.accepted_idx += 1;\n                    sync_txn.push(StorageOp::SetStopsign(Some(ss)));\n                }\n                None if self.state_cache.stopsign.is_some() => {\n                    self.state_cache.stopsign = None;\n                    sync_txn.push(StorageOp::SetStopsign(None));\n                }\n                None => (),\n            }\n        }\n        self.storage.write_atomically(sync_txn)?;\n        Ok(self.state_cache.accepted_idx)\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_handle_acceptsync",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 53,
+        "end_line": 79,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "core_promise_accept",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 301,
+        "end_line": 314,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_promise_accept(&mut self, prom: Promise<T>, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        {\n            let (r, p) = &self.state;\n            debug!(\n                self.logger,\n                \"Self role {:?}, phase {:?}. Incoming message Promise Accept from {}\", r, p, from\n            );\n        }\n        if prom.n == self.leader_state.n_leader {\n            self.leader_state.set_promise(prom, from, false);\n            self.send_accsync(from);\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "core_send_accsync",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 150,
+        "end_line": 191,
+        "kind": "code_observation",
+        "text": "    fn send_accsync(&mut self, to: NodeId) {\n        let current_n = self.leader_state.n_leader;\n        let PromiseMetaData {\n            n_accepted: prev_round_max_promise_n,\n            accepted_idx: prev_round_max_accepted_idx,\n            ..\n        } = &self.leader_state.get_max_promise_meta();\n        let PromiseMetaData {\n            n_accepted: followers_promise_n,\n            accepted_idx: followers_accepted_idx,\n            pid,\n            ..\n        } = self.leader_state.get_promise_meta(to);\n        let followers_decided_idx = self\n            .leader_state\n            .get_decided_idx(*pid)\n            .expect(\"Received PromiseMetaData but not found in ld\");\n        // Follower can have valid accepted entries depending on which leader they were previously following\n        let followers_valid_entries_idx = if *followers_promise_n == current_n {\n            *followers_accepted_idx\n        } else if *followers_promise_n == *prev_round_max_promise_n {\n            *prev_round_max_accepted_idx.min(followers_accepted_idx)\n        } else {\n            followers_decided_idx\n        };\n        let log_sync = self.create_log_sync(followers_valid_entries_idx, followers_decided_idx);\n        self.leader_state.increment_seq_num_session(to);\n        let acc_sync = AcceptSync {\n            n: current_n,\n            seq_num: self.leader_state.next_seq_num(to),\n            decided_idx: self.get_decided_idx(),\n            log_sync,\n            #[cfg(feature = \"unicache\")]\n            unicache: self.internal_storage.get_unicache(),\n        };\n        let msg = Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to,\n            msg: PaxosMsg::AcceptSync(acc_sync),\n        });\n        self.outgoing.push(msg);\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "core_majority_promises",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 257,
+        "end_line": 285,
+        "kind": "code_observation",
+        "text": "    fn handle_majority_promises(&mut self) {\n        let max_promise_sync = self.leader_state.take_max_promise_sync();\n        let decided_idx = self.leader_state.get_max_decided_idx();\n        let mut new_accepted_idx = self\n            .internal_storage\n            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync)\n            .expect(WRITE_ERROR_MSG);\n        if !self.accepted_reconfiguration() {\n            if !self.buffered_proposals.is_empty() {\n                let entries = std::mem::take(&mut self.buffered_proposals);\n                new_accepted_idx = self\n                    .internal_storage\n                    .append_entries_without_batching(entries)\n                    .expect(WRITE_ERROR_MSG);\n            }\n            if let Some(ss) = self.buffered_stopsign.take() {\n                self.internal_storage\n                    .append_stopsign(ss)\n                    .expect(WRITE_ERROR_MSG);\n                new_accepted_idx = self.internal_storage.get_accepted_idx();\n            }\n        }\n        self.state = (Role::Leader, Phase::Accept);\n        self.leader_state\n            .set_accepted_idx(self.pid, new_accepted_idx);\n        for pid in self.leader_state.get_promised_followers() {\n            self.send_accsync(pid);\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "core_handle_decide",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 128,
+        "end_line": 138,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_decide(&mut self, dec: Decide) {\n        if self.check_valid_ballot(dec.n)\n            && self.state.1 == Phase::Accept\n            && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected\n        {\n            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx);\n            if let Some(idx) = new_accepted_idx {\n                self.reply_accepted(dec.n, idx);\n            }\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "docs_decided",
+        "file": "docs/omnipaxos/log.md",
+        "start_line": 23,
+        "end_line": 24,
+        "kind": "document_statement",
+        "text": "- `Decided(T)`: The entry is decided and guaranteed to not be reverted. It is thus safe to apply a decided entry to the application state. For instance, in our case, it is safe to update our key-value store when we read a `Decided(KeyValue)` entry.\n- `Undecided(T)`: The entry is NOT decided and might be removed from the log at a later time. However, it could be useful in applications that allow speculative execution for example.",
+        "content_digest": "49924ce2b143cecce202698b97376eb9eaa5e0612f9e083f5fe980abc27a418d"
+      },
+      {
+        "id": "core_propose_entry",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 359,
+        "end_line": 365,
+        "kind": "code_observation",
+        "text": "    fn propose_entry(&mut self, entry: T) {\n        match self.state {\n            (Role::Leader, Phase::Prepare) => self.buffered_proposals.push(entry),\n            (Role::Leader, Phase::Accept) => self.accept_entry_leader(entry),\n            _ => self.forward_proposals(vec![entry]),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_forward_buffered",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 53,
+        "end_line": 86,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }\n\n    fn forward_buffered_proposals(&mut self) {\n        let proposals = std::mem::take(&mut self.buffered_proposals);\n        if !proposals.is_empty() {\n            self.forward_proposals(proposals);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "core_min_all_accepted",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 186,
+        "end_line": 195,
+        "kind": "code_observation",
+        "text": "    pub fn get_min_all_accepted_idx(&self) -> &usize {\n        self.accepted_indexes\n            .iter()\n            .min()\n            .expect(\"Should be all initialised to 0!\")\n    }\n\n    pub fn reset_latest_accept_meta(&mut self) {\n        self.latest_accept_meta = vec![None; self.max_pid];\n    }",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      },
+      {
+        "id": "core_leader_state_layout",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 96,
+        "end_line": 112,
+        "kind": "code_observation",
+        "text": "    pub fn with(n_leader: Ballot, max_pid: usize, quorum: Quorum) -> Self {\n        Self {\n            n_leader,\n            promises_meta: vec![PromiseState::NotPromised; max_pid],\n            follower_seq_nums: vec![SequenceNumber::default(); max_pid],\n            accepted_indexes: vec![0; max_pid],\n            max_promise_meta: PromiseMetaData::default(),\n            max_promise_sync: None,\n            latest_accept_meta: vec![None; max_pid],\n            max_pid,\n            quorum,\n        }\n    }\n\n    fn pid_to_idx(pid: NodeId) -> usize {\n        (pid - 1) as usize\n    }",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      },
+      {
+        "id": "core_trim_check",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 141,
+        "end_line": 178,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn trim(&mut self, trim_idx: Option<usize>) -> Result<(), CompactionErr> {\n        match self.state {\n            (Role::Leader, _) => {\n                let min_all_accepted_idx = self.leader_state.get_min_all_accepted_idx();\n                let trimmed_idx = match trim_idx {\n                    Some(idx) if idx <= *min_all_accepted_idx => idx,\n                    None => {\n                        #[cfg(feature = \"logging\")]\n                        trace!(\n                            self.logger,\n                            \"No trim index provided, using min_las_idx: {:?}\",\n                            min_all_accepted_idx\n                        );\n                        *min_all_accepted_idx\n                    }\n                    _ => {\n                        return Err(CompactionErr::NotAllDecided(*min_all_accepted_idx));\n                    }\n                };\n                let result = self.internal_storage.try_trim(trimmed_idx);\n                if result.is_ok() {\n                    for pid in &self.peers {\n                        let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: *pid,\n                            msg,\n                        }));\n                    }\n                }\n                result.map_err(|e| {\n                    *e.downcast()\n                        .expect(\"storage error while trying to trim log\")\n                })\n            }\n            _ => Err(CompactionErr::NotCurrentLeader(self.get_current_leader())),\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_try_trim",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 414,
+        "end_line": 430,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn try_trim(&mut self, idx: usize) -> StorageResult<()> {\n        let decided_idx = self.get_decided_idx();\n        let log_decided_idx = self.get_decided_idx_without_stopsign();\n        let new_compacted_idx = match idx.cmp(&decided_idx) {\n            Ordering::Less => idx,\n            Ordering::Equal => log_decided_idx,\n            Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,\n        };\n        if new_compacted_idx > self.get_compacted_idx() {\n            self.storage.write_atomically(vec![\n                StorageOp::Trim(new_compacted_idx),\n                StorageOp::SetCompactedIdx(new_compacted_idx),\n            ])?;\n            self.state_cache.compacted_idx = new_compacted_idx;\n        }\n        Ok(())\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_try_snapshot",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 432,
+        "end_line": 453,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn try_snapshot(&mut self, snapshot_idx: Option<usize>) -> StorageResult<()> {\n        let decided_idx = self.get_decided_idx();\n        let log_decided_idx = self.get_decided_idx_without_stopsign();\n        let new_compacted_idx = match snapshot_idx {\n            Some(i) => match i.cmp(&decided_idx) {\n                Ordering::Less => i,\n                Ordering::Equal => log_decided_idx,\n                Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,\n            },\n            None => log_decided_idx,\n        };\n        if new_compacted_idx > self.get_compacted_idx() {\n            let snapshot = self.create_snapshot(new_compacted_idx)?;\n            self.storage.write_atomically(vec![\n                StorageOp::Trim(new_compacted_idx),\n                StorageOp::SetCompactedIdx(new_compacted_idx),\n                StorageOp::SetSnapshot(Some(snapshot)),\n            ])?;\n            self.state_cache.compacted_idx = new_compacted_idx;\n        }\n        Ok(())\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "core_snapshot_api",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 184,
+        "end_line": 205,
+        "kind": "interface_statement",
+        "text": "    pub(crate) fn snapshot(\n        &mut self,\n        idx: Option<usize>,\n        local_only: bool,\n    ) -> Result<(), CompactionErr> {\n        let result = self.internal_storage.try_snapshot(idx);\n        if !local_only && result.is_ok() {\n            // since it is decided, it is ok even for a follower to send this\n            for pid in &self.peers {\n                let msg = PaxosMsg::Compaction(Compaction::Snapshot(idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: *pid,\n                    msg,\n                }));\n            }\n        }\n        result.map_err(|e| {\n            *e.downcast()\n                .expect(\"storage error while trying to snapshot log\")\n        })\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_stopsign_decided",
+        "file": "omnipaxos/src/storage/state_cache.rs",
+        "start_line": 123,
+        "end_line": 126,
+        "kind": "code_observation",
+        "text": "    // Returns whether a stopsign is decided\n    pub(super) fn stopsign_is_decided(&self) -> bool {\n        self.stopsign.is_some() && self.decided_idx == self.accepted_idx\n    }",
+        "content_digest": "aab4968f8afc4914329a9359253d14bb3fbb03dbb1ba8a683019eeda5d7303ac"
+      },
+      {
+        "id": "core_is_reconfigured",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 284,
+        "end_line": 290,
+        "kind": "code_observation",
+        "text": "    /// Returns whether this Sequence Paxos has been reconfigured\n    pub(crate) fn is_reconfigured(&self) -> Option<StopSign> {\n        match self.internal_storage.get_stopsign() {\n            Some(ss) if self.internal_storage.stopsign_is_decided() => Some(ss),\n            _ => None,\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_forward_proposals",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 371,
+        "end_line": 384,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn forward_proposals(&mut self, mut entries: Vec<T>) {\n        let leader = self.get_current_leader();\n        if leader > 0 && self.pid != leader {\n            let pf = PaxosMsg::ProposalForward(entries);\n            let msg = Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: leader,\n                msg: pf,\n            });\n            self.outgoing.push(msg);\n        } else {\n            self.buffered_proposals.append(&mut entries);\n        }\n    }",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "core_resend_follower",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 240,
+        "end_line": 269,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_follower(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Promise\n                match &self.cached_promise_message {\n                    Some(promise) => {\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: promise.n.pid,\n                            msg: PaxosMsg::Promise(promise.clone()),\n                        }));\n                    }\n                    None => {\n                        // Shouldn't be possible to be in prepare phase without having\n                        // cached the promise sent as a response to the prepare\n                        #[cfg(feature = \"logging\")]\n                        warn!(self.logger, \"In Prepare phase without a cached promise!\");\n                        self.state = (Role::Follower, Phase::Recover);\n                        self.send_preparereq_to_all_peers();\n                    }\n                }\n            }\n            Phase::Recover => {\n                // Resend PrepareReq\n                self.send_preparereq_to_all_peers();\n            }\n            Phase::Accept => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "core_resend_leader",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 371,
+        "end_line": 403,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn resend_messages_leader(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Accept => {\n                // Resend AcceptStopSign or StopSign's decide\n                if let Some(ss) = self.internal_storage.get_stopsign() {\n                    let decided_idx = self.internal_storage.get_decided_idx();\n                    for follower in self.leader_state.get_promised_followers() {\n                        if self.internal_storage.stopsign_is_decided() {\n                            self.send_decide(follower, decided_idx, true);\n                        } else if self.leader_state.get_accepted_idx(follower)\n                            != self.internal_storage.get_accepted_idx()\n                        {\n                            self.send_accept_stopsign(follower, ss.clone(), true);\n                        }\n                    }\n                }\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Recover => (),\n            Phase::None => (),\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "rt_egress_drop",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 237,
+        "end_line": 252,
+        "kind": "code_observation",
+        "text": "    fn drain_outgoing_buf(&mut self) {\n        let cap = self.outgoing_buf_cap();\n        trim_oldest(&mut self.outgoing_buf, cap);\n\n        let pending = std::mem::take(&mut self.outgoing_buf);\n        let mut iter = pending.into_iter();\n        for msg in iter.by_ref() {\n            match self.outgoing_tx.try_send(msg) {\n                Ok(()) => {}\n                Err(async_channel::TrySendError::Full(msg)) => {\n                    self.outgoing_buf.push(msg);\n                    break;\n                }\n                Err(async_channel::TrySendError::Closed(_)) => {\n                    // Receiver dropped — user is not draining outgoing. Discard\n                    // everything remaining; nothing left to retry against.",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_trim_oldest",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 715,
+        "end_line": 721,
+        "kind": "code_observation",
+        "text": "fn trim_oldest<M>(buf: &mut Vec<M>, cap: usize) {\n    if buf.len() > cap {\n        let excess = buf.len() - cap;\n        buf.drain(..excess);\n    }\n}\n",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      },
+      {
+        "id": "rt_egress_config_doc",
+        "file": "omnipaxos_runtime/src/handle.rs",
+        "start_line": 55,
+        "end_line": 63,
+        "kind": "document_statement",
+        "text": "    /// the *oldest* buffered messages are dropped rather than growing without\n    /// bound -- safe because OmniPaxos already tolerates lost messages via its\n    /// own resend/retry mechanisms.\n    pub max_outgoing_buffered: usize,\n}\n\nimpl Default for RuntimeConfig {\n    fn default() -> Self {\n        Self {",
+        "content_digest": "1bcd95ea113546ecda308262d393991e87e7e1afc3dfffda1151b062e2c3394b"
+      },
+      {
+        "id": "rt_dispatch_undispatched",
+        "file": "omnipaxos_runtime/src/actor.rs",
+        "start_line": 485,
+        "end_line": 520,
+        "kind": "code_observation",
+        "text": "    fn try_dispatch_undispatched(&mut self) {\n        let Some((leader, accepted)) = self.op.get_current_leader() else {\n            return;\n        };\n        if leader == self.pid && !accepted {\n            // We're leader but not yet in Accept phase — leave entries undispatched\n            // and wait for the next tick.\n            return;\n        }\n        let entries: Vec<(EntryId, T)> = self\n            .pending\n            .iter_mut()\n            .filter_map(|p| p.undispatched.take().map(|entry| (p.id, entry)))\n            .collect();\n        if leader == self.pid {\n            for (id, entry) in entries {\n                self.accept_as_leader(id, entry, None);\n            }\n        } else if !entries.is_empty() {\n            self.enqueue_outgoing(Message::AsyncRuntime(AsyncRuntimeMessage {\n                from: self.pid,\n                to: leader,\n                msg: AsyncRuntimeMsg::TaggedProposal { entries },\n            }));\n        }\n    }\n\n    fn handle_runtime_msg(&mut self, arm: AsyncRuntimeMessage<T>) {\n        match arm.msg {\n            AsyncRuntimeMsg::TaggedProposal { entries } => {\n                let cur = self.op.get_current_leader().map(|(p, _)| p);\n                if cur == Some(self.pid) {\n                    // Collect accepted assignments and reply to the origin with a\n                    // single batched `Assigned`.\n                    let from = arm.from;\n                    let assigned: Vec<(EntryId, usize)> = entries",
+        "content_digest": "1e4ee4f8d603a1b1407881807d1fff962e317eb80a735e589c9b15d907e24473"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "8124ecbeb5d1411eb7818602822db310",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@egress_drop_covers_client_msgs": "8124ecbeb5d1411eb7818602822db310-knowledge-0"
+      },
+      "effects": [
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "rt_egress_drop"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "rt_trim_oldest"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "rt_egress_config_doc"
+        },
+        {
+          "object": "sources",
+          "action": "create",
+          "target": "rt_dispatch_undispatched"
+        },
+        {
+          "object": "knowledge",
+          "action": "create",
+          "target": "@egress_drop_covers_client_msgs"
+        }
+      ]
+    },
+    "applied_operations": {
+      "submission-3f84facd1a81451882518e32ee8be535": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-3f84facd1a81451882518e32ee8be535.json"
+      },
+      "submission-93e6d663e93c42d7b68b91449efbcf31": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-93e6d663e93c42d7b68b91449efbcf31.json"
+      },
+      "submission-7862ce56b9d94e81b9351623e93f016b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7862ce56b9d94e81b9351623e93f016b.json"
+      },
+      "submission-2318deef80994e8f8c04435040988c3d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-2318deef80994e8f8c04435040988c3d.json"
+      },
+      "submission-84e0053ba3d1476391e92e2ceac40c44": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-84e0053ba3d1476391e92e2ceac40c44.json"
+      },
+      "submission-7785c7a569d24ffdbebf0f66a0642e26": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7785c7a569d24ffdbebf0f66a0642e26.json"
+      },
+      "submission-f48a2678152a46b987d08e37826d2ca5": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-f48a2678152a46b987d08e37826d2ca5.json"
+      },
+      "submission-9e2e871d737f4e6f829b8239c8cbc484": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-9e2e871d737f4e6f829b8239c8cbc484.json"
+      },
+      "submission-423b10df284a4783b577202d1d0242ba": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-423b10df284a4783b577202d1d0242ba.json"
+      },
+      "submission-8bed726f16774b8aa00007cb68becf35": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-8bed726f16774b8aa00007cb68becf35.json"
+      },
+      "submission-7991d582dc2c45ddbd753e3b5febd887": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7991d582dc2c45ddbd753e3b5febd887.json"
+      },
+      "submission-030f3832d93a40fd9b111b694d9096e6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-030f3832d93a40fd9b111b694d9096e6.json"
+      },
+      "submission-b05ed4eba0454480af172265aa519234": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-b05ed4eba0454480af172265aa519234.json"
+      },
+      "submission-ebca976895a64f3ea2f6e73be04a52fd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-ebca976895a64f3ea2f6e73be04a52fd.json"
+      },
+      "submission-7d8e38448b6343c797fbe71f989b49b8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7d8e38448b6343c797fbe71f989b49b8.json"
+      },
+      "submission-2f52908fe4724376bc2faefa2c063596": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-2f52908fe4724376bc2faefa2c063596.json"
+      },
+      "submission-ccac9eafdc404a76b13f2019eb6da8eb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-ccac9eafdc404a76b13f2019eb6da8eb.json"
+      },
+      "submission-bbacedcf13a344e18fbbe2d2fb6cb3a7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-bbacedcf13a344e18fbbe2d2fb6cb3a7.json"
+      },
+      "submission-554d14cd05aa476ca61120017bd03dcd": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-554d14cd05aa476ca61120017bd03dcd.json"
+      },
+      "submission-9cb73714a31e44fea433cb27c1d7bab7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-9cb73714a31e44fea433cb27c1d7bab7.json"
+      },
+      "submission-8afe0dcec44c440ab1c4f57ac280b9e1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-8afe0dcec44c440ab1c4f57ac280b9e1.json"
+      },
+      "submission-be0ae69c251945f891c1c9ff307608aa": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-be0ae69c251945f891c1c9ff307608aa.json"
+      },
+      "submission-eea1a9e472404dbb99c96f3f453b2419": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-eea1a9e472404dbb99c96f3f453b2419.json"
+      },
+      "submission-484c638fa4f94e68a460c9cc2ebf26c9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-484c638fa4f94e68a460c9cc2ebf26c9.json"
+      },
+      "submission-b175327d06fb4d368e1e2a79c51f55c8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-b175327d06fb4d368e1e2a79c51f55c8.json"
+      },
+      "submission-7ffd95bb6c71444186da38a8eedef922": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-7ffd95bb6c71444186da38a8eedef922.json"
+      },
+      "submission-9e443944f57644feb8abd976dc44e6cb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-9e443944f57644feb8abd976dc44e6cb.json"
+      },
+      "submission-09dbcecc828c48239e683c97347101cf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-09dbcecc828c48239e683c97347101cf.json"
+      },
+      "submission-c78f9e74184d4635afd9a929321d9483": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-c78f9e74184d4635afd9a929321d9483.json"
+      },
+      "submission-825ad7c125e5415bbc1e1f6c5d7c6bf9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-825ad7c125e5415bbc1e1f6c5d7c6bf9.json"
+      },
+      "submission-8124ecbeb5d1411eb7818602822db310": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-18_16-39-50-omnipaxos-real-run/semantic-commits/submission-8124ecbeb5d1411eb7818602822db310.json"
+      }
+    }
+  }
+}

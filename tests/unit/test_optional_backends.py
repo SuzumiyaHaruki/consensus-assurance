@@ -63,7 +63,7 @@ def test_shared_seed_identity_and_directory_boundaries(tmp_path):
     command=['cargo','test','--','--nocapture']
     expected=cargo_build.compatibility(basis,command)
     assert cargo_build.compatibility(basis,command+['--exact','one','two'])==expected
-    for field in ('source_files','source_modes','lock','tools','policy','test_target'):
+    for field in ('source_files','source_modes','lock','tools','policy','test_target','resolved_features'):
         changed=copy.deepcopy(basis);changed[field]='different'
         if field=='lock':changed[field]={'path':'Cargo.lock','digest':'different'}
         assert cargo_build.compatibility(changed,command)!=expected
@@ -139,6 +139,7 @@ def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remai
     {'execution_package':'./...'}, {'execution_package':'. ./internal/core'}, {'execution_package':'.;true'},
     {'execution_package':'example.org/other'}, {'execution_package':'internal/escape'},
     {'execution_package':'internal/core/value.go'},
+    {'features':['extra']}, {'default_features':False}, {'all_features':True},
     {'files':{'value.go':'helper.go'}}, {'files':{'go.work':'helper.go'}},
     {'files':{'internal/core/go.mod':'helper.go'}},
     {'execution_package':'internal/core','files':{'internal/core/assurance_generated_test.go':'helper.go'}},
@@ -193,6 +194,12 @@ def test_exact_test_selection_validation():
     for names in (['module::*'],['--ignored'],['module::'],['module/test']):
         with pytest.raises(ValueError):CargoBackend.test_filters(names)
     assert CargoBackend.test_filters(['module::case','control'])==['--exact','module::case','control']
+    for features in ([''],['extra','extra'],['a,b'],['a b'],['--all-features'],['a\x00b']):
+        with pytest.raises(ValueError):CargoBackend.feature_flags(features)
+    assert CargoBackend.feature_flags(['crate/extra','dep?/trace'],False,True)==[
+        '--no-default-features','--all-features','--features','crate/extra,dep?/trace']
+    for selection in ({'features':[1]},{'default_features':'false'},{'all_features':1}):
+        with pytest.raises(ValueError):Harness(kind='rust_test',source='#[test] fn measured() {}',description='Invalid selection',semantic_changes=[],**selection)
 
 
 @pytest.mark.parametrize('backend_name',['go','rust'])

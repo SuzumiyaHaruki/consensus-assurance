@@ -1,0 +1,20 @@
+I've completed this pass of the audit. Two concrete defects are reproduced on the unmodified captured source; the implementation itself is byte-identical to `../source` (only test files and notes were added).
+
+**Finding 1 — `INodeUser.ReadIndex` never wakes the execution engine** ([nodehost.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/nodehost.go:2063))
+
+`(*nodeUser).ReadIndex` enqueues the request but, unlike `NodeHost.ReadIndex` (`nodehost.go:1477-1481`) and `(*nodeUser).Propose` (`nodehost.go:2056-2060`), it never calls `setStepReady`. The request is only dispatched by the next tick (once per RTT), so a one-RTT timeout deterministically returns `RequestTimeout` on a healthy cluster, while `NodeHost.ReadIndex` with the identical timeout completes. Measured with a longer timeout: ~10–60 µs via `NodeHost.ReadIndex` versus ~7–10 ms (one RTT) via `INodeUser.ReadIndex`.
+
+Executed evidence: `TestAuditNodeUserReadIndexOneTickTimeout` failed 5/5; adding the single missing wakeup in an isolated copy (`audit/diag/`) makes the same test pass, confirming causality. The existing upstream test (`TestNodeHostNodeUserRead`, 45-RTT timeout) cannot see the delay.
+
+**Finding 2 — a candidate records a dropped ReadIndex twice** ([raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/raft.go:1998))
+
+`handleCandidateReadIndex` calls `reportDroppedReadIndex` and then appends the same `SystemCtx` again, so `pb.Update.DroppedReadIndexes` carries two identical entries for one request. The node layer happens to be idempotent here (the batch is deleted on first handling), so no client double-notification results; the raft update is still wrong. This function has 0% statement coverage upstream.
+
+Reproductions are preserved and gated behind the `dragonboat_audit` tag so the default suite is unaffected:
+
+```
+go test -tags dragonboat_no_rocksdb,dragonboat_audit -run TestAuditNodeUserReadIndexOneTickTimeout -v .
+go test -tags dragonboat_no_rocksdb,dragonboat_audit -run TestAudit -v ./internal/raft/
+```
+
+The full write-up — expected behavior and basis, necessary conditions, executed outputs, non-findings (e.g. `Update.HasUpdate` ignoring `DroppedReadIndexes`, a cosmetic shadow in `transport.Chunk.record`), coverage data, and unresolved areas — is in [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md). Baseline context: the supplied v3.3.8 tree passes its own tests (root package, all internal packages that build offline) and `-race`; `internal/transport` and the rocksdb-backed packages could not be exercised in the ordinary shell for environmental reasons.

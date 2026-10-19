@@ -1,0 +1,592 @@
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/main.rs tests/tests/audit/main.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/main.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/main.rs	2026-10-18 12:56:15.609329408 +0800
+@@ -0,0 +1,13 @@
++#![cfg_attr(feature = "bt", feature(error_generic_member_access))]
++#![cfg_attr(feature = "bt", allow(unused_features))]
++
++#[macro_use]
++#[path = "../fixtures/mod.rs"]
++mod fixtures;
++
++mod t50_snapshot_install_purge_order;
++mod t10_partial_success_none;
++mod t11_add_learner_blocking_leader_change;
++mod t11_shutdown_sm_worker;
++mod t12_apply_panic_hang;
++mod t60_quit_leader_replication;
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t10_partial_success_none.rs tests/tests/audit/t10_partial_success_none.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t10_partial_success_none.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/t10_partial_success_none.rs	2026-10-18 12:49:28.959459425 +0800
+@@ -0,0 +1,60 @@
++//! Audit-only reproduction: `AppendEntriesResponse::PartialSuccess(None)` is
++//! documented as valid when the request's `prev_log_id` is `None`, but
++//! `ReplicationHandler::update_matching()` asserts that a matching id is
++//! always `Some`.
++//!
++//! Setup is deliberately non-blocking: a single-node leader is initialized
++//! first, then a learner is added with the quota set to 0. The first
++//! AppendEntries to that learner has `prev_log_id = None`, so the test network
++//! returns `PartialSuccess(None)`.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Result;
++use openraft::Config;
++use openraft::ServerState;
++
++use crate::fixtures::init_default_ut_tracing;
++use crate::fixtures::RaftRouter;
++
++#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
++async fn partial_success_none() -> Result<()> {
++    let config = Arc::new(Config { ..Default::default() }.validate()?);
++
++    let mut router = RaftRouter::new(config.clone());
++
++    tracing::info!("--- single-node leader");
++    router.new_raft_node(0).await;
++    router.initialize(0).await?;
++    router.wait(&0, Some(Duration::from_secs(2))).state(ServerState::Leader, "n0 leader").await?;
++
++    tracing::info!("--- add learner 1 with zero AppendEntries quota");
++    router.new_raft_node(1).await;
++    router.set_append_entries_quota(Some(0));
++
++    let n0 = router.get_raft_handle(&0)?;
++    // Non-blocking: the membership add commits with the single voter while the
++    // first replication to learner 1 produces PartialSuccess(None).
++    let add_res = n0.add_learner(1, (), false).await;
++    tracing::info!(?add_res, "non-blocking add_learner result");
++
++    let stop = tokio::time::timeout(Duration::from_secs(3), async {
++        loop {
++            match n0.with_raft_state(|_| ()).await {
++                Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
++                Err(e) => return e,
++            }
++        }
++    })
++    .await;
++
++    tracing::info!(?stop, "node 0 stop state");
++    match stop {
++        Ok(e) => {
++            tracing::info!(error = %e, "node 0 stopped");
++            Ok(())
++        }
++        Err(_) => anyhow::bail!("BUG NOT REPRODUCED: node 0 did not stop"),
++    }
++}
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t11_add_learner_blocking_leader_change.rs tests/tests/audit/t11_add_learner_blocking_leader_change.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t11_add_learner_blocking_leader_change.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/t11_add_learner_blocking_leader_change.rs	2026-10-18 12:32:13.486276523 +0800
+@@ -0,0 +1,82 @@
++//! Audit-only probe: `add_learner(blocking=true)` is documented to block
++//! until the learner is up to date. Its wait predicate treats a leadership
++//! change (metrics.replication becomes None) as a successful stop, so it may
++//! return Ok while the learner has not received any logs.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Result;
++use maplit::btreeset;
++use openraft::Config;
++use openraft::LogIdOptionExt;
++use openraft::ServerState;
++
++use crate::fixtures::init_default_ut_tracing;
++use crate::fixtures::RaftRouter;
++
++#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
++async fn add_learner_blocking_leader_change() -> Result<()> {
++    let config = Arc::new(
++        Config {
++            election_timeout_min: 300,
++            election_timeout_max: 400,
++            heartbeat_interval: 50,
++            ..Default::default()
++        }
++        .validate()?,
++    );
++
++    let mut router = RaftRouter::new(config.clone());
++
++    let log_index = router.new_cluster(btreeset! {0, 1}, btreeset! {}).await?;
++    tracing::info!(log_index, "cluster created");
++
++    // Learner 2 never answers AppendEntries; it cannot catch up.
++    router.set_rpc_blocked(2, true);
++
++    // Let node 0's own vote lease expire so it will grant node 1's campaign.
++    tokio::time::sleep(Duration::from_millis(600)).await;
++
++    let n0 = router.get_raft_handle(&0)?;
++    let add = tokio::spawn(async move { n0.add_learner(2, (), true).await });
++
++    // Wait for the add-membership log to commit before changing leadership.
++    for _ in 0..100 {
++        let m = router.get_raft_handle(&0)?.metrics().borrow().clone();
++        if m.membership_config.membership().get_node(&2).is_some() {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    {
++        let m = router.get_raft_handle(&0)?.metrics().borrow().clone();
++        assert!(m.membership_config.membership().get_node(&2).is_some(), "learner 2 was not added");
++    }
++
++    tracing::info!("--- force node 1 to campaign while add_learner is waiting");
++    let n1 = router.get_raft_handle(&1)?;
++    n1.trigger().elect().await?;
++    router.wait(&1, Some(Duration::from_secs(2))).state(ServerState::Leader, "n1 leader").await?;
++
++    let res = tokio::time::timeout(Duration::from_millis(500), add).await;
++    tracing::info!(?res, "add_learner result after leadership change");
++
++    let add_res = res.expect("add_learner should have stopped")?;
++    assert!(add_res.is_ok(), "add_learner returned an error: {:?}", add_res);
++
++    // The learner is still blocked and has not received the cluster log.
++    let m1 = router.get_raft_handle(&1)?.metrics().borrow().clone();
++    let matching = m1.replication.as_ref().and_then(|r| r.get(&2)).cloned();
++    tracing::info!(?matching, ?log_index, "learner 2 replication state at add_learner return");
++    eprintln!(
++        "add_learner returned Ok after leadership change; learner-2 matching={:?}, cluster log_index={}",
++        matching, log_index
++    );
++    assert!(
++        matching.map(|x| x.index().unwrap_or(0)).unwrap_or(0) < log_index,
++        "learner 2 unexpectedly caught up"
++    );
++
++    Ok(())
++}
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t11_shutdown_sm_worker.rs tests/tests/audit/t11_shutdown_sm_worker.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t11_shutdown_sm_worker.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/t11_shutdown_sm_worker.rs	2026-10-18 12:54:13.799253113 +0800
+@@ -0,0 +1,95 @@
++//! Audit-only probe: `Raft::shutdown()` waits for RaftCore, but RaftCore owns
++//! the state-machine worker only through a detached JoinHandle. If the worker
++//! is in the middle of an install/apply, it can finish after `shutdown()`
++//! returns and modify the store.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Result;
++use openraft::storage::Adaptor;
++use openraft::storage::RaftStateMachine;
++use openraft::Config;
++use openraft::LogIdOptionExt;
++use openraft::SnapshotPolicy;
++use openraft_memstore::BlockOperation;
++use openraft_memstore::MemStore;
++use openraft_memstore::TypeConfig;
++
++use crate::fixtures::init_default_ut_tracing;
++use crate::fixtures::RaftRouter;
++
++#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
++async fn shutdown_does_not_wait_for_sm_worker() -> Result<()> {
++    let config = Arc::new(
++        Config {
++            snapshot_policy: SnapshotPolicy::LogsSinceLast(1),
++            max_in_snapshot_log_to_keep: 0,
++            purge_batch_size: 1,
++            enable_heartbeat: false,
++            election_timeout_min: 3_000,
++            election_timeout_max: 4_000,
++            ..Default::default()
++        }
++        .validate()?,
++    );
++
++    let mut router = RaftRouter::new(config.clone());
++    router.new_raft_node(0).await;
++    router.initialize(0).await?;
++    router.wait(&0, Some(Duration::from_secs(3))).state(openraft::ServerState::Leader, "n0 leader").await?;
++
++    let log_index = router.client_request_many(0, "audit", 5).await?;
++    let n0 = router.get_raft_handle(&0)?;
++    n0.trigger().snapshot().await?;
++
++    let mut snapshot = None;
++    for _ in 0..200 {
++        if let Some(s) = n0.get_snapshot().await? {
++            if s.meta.last_log_id.index() >= Some(log_index) {
++                snapshot = Some(s);
++                break;
++            }
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    let snapshot = snapshot.expect("node 0 did not build the snapshot");
++    let snap_last = snapshot.meta.last_log_id.expect("snapshot last log id");
++    let leader_vote = n0.with_raft_state(|st| *st.vote_ref()).await?;
++
++    let inner = Arc::new(MemStore::default());
++    let (log_store, _unused_sm) = Adaptor::<TypeConfig, Arc<MemStore>>::new(inner.clone());
++    let (sm, _unused_log) = Adaptor::<TypeConfig, Arc<MemStore>>::new(inner.clone());
++    let mut read_sm = sm.clone();
++    let before = read_sm.applied_state().await?.0;
++
++    log_store
++        .clone()
++        .storage_mut()
++        .await
++        .set_blocking(BlockOperation::InstallSnapshot, Duration::from_secs(1));
++
++    let n3 = openraft::Raft::new(3, config.clone(), router.clone(), log_store, sm.clone()).await?;
++    let n3_shutdown = n3.clone();
++    let install = tokio::spawn(async move { n3.install_full_snapshot(leader_vote, snapshot).await });
++
++    // Let the worker enter the delayed install.
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    n3_shutdown.shutdown().await?;
++    tracing::info!("shutdown returned");
++
++    // The worker was still sleeping; it now completes the install.
++    tokio::time::sleep(Duration::from_millis(1_200)).await;
++    let after = sm.clone().applied_state().await?.0;
++    tracing::info!(?before, ?after, ?snap_last, "SM state after shutdown");
++    eprintln!("SM applied after shutdown: before={:?}, after={:?}, snapshot={:?}", before, after, snap_last);
++    assert_eq!(None, before, "precondition: empty state machine");
++    assert_eq!(
++        Some(snap_last),
++        after,
++        "the state-machine worker completed install after shutdown returned"
++    );
++
++    install.abort();
++    Ok(())
++}
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t12_apply_panic_hang.rs tests/tests/audit/t12_apply_panic_hang.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t12_apply_panic_hang.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/t12_apply_panic_hang.rs	2026-10-18 12:56:15.751335335 +0800
+@@ -0,0 +1,42 @@
++//! Audit-only probe: a panic in `RaftStateMachine::apply()` kills the
++//! state-machine worker, but RaftCore is not notified. The client responder
++//! for the entry being applied is held in `client_resp_channels`, so
++//! `client_write()` can wait forever while the core remains alive.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Result;
++use maplit::btreeset;
++use openraft::Config;
++
++use crate::fixtures::init_default_ut_tracing;
++use crate::fixtures::RaftRouter;
++
++#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
++async fn apply_panic_hangs_client_write() -> Result<()> {
++    let config = Arc::new(Config { enable_heartbeat: false, ..Default::default() }.validate()?);
++    let mut router = RaftRouter::new(config);
++
++    let log_index = router.new_cluster(btreeset! {0}, btreeset! {}).await?;
++    tracing::info!(log_index, "single-node cluster ready");
++
++    let (log_store, _sm) = router.get_storage_handle(&0)?;
++    log_store.storage_mut().await.set_panic_on_apply(true);
++
++    let write = tokio::time::timeout(Duration::from_secs(2), router.client_request_many(0, "audit", 1)).await;
++    tracing::info!(?write, "client write with apply panic");
++
++    let n0 = router.get_raft_handle(&0)?;
++    let core = tokio::time::timeout(Duration::from_secs(1), n0.with_raft_state(|_| ())).await;
++    tracing::info!(?core, "core state after apply panic");
++
++    eprintln!("apply panic: client_write={:?}, core={:?}", write.is_err(), core);
++    assert!(write.is_err(), "expected client_write to hang after the apply panic");
++    assert!(
++        matches!(core, Ok(Ok(()))),
++        "expected RaftCore to remain alive while the client responder is held"
++    );
++
++    Ok(())
++}
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t50_snapshot_install_purge_order.rs tests/tests/audit/t50_snapshot_install_purge_order.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t50_snapshot_install_purge_order.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/t50_snapshot_install_purge_order.rs	2026-10-18 12:24:48.504123249 +0800
+@@ -0,0 +1,145 @@
++//! Audit-only reproduction: snapshot install purges logs before the state
++//! machine install has completed, leaving an unrecoverable persisted state if
++//! the node crashes in that window.
++//!
++//! The install is held pending with a test-only hook in `memstore`
++//! (`BlockOperation::InstallSnapshot`). The log store and state machine use
++//! separate adaptors/locks so the log store can be inspected while the state
++//! machine install is blocked.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Result;
++use openraft::storage::Adaptor;
++use openraft::storage::RaftLogStorage;
++use openraft::storage::RaftStateMachine;
++use openraft::Config;
++use openraft::LogIdOptionExt;
++use openraft::RaftStorage;
++use openraft::SnapshotPolicy;
++use openraft_memstore::BlockOperation;
++use openraft_memstore::MemStore;
++use openraft_memstore::TypeConfig;
++
++use crate::fixtures::init_default_ut_tracing;
++use crate::fixtures::RaftRouter;
++
++#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
++async fn snapshot_install_purges_before_install_completes() -> Result<()> {
++    let config = Arc::new(
++        Config {
++            snapshot_policy: SnapshotPolicy::LogsSinceLast(1),
++            max_in_snapshot_log_to_keep: 0,
++            purge_batch_size: 1,
++            enable_heartbeat: false,
++            election_timeout_min: 3_000,
++            election_timeout_max: 4_000,
++            ..Default::default()
++        }
++        .validate()?,
++    );
++
++    let mut router = RaftRouter::new(config.clone());
++
++    tracing::info!("--- single voter 0, produce a snapshot");
++    router.new_raft_node(0).await;
++    router.initialize(0).await?;
++    router.wait(&0, Some(Duration::from_secs(3))).state(openraft::ServerState::Leader, "n0 leader").await?;
++
++    let log_index = router.client_request_many(0, "audit", 5).await?;
++    let n0 = router.get_raft_handle(&0)?;
++    n0.trigger().snapshot().await?;
++
++    let mut snapshot = None;
++    for _ in 0..200 {
++        if let Some(s) = n0.get_snapshot().await? {
++            if s.meta.last_log_id.index() >= Some(log_index) {
++                snapshot = Some(s);
++                break;
++            }
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    let snapshot = snapshot.expect("node 0 did not build the expected snapshot");
++    let snap_last = snapshot.meta.last_log_id.expect("snapshot must contain a last log id");
++    tracing::info!(?snap_last, "got snapshot to install");
++
++    let leader_vote = n0.with_raft_state(|st| *st.vote_ref()).await?;
++    let persisted_vote = leader_vote;
++
++    tracing::info!("--- empty node 3 with separate log-store and state-machine adaptors");
++    let inner = Arc::new(MemStore::default());
++    let (log_store, _unused_sm) = Adaptor::<TypeConfig, Arc<MemStore>>::new(inner.clone());
++    let (sm, _unused_log) = Adaptor::<TypeConfig, Arc<MemStore>>::new(inner.clone());
++
++    log_store
++        .clone()
++        .storage_mut()
++        .await
++        .set_blocking(BlockOperation::InstallSnapshot, Duration::from_secs(10));
++
++    let n3 = openraft::Raft::new(3, config.clone(), router.clone(), log_store.clone(), sm.clone()).await?;
++
++    let mut read_sm = sm.clone();
++    let pre_install_applied = read_sm.applied_state().await?.0;
++    tracing::info!(?pre_install_applied, "node 3 applied before install");
++
++    let install = tokio::spawn(async move { n3.install_full_snapshot(leader_vote, snapshot).await });
++
++    // The log purge is a RaftCore command; it does not wait for the state
++    // machine install command to finish.
++    let mut log_reader = log_store.clone();
++    let mut purged = None;
++    for _ in 0..500 {
++        let st = log_reader.get_log_state().await?;
++        if st.last_purged_log_id == Some(snap_last) {
++            purged = st.last_purged_log_id;
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    let purged = purged.expect("follower log was not purged");
++    assert_eq!(snap_last, purged, "log purge should have reached the snapshot");
++
++    // The SM install is still in progress: its adapter lock is held by the
++    // blocked `install_snapshot()` call.
++    let mut blocked_sm = sm.clone();
++    let sm_read = tokio::time::timeout(Duration::from_millis(300), async move { blocked_sm.applied_state().await }).await;
++    assert!(
++        sm_read.is_err(),
++        "install must still be pending when the log purge has already been persisted"
++    );
++    tracing::info!(?purged, ?pre_install_applied, "PURGE PERSISTED WHILE SM INSTALL IS PENDING");
++
++    // The state left by a crash at this point: the log store is purged up to
++    // the snapshot, while the state machine is still at its pre-install state
++    // and does not yet have the new snapshot. Re-create that persisted state
++    // in a fresh store and start a node from it.
++    tracing::info!("--- restart from the mid-install persisted state");
++    let crash_store = Arc::new(MemStore::default());
++    let mut crash_log_store = crash_store.clone();
++    crash_log_store.purge_logs_upto(snap_last).await?;
++    // The follower persisted the leader's vote before starting the install.
++    crash_log_store.save_vote(&persisted_vote).await?;
++
++    let (crash_log, _unused_crash_sm) = Adaptor::<TypeConfig, Arc<MemStore>>::new(crash_store.clone());
++    let (crash_sm, _unused_crash_log) = Adaptor::<TypeConfig, Arc<MemStore>>::new(crash_store.clone());
++
++    let restarted = openraft::Raft::new(4, config, router.clone(), crash_log, crash_sm).await;
++    tracing::info!(restart_ok = restarted.is_ok(), "restart with the mid-install state");
++    let restarted = restarted?;
++
++    let res = tokio::time::timeout(Duration::from_secs(3), restarted.with_raft_state(|_| ())).await;
++    tracing::info!(?res, "restarted node state access");
++    match res {
++        Ok(Err(e)) => {
++            tracing::info!(error = %e, "restarted node reported a fatal error");
++        }
++        Ok(Ok(())) => panic!("BUG NOT REPRODUCED: restarted node served state despite purge-before-install"),
++        Err(_) => panic!("restarted node hung on state access"),
++    }
++
++    install.abort();
++    Ok(())
++}
+diff -ruN /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t60_quit_leader_replication.rs tests/tests/audit/t60_quit_leader_replication.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/tests/tests/audit/t60_quit_leader_replication.rs	1970-01-01 08:00:00.000000000 +0800
++++ tests/tests/audit/t60_quit_leader_replication.rs	2026-10-18 12:51:03.035340155 +0800
+@@ -0,0 +1,127 @@
++//! Audit-only probe: `Command::QuitLeader` is documented as "No longer a
++//! leader. Clean up leader's data.", but the runtime only clears
++//! `leader_data`; the replication handles in `self.replications` remain.
++//!
++//! To observe it externally, keep a chunked snapshot from the old leader to a
++//! learner in flight, force a leadership change, and count InstallSnapshot
++//! RPCs sent by the deposed leader after it stepped down.
++
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++
++use anyhow::Result;
++use anyerror::AnyError;
++use maplit::btreeset;
++use openraft::Config;
++use openraft::error::NetworkError;
++use openraft::ServerState;
++use openraft::SnapshotPolicy;
++
++use crate::fixtures::init_default_ut_tracing;
++use crate::fixtures::RaftRouter;
++use openraft::RPCTypes;
++
++#[async_entry::test(worker_threads = 8, init = "init_default_ut_tracing()", tracing_span = "debug")]
++async fn quit_leader_keeps_snapshot_replication() -> Result<()> {
++    let config = Arc::new(
++        Config {
++            snapshot_policy: SnapshotPolicy::LogsSinceLast(1),
++            max_in_snapshot_log_to_keep: 0,
++            purge_batch_size: 1,
++            snapshot_max_chunk_size: 1,
++            max_payload_entries: 3,
++            heartbeat_interval: 50,
++            election_timeout_min: 300,
++            election_timeout_max: 400,
++            ..Default::default()
++        }
++        .validate()?,
++    );
++
++    let mut router = RaftRouter::new(config.clone());
++
++    tracing::info!("--- 2 voters, 0 is leader");
++    let log_index = router.new_cluster(btreeset! {0, 1}, btreeset! {}).await?;
++
++    tracing::info!(log_index, "--- write logs, snapshot and purge the leader log");
++    let log_index = router.client_request_many(0, "audit", 200).await?;
++    let n0 = router.get_raft_handle(&0)?;
++    n0.trigger().snapshot().await?;
++
++    for _ in 0..200 {
++        let m = n0.metrics().borrow().clone();
++        if m.snapshot.as_ref().map(|x| x.index).unwrap_or(0) >= log_index
++            && m.purged.as_ref().map(|x| x.index).unwrap_or(0) >= log_index
++        {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    let m0 = n0.metrics().borrow().clone();
++    tracing::info!(snapshot = ?m0.snapshot, purged = ?m0.purged, log_index, "leader snapshot/purge state");
++    assert!(m0.purged.as_ref().map(|x| x.index).unwrap_or(0) >= log_index, "leader log was not purged");
++
++    // Record every InstallSnapshot RPC by (from, target) and slow each chunk so
++    // the snapshot is still in flight when leadership changes.
++    //
++    // Partition the new leader (1) from learner 2 so the learner keeps the old
++    // vote and the deposed leader's in-flight snapshot can keep making
++    // progress. The old leader (0) can still reach learner 2.
++    router.set_rpc_pre_hook(RPCTypes::AppendEntries, move |_router, _req, from_id, target| {
++        if from_id == 1 && target == 2 {
++            return Err(NetworkError::new(&AnyError::error("new leader cannot reach learner 2")).into());
++        }
++        Ok(())
++    });
++
++    let calls = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
++    let calls_hook = calls.clone();
++    router.set_rpc_pre_hook(RPCTypes::InstallSnapshot, move |_router, _req, from_id, target| {
++        if from_id == 1 && target == 2 {
++            return Err(
++                NetworkError::new(&AnyError::error("new leader cannot send snapshot to learner 2")).into(),
++            );
++        }
++        calls_hook.lock().unwrap().push((from_id, target));
++        std::thread::sleep(Duration::from_millis(1));
++        Ok(())
++    });
++
++    tracing::info!("--- add learner 2 behind the purged log; it must receive a snapshot");
++    router.new_raft_node(2).await;
++    n0.add_learner(2, (), false).await?;
++
++    for _ in 0..200 {
++        if calls.lock().unwrap().iter().any(|(from, to)| *from == 0 && *to == 2) {
++            break;
++        }
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    let first = calls.lock().unwrap().iter().any(|(from, to)| *from == 0 && *to == 2);
++    assert!(first, "leader 0 did not start sending a snapshot to learner 2");
++
++    // Let node 0's own vote lease expire, then force node 1 to campaign.
++    tokio::time::sleep(Duration::from_millis(600)).await;
++    let n1 = router.get_raft_handle(&1)?;
++    n1.trigger().elect().await?;
++    router.wait(&1, Some(Duration::from_secs(2))).state(ServerState::Leader, "n1 leader").await?;
++    router.wait(&0, Some(Duration::from_secs(2))).state(ServerState::Follower, "n0 follower").await?;
++
++    let before = calls.lock().unwrap().len();
++    tokio::time::sleep(Duration::from_millis(2_000)).await;
++    let post: Vec<(u64, u64)> = calls.lock().unwrap()[before..].to_vec();
++    let post_old: Vec<(u64, u64)> = post.into_iter().filter(|(from, to)| *from == 0 && *to == 2).collect();
++    tracing::info!(?post_old, "InstallSnapshot RPCs from deposed leader 0 after step-down");
++    eprintln!(
++        "deposed leader 0 sent {} InstallSnapshot chunks after step-down; sample={:?}",
++        post_old.len(),
++        &post_old[..post_old.len().min(8)]
++    );
++    assert!(
++        !post_old.is_empty(),
++        "deposed leader 0 sent no snapshot chunks after stepping down"
++    );
++
++    Ok(())
++}

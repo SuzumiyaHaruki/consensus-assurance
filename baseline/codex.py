@@ -101,6 +101,7 @@ def decode(folder, result, session_id=None):
     identity = identities[-1] if identities else session_id
     completed = [e for e in events if e.get("type") == "turn.completed"]
     diagnostic = codex_diagnostic(events)
+    # Baseline results are file-backed; a completed turn need not include final text.
     final_path = folder / "final.txt"
     final = final_path.read_text(errors="replace") if final_path.is_file() else ""
     tools = [e["item"] for e in events if e.get("type") == "item.completed"
@@ -131,7 +132,7 @@ def decode(folder, result, session_id=None):
         return result
     if any(x != identity for x in identities) or session_id and identity != session_id:
         result.update(status="session_mismatch", reason="Exact session changed; no replacement session allowed")
-    elif not completed or not final:
+    elif not completed:
         result.update(status="external_blocker_needs_review", reason="Incomplete or unrecognized native completion")
     elif final.lstrip().startswith("RUN_BLOCKED:"):
         result.update(status="run_blocked", reason=final)

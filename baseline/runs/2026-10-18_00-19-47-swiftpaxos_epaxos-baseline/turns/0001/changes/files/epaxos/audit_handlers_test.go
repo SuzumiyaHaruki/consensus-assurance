@@ -1,0 +1,577 @@
+package epaxos
+
+import (
+	"bufio"
+	"bytes"
+	"os"
+	"sync"
+	"testing"
+
+	"github.com/imdea-software/swiftpaxos/config"
+	"github.com/imdea-software/swiftpaxos/dlog"
+	"github.com/imdea-software/swiftpaxos/replica"
+	"github.com/imdea-software/swiftpaxos/replica/defs"
+	"github.com/imdea-software/swiftpaxos/state"
+)
+
+// auditCaptureReply installs a writer for peer and returns the bytes that the
+// handler sends to that peer.
+func auditCaptureReply(r *Replica, peer int32) (*bytes.Buffer, *bufio.Writer) {
+	buf := new(bytes.Buffer)
+	w := bufio.NewWriter(buf)
+	r.PeerWriters[peer] = w
+	return buf, w
+}
+
+// auditReplica builds an EPaxos replica without starting the network loop, so
+// handlers can be driven synchronously from a test.  All outbound RPCs are
+// no-ops because PeerWriters contains nil writers.
+func auditReplica(n int, id int32, slots int) *Replica {
+	rr := &replica.Replica{
+		Logger:             dlog.New("", false),
+		M:                  sync.Mutex{},
+		N:                  n,
+		F:                  (n - 1) / 2,
+		Id:                 id,
+		PeerAddrList:       make([]string, n),
+		PeerWriters:        make([]*bufio.Writer, n),
+		PeerReaders:        make([]*bufio.Reader, n),
+		Alive:              make([]bool, n),
+		PreferredPeerOrder: make([]int32, n),
+		State:              state.InitState(),
+		Stats:              &defs.Stats{M: make(map[string]int)},
+		ProposeChan:        make(chan *defs.GPropose, 8),
+		Thrifty:            true,
+		Exec:               true,
+		Dreply:             true,
+	}
+	for i := 0; i < n; i++ {
+		rr.Alive[i] = true
+		rr.PreferredPeerOrder[i] = int32((int(id) + 1 + i) % n)
+	}
+
+	r := &Replica{
+		Replica:            rr,
+		InstanceSpace:      make([][]*Instance, n),
+		crtInstance:        make([]int32, n),
+		CommittedUpTo:      make([]int32, n),
+		ExecedUpTo:         make([]int32, n),
+		conflicts:          make([]map[state.Key]*InstPair, n),
+		maxSeqPerKey:       make(map[state.Key]int32),
+		clientMutex:        new(sync.Mutex),
+		instancesToRecover: make(chan *instanceId, 8),
+		IsLeader:           true,
+		maxRecvBallot:      -1,
+	}
+	for i := 0; i < n; i++ {
+		r.InstanceSpace[i] = make([]*Instance, slots)
+		r.crtInstance[i] = -1
+		r.CommittedUpTo[i] = -1
+		r.ExecedUpTo[i] = -1
+		r.conflicts[i] = make(map[state.Key]*InstPair)
+	}
+	r.exec = &Exec{r}
+	return r
+}
+
+func auditDeps(n int, vals ...int32) []int32 {
+	d := make([]int32, n)
+	for i := range d {
+		d[i] = -1
+	}
+	for i := 0; i < len(vals) && i < n; i++ {
+		d[i] = vals[i]
+	}
+	return d
+}
+
+// An acceptor that receives an Accept message must record ACCEPTED.  This is
+// the state that handlePrepare reports as case 2 of the recovery algorithm.
+func TestAuditAcceptMarksInstanceAccepted(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	r.handleAccept(&Accept{LeaderId: 1, Replica: 1, Instance: 0, Ballot: 0,
+		Seq: 4, Deps: auditDeps(5)})
+
+	inst := r.InstanceSpace[1][0]
+	if inst == nil {
+		t.Fatal("instance was not created")
+	}
+	t.Logf("after Accept: Status=%d bal=%d vbal=%d Seq=%d Cmds=%v",
+		inst.Status, inst.bal, inst.vbal, inst.Seq, inst.Cmds)
+	if inst.Status != ACCEPTED {
+		t.Errorf("accepted instance Status=%v, want ACCEPTED (%v)", inst.Status, ACCEPTED)
+	}
+
+	// The same state is what a subsequent Prepare reports to a recovering
+	// leader.  Capture and decode that reply over the wire.
+	buf, _ := auditCaptureReply(r, 1)
+	r.handlePrepare(&Prepare{LeaderId: 1, Replica: 1, Instance: 0, Ballot: 0})
+	raw := buf.Bytes()
+	if len(raw) < 2 {
+		t.Fatalf("no PrepareReply was sent (got %d bytes)", len(raw))
+	}
+	reply := &PrepareReply{}
+	if err := reply.Unmarshal(bytes.NewReader(raw[1:])); err != nil {
+		t.Fatalf("decode PrepareReply: %v", err)
+	}
+	t.Logf("PrepareReply for the accepted instance: Status=%d VBallot=%d Command=%v Seq=%d",
+		reply.Status, reply.VBallot, reply.Command, reply.Seq)
+	if reply.Status != ACCEPTED {
+		t.Errorf("PrepareReply.Status=%v, want ACCEPTED", reply.Status)
+	}
+}
+
+// TryPreAccept is the recovery path that pre-accepts a value at a new ballot.
+// A successful responder must report that ballot as VBallot; otherwise the
+// recovering leader's handleTryPreAcceptReply treats the reply as a nack.
+func TestAuditTryPreAcceptRecordsVBallot(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	const ballot = int32(7)
+	buf, _ := auditCaptureReply(r, 3)
+	r.handleTryPreAccept(&TryPreAccept{LeaderId: 3, Replica: 3, Instance: 0,
+		Ballot: ballot, Command: []state.Command{{Op: state.PUT, K: 1, V: state.Value("x")}},
+		Seq: 0, Deps: auditDeps(5)})
+
+	inst := r.InstanceSpace[3][0]
+	if inst == nil {
+		t.Fatal("instance was not created")
+	}
+	t.Logf("after TryPreAccept: Status=%d bal=%d vbal=%d", inst.Status, inst.bal, inst.vbal)
+	if inst.Status != PREACCEPTED {
+		t.Fatalf("Status=%v, want PREACCEPTED", inst.Status)
+	}
+	if inst.vbal != ballot {
+		t.Errorf("vbal=%d, want %d; reply would carry a VBallot that does not equal the leader's lastTriedBallot", inst.vbal, ballot)
+	}
+
+	raw := buf.Bytes()
+	if len(raw) < 2 {
+		t.Fatalf("no TryPreAcceptReply was sent (got %d bytes)", len(raw))
+	}
+	reply := &TryPreAcceptReply{}
+	if err := reply.Unmarshal(bytes.NewReader(raw[1:])); err != nil {
+		t.Fatalf("decode TryPreAcceptReply: %v", err)
+	}
+	t.Logf("TryPreAcceptReply: Ballot=%d VBallot=%d Status=%d", reply.Ballot, reply.VBallot, reply.ConflictStatus)
+	if reply.VBallot != ballot {
+		t.Errorf("reply VBallot=%d, want %d; handleTryPreAcceptReply requires equality to count acceptance", reply.VBallot, ballot)
+	}
+}
+
+// A reply with a newer ballot must count as a nack and eventually force a new
+// prepare.  In handleAcceptReply the "newer ballot" branch is unreachable
+// because the preceding != check returns first.
+func TestAuditAcceptReplyCountsHigherBallotAsNack(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	inst := r.newInstance(1, 0, []state.Command{{Op: state.PUT, K: 1, V: state.Value("x")}},
+		0, 0, PREACCEPTED, 0, auditDeps(5))
+	inst.Status = ACCEPTED
+	inst.lb = r.newLeaderBookkeeping(nil, auditDeps(5), auditDeps(5), auditDeps(5), 0, inst.Cmds, ACCEPTED, 0)
+	r.InstanceSpace[1][0] = inst
+
+	r.handleAcceptReply(&AcceptReply{Replica: 1, Instance: 0, Ballot: 1})
+	t.Logf("after higher-ballot AcceptReply: nacks=%d lastTriedBallot=%d",
+		inst.lb.nacks, inst.lb.lastTriedBallot)
+	if inst.lb.nacks == 0 {
+		t.Errorf("higher-ballot reply was silently discarded: nacks=%d, so the leader never re-prepares", inst.lb.nacks)
+	}
+}
+
+// A PreAccept for instance (replica, instance) must update that instance.
+// When a recovering leader (LeaderId != Replica) retries PreAccept for an
+// instance already accepted without a stored command, the current code writes
+// the command into the leader's row instead.
+func TestAuditPreAcceptStoresCommandInAddressedInstance(t *testing.T) {
+	r := auditReplica(5, 1, 64)
+	// Unrelated instance in the leader's row at the same instance number.
+	other := r.newInstance(3, 0, []state.Command{{Op: state.PUT, K: 99, V: state.Value("keep")}},
+		0, 0, COMMITTED, 1, auditDeps(5))
+	r.InstanceSpace[3][0] = other
+	// Target instance: accepted metadata but no command stored locally.
+	target := r.newInstance(0, 0, nil, 0, 0, ACCEPTED, 2, auditDeps(5))
+	r.InstanceSpace[0][0] = target
+
+	r.handlePreAccept(&PreAccept{LeaderId: 3, Replica: 0, Instance: 0,
+		Ballot: 0, Command: []state.Command{{Op: state.PUT, K: 1, V: state.Value("new")}},
+		Seq: 2, Deps: auditDeps(5)})
+
+	if target.Cmds != nil {
+		t.Logf("target now has Cmds=%v", target.Cmds)
+	} else {
+		t.Logf("target Cmds is still nil")
+	}
+	t.Logf("unrelated [3][0] Cmds=%v", other.Cmds)
+	if len(other.Cmds) > 0 && other.Cmds[0].K == 1 {
+		t.Errorf("PreAccept for replica 0 wrote its command into instance [leader=3][0], overwriting unrelated command %v", other.Cmds)
+	}
+	if target.Cmds == nil {
+		t.Errorf("PreAccept for replica 0 did not store the command in the addressed instance [0][0]")
+	}
+}
+
+// If the leader's row does not already contain the same instance number, the
+// out-of-place store above dereferences a nil *Instance and crashes the
+// replica.
+func TestAuditPreAcceptOutOfPlaceStoreDoesNotPanic(t *testing.T) {
+	r := auditReplica(5, 1, 64)
+	target := r.newInstance(0, 0, nil, 0, 0, ACCEPTED, 2, auditDeps(5))
+	r.InstanceSpace[0][0] = target
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("handlePreAccept panicked because instance [leader=3][0] was nil: %v", p)
+		}
+	}()
+	r.handlePreAccept(&PreAccept{LeaderId: 3, Replica: 0, Instance: 0,
+		Ballot: 0, Command: []state.Command{{Op: state.PUT, K: 1, V: state.Value("new")}},
+		Seq: 2, Deps: auditDeps(5)})
+}
+
+// The synthetic local PrepareReply that starts recovery should report the
+// value ballot of the locally stored value, not the new prepare ballot.
+func TestAuditRecoveryLocalReplyKeepsValueBallot(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	r.IsLeader = false
+	inst := r.newInstance(2, 0, []state.Command{{Op: state.PUT, K: 1, V: state.Value("x")}},
+		5, 2, ACCEPTED, 3, auditDeps(5))
+	r.InstanceSpace[2][0] = inst
+	oldBal, oldVBal := inst.bal, inst.vbal
+
+	r.startRecoveryForInstance(2, 0)
+	lb := inst.lb
+	if len(lb.prepareReplies) != 1 {
+		t.Fatalf("prepareReplies=%d, want 1", len(lb.prepareReplies))
+	}
+	reply := lb.prepareReplies[0]
+	t.Logf("old bal=%d old vbal=%d new lastTriedBallot=%d local reply Ballot=%d VBallot=%d Status=%d",
+		oldBal, oldVBal, lb.lastTriedBallot, reply.Ballot, reply.VBallot, reply.Status)
+	if reply.VBallot == lb.lastTriedBallot {
+		t.Errorf("local reply VBallot=%d equals the new prepare ballot %d; the pre-recovery value ballot 5 was overwritten",
+			reply.VBallot, lb.lastTriedBallot)
+	}
+}
+
+// Safety consequence of the local VBallot overwrite: the synthetic local
+// PrepareReply reports the new prepare ballot as its value ballot even though
+// its status is NONE and it carries no command.  That reply then masks every
+// remote reply at a real (lower) value ballot, and recovery phase 1 restarts
+// with NOOP instead of the value a quorum already committed.
+func TestAuditRecoveryDoesNotDiscardCommittedRemoteValue(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	r.IsLeader = true
+	r.maxRecvBallot = 9 // makeBallot => 10
+
+	// No local copy of instance 2.0.
+	r.startRecoveryForInstance(2, 0)
+	inst := r.InstanceSpace[2][0]
+	if inst == nil || inst.lb == nil {
+		t.Fatal("recovery did not create local bookkeeping")
+	}
+	ballot := inst.lb.lastTriedBallot
+	cmds := []state.Command{{Op: state.PUT, K: 42, V: state.Value("committed")}}
+	for _, acceptor := range []int32{3, 4} {
+		r.handlePrepareReply(&PrepareReply{
+			AcceptorId: acceptor,
+			Replica:    2,
+			Instance:   0,
+			Ballot:     ballot,
+			VBallot:    7,
+			Status:     COMMITTED,
+			Command:    cmds,
+			Seq:        4,
+			Deps:       auditDeps(5),
+		})
+	}
+
+	inst = r.InstanceSpace[2][0]
+	if inst.Status == COMMITTED && len(inst.Cmds) > 0 && inst.Cmds[0].K == 42 {
+		t.Logf("recovery preserved the committed command")
+		return
+	}
+	t.Errorf("recovery discarded the committed command: Status=%v Cmds=%v (phase-1 result)", inst.Status, inst.Cmds)
+}
+
+// Even without the synthetic local reply, PrepareReply.VBallot is not encoded
+// on the wire.  A stale PREACCEPTED value from a later-arriving reply then
+// replaces an ACCEPTED value from an earlier reply at a higher value ballot.
+func TestAuditPrepareRepliesPreserveValueBallotOrdering(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	const ballot = int32(10)
+	inst := r.newInstance(2, 0, nil, ballot, ballot, NONE, -1, auditDeps(5))
+	inst.lb = r.newLeaderBookkeeping(nil, auditDeps(5), auditDeps(5), auditDeps(5), ballot, nil, NONE, -1)
+	inst.lb.preparing = true
+	inst.lb.leaderResponded = true
+	inst.lb.ballot = -1
+	r.InstanceSpace[2][0] = inst
+	// The recovering leader's own NONE reply (normally appended by
+	// startRecoveryForInstance); it carries no value.
+	inst.lb.prepareReplies = append(inst.lb.prepareReplies, &PrepareReply{
+		AcceptorId: 0, Replica: 2, Instance: 0, Ballot: ballot, VBallot: -1, Status: NONE})
+
+	encode := func(in *PrepareReply) *PrepareReply {
+		t.Helper()
+		var buf bytes.Buffer
+		in.Marshal(&buf)
+		out := &PrepareReply{}
+		if err := out.Unmarshal(bytes.NewReader(buf.Bytes())); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out
+	}
+	accepted := []state.Command{{Op: state.PUT, K: 1, V: state.Value("accepted")}}
+	stale := []state.Command{{Op: state.PUT, K: 1, V: state.Value("stale")}}
+	high := encode(&PrepareReply{AcceptorId: 1, Replica: 2, Instance: 0, Ballot: ballot,
+		VBallot: 7, Status: ACCEPTED, Command: accepted, Seq: 4, Deps: auditDeps(5)})
+	low := encode(&PrepareReply{AcceptorId: 3, Replica: 2, Instance: 0, Ballot: ballot,
+		VBallot: 5, Status: PREACCEPTED, Command: stale, Seq: 3, Deps: auditDeps(5)})
+	t.Logf("decoded VBallots: high=%d low=%d", high.VBallot, low.VBallot)
+
+	r.handlePrepareReply(high)
+	r.handlePrepareReply(low)
+
+	got := r.InstanceSpace[2][0]
+	if got != nil && len(got.Cmds) > 0 {
+		t.Logf("recovery selected %v (Status=%v)", got.Cmds, got.Status)
+	}
+	if got == nil || len(got.Cmds) == 0 || string(got.Cmds[0].V) != "accepted" {
+		t.Errorf("recovery did not keep the ACCEPTED value at VBallot 7; selected %v", got)
+	}
+}
+
+// A replica can receive a Commit for an instance in its own row that it did not
+// create (for example, after a restart or after another replica recovered that
+// instance).  handleCommit creates a default instance with lb == nil and then
+// dereferences inst.lb.clientProposals.
+func TestAuditCommitForUnknownOwnInstanceDoesNotPanic(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("handleCommit panicked on an own-row instance with no bookkeeping: %v", p)
+		}
+	}()
+	r.handleCommit(&Commit{LeaderId: 1, Replica: 0, Instance: 0, Ballot: 0,
+		Command: state.NOOP(), Seq: 0, Deps: auditDeps(5)})
+	if inst := r.InstanceSpace[0][0]; inst == nil || inst.Status != COMMITTED {
+		t.Errorf("commit was not applied: %+v", inst)
+	}
+}
+
+// recordInstanceMetadata is only active in durable mode (the shipped run.go
+// passes durable=false).  Check the on-disk header layout so the limitation of
+// that mode is explicit.
+func TestAuditDurableMetadataLayout(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "epaxos-stable-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	r := auditReplica(5, 0, 64)
+	r.StableStore = f
+	r.Durable = true
+	inst := r.newInstance(0, 0, nil, 7, 3, PREACCEPTED, 11, auditDeps(5))
+	r.recordInstanceMetadata(inst)
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 13+5*4)
+	n, _ := f.Read(buf)
+	t.Logf("metadata bytes (%d): % x", n, buf[:n])
+	if n < 13 {
+		t.Fatalf("short metadata: %d", n)
+	}
+	bal := int32(uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24)
+	vbal := int32(uint32(buf[4]) | uint32(buf[5])<<8 | uint32(buf[6])<<16 | uint32(buf[7])<<24)
+	status := int8(buf[8])
+	t.Logf("decoded: bal=%d vbal=%d status=%d", bal, vbal, status)
+	if bal != 7 || vbal != 3 || status != PREACCEPTED {
+		t.Errorf("metadata does not preserve bal/vbal/status independently: got bal=%d vbal=%d status=%d", bal, vbal, status)
+	}
+}
+
+// findPreAcceptConflicts must consider the target instance itself when it
+// already holds a different PREACCEPTED value.  The loop breaks at
+// i == instance before applying the normal conflict test.
+func TestInvestigationSelfConflictSkip(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	oldCmd := []state.Command{{Op: state.PUT, K: 1, V: state.Value("old")}}
+	inst := r.newInstance(0, 0, oldCmd, 0, 0, PREACCEPTED, 1, auditDeps(5))
+	r.InstanceSpace[0][0] = inst
+	r.crtInstance[0] = 0
+	r.ExecedUpTo[0] = -1
+
+	newCmd := []state.Command{{Op: state.PUT, K: 1, V: state.Value("new")}}
+	conflict, cr, ci := r.findPreAcceptConflicts(newCmd, 0, 0, 2, auditDeps(5))
+	t.Logf("findPreAcceptConflicts(different PREACCEPTED value) = %v conflict at %d.%d", conflict, cr, ci)
+	if !conflict {
+		t.Errorf("a different PREACCEPTED value for the target instance was not reported as a conflict")
+	}
+}
+
+// updateAttributes must consider every command in a batch.  It currently
+// breaks at the first command that adds a dependency for a replica, so a
+// later command with a newer dependency on the same replica is lost.
+func TestAuditUpdateAttributesConsidersWholeBatch(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	r.conflicts[1][100] = &InstPair{last: 5, lastWrite: 5}
+	r.conflicts[1][200] = &InstPair{last: 9, lastWrite: 9}
+	r.InstanceSpace[1][5] = r.newInstance(1, 5, nil, 0, 0, COMMITTED, 1, auditDeps(5))
+	r.InstanceSpace[1][9] = r.newInstance(1, 9, nil, 0, 0, COMMITTED, 2, auditDeps(5))
+
+	cmds := []state.Command{
+		{Op: state.PUT, K: 100, V: state.Value("a")},
+		{Op: state.PUT, K: 200, V: state.Value("b")},
+	}
+	seq, deps, _ := r.updateAttributes(cmds, 0, auditDeps(5), 0, 0)
+	t.Logf("updateAttributes batch => seq=%d deps=%v", seq, deps)
+	if deps[1] != 9 {
+		t.Errorf("dependency on replica 1 is %d, want 9 (newest conflicting instance in the batch)", deps[1])
+	}
+	if seq != 3 {
+		t.Errorf("seq is %d, want 3 (one beyond the newest conflicting instance's seq)", seq)
+	}
+}
+
+// End-to-end version of the batch-dependency test through handlePropose:
+// queue a second proposal before handling the first, so handlePropose drains
+// both into one instance.
+func TestAuditBatchedProposalUsesNewestDependency(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	r.conflicts[1][100] = &InstPair{last: 5, lastWrite: 5}
+	r.conflicts[1][200] = &InstPair{last: 9, lastWrite: 9}
+	r.InstanceSpace[1][5] = r.newInstance(1, 5, nil, 0, 0, COMMITTED, 1, auditDeps(5))
+	r.InstanceSpace[1][9] = r.newInstance(1, 9, nil, 0, 0, COMMITTED, 2, auditDeps(5))
+
+	first := &defs.GPropose{Propose: &defs.Propose{CommandId: 1, ClientId: 1,
+		Command: state.Command{Op: state.PUT, K: 100, V: state.Value("a")}}}
+	second := &defs.GPropose{Propose: &defs.Propose{CommandId: 2, ClientId: 1,
+		Command: state.Command{Op: state.PUT, K: 200, V: state.Value("b")}}}
+	r.ProposeChan <- second
+	r.handlePropose(first)
+
+	inst := r.InstanceSpace[0][0]
+	if inst == nil {
+		t.Fatal("proposal did not create instance 0.0")
+	}
+	t.Logf("batched instance: seq=%d deps=%v cmds=%v", inst.Seq, inst.Deps, inst.Cmds)
+	if inst.Deps[1] != 9 || inst.Seq != 3 {
+		t.Errorf("batched proposal has seq=%d deps[1]=%d, want seq=3 deps[1]=9", inst.Seq, inst.Deps[1])
+	}
+}
+
+// replica.New evaluates defs.IP() even when no latency file is configured.
+// defs.IP ignores the error from net.Dial and dereferences conn.
+func TestAuditIPHelperDoesNotPanic(t *testing.T) {
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("defs.IP panicked in this environment: %v", p)
+		}
+	}()
+	t.Logf("defs.IP() = %q", defs.IP())
+}
+
+// This is the startup path used by epaxos.New.  It must not require a route to
+// 8.8.8.8 when no latency file is configured.
+func TestAuditReplicaConstructionDoesNotRequireExternalRoute(t *testing.T) {
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("replica.New panicked during startup: %v", p)
+		}
+	}()
+	_ = replica.New("a", 0, 1, []string{"127.0.0.1:10000"}, true, false, false,
+		&config.Config{}, dlog.New("", false))
+}
+
+// A TryPreAccept that hits an ACCEPTED/COMMITTED conflict must report that
+// status; the leader uses ConflictStatus >= ACCEPTED to abandon the attempt.
+func TestAuditTryPreAcceptReportsConflictStatus(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	conflict := r.newInstance(1, 5, []state.Command{{Op: state.PUT, K: 1, V: state.Value("old")}},
+		0, 0, COMMITTED, 3, auditDeps(5))
+	r.InstanceSpace[1][5] = conflict
+	r.crtInstance[1] = 5
+	r.crtInstance[0] = 0
+	buf, _ := auditCaptureReply(r, 3)
+	r.handleTryPreAccept(&TryPreAccept{LeaderId: 3, Replica: 0, Instance: 0, Ballot: 7,
+		Command: []state.Command{{Op: state.PUT, K: 1, V: state.Value("new")}},
+		Seq:     0, Deps: auditDeps(5)})
+
+	raw := buf.Bytes()
+	if len(raw) < 2 {
+		t.Fatal("no TryPreAcceptReply was sent")
+	}
+	reply := &TryPreAcceptReply{}
+	if err := reply.Unmarshal(bytes.NewReader(raw[1:])); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("TryPreAcceptReply: conflict=%d.%d status=%d", reply.ConflictReplica, reply.ConflictInstance, reply.ConflictStatus)
+	if reply.ConflictStatus != COMMITTED {
+		t.Errorf("ConflictStatus=%d, want COMMITTED (%d) for the conflicting instance", reply.ConflictStatus, COMMITTED)
+	}
+}
+
+// With N=7 and f=3 crashes there are only 4 live replicas.  A fast quorum
+// (size 5) is impossible, but a slow majority (size 4) is available.  The
+// accept phase must start after a majority of preaccept replies.
+func TestAuditSlowPathStartsWithMajority(t *testing.T) {
+	r := auditReplica(7, 0, 64)
+	deps := auditDeps(7)
+	cdeps := auditDeps(7)
+	cmds := []state.Command{{Op: state.PUT, K: 1, V: state.Value("x")}}
+	inst := r.newInstance(0, 0, cmds, 0, 0, PREACCEPTED, 0, deps)
+	inst.lb = r.newLeaderBookkeeping(nil, deps, cdeps, deps, 0, cmds, PREACCEPTED, 0)
+	r.InstanceSpace[0][0] = inst
+
+	for i := 0; i < 3; i++ {
+		r.handlePreAcceptReply(&PreAcceptReply{Replica: 0, Instance: 0, Ballot: 0,
+			VBallot: 0, Seq: 0, Deps: deps, CommittedDeps: cdeps, Status: PREACCEPTED_EQ})
+	}
+	t.Logf("N=7 after self+3 replies (majority=4): preAcceptOKs=%d lb.status=%d inst.status=%d",
+		inst.lb.preAcceptOKs, inst.lb.status, inst.Status)
+	if inst.lb.status != ACCEPTED {
+		t.Errorf("accept phase did not start after a slow-quorum majority; status=%d", inst.lb.status)
+	}
+}
+
+// When the leader adopts a value that was already ACCEPTED at a higher value
+// ballot, its own instance must record that value ballot too.  The fast commit
+// path sets inst.bal = lb.ballot but leaves inst.vbal at the original ballot.
+func TestAuditFastCommitRecordsValueBallot(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	deps := auditDeps(5)
+	cmds := []state.Command{{Op: state.PUT, K: 1, V: state.Value("x")}}
+	inst := r.newInstance(0, 0, cmds, 0, 0, PREACCEPTED, 0, deps)
+	inst.lb = r.newLeaderBookkeeping(nil, deps, deps, deps, 0, cmds, PREACCEPTED, 0)
+	r.InstanceSpace[0][0] = inst
+
+	for i := 0; i < 2; i++ {
+		r.handlePreAcceptReply(&PreAcceptReply{Replica: 0, Instance: 0, Ballot: 0,
+			VBallot: 5, Seq: 0, Deps: deps, CommittedDeps: deps, Status: PREACCEPTED_EQ})
+	}
+	t.Logf("after adopting a preaccepted value at vbal=5: status=%d bal=%d vbal=%d",
+		inst.Status, inst.bal, inst.vbal)
+	if inst.vbal != 5 {
+		t.Errorf("inst.vbal=%d, want 5 (the adopted value's VBallot)", inst.vbal)
+	}
+}
+
+// A reply with a higher VBallot that carries ACCEPTED status sets lb.status to
+// ACCEPTED.  The early status guard then rejects every later PreAccept reply,
+// so the leader can never count a quorum or start Accept.
+func TestAuditHigherVBallotReplyDoesNotBlockFurtherReplies(t *testing.T) {
+	r := auditReplica(5, 0, 64)
+	deps := auditDeps(5)
+	cmds := []state.Command{{Op: state.PUT, K: 1, V: state.Value("x")}}
+	inst := r.newInstance(0, 0, cmds, 0, 0, PREACCEPTED, 0, deps)
+	inst.lb = r.newLeaderBookkeeping(nil, deps, deps, deps, 0, cmds, PREACCEPTED, 0)
+	r.InstanceSpace[0][0] = inst
+
+	reply := &PreAcceptReply{Replica: 0, Instance: 0, Ballot: 0, VBallot: 5,
+		Seq: 0, Deps: deps, CommittedDeps: deps, Status: ACCEPTED}
+	r.handlePreAcceptReply(reply)
+	t.Logf("after first reply: preAcceptOKs=%d lb.status=%d", inst.lb.preAcceptOKs, inst.lb.status)
+	r.handlePreAcceptReply(reply)
+	t.Logf("after second reply: preAcceptOKs=%d lb.status=%d", inst.lb.preAcceptOKs, inst.lb.status)
+	if inst.lb.preAcceptOKs != 2 {
+		t.Errorf("second reply was ignored: preAcceptOKs=%d, want 2", inst.lb.preAcceptOKs)
+	}
+}

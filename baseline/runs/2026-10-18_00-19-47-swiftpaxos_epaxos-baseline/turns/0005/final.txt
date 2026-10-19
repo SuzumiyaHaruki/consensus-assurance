@@ -1,0 +1,35 @@
+Continued. The key new result is a cluster-wide safety violation, not just a local recovery error.
+
+`TestAuditClusterChosenValueSurvivesLeaderCrash` now reproduces this sequence:
+
+- Replicas 0, 1, and 2 form a fast quorum and choose a PUT.
+- The Commit broadcast is dropped and replica 0 crashes.
+- Replica 4, which has no copy, recovers from replicas 1 and 2, which hold preaccepted copies.
+- After recovery, replica 0 still has the chosen PUT, but replicas 1-4 all have `COMMITTED` NOOP.
+
+```
+replica 0: status=4 cmds=[{1 7 [99 104 111 115 101 110]}]  // "chosen"
+replica 1: status=4 cmds=[{0 0 []}]                         // NOOP
+replica 2: status=4 cmds=[{0 0 []}]                         // NOOP
+replica 3: status=4 cmds=[{0 0 []}]                         // NOOP
+replica 4: status=4 cmds=[{0 0 []}]                         // NOOP
+```
+
+The local synthetic `PrepareReply` claims the new value ballot, masks the preaccepted replies, and starts phase 1 with NOOP. The NOOP PreAccept then replaces the preaccepted value on the live replicas. This upgrades F1 from a prepare-phase defect to a demonstrated agreement/safety failure.
+
+I also added F17: recovery paths (`handleTryPreAccept` and `handlePrepareReply` sub-case 1) install commands without updating the conflict table, so later proposals can miss dependencies. F4 and the `proposeTime` ordering case remain investigations with their alternative explanations recorded.
+
+Current status: two cluster controls pass; 23 finding tests fail as intended; `go build ./...` passes; the captured implementation remains byte-identical to `../source`.
+
+- [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_00-19-47-swiftpaxos_epaxos-baseline/work/report.md)
+- [audit_cluster_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_00-19-47-swiftpaxos_epaxos-baseline/work/epaxos/audit_cluster_test.go)
+- [audit_all_output.txt](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_00-19-47-swiftpaxos_epaxos-baseline/work/audit_all_output.txt)
+- [audit_cluster_chosen_output.txt](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_00-19-47-swiftpaxos_epaxos-baseline/work/audit_cluster_chosen_output.txt)
+
+```bash
+cd /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_00-19-47-swiftpaxos_epaxos-baseline/work
+go test ./epaxos -run 'TestAuditClusterChosenValueSurvivesLeaderCrash' -v
+go test ./epaxos -run TestAudit -v
+```
+
+The full master/replica/client startup remains blocked in this shell by F16 and the master's `ping` dependency; the in-process router covers the protocol-level tests.

@@ -1,0 +1,18 @@
+The audit's next investigation is complete and written up. Summary of this round:
+
+**New finding F10 — a forged `Replicate` kills the node from the raft layer**
+
+`handleReplicateMessage` checks only the anchor (`LogIndex`/`LogTerm`) and then passes peer-supplied entries straight to `entryLog.tryAppend`; nothing verifies `Entries[i].Index == LogIndex+1+i`. Two consequences, both reproduced:
+
+- an entry claiming a committed index with a different term triggers `plog.Panicf("entry %d conflicts with committed entry")` in `tryAppend`;
+- non-contiguous indices are accepted silently, leaving a log with a hole (indices 1,2,3,4,9 with `committed=5`) that panics later in `getEntries`/`entriesToApply`.
+
+Reachability matches the F6–F9 pattern: the transport checks only deployment ID (`1`) and bin version (`210`), `Peer.Handle` accepts a `Replicate` from any known member, and the step worker recovers only when error injection is on. The attacker only brute-forces small indexes/terms.
+
+Evidence, all in the tree:
+
+- [zz_audit_forgedreplicate_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/zz_audit_forgedreplicate_test.go) — two failing repros plus a well-formed-control that must keep working.
+- [e2ereplicate/main.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/audit/tools/e2ereplicate/main.go) — real three-node cluster, 480 forged frames; the captured tree dies with `panic: entry 4 conflicts with committed entry, committed 5` through `tryAppend → handleReplicateMessage → stepWorkerMain` ([full log](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/audit/cover/f10/e2e_stderr.txt)).
+- Fix in `audit/diag-fixes/` rejects entries that don't follow the anchor with the existing `ReplicateResp{Reject:true}` shape; the three raft tests and upstream `TestHandleMTReplicate` pass, the full fixed raft suite is green, and the same 480-batch attack now prints `NODEHOSTS SURVIVED THE FORGED REPLICATE BATCHES`.
+
+The report now has 10 findings, an updated matrix (36 audit tests: 23 pass, 13 deliberate repro failures), the new reproduction inventory entries, fix snippet, and command log. The audited implementation is byte-identical to `../source`; only build-tagged tests, harnesses and logs were added.

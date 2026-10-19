@@ -1,0 +1,23 @@
+Audit continued and produced two concrete, reproducible defects in the `RestoreCommittedLogs` startup path. The captured implementation was not modified; the reproduction tests and outputs are preserved.
+
+## Findings
+
+1. **Committed membership is lost on restart.** `restoreFromCommittedLogs()` calls `processLogs(commitIndex, nil)`, which sets `lastApplied = commitIndex` but does not update Raft's own `r.configurations`. `NewRaft()` then scans configuration entries starting at `max(snapshotIndex, lastApplied) + 1`, skipping every committed configuration entry. The node restarts with an empty configuration, or with the snapshot's stale membership.
+
+   Executed consequences:
+
+   - A restarted single-voter cluster reports `{Servers:[]}`, logs `no known peers, aborting election`, and never becomes leader.
+   - Restarting all three voters leaves all three in `Follower` with empty configurations and no leader.
+   - With a snapshot, a committed membership change after the snapshot is ignored; the node keeps the old voter set.
+   - A control with `RestoreCommittedLogs=false` recovers the same configuration successfully.
+
+2. **`NewRaft()` deadlocks while restoring a large committed log.** Replay happens before `runFSM` starts. `processLogs` sends batches into `fsmMutateCh`, which has capacity 128. With `MaxAppendEntries=64`, more than 8192 committed entries block forever in `NewRaft`. A 9001-entry test hangs in a channel send (`raft.go:1305 -> 1346 -> api.go:753 -> NewRaft`), while an 8000-entry control returns in 0.01 s. This is below the default `TrailingLogs`/`SnapshotThreshold` range, so it is realistic after a snapshot.
+
+## Evidence
+
+- Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_16-03-24-hashicorp_raft-baseline/work/report.md)
+- Reproduction tests: [audit_restore_committed_config_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_16-03-24-hashicorp_raft-baseline/work/audit_restore_committed_config_test.go)
+- Combined run: `go test -run TestAuditRestoreCommittedLogs -v .`
+- Captured outputs are under `work/audit_results/`, including single-node, snapshot-stale, three-voter, deadlock, and both passing controls.
+
+Upstream/network/fuzzy baseline runs and three load-sensitive full-suite flakes are documented separately; the flakes pass individually and are not counted as findings. Remaining source-based suspicion: `LogCache` does not forward `CommitTrackingLogStore`, so wrapping a compatible store makes `RestoreCommittedLogs` return `ErrIncompatibleLogStore`.

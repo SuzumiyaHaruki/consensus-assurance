@@ -13,9 +13,9 @@ from consensus_assurance.adapters.runners.toolchains import cargo_tool, cargo_en
 
 class CargoBackend:
     name = "cargo"
-    version = "3"
+    version = "4"
     harness_kind = "rust_test"
-    harness_instructions = "Write Rust #[test] integration tests using the captured crate's public API and existing dependencies. The controller fixes the workspace lock and tools; build reuse is specific to a manifest, integration test target and saved build basis. Switching crates may require a first heavy dependency build. Consult research.json build_inputs for preparation evidence and current seed availability; unlisted targets are not known to be prepared, and available seeds still require execution-time validation. Only the generated test target runs, serially with --nocapture and --locked --offline. Optional test_names selects exact full test names; omission runs the whole generated target. Unselected code still compiles. Emit complete CA_EVENT JSON lines. Helpers are workspace-relative; never replace manifests, locks, build scripts or Cargo configuration. No extra feature flags are added; original dev-dependencies can enable additional features. Actual compiler-artifact records describe reuse; declaration syntax does not establish active cfg branches or private-state reachability."
+    harness_instructions = "Write Rust #[test] integration tests using the captured crate's public API and existing dependencies. Select any captured crate through execution_package. The controller fixes the workspace lock and tools; build reuse is specific to a manifest, integration test target, feature selection and saved build basis. Switching crates or features may require a first heavy dependency build. Consult research.json build_inputs for preparation evidence and current seed availability; unlisted targets are not known to be prepared, and available seeds still require execution-time validation. Only the generated test target runs, serially with --nocapture and --locked --offline. Optional test_names selects exact full test names; omission runs the whole generated target. Unselected code still compiles. Emit complete CA_EVENT JSON lines. Helpers are workspace-relative; never replace manifests, locks, build scripts or Cargo configuration. Optional features selects named Cargo features, default_features=false disables defaults, and all_features=true enables all features; omission preserves Cargo defaults. Original dependency and dev-dependency feature unification still applies. Actual compiler-artifact records describe reuse; declaration syntax does not establish active cfg branches or private-state reachability."
 
     def __init__(self, target=None, timeout=90, seed_cache_dir=None):
         self.seed_cache_dir = Path(seed_cache_dir).expanduser().absolute() if seed_cache_dir is not None else None
@@ -34,6 +34,8 @@ class CargoBackend:
 
     def resolve_harness(self,harness,source,target_files):
         self.test_filters(harness.test_names)
+        self.feature_flags(harness.features,harness.default_features,harness.all_features)
+        harness.features=sorted(harness.features)
         package = local_package(harness.execution_package if harness.execution_package is not None else self.package)
         filename = str(Path(package)/"tests"/Path(self.harness_filename).name)
         manifest = str(Path(package)/"Cargo.toml")
@@ -65,12 +67,24 @@ class CargoBackend:
             raise ValueError('Rust test_names must be distinct exact full test names, not flags or patterns')
         return ['--exact',*test_names]
 
-    def experiment_command(self,execution_package=None,harness_filename=None,test_names=None):
+    @staticmethod
+    def feature_flags(features=None,default_features=True,all_features=False):
+        features=features or []
+        if len(set(features))!=len(features) or any(not name or name.startswith('-') or
+                any(c.isspace() or c in ',\x00' for c in name) for name in features):
+            raise ValueError('Rust features must be distinct feature names, not flags or comma-separated lists')
+        return ([*(['--no-default-features'] if not default_features else []),
+            *(['--all-features'] if all_features else []),
+            *(['--features',','.join(sorted(features))] if features else [])])
+
+    def experiment_command(self,execution_package=None,harness_filename=None,test_names=None,*,
+            features=None,default_features=True,all_features=False):
         if harness_filename is not None and execution_package is None:raise ValueError("Accepted Rust input lacks a fixed execution_package")
         package=local_package(execution_package if execution_package is not None else self.package)
         filename=self.destination(package,harness_filename or self.harness_filename)
         return [str(self.cargo),'test','--locked','--offline','--manifest-path',str(Path(package)/'Cargo.toml'),
-            '--test',filename.stem,'--message-format=json','--','--nocapture','--test-threads=1',*self.test_filters(test_names)]
+            '--test',filename.stem,'--message-format=json',*self.feature_flags(features,default_features,all_features),
+            '--','--nocapture','--test-threads=1',*self.test_filters(test_names)]
 
     def version_command(self):
         return [str(self.cargo.parent/'rustc'),'--version','--verbose']

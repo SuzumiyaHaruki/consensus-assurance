@@ -231,6 +231,9 @@ class Harness(Record):
     files: dict[str, str] = {}
     execution_package: str | None = None
     test_names: TestNames | None = None
+    features: list[StrictStr] = []
+    default_features: StrictBool = True
+    all_features: StrictBool = False
     description: str = ""
     semantic_changes: list[str] = []
     prerequisites: list[EventRequirement] = []

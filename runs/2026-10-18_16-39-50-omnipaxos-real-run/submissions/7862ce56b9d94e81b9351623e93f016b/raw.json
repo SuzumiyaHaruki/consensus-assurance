@@ -1,0 +1,190 @@
+{
+  "rationale": "The executed probe answered the core premise: on a real trimmed two-node log, read_decided_suffix(1) returns three elements (Trimmed(4), Decided(5), Decided(6)) for five requested indices, while from=4 returns two; replaying the actor's per-element cursor arithmetic over those real outputs leaves the cursor at 4 and re-delivers entries 5 and 6 on the next push with no new decisions. This update records the executed fact, asserts the scoped runtime consumption defect it exposes, and requests a successor execution whose comparison admission carries a common identity field so the controller can evaluate the predicate directly (the first run's comparisons were unknown only because the admission alias lacked ready.from/ready.start_from).",
+  "knowledge": [
+    {
+      "ref": "@suffix_collapse_observed",
+      "kind": "fact",
+      "statement": "With decided=6 and compacted=4 on the executed two-node log, read_decided_suffix(1) returned exactly [Trimmed(4), Decided(5), Decided(6)] (len 3) although decided-from is 5, while read_decided_suffix(4) returned [Decided(5), Decided(6)] (len 2). The trimmed prefix is represented by a single Trimmed element, so the returned vector length is not the number of requested log indices when the start is below the compacted index.",
+      "conditions": "Two OmniPaxos instances (pids 1,2) built from ClusterConfig {configuration_id:1, nodes:[1,2]}, MemoryStorage, batch_size 1, no snapshots; node 1 becomes leader via try_become_leader, appends Value(1..=6) with full message delivery after each append, then trims to 4 and the trim is forwarded to node 2; both nodes report decided 6.",
+      "source_ids": [
+        "core_read_suffix",
+        "core_entry_type",
+        "core_compacted_entry"
+      ],
+      "executions": {
+        "8572576b3ff04353ac08bce770a5ad51": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "ref": "@cursor_redelivery_observed",
+      "kind": "behavior",
+      "statement": "Applied to those real read_decided_suffix outputs, one cursor step per returned element (the actor's push_to_sub rule) leaves next_idx at 4 after the catch-up from 1, and the next push_to_all_subs read from 4 yields entries 5 and 6 again, so the delivered value sequence is 5,6,5,6 with duplicates of 5 and 6 while decided remains 6 and no new entry was decided.",
+      "conditions": "Same executed setup as @suffix_collapse_observed; the cursor replay reproduces omnipaxos_runtime/src/actor.rs push_to_sub (next_idx += 1 per element) and one subsequent push_to_all_subs read from the resulting cursor (start = 0 for a single subscriber). The replay is a reconstruction of the runtime source logic over executed core outputs, not an execution of the runtime crate.",
+      "source_ids": [
+        "rt_decided_sub",
+        "rt_push_sub",
+        "rt_push_all",
+        "rt_subscribe_api",
+        "core_read_suffix"
+      ],
+      "executions": {
+        "8572576b3ff04353ac08bce770a5ad51": [
+          3
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "93e6d663e93c42d7b68b91449efbcf31-question-0",
+      "experiment_id": "93e6d663e93c42d7b68b91449efbcf31-experiment",
+      "source_ids": [
+        "core_read_suffix",
+        "core_entry_type",
+        "core_compacted_entry",
+        "rt_decided_sub",
+        "rt_push_sub",
+        "rt_push_all",
+        "rt_subscribe_api"
+      ],
+      "executions": {
+        "8572576b3ff04353ac08bce770a5ad51": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The executed run establishes the decisive operands (receipt 8572576b3ff04353ac08bce770a5ad51, parsed events 0-3, test decided_suffix_collapses_trimmed_prefix passed, exit 0). Event 0 shows the setup was real: node 1 is leader in Accept, both nodes decided 6, compacted 4. Event 1 shows read_decided_suffix(1) returned kinds trimmed,decided,decided with tokens T4,5,6 and len 3 while decided_minus_from is 5, so a trimmed prefix of four indices is collapsed into one element. Event 2 shows the aligned case at from=4 (len 2). Event 3 applies the runtime's own cursor rule from source, one increment per returned element, to those real reads: cursor_after_catchup is 4, the next push reads from 4 and returns tokens 5,6, and delivered_values is 5,6,5,6 with duplicate_values 5,6 while decided stays 6. Nothing new was decided between the two reads, so the re-delivery is caused by the cursor arithmetic alone. The runtime therefore violates its documented single in-order decided stream for a subscriber whose next_idx is below the compacted index: subscribe_decided accepts any from and neither rejects a compacted start nor advances the cursor to decided after a collapsed catch-up, and a lagging subscriber crosses the same boundary. An application applying Decided entries to its state machine would apply entries 5 and 6 twice. The three declared EventComparisons reported unknown solely because my admission alias ready lacked the identity fields from/start_from the comparisons key on; the measured fields were fully observed, and a successor execution with a shared run identity is requested to make the predicate evaluation explicit.",
+      "counterevidence": [
+        "A subscriber that only starts at or after the compacted index is aligned: event 2 shows from=4 yields exactly two elements for two indices, so the defect is limited to a cursor below the compacted index.",
+        "The Trimmed element is a documented LogEntry variant carrying the compacted index, so delivering it is correct; the defect is only the one-step-per-element increment that treats it as a single log index."
+      ],
+      "limitations": [
+        "omnipaxos_runtime is not a dev-dependency of the omnipaxos test target, so the actor cannot be compiled or run here; events 1-2 measure the core read shape and event 3 is a faithful replay of the actor's source arithmetic over that output, not an actor execution.",
+        "Only one compaction point, no snapshots, no batching and a single subscriber are exercised; snapshot-based compaction yields a Snapshotted element under the same collapse but was not executed.",
+        "The first run's comparison outcomes are unknown for admission-identity reasons recorded above; the asserted defect rests on the parsed event operands, and a successor execution is registered to produce an admitted comparison."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "93e6d663e93c42d7b68b91449efbcf31-question-0",
+    "previous_id": "93e6d663e93c42d7b68b91449efbcf31-experiment",
+    "revision_reason": "Every event now carries run=1 and all comparisons use identity_fields [run] with a readiness admission that also carries run, so prerequisite correlation is unambiguous; the probe logic, inputs and assertions are otherwise unchanged.",
+    "harness_path": "omnipaxos/tests/assurance_generated.rs",
+    "source_ids": [
+      "core_read_suffix",
+      "core_entry_type",
+      "core_compacted_entry",
+      "rt_push_sub",
+      "rt_push_all"
+    ],
+    "scope": {
+      "description": "Same two-node in-process execution as the previous probe, repeated to obtain a properly admitted comparison: six decided entries, trim to 4, record read_decided_suffix(1) and (4) and replay the actor cursor arithmetic; all events carry run=1.",
+      "assumptions": [
+        "All produced messages are delivered synchronously to their addressed node until none remain.",
+        "No ticks are called, so BLE elections do not occur; leadership is obtained with try_become_leader.",
+        "Trim(4) is accepted because both nodes have accepted index 6."
+      ],
+      "excluded": [
+        "Network faults, snapshots, batching, reconfiguration, multiple subscribers."
+      ],
+      "parameters": {
+        "nodes": [
+          1,
+          2
+        ],
+        "entries": 6,
+        "trim_idx": 4,
+        "run": 1
+      }
+    },
+    "prefix": "Identical construction to the previous run: build nodes 1 and 2 from ClusterConfig {configuration_id:1, nodes:[1,2]} with MemoryStorage; pump; node1.try_become_leader(); pump to leader Accept; append Value(1..=6) with a full pump after each; node1.trim(Some(4)); pump. Emit CA_EVENT ready/run=1, suffix_shape/run=1 for from=1 and from=4, cursor_replay/run=1 as before.",
+    "comparisons": [
+      {
+        "event": "suffix_shape",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "len",
+          "op": "eq",
+          "value": 3
+        },
+        "applicability_conditions": [
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 1
+          }
+        ],
+        "description": "From 1 below compacted 4, read_decided_suffix returns 3 elements for 5 indices."
+      },
+      {
+        "event": "suffix_shape",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "len",
+          "op": "eq",
+          "value": 2
+        },
+        "applicability_conditions": [
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 4
+          }
+        ],
+        "description": "From the compacted boundary, one element per remaining index."
+      },
+      {
+        "event": "cursor_replay",
+        "identity_fields": [
+          "run"
+        ],
+        "admission_alias": "ready",
+        "assertion": {
+          "field": "duplicates",
+          "op": "eq",
+          "value": true
+        },
+        "description": "The per-element cursor after the catch-up is 4, so the next push re-delivers entries 5 and 6."
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "ready",
+        "event": "ready",
+        "conditions": [
+          {
+            "field": "run",
+            "op": "eq",
+            "value": 1
+          },
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 6
+          },
+          {
+            "field": "compacted",
+            "op": "eq",
+            "value": 4
+          }
+        ]
+      }
+    ],
+    "test_names": [
+      "decided_suffix_collapses_trimmed_prefix"
+    ]
+  }
+}

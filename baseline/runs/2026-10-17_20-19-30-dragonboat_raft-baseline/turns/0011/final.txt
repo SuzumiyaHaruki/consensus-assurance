@@ -1,0 +1,25 @@
+This pass added a third (minor) finding and pinned down Finding 1's exact boundary.
+
+**Finding 3 (new, executed): `pb.Update.HasUpdate` ignores dropped read indexes**
+
+`raftpb.Update.HasUpdate` ([raftpb/raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/raftpb/raft.go:112)) checks state, snapshot, entries-to-save, committed entries, messages, ready-to-reads and dropped entries — but not `DroppedReadIndexes`. A node whose only pending work is a dropped read index therefore reports `Peer.HasUpdate() == true` (peer.go checks the field) while the `pb.Update` produced for that node reports `HasUpdate() == false`. The test asserts the `Peer` side first, then the `Update` side, so the contradiction is between the two API layers:
+
+```
+zz_audit_repro_test.go:169: pb.Update.HasUpdate() reported false for an
+    update carrying 2 dropped read index(es)
+--- FAIL: TestAuditUpdateHasUpdateWithDroppedReadIndexes
+```
+
+No production code in this tree calls `Update.HasUpdate`, so the impact is limited to API consumers — reported as minor.
+
+**Finding 1 boundary**
+
+Added `TestAuditNodeUserReadIndexTwoTickTimeout`: with the same single-node cluster, a two-RTT timeout on the `INodeUser` path completes while the one-RTT timeout times out. That confirms the failure is exactly the one-tick dispatch delay, not a general read-path problem.
+
+**Final state**
+
+- Findings: F1 (`(*nodeUser).ReadIndex` misses the engine wakeup), F2 (`handleCandidateReadIndex` records a dropped ReadIndex twice), F3 (`pb.Update.HasUpdate` ignores dropped read indexes).
+- Audit-tagged raft run: fuzz PASS, in-memory model PASS, vote-restart PASS, proposal control PASS; F2 (two tests) and F3 fail as documented. F1 fails under the audit tag in the root package.
+- Default suites and `-race` (including the transport suite with generated TLS certs in the diagnostic copy) remain green; the implementation is byte-identical to `../source`.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) is reorganized as Summary → F1 → F2 → F3 → observations → reviewed areas → inventory → command log → unresolved work, and states that no executable coverage gap remains for buildable code.

@@ -1,0 +1,134 @@
+{
+  "rationale": "Orient in the captured OmniPaxos snapshot and register one sourced client-completion question raised by the async runtime's append_notify correlation: drain_notifiers resolves Ok(idx) on idx <= decided before it considers that the assignment ballot has been superseded, and it never compares the decided value at idx with the entry the caller submitted. The runtime's own tests pin both halves of the exposure: Ok(idx) is asserted to mean the caller's entry occupies idx, and the Superseded regression test shows an entry accepted only on the old leader being replaced at the same index by a different value. This update records the behavior, the question, the missing timeline/identity link, and the limitation that the omnipaxos test target cannot link the runtime crate.",
+  "sources": [
+    {
+      "id": "actor_drain",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 200,
+      "end_line": 222,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_pending",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 58,
+      "end_line": 75,
+      "kind": "code_observation"
+    },
+    {
+      "id": "actor_assigned",
+      "file": "omnipaxos_runtime/src/actor.rs",
+      "start_line": 533,
+      "end_line": 546,
+      "kind": "code_observation"
+    },
+    {
+      "id": "handle_contract",
+      "file": "omnipaxos_runtime/src/handle.rs",
+      "start_line": 146,
+      "end_line": 160,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "superseded_doc",
+      "file": "omnipaxos_runtime/src/event.rs",
+      "start_line": 47,
+      "end_line": 58,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "test_ok_content",
+      "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+      "start_line": 386,
+      "end_line": 398,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "test_superseded_replace",
+      "file": "omnipaxos_runtime/tests/async_runtime_test.rs",
+      "start_line": 958,
+      "end_line": 980,
+      "kind": "test_expectation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@ok_after_overwrite",
+      "question": "Can append_notify resolve Ok(idx) for an entry that lost leadership before decision and was replaced at idx by a different decided entry?",
+      "source_ids": [
+        "actor_drain",
+        "actor_pending",
+        "handle_contract",
+        "superseded_doc",
+        "test_ok_content",
+        "test_superseded_replace"
+      ],
+      "hypothesis": "Yes: Pending keeps only (assigned_idx, ballot_at_assignment). drain_notifiers first resolves Ok whenever idx <= decided, before the ballot < cur_ballot arm, and never reads the log to compare the decided value at idx with the pending entry. When the originating node's locally accepted entry is overwritten by a new leader and the replacement at idx is decided, the origin's decided_idx advances to idx while the pending ballot is stale, so Ok(idx) reports completion of an entry that was never decided.",
+      "discriminator": "Whether a legal actor schedule lets the origin process the new ballot and the decided advance to idx before any drain_notifiers pass observes the stale pending (the false Ok is avoided if a tick drains while decided < idx, yielding Superseded), and whether the decided entry at idx is the replacement rather than the caller's entry.",
+      "disposition": "active"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@drain_order",
+      "kind": "behavior",
+      "statement": "Pending append_notify calls in the runtime actor are resolved in this order: Ok(idx) when the recorded assignment index is <= the actor's current decided index; Superseded when the assignment ballot is lower than the current promise ballot; Timeout when the deadline passed; otherwise the pending stays queued. The Ok arm is evaluated first and does not inspect the log or compare the entry stored at idx.",
+      "conditions": "omnipaxos_runtime actor, append_notify tracking enabled; pending entry has an assigned (idx, ballot) from local accept or a remote Assigned reply; drain_notifiers runs on each actor tick and after command handling.",
+      "source_ids": [
+        "actor_drain",
+        "actor_pending"
+      ]
+    },
+    {
+      "ref": "@ok_means_entry",
+      "kind": "fact",
+      "statement": "The runtime's test suite treats a successful append_notify as a claim that the caller's entry is decided at the returned index: the batching regression test reads the decided log back and asserts the value at the returned index equals the submitted entry, so a returned index holding a different value is a contract violation under the project's own expectation.",
+      "conditions": "The test environment's exercised conditions: 3-node runtime cluster with real transport, batching enabled, and a submitted append_notify entry; this is an individual test expectation plus the handle-level description, not a proof of a defect by itself.",
+      "source_ids": [
+        "test_ok_content",
+        "handle_contract"
+      ]
+    },
+    {
+      "ref": "@superseded_replace",
+      "kind": "fact",
+      "statement": "The Superseded regression test demonstrates that an entry accepted only on the old leader can be genuinely lost and replaced at the same log index by a different value under the new leader, and that Superseded is the intended observable in that case; it also shows the origin node learns of the new higher-ballot leader.",
+      "conditions": "3-node runtime cluster, the elected leader's outgoing traffic is cut while its incoming traffic stays open; a new leader is elected by the other two nodes and a fresh entry is appended and decided at the old index.",
+      "source_ids": [
+        "test_superseded_replace",
+        "superseded_doc"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@ok_after_overwrite",
+      "question": "Is there a reachable actor schedule in which the originating node observes the new ballot and decided_idx >= assigned_idx within one drain_notifiers pass, so that the Ok arm preempts Superseded and the entry at idx is the replacement entry?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@ok_after_overwrite",
+      "source_ids": [
+        "actor_drain",
+        "actor_pending",
+        "handle_contract",
+        "superseded_doc",
+        "test_ok_content",
+        "test_superseded_replace"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "The source establishes the mechanism: a pending append_notify stores only (assigned_idx, assignment_ballot), and drain_notifiers resolves Ok whenever decided_idx >= assigned_idx before it checks whether that ballot has been superseded; nothing in the Ok path reads the entry at assigned_idx. The runtime's own tests establish both premises the false Ok would need: Ok(idx) is expected to mean the caller's value is decided at idx, and an entry accepted only on the old leader can be replaced at the same index by a different decided value while the origin learns of the new ballot. What is not yet established is the decisive schedule: the origin's actor drains on each tick (10 ms by default) and when commands arrive, so a drain while decided_idx < assigned_idx and the promise ballot has already changed yields Superseded and avoids the false Ok. A false Ok requires the decided advance to assigned_idx and the ballot change to be visible in the same drain pass, or the decided advance to arrive with the new ballot before any intervening tick. The runtime crate is not a dev-dependency of the omnipaxos test target, so the fixed assurance_generated harness cannot execute this path; the open question is therefore the actor-level interleaving and log-content identity, not the core Paxos decision rule.",
+      "counterevidence": [
+        "The Superseded doc explicitly calls itself a heuristic and notes the entry can still be decided under the new ballot at log_entry_idx; when the caller's entry survives reconciliation, returning Ok once decided_idx reaches idx is correct and must not be suppressed.",
+        "The false-Ok case requires the origin's own minority-accepted entry to be replaced at that index; if the new leader adopts the value, the decided entry at idx is still the caller's entry and Ok is accurate."
+      ],
+      "limitations": [
+        "omnipaxos_runtime is not listed in omnipaxos/Cargo.toml dev-dependencies, so tests/assurance_generated.rs in the omnipaxos crate cannot construct the actor or call append_notify.",
+        "No execution receipt exists for this question; the account rests on source reading and the runtime's saved test expectations, which describe intent but do not establish a schedule.",
+        "The hash-free timing of tokio channel delivery and the actor's select_biased loop is unmeasured here; the 10 ms tick and 1 ms egress defaults in RuntimeConfig are configuration, not observed interleaving."
+      ]
+    }
+  ]
+}

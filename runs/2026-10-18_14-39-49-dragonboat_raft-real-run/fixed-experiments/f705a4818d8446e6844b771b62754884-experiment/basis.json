@@ -1,0 +1,351 @@
+{
+  "id": "f705a4818d8446e6844b771b62754884-experiment",
+  "investigation_id": "827f420be72d403f9a804a543fac77cc-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package dragonboat\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"math\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/lni/dragonboat/v3/config\"\n\tdragonraft \"github.com/lni/dragonboat/v3/internal/raft\"\n\tpb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\nvar (\n\terrAssuranceCompacted   = errors.New(\"assurance log compacted\")\n\terrAssuranceOutOfDate   = errors.New(\"assurance snapshot out of date\")\n\terrAssuranceUnavailable = errors.New(\"assurance log unavailable\")\n)\n\ntype assuranceLogDB struct {\n\tentries     []pb.Entry\n\tmarkerIndex uint64\n\tmarkerTerm  uint64\n\tsnapshot    pb.Snapshot\n\tstate       pb.State\n}\n\nfunc newAssuranceLogDB() *assuranceLogDB {\n\treturn &assuranceLogDB{}\n}\n\nfunc (db *assuranceLogDB) firstIndex() uint64 {\n\treturn db.markerIndex + 1\n}\n\nfunc (db *assuranceLogDB) lastIndex() uint64 {\n\treturn db.markerIndex + uint64(len(db.entries))\n}\n\nfunc (db *assuranceLogDB) GetRange() (uint64, uint64) {\n\treturn db.firstIndex(), db.lastIndex()\n}\n\nfunc (db *assuranceLogDB) SetRange(index uint64, length uint64) {}\n\nfunc (db *assuranceLogDB) NodeState() (pb.State, pb.Membership) {\n\treturn db.state, db.snapshot.Membership\n}\n\nfunc (db *assuranceLogDB) SetState(state pb.State) {\n\tdb.state = state\n}\n\nfunc (db *assuranceLogDB) CreateSnapshot(snapshot pb.Snapshot) error {\n\tif db.snapshot.Index >= snapshot.Index {\n\t\treturn errAssuranceOutOfDate\n\t}\n\tdb.snapshot = snapshot\n\treturn nil\n}\n\nfunc (db *assuranceLogDB) ApplySnapshot(snapshot pb.Snapshot) error {\n\tif db.snapshot.Index >= snapshot.Index {\n\t\treturn errAssuranceOutOfDate\n\t}\n\tdb.snapshot = snapshot\n\tdb.markerIndex = snapshot.Index\n\tdb.markerTerm = snapshot.Term\n\tdb.entries = nil\n\treturn nil\n}\n\nfunc (db *assuranceLogDB) Term(index uint64) (uint64, error) {\n\tif index == 0 {\n\t\treturn 0, nil\n\t}\n\tif index == db.markerIndex {\n\t\treturn db.markerTerm, nil\n\t}\n\tif index < db.firstIndex() {\n\t\treturn 0, errAssuranceCompacted\n\t}\n\tif index > db.lastIndex() {\n\t\treturn 0, errAssuranceUnavailable\n\t}\n\treturn db.entries[index-db.firstIndex()].Term, nil\n}\n\nfunc (db *assuranceLogDB) Entries(low uint64, high uint64, maxSize uint64) ([]pb.Entry, error) {\n\tif low <= db.markerIndex {\n\t\treturn nil, errAssuranceCompacted\n\t}\n\tif high > db.lastIndex()+1 {\n\t\treturn nil, errAssuranceUnavailable\n\t}\n\tif low >= high {\n\t\treturn nil, nil\n\t}\n\tentries := append([]pb.Entry(nil), db.entries[low-db.firstIndex():high-db.firstIndex()]...)\n\tif maxSize == math.MaxUint64 || len(entries) == 0 {\n\t\treturn entries, nil\n\t}\n\ttotal := 0\n\tfor i := range entries {\n\t\ttotal += entries[i].SizeUpperLimit()\n\t\tif uint64(total) > maxSize {\n\t\t\treturn entries[:i], nil\n\t\t}\n\t}\n\treturn entries, nil\n}\n\nfunc (db *assuranceLogDB) Snapshot() pb.Snapshot {\n\treturn db.snapshot\n}\n\nfunc (db *assuranceLogDB) Compact(index uint64) error {\n\treturn nil\n}\n\nfunc (db *assuranceLogDB) Append(entries []pb.Entry) error {\n\tif len(entries) == 0 {\n\t\treturn nil\n\t}\n\toffset := entries[0].Index - db.markerIndex\n\tif uint64(len(db.entries)+1) > offset {\n\t\tdb.entries = db.entries[:offset-1]\n\t}\n\tdb.entries = append(db.entries, entries...)\n\treturn nil\n}\n\ntype assuranceCluster struct {\n\tpeers   map[uint64]*dragonraft.Peer\n\tlogs    map[uint64]*assuranceLogDB\n\tapplied map[uint64]uint64\n\tcommit  map[uint64]uint64\n\tready   map[uint64][]pb.ReadyToRead\n}\n\nfunc newAssuranceCluster(t *testing.T) *assuranceCluster {\n\tt.Helper()\n\tc := &assuranceCluster{\n\t\tpeers:   make(map[uint64]*dragonraft.Peer),\n\t\tlogs:    make(map[uint64]*assuranceLogDB),\n\t\tapplied: make(map[uint64]uint64),\n\t\tcommit:  make(map[uint64]uint64),\n\t\tready:   make(map[uint64][]pb.ReadyToRead),\n\t}\n\taddresses := []dragonraft.PeerAddress{\n\t\t{NodeID: 1, Address: \"assurance-1\"},\n\t\t{NodeID: 2, Address: \"assurance-2\"},\n\t\t{NodeID: 3, Address: \"assurance-3\"},\n\t}\n\tfor id := uint64(1); id <= 3; id++ {\n\t\tdb := newAssuranceLogDB()\n\t\tcfg := config.Config{\n\t\t\tClusterID:       7,\n\t\t\tNodeID:          id,\n\t\t\tElectionRTT:     10,\n\t\t\tHeartbeatRTT:    1,\n\t\t\tMaxInMemLogSize: 0,\n\t\t}\n\t\tc.logs[id] = db\n\t\tc.peers[id] = dragonraft.Launch(cfg, db, nil, addresses, true, true)\n\t\tc.applied[id] = uint64(len(addresses))\n\t\tc.peers[id].NotifyRaftLastApplied(c.applied[id])\n\t}\n\treturn c\n}\n\nfunc (c *assuranceCluster) pump(id uint64) []pb.Message {\n\tupdate := c.peers[id].GetUpdate(true, c.applied[id])\n\tc.ready[id] = append(c.ready[id], update.ReadyToReads...)\n\tif update.State.Commit > c.commit[id] {\n\t\tc.commit[id] = update.State.Commit\n\t}\n\tmessages := append([]pb.Message(nil), update.Messages...)\n\tif len(update.EntriesToSave) > 0 {\n\t\tif err := c.logs[id].Append(update.EntriesToSave); err != nil {\n\t\t\tpanic(err)\n\t\t}\n\t}\n\tc.peers[id].Commit(update)\n\treturn messages\n}\n\nfunc (c *assuranceCluster) deliver(message pb.Message) []pb.Message {\n\tc.peers[message.To].Handle(message)\n\treturn c.pump(message.To)\n}\n\nfunc (c *assuranceCluster) drain(messages []pb.Message) {\n\tqueue := append([]pb.Message(nil), messages...)\n\tfor len(queue) > 0 {\n\t\tmessage := queue[0]\n\t\tqueue = queue[1:]\n\t\tqueue = append(queue, c.deliver(message)...)\n\t}\n}\n\nfunc (c *assuranceCluster) deliverTo(id uint64, messages []pb.Message) []pb.Message {\n\tvar produced []pb.Message\n\tfor _, message := range messages {\n\t\tif message.To == id {\n\t\t\tproduced = append(produced, c.deliver(message)...)\n\t\t}\n\t}\n\treturn produced\n}\n\nfunc findAssuranceMessage(messages []pb.Message,\n\tmessageType pb.MessageType, to uint64, hint uint64) (pb.Message, bool) {\n\tfor _, message := range messages {\n\t\tif message.Type == messageType && message.To == to &&\n\t\t\t(hint == 0 || message.Hint == hint) {\n\t\t\treturn message, true\n\t\t}\n\t}\n\treturn pb.Message{}, false\n}\n\nfunc emitObserverEndpointEvent(t *testing.T, event map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"failed to marshal assurance event: %v\", err)\n\t}\n\tt.Logf(\"CA_EVENT %s\", b)\n}\n\n// registerAssuranceObserver records node 4 as an observer in every voter's\n// raft membership, which is the state produced by an applied AddObserver\n// config change.\nfunc registerAssuranceObserver(t *testing.T, c *assuranceCluster) {\n\tt.Helper()\n\tfor id := uint64(1); id <= 3; id++ {\n\t\tc.peers[id].ApplyConfigChange(pb.ConfigChange{\n\t\t\tType:    pb.AddObserver,\n\t\t\tNodeID:  4,\n\t\t\tAddress: \"assurance-4\",\n\t\t})\n\t\tif messages := c.pump(id); len(messages) > 0 {\n\t\t\tc.drain(messages)\n\t\t}\n\t}\n\tif c.commit[1] < 4 {\n\t\tt.Fatalf(\"observer registration disturbed the leader commit, commit=%d\",\n\t\t\tc.commit[1])\n\t}\n}\n\n// newAssuranceObserver launches a real observer Raft peer for node 4. Its log\n// DB carries the committed voter membership {1,2,3}, which is what an observer\n// learns from the replicated bootstrap entries or a snapshot, and a leader\n// heartbeat teaches it the current leader.\nfunc newAssuranceObserver(t *testing.T) *dragonraft.Peer {\n\tt.Helper()\n\tdb := newAssuranceLogDB()\n\tdb.snapshot.Membership = pb.Membership{\n\t\tConfigChangeId: 1,\n\t\tAddresses: map[uint64]string{\n\t\t\t1: \"assurance-1\",\n\t\t\t2: \"assurance-2\",\n\t\t\t3: \"assurance-3\",\n\t\t},\n\t}\n\tcfg := config.Config{\n\t\tClusterID:       7,\n\t\tNodeID:          4,\n\t\tElectionRTT:     10,\n\t\tHeartbeatRTT:    1,\n\t\tMaxInMemLogSize: 0,\n\t\tIsObserver:      true,\n\t}\n\tobserver := dragonraft.Launch(cfg, db, nil, nil, false, true)\n\tobserver.Handle(pb.Message{\n\t\tFrom: 1,\n\t\tTo:   4,\n\t\tType: pb.Heartbeat,\n\t\tTerm: 1,\n\t})\n\tupdate := observer.GetUpdate(true, 0)\n\tobserver.Commit(update)\n\treturn observer\n}\n\n// admitObserverRead registers an observer-local ReadIndex request and returns\n// the pending-read bookkeeping together with the ReadIndex message that the\n// observer's real raft peer forwarded to its leader.\nfunc admitObserverRead(t *testing.T, observer *dragonraft.Peer,\n\treads *pendingReadIndex, req *RequestState,\n\tctx pb.SystemCtx) pb.Message {\n\tt.Helper()\n\treads.add(ctx, []*RequestState{req})\n\tobserver.ReadIndex(ctx)\n\tupdate := observer.GetUpdate(true, 0)\n\tforwarded := append([]pb.Message(nil), update.Messages...)\n\tobserver.Commit(update)\n\tmessage, ok := findAssuranceMessage(forwarded, pb.ReadIndex, 1, ctx.Low)\n\tif !ok {\n\t\tt.Fatalf(\"observer did not forward its ReadIndex request; messages=%+v\",\n\t\t\tforwarded)\n\t}\n\treturn message\n}\n\n// consumeObserverReady feeds the observer peer's real ReadyToRead output into\n// the node-level pending read registry and returns the ready index.\nfunc consumeObserverReady(t *testing.T, observer *dragonraft.Peer,\n\treads *pendingReadIndex) []pb.ReadyToRead {\n\tt.Helper()\n\tupdate := observer.GetUpdate(true, 0)\n\tready := append([]pb.ReadyToRead(nil), update.ReadyToReads...)\n\tobserver.Commit(update)\n\treads.addReady(ready)\n\treturn ready\n}\n\nfunc completedFlag(req *RequestState) int {\n\tselect {\n\tcase <-req.CompletedC:\n\t\treturn 1\n\tdefault:\n\t\treturn 0\n\t}\n}\n\nfunc TestAssuranceObserverLocalReadIndexCompletion(t *testing.T) {\n\tc := newAssuranceCluster(t)\n\tfor i := 0; i < 100 && c.commit[1] < uint64(4); i++ {\n\t\tc.peers[1].Tick()\n\t\tc.drain(c.pump(1))\n\t}\n\tif c.commit[1] < 4 {\n\t\tt.Fatalf(\"leader failed to commit its current-term no-op, commit=%d\",\n\t\t\tc.commit[1])\n\t}\n\tregisterAssuranceObserver(t, c)\n\tobserver := newAssuranceObserver(t)\n\n\tpool := &sync.Pool{New: func() interface{} { return &RequestState{} }}\n\treads4 := newPendingReadIndex(pool, newReadIndexQueue(16))\n\treq4, err := reads4.read(50)\n\tif err != nil {\n\t\tt.Fatalf(\"failed to create observer read: %v\", err)\n\t}\n\tctxA := reads4.nextCtx()\n\tctxB := pb.SystemCtx{Low: 202, High: 2003}\n\n\tforwardedA := admitObserverRead(t, observer, reads4, req4, ctxA)\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":      \"observer_local_readindex_forwarded\",\n\t\t\"request_id\": \"observer-read-A\",\n\t\t\"node_id\":    uint64(4),\n\t\t\"leader_id\":  forwardedA.To,\n\t\t\"ctx_low\":    ctxA.Low,\n\t\t\"ctx_high\":   ctxA.High,\n\t})\n\n\t// The real leader admits the observer's forwarded request.\n\tleaderMessagesA := c.deliver(forwardedA)\n\t// A later voter-originated request is queued behind the observer's request.\n\tc.peers[3].ReadIndex(ctxB)\n\tleaderMessagesB := c.deliverTo(1, c.pump(3))\n\tif len(leaderMessagesB) == 0 {\n\t\tt.Fatal(\"leader produced no confirmation heartbeat for the later context\")\n\t}\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":            \"later_voter_readindex_queued\",\n\t\t\"request_id\":       \"voter-read-B\",\n\t\t\"node_id\":          uint64(3),\n\t\t\"leader_id\":        uint64(1),\n\t\t\"ctx_low\":          ctxB.Low,\n\t\t\"ctx_high\":         ctxB.High,\n\t\t\"admitted_ctx_low\": ctxA.Low,\n\t})\n\n\theartbeatB, ok := findAssuranceMessage(leaderMessagesB, pb.Heartbeat, 3, ctxB.Low)\n\tif !ok {\n\t\tt.Fatalf(\"no heartbeat carrying the later context was sent to node 3; messages=%+v\",\n\t\t\tleaderMessagesB)\n\t}\n\tnode3Output := c.deliver(heartbeatB)\n\tleaderReplies := c.deliverTo(1, node3Output)\n\tobserverReply, ok := findAssuranceMessage(leaderReplies, pb.ReadIndexResp, 4, 0)\n\tif !ok {\n\t\tt.Fatalf(\"leader produced no ReadIndex response for observer 4; messages=%+v\",\n\t\t\tleaderReplies)\n\t}\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":              \"observer_readindex_reply\",\n\t\t\"request_id\":         \"observer-read-A\",\n\t\t\"reply_to\":           observerReply.To,\n\t\t\"admitted_ctx_low\":   ctxA.Low,\n\t\t\"admitted_ctx_high\":  ctxA.High,\n\t\t\"trigger_from\":       uint64(3),\n\t\t\"trigger_ctx_low\":    ctxB.Low,\n\t\t\"trigger_ctx_high\":   ctxB.High,\n\t\t\"response_ctx_low\":   observerReply.Hint,\n\t\t\"response_ctx_high\":  observerReply.HintHigh,\n\t\t\"response_log_index\": observerReply.LogIndex,\n\t})\n\n\t// Feed the reply through the observer's real handler and the node-level\n\t// pending-read registry.\n\tobserver.Handle(observerReply)\n\tready := consumeObserverReady(t, observer, reads4)\n\treads4.applied(observerReply.LogIndex)\n\tbatch, exists := reads4.batches[ctxA]\n\tbatchIndex := uint64(0)\n\tif exists {\n\t\tbatchIndex = batch.index\n\t}\n\treadyCtxLow := uint64(0)\n\treadyIndex := uint64(0)\n\tif len(ready) > 0 {\n\t\treadyCtxLow = ready[0].SystemCtx.Low\n\t\treadyIndex = ready[0].Index\n\t}\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":                 \"observer_read_completion_state\",\n\t\t\"request_id\":            \"observer-read-A\",\n\t\t\"ready_count\":           len(ready),\n\t\t\"ready_ctx_low\":         readyCtxLow,\n\t\t\"ready_index\":           readyIndex,\n\t\t\"applied_index\":         observerReply.LogIndex,\n\t\t\"original_batch_exists\": exists,\n\t\t\"original_batch_index\":  batchIndex,\n\t\t\"completed_after_reply\": completedFlag(req4),\n\t})\n\n\t// A late confirmation of the observer's own context cannot repair it: the\n\t// leader already removed the queued entry.\n\tif heartbeatA, ok := findAssuranceMessage(\n\t\tleaderMessagesA, pb.Heartbeat, 2, ctxA.Low); ok {\n\t\tlateOutputs := c.deliverTo(1, c.deliver(heartbeatA))\n\t\tcorrect := 0\n\t\tfor _, message := range lateOutputs {\n\t\t\tif message.Type == pb.ReadIndexResp && message.To == 4 &&\n\t\t\t\tmessage.Hint == ctxA.Low && message.HintHigh == ctxA.High {\n\t\t\t\tcorrect++\n\t\t\t}\n\t\t}\n\t\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\t\"event\":                       \"observer_late_confirmation\",\n\t\t\t\"request_id\":                  \"observer-read-A\",\n\t\t\t\"context_correct_reply_count\": correct,\n\t\t\t\"completed_after_late_reply\":  completedFlag(req4),\n\t\t})\n\t}\n}\n\nfunc TestAssuranceObserverLocalReadIndexControl(t *testing.T) {\n\tc := newAssuranceCluster(t)\n\tfor i := 0; i < 100 && c.commit[1] < uint64(4); i++ {\n\t\tc.peers[1].Tick()\n\t\tc.drain(c.pump(1))\n\t}\n\tif c.commit[1] < 4 {\n\t\tt.Fatalf(\"leader failed to commit its current-term no-op, commit=%d\",\n\t\t\tc.commit[1])\n\t}\n\tregisterAssuranceObserver(t, c)\n\tobserver := newAssuranceObserver(t)\n\n\tpool := &sync.Pool{New: func() interface{} { return &RequestState{} }}\n\treads4 := newPendingReadIndex(pool, newReadIndexQueue(16))\n\treq4, err := reads4.read(50)\n\tif err != nil {\n\t\tt.Fatalf(\"failed to create observer read: %v\", err)\n\t}\n\tctxA := reads4.nextCtx()\n\tctxB := pb.SystemCtx{Low: 202, High: 2003}\n\n\tforwardedA := admitObserverRead(t, observer, reads4, req4, ctxA)\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":      \"control_observer_local_readindex_forwarded\",\n\t\t\"request_id\": \"control-observer-read-A\",\n\t\t\"node_id\":    uint64(4),\n\t\t\"leader_id\":  forwardedA.To,\n\t\t\"ctx_low\":    ctxA.Low,\n\t\t\"ctx_high\":   ctxA.High,\n\t})\n\tleaderMessagesA := c.deliver(forwardedA)\n\tc.peers[3].ReadIndex(ctxB)\n\t_ = c.deliverTo(1, c.pump(3))\n\n\t// Confirm the observer's own admitted context first.\n\theartbeatA, ok := findAssuranceMessage(leaderMessagesA, pb.Heartbeat, 2, ctxA.Low)\n\tif !ok {\n\t\tt.Fatalf(\"no heartbeat carrying the observer context was sent to node 2; messages=%+v\",\n\t\t\tleaderMessagesA)\n\t}\n\tleaderReplies := c.deliverTo(1, c.deliver(heartbeatA))\n\tobserverReply, ok := findAssuranceMessage(leaderReplies, pb.ReadIndexResp, 4, 0)\n\tif !ok {\n\t\tt.Fatalf(\"leader produced no ReadIndex response for observer 4; messages=%+v\",\n\t\t\tleaderReplies)\n\t}\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":              \"control_observer_readindex_reply\",\n\t\t\"request_id\":         \"control-observer-read-A\",\n\t\t\"reply_to\":           observerReply.To,\n\t\t\"admitted_ctx_low\":   ctxA.Low,\n\t\t\"admitted_ctx_high\":  ctxA.High,\n\t\t\"trigger_from\":       uint64(2),\n\t\t\"response_ctx_low\":   observerReply.Hint,\n\t\t\"response_ctx_high\":  observerReply.HintHigh,\n\t\t\"response_log_index\": observerReply.LogIndex,\n\t})\n\n\tobserver.Handle(observerReply)\n\tready := consumeObserverReady(t, observer, reads4)\n\treads4.applied(observerReply.LogIndex)\n\tbatch, exists := reads4.batches[ctxA]\n\tbatchIndex := uint64(0)\n\tif exists {\n\t\tbatchIndex = batch.index\n\t}\n\treadyIndex := uint64(0)\n\tif len(ready) > 0 {\n\t\treadyIndex = ready[0].Index\n\t}\n\temitObserverEndpointEvent(t, map[string]interface{}{\n\t\t\"event\":                 \"control_observer_read_completion_state\",\n\t\t\"request_id\":            \"control-observer-read-A\",\n\t\t\"ready_count\":           len(ready),\n\t\t\"ready_index\":           readyIndex,\n\t\t\"applied_index\":         observerReply.LogIndex,\n\t\t\"original_batch_exists\": exists,\n\t\t\"original_batch_index\":  batchIndex,\n\t\t\"completed_after_reply\": completedFlag(req4),\n\t})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "test_names": [
+        "TestAssuranceObserverLocalReadIndexCompletion",
+        "TestAssuranceObserverLocalReadIndexControl"
+      ],
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "observer_admitted",
+          "event": "observer_local_readindex_forwarded",
+          "conditions": [
+            {
+              "field": "request_id",
+              "op": "eq",
+              "value": "observer-read-A",
+              "reference": null
+            },
+            {
+              "field": "node_id",
+              "op": "eq",
+              "value": 4,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "control_observer_admitted",
+          "event": "control_observer_local_readindex_forwarded",
+          "conditions": [
+            {
+              "field": "request_id",
+              "op": "eq",
+              "value": "control-observer-read-A",
+              "reference": null
+            },
+            {
+              "field": "node_id",
+              "op": "eq",
+              "value": 4,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "leader-readindex-admission",
+      "readindex-confirm-handler",
+      "readindex-confirm",
+      "observer-readindex-forward",
+      "follower-readindex-forward",
+      "follower-readindexresp",
+      "node-process-ready",
+      "pending-read-addready",
+      "pending-read-applied",
+      "systemctx-identity"
+    ],
+    "anchors": [
+      {
+        "material_id": "leader-readindex-admission",
+        "symbol": "handleLeaderReadIndex",
+        "start_line": 1662,
+        "end_line": 1695,
+        "anchor": {
+          "source_ids": [
+            "leader-readindex-admission"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "leader-readindex-admission",
+          "start_line": 1662,
+          "end_line": 1662,
+          "symbol": "handleLeaderReadIndex"
+        }
+      },
+      {
+        "material_id": "readindex-confirm-handler",
+        "symbol": "handleReadIndexLeaderConfirmation",
+        "start_line": 1771,
+        "end_line": 1790,
+        "anchor": {
+          "source_ids": [
+            "readindex-confirm-handler"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "readindex-confirm-handler",
+          "start_line": 1771,
+          "end_line": 1771,
+          "symbol": "handleReadIndexLeaderConfirmation"
+        }
+      },
+      {
+        "material_id": "observer-readindex-forward",
+        "symbol": "handleObserverReadIndex",
+        "start_line": 1878,
+        "end_line": 1880,
+        "anchor": {
+          "source_ids": [
+            "observer-readindex-forward"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "observer-readindex-forward",
+          "start_line": 1878,
+          "end_line": 1878,
+          "symbol": "handleObserverReadIndex"
+        }
+      },
+      {
+        "material_id": "follower-readindex-forward",
+        "symbol": "handleFollowerReadIndex",
+        "start_line": 1936,
+        "end_line": 1944,
+        "anchor": {
+          "source_ids": [
+            "follower-readindex-forward"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "follower-readindex-forward",
+          "start_line": 1936,
+          "end_line": 1936,
+          "symbol": "handleFollowerReadIndex"
+        }
+      },
+      {
+        "material_id": "follower-readindexresp",
+        "symbol": "handleFollowerReadIndexResp",
+        "start_line": 1955,
+        "end_line": 1963,
+        "anchor": {
+          "source_ids": [
+            "follower-readindexresp"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "follower-readindexresp",
+          "start_line": 1955,
+          "end_line": 1955,
+          "symbol": "handleFollowerReadIndexResp"
+        }
+      },
+      {
+        "material_id": "pending-read-addready",
+        "symbol": "pendingReadIndex.addReady",
+        "start_line": 861,
+        "end_line": 873,
+        "anchor": {
+          "source_ids": [
+            "pending-read-addready"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "pending-read-addready",
+          "start_line": 861,
+          "end_line": 861,
+          "symbol": "pendingReadIndex.addReady"
+        }
+      },
+      {
+        "material_id": "pending-read-applied",
+        "symbol": "pendingReadIndex.applied",
+        "start_line": 908,
+        "end_line": 937,
+        "anchor": {
+          "source_ids": [
+            "pending-read-applied"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "pending-read-applied",
+          "start_line": 908,
+          "end_line": 908,
+          "symbol": "pendingReadIndex.applied"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Observer-local ReadIndex endpoint. A real observer Raft peer for node 4 forwards an observer-originated ReadIndex request to the real leader of a three-voter in-process group, a later voter-originated request is queued behind it, and the leader's reply is processed by the observer's own Raft handler and the node-level pending-read registry.",
+      "assumptions": [
+        "The voter group is three real in-process Raft Peer handlers with bootstrap membership {1,2,3}; node 1 is the leader and the storage backend is a test-only in-memory ILogDB.",
+        "Each voter records node 4 as an observer through Peer.ApplyConfigChange, which is the state produced by an applied AddObserver entry; the leader's ReadIndex reply path does not consult that map.",
+        "Observer 4 is a real Raft peer launched with IsObserver and a log DB carrying the committed voter membership; a leader heartbeat teaches it the current leader before it forwards a read.",
+        "The observer's SystemCtx is generated by the real node-level pendingReadIndex generator; the later voter request uses the fixed distinct context {202,2003}.",
+        "Message delivery order is controlled by the harness; both heartbeat confirmations are legal, carry the same leader term, and reach their followers only when the harness delivers them.",
+        "The control case keeps the same setup and only delivers the observer's own confirmation first.",
+        "Production code is unchanged."
+      ],
+      "excluded": [
+        "No NodeHost, transport, disk persistence, restart or snapshot path is exercised.",
+        "No proposal, membership change or leader change occurs while the read is outstanding.",
+        "The run observes reply-context association and pending-read completion only; it does not attempt to establish a stale data value."
+      ],
+      "parameters": {}
+    },
+    "prefix": "The harness launches three real Raft peers with bootstrap membership {1,2,3} and ticks node 1 until its current-term no-op is committed, then records node 4 as an observer in each voter's raft membership through ApplyConfigChange. It launches observer 4 as a real observer peer whose log DB carries the committed voter membership and delivers one leader heartbeat so the observer knows its leader. The node-level pendingReadIndex registers one observer read under a generated context A and the observer peer forwards it to the leader. A later voter-originated request with context B is queued, node 3 receives its heartbeat and returns the confirmation that the leader uses to confirm B, and the leader's reply addressed to observer 4 is emitted and then handled by the observer peer. The resulting ReadyToRead output is fed to pendingReadIndex.addReady and the reply's log index to pendingReadIndex.applied, and the run records the ready index, whether the batch keyed by context A still exists and its index, and whether the client read completed. A late confirmation of context A is then delivered and checked for a context-correct reply. The control case repeats the setup, confirms context A first, and records the same completion fields.",
+    "requirement": "An observer-originated ReadIndex request must be answered with the SystemCtx the observer admitted, and its admitted pending read must complete once a valid ready index is applied. Confirming a later queued context first must not leave the observer's admitted batch unready after the ReadyToRead index has been applied.",
+    "responsibility": "handleReadIndexLeaderConfirmation constructs the remote ReadIndex reply; handleObserverReadIndex and handleFollowerReadIndex forward the observer's request; handleFollowerReadIndexResp and node.go's pendingReadIndex consume the reply and complete the read. The experiment exercises those real handlers and controls only which legal heartbeat confirmation is delivered first.",
+    "comparisons": [
+      {
+        "event": "observer_readindex_reply",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "observer_admitted",
+        "assertion": {
+          "field": "response_ctx_low",
+          "op": "eq",
+          "value": null,
+          "reference": "observer_admitted.ctx_low"
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "reply_to",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          },
+          {
+            "field": "trigger_from",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ],
+        "description": "When a later voter context is confirmed first, the reply delivered to observer 4 must still carry the context the observer admitted."
+      },
+      {
+        "event": "observer_read_completion_state",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "observer_admitted",
+        "assertion": {
+          "field": "completed_after_reply",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "ready_count",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "applied_index",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ],
+        "description": "After the observer's real handler produced a ReadyToRead and its index was applied, the observer's admitted read should complete."
+      },
+      {
+        "event": "control_observer_readindex_reply",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "control_observer_admitted",
+        "assertion": {
+          "field": "response_ctx_low",
+          "op": "eq",
+          "value": null,
+          "reference": "control_observer_admitted.ctx_low"
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "reply_to",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          },
+          {
+            "field": "trigger_from",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ],
+        "description": "In the control, confirming the observer's own context must yield a reply carrying that context."
+      },
+      {
+        "event": "control_observer_read_completion_state",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "control_observer_admitted",
+        "assertion": {
+          "field": "completed_after_reply",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "ready_count",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "applied_index",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ],
+        "description": "In the control, the observer's admitted read should complete through the same consumer path."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "0917893e9a6d4b5f8bf6b7752319db78",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/lni/dragonboat/v3",
+      "variant": "dragonboat_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "f705a4818d8446e6844b771b62754884",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

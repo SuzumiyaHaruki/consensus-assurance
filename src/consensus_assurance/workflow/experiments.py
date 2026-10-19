@@ -34,6 +34,8 @@ def validate_basis(state, basis, implementation):
     require_uses(state, basis.knowledge)
     if implementation is None or basis.harness.kind != implementation.harness_kind:
         raise ValueError('Unsupported experiment harness')
+    if basis.harness.kind != 'rust_test' and (basis.harness.features or not basis.harness.default_features or basis.harness.all_features):
+        raise ValueError('Cargo feature selection is only supported for Rust experiments')
     materials = {m.id: m for m in state.materials}
     for anchor in basis.anchors:
         located, error = locate(anchor, materials)
@@ -118,8 +120,10 @@ def execute(engine, fixed, operation_id):
         paths = install_harness(workspace, fixed.harness_filename, harness, engine.state.snapshot.files)
         # A completed raw receipt must reach runner recovery even after the deadline.
         # New actions still require budget.take; the runner cannot start with zero time.
+        build_options = ({'features':harness.features, 'default_features':harness.default_features,
+                          'all_features':harness.all_features} if harness.kind == 'rust_test' else {})
         check = run_experiment(engine.runner,
-            engine.implementation.experiment_command(harness.execution_package, fixed.harness_filename, harness.test_names),
+            engine.implementation.experiment_command(harness.execution_package, fixed.harness_filename, harness.test_names, **build_options),
             workspace, fixed.snapshot_id, min(engine.config.budget.action_timeout, engine.budget.remaining()), engine.config.execution_isolation,
             'experiment', adapter=engine.implementation)
         check.experiment_id = fixed.id

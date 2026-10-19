@@ -1,0 +1,766 @@
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/core/tick.rs openraft/src/core/tick.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/core/tick.rs	2026-10-18 11:44:44.748367482 +0800
++++ openraft/src/core/tick.rs	2026-10-18 12:37:18.631332606 +0800
+@@ -200,4 +200,25 @@
+ 
+         Ok(())
+     }
++
++    /// AUDIT-ONLY: a zero heartbeat interval is accepted by the config parser
++    /// and makes the tick loop emit without any delay.
++    #[tokio::test]
++    async fn audit_zero_interval_busy_loops() {
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        let th = Tick::<TickUTConfig>::spawn(Duration::ZERO, tx, true);
++
++        TickUTConfig::sleep(Duration::from_millis(100)).await;
++
++        let mut n = 0;
++        while rx.try_recv().is_ok() {
++            n += 1;
++        }
++        eprintln!("zero-interval ticks in 100ms: {}", n);
++        // A normal 50ms heartbeat interval would produce about 2 ticks in this
++        // window.  The zero interval is limited only by the runtime scheduler.
++        assert!(n > 20, "expected a busy tick loop, got only {} ticks", n);
++
++        let _ = th.shutdown();
++    }
+ }
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/engine/mod.rs openraft/src/engine/mod.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/engine/mod.rs	2026-10-18 11:44:44.755367870 +0800
++++ openraft/src/engine/mod.rs	2026-10-18 12:25:26.581035449 +0800
+@@ -40,6 +40,8 @@
+ #[cfg(test)]
+ mod tests {
+     mod append_entries_test;
++    mod audit_log_id_list_test;
++    mod audit_purge_batch_zero_test;
+     mod elect_test;
+     mod handle_vote_req_test;
+     mod handle_vote_resp_test;
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/engine/tests/audit_log_id_list_test.rs openraft/src/engine/tests/audit_log_id_list_test.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/engine/tests/audit_log_id_list_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/engine/tests/audit_log_id_list_test.rs	2026-10-18 12:00:42.862297675 +0800
+@@ -0,0 +1,176 @@
++//! Audit-only randomized model test for `LogIdList`.
++//!
++//! Not part of the captured implementation. It checks the compressed key-log-id
++//! representation against a plain `Vec<LogId>` model under append, truncate and
++//! purge operations.
++
++use crate::engine::LogIdList;
++use crate::testing::log_id;
++use crate::LogId;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++#[derive(Default)]
++struct Model {
++    /// All non-purged logs, consecutive, ordered by index.
++    logs: Vec<LogId<u64>>,
++    /// Log id returned at the purged boundary, if any.
++    purged_upto: Option<LogId<u64>>,
++}
++
++impl Model {
++    fn last_index(&self) -> Option<u64> {
++        self.logs.last().map(|x| x.index).or(self.purged_upto.map(|x| x.index))
++    }
++
++    fn get(&self, index: u64) -> Option<LogId<u64>> {
++        if let Some(p) = self.purged_upto {
++            if index <= p.index {
++                return (index == p.index).then_some(p);
++            }
++        }
++        self.logs.iter().find(|x| x.index == index).cloned()
++    }
++
++    fn first(&self) -> Option<LogId<u64>> {
++        self.purged_upto.or_else(|| self.logs.first().cloned())
++    }
++
++    fn last(&self) -> Option<LogId<u64>> {
++        self.logs.last().cloned().or(self.purged_upto)
++    }
++
++    fn append(&mut self, lid: LogId<u64>) {
++        if let Some(last) = self.logs.last() {
++            assert!(lid.index > last.index, "test bug: non-monotonic append {lid:?} after {last:?}");
++        }
++        self.logs.push(lid);
++    }
++
++    fn truncate(&mut self, at: u64) {
++        if let Some(p) = self.purged_upto {
++            assert!(at > p.index, "test bug: truncate {at} into purged region {}", p.index);
++        }
++        self.logs.retain(|x| x.index < at);
++    }
++
++    fn purge(&mut self, upto: LogId<u64>) {
++        self.logs.retain(|x| x.index > upto.index);
++        self.purged_upto = Some(upto);
++    }
++}
++
++fn check(ids: &LogIdList<u64>, m: &Model, ctx: &str) {
++    let last = m.last_index();
++
++    for i in 0..last.map(|x| x + 3).unwrap_or(0) {
++        assert_eq!(
++            m.get(i),
++            ids.get(i),
++            "{ctx}: get({i}) mismatch; keys: {:?}, logs: {:?}, purged: {:?}",
++            ids.key_log_ids(),
++            m.logs,
++            m.purged_upto
++        );
++    }
++
++    assert_eq!(m.first(), ids.first().cloned(), "{ctx}: first; keys: {:?}", ids.key_log_ids());
++    assert_eq!(m.last(), ids.last().cloned(), "{ctx}: last; keys: {:?}", ids.key_log_ids());
++
++    for k in ids.key_log_ids() {
++        assert_eq!(Some(k.clone()), ids.get(k.index), "{ctx}: key log id not reachable via get: {k}");
++    }
++}
++
++#[test]
++fn audit_log_id_list_random_ops() {
++    for seed in 0..60 {
++        let mut rng = Lcg(seed);
++        let mut ids = LogIdList::<u64>::default();
++        let mut m = Model::default();
++        let mut next_index = 0u64;
++        let mut term = 1u64;
++
++        for step in 0..400 {
++            let op = if next_index == 0 { 0 } else { rng.below(8) };
++            let ctx = format!("seed {seed} step {step} op {op}");
++
++            match op {
++                // append one log with a random leader id
++                0 | 1 => {
++                    if rng.below(4) == 0 {
++                        term += 1;
++                    }
++                    let lid = log_id(term, 1, next_index);
++                    ids.append(lid);
++                    m.append(lid);
++                    next_index += 1;
++                }
++                // append a batch by the same leader
++                2 | 3 => {
++                    term += 1;
++                    let n = 1 + rng.below(4);
++                    let batch = (0..n).map(|k| log_id(term, 1, next_index + k)).collect::<Vec<_>>();
++                    ids.extend_from_same_leader(&batch);
++                    for lid in &batch {
++                        m.append(*lid);
++                    }
++                    next_index += n;
++                }
++                // append a batch with mixed leaders
++                4 => {
++                    let n = 1 + rng.below(4);
++                    let batch = (0..n)
++                        .map(|k| {
++                            if rng.below(2) == 0 {
++                                term += 1;
++                            }
++                            log_id(term, 1, next_index + k)
++                        })
++                        .collect::<Vec<_>>();
++                    ids.extend(&batch);
++                    for lid in &batch {
++                        m.append(*lid);
++                    }
++                    next_index += n;
++                }
++                // truncate: delete logs at and after `at`
++                5 | 6 => {
++                    let lower = m.purged_upto.map(|x| x.index + 1).unwrap_or(0);
++                    if next_index <= lower {
++                        continue;
++                    }
++                    let at = lower + rng.below(next_index - lower);
++                    ids.truncate(at);
++                    m.truncate(at);
++                    next_index = at;
++                }
++                // purge upto an existing log id
++                7 => {
++                    let lower = m.purged_upto.map(|x| x.index).unwrap_or(0);
++                    if next_index <= lower {
++                        continue;
++                    }
++                    let idx = lower + rng.below(next_index - lower);
++                    let lid = m.get(idx).expect("log exists");
++                    ids.purge(&lid);
++                    m.purge(lid);
++                }
++                _ => unreachable!(),
++            }
++
++            check(&ids, &m, &ctx);
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/engine/tests/audit_purge_batch_zero_test.rs openraft/src/engine/tests/audit_purge_batch_zero_test.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/engine/tests/audit_purge_batch_zero_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/engine/tests/audit_purge_batch_zero_test.rs	2026-10-18 12:39:41.440815854 +0800
+@@ -0,0 +1,55 @@
++//! Audit-only reproduction: `calc_purge_upto()` subtracts one from
++//! `purge_end` without handling `purge_end == 0`.  A zero purge batch is
++//! accepted by `Config::validate()`, and a snapshot at index 0 with
++//! `max_in_snapshot_log_to_keep > 0` makes `purge_end` zero.
++
++use std::panic::AssertUnwindSafe;
++
++use crate::engine::testing::UTConfig;
++use crate::engine::Engine;
++use crate::engine::LogIdList;
++use crate::CommittedLeaderId;
++use crate::Config;
++use crate::LogId;
++
++fn log_id(term: u64, index: u64) -> LogId<u64> {
++    LogId::<u64> {
++        leader_id: CommittedLeaderId::new(term, 0),
++        index,
++    }
++}
++
++#[test]
++fn audit_calc_purge_upto_zero_batch() {
++    let mut eng = Engine::<UTConfig>::default();
++    eng.state.enable_validation(false);
++    eng.state.log_ids = LogIdList::new(vec![log_id(0, 0), log_id(1, 1)]);
++
++    // A snapshot covers index 0; keeping two logs means purge_end == 0.
++    eng.state.snapshot_meta.last_log_id = Some(log_id(0, 0));
++    eng.config.max_in_snapshot_log_to_keep = 2;
++    eng.config.purge_batch_size = 0;
++
++    let res = std::panic::catch_unwind(AssertUnwindSafe(|| eng.log_handler().calc_purge_upto()));
++    assert!(
++        res.is_err(),
++        "expected the unguarded purge_end - 1 to underflow, got {:?}",
++        res.ok()
++    );
++}
++
++#[test]
++fn audit_config_accepts_zero_limits() -> anyhow::Result<()> {
++    let config = Config::build(&[
++        "foo",
++        "--purge-batch-size=0",
++        "--snapshot-max-chunk-size=0",
++        "--heartbeat-interval=0",
++        "--install-snapshot-timeout=0",
++    ])?;
++    assert_eq!(0, config.purge_batch_size);
++    assert_eq!(0, config.snapshot_max_chunk_size);
++    assert_eq!(0, config.heartbeat_interval);
++    assert_eq!(0, config.install_snapshot_timeout);
++    Ok(())
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/membership/audit_membership_transition_test.rs openraft/src/membership/audit_membership_transition_test.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/membership/audit_membership_transition_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/membership/audit_membership_transition_test.rs	2026-10-18 13:19:35.928965051 +0800
+@@ -0,0 +1,208 @@
++//! Audit-only randomized model test for membership transitions.
++//!
++//! Checks `Membership::change` against a small model: the intermediate
++//! config must be coherent with the current config and with the goal, the
++//! goal must be reachable in one more step, and `retain=false` must remove
++//! only old voters absent from the new voter set.
++
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++
++use maplit::btreeset;
++
++use crate::quorum::Coherent;
++use crate::quorum::Joint;
++use crate::ChangeMembers;
++use crate::Membership;
++
++type M = Membership<u64, ()>;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++fn all_nodes() -> BTreeMap<u64, ()> {
++    (0..6).map(|i| (i, ())).collect()
++}
++
++fn union(configs: &[BTreeSet<u64>]) -> BTreeSet<u64> {
++    configs.iter().flatten().cloned().collect()
++}
++
++fn to_joint(configs: &[BTreeSet<u64>]) -> Joint<u64, Vec<u64>, Vec<Vec<u64>>> {
++    Joint::from(configs.iter().map(|c| c.iter().cloned().collect::<Vec<_>>()).collect::<Vec<_>>())
++}
++
++fn goal_vec(goal: &BTreeSet<u64>) -> Vec<u64> {
++    goal.iter().cloned().collect()
++}
++
++fn expected_configs(current: &[BTreeSet<u64>], goal: &BTreeSet<u64>) -> Vec<BTreeSet<u64>> {
++    if current.iter().any(|c| c == goal) {
++        vec![goal.clone()]
++    } else {
++        vec![current.last().unwrap().clone(), goal.clone()]
++    }
++}
++
++fn subset(rng: &mut Lcg, universe: &[u64]) -> BTreeSet<u64> {
++    universe.iter().filter(|_| rng.below(2) == 0).cloned().collect()
++}
++
++fn non_empty_subset(rng: &mut Lcg, universe: &[u64]) -> BTreeSet<u64> {
++    for _ in 0..100 {
++        let s = subset(rng, universe);
++        if !s.is_empty() {
++            return s;
++        }
++    }
++    btreeset! { universe[0] }
++}
++
++fn map_of(set: &BTreeSet<u64>) -> BTreeMap<u64, ()> {
++    set.iter().map(|x| (*x, ())).collect()
++}
++
++#[test]
++fn audit_membership_change_model() {
++    let universe = [0u64, 1, 2, 3, 4, 5];
++
++    for seed in 0..30 {
++        let mut rng = Lcg(seed);
++        let mut current = if seed % 2 == 0 {
++            vec![btreeset! {0u64, 1, 2}]
++        } else {
++            vec![btreeset! {0u64, 1, 2}, btreeset! {2u64, 3, 4}]
++        };
++
++        for step in 0..200 {
++            let m = M::new(current.clone(), all_nodes());
++            let retain = rng.below(2) == 0;
++            let kind = rng.below(8);
++            let old_voters = union(&current);
++            let last = current.last().unwrap().clone();
++
++            let (change, goal, expected_nodes) = match kind {
++                0 => {
++                    let goal = non_empty_subset(&mut rng, &universe);
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::ReplaceAllVoters(goal.clone()), goal, nodes)
++                }
++                1 => {
++                    let add = subset(&mut rng, &universe);
++                    let goal = last.union(&add).cloned().collect::<BTreeSet<_>>();
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::AddVoterIds(add), goal, nodes)
++                }
++                2 => {
++                    let add = subset(&mut rng, &universe);
++                    let goal = last.union(&add).cloned().collect::<BTreeSet<_>>();
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::AddVoters(map_of(&add)), goal, nodes)
++                }
++                3 => {
++                    let rem = non_empty_subset(&mut rng, &last.iter().cloned().collect::<Vec<_>>());
++                    let goal = last.difference(&rem).cloned().collect::<BTreeSet<_>>();
++                    if goal.is_empty() {
++                        continue;
++                    }
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::RemoveVoters(rem), goal, nodes)
++                }
++                4 => {
++                    let add = subset(&mut rng, &universe);
++                    let nodes = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::AddNodes(map_of(&add)), last.clone(), nodes)
++                }
++                5 => {
++                    let learner = universe.iter().find(|x| !old_voters.contains(x)).cloned();
++                    let mut nodes = old_voters.clone();
++                    if let Some(l) = learner {
++                        nodes.insert(l);
++                    }
++                    let expected = all_nodes().into_keys().collect::<BTreeSet<_>>();
++                    (ChangeMembers::SetNodes(map_of(&nodes)), last.clone(), expected)
++                }
++                6 => {
++                    let learners = all_nodes().into_keys().filter(|x| !old_voters.contains(x)).collect::<BTreeSet<_>>();
++                    if learners.is_empty() {
++                        continue;
++                    }
++                    let rem = non_empty_subset(&mut rng, &learners.iter().cloned().collect::<Vec<_>>());
++                    let expected = all_nodes().into_keys().filter(|x| !rem.contains(x)).collect::<BTreeSet<_>>();
++                    (ChangeMembers::RemoveNodes(rem), last.clone(), expected)
++                }
++                7 => {
++                    let learner = universe.iter().find(|x| !old_voters.contains(x)).cloned();
++                    let mut nodes = old_voters.clone();
++                    if let Some(l) = learner {
++                        nodes.insert(l);
++                    }
++                    let expected = nodes.clone();
++                    (ChangeMembers::ReplaceAllNodes(map_of(&nodes)), last.clone(), expected)
++                }
++                _ => unreachable!(),
++            };
++
++            // Node-only changes leave the voter configs untouched.  Only a
++            // voter change goes through `next_coherent`/`find_coherent`.
++            let expected_cfg = if kind < 4 {
++                expected_configs(&current, &goal)
++            } else {
++                current.clone()
++            };
++            let mut want_nodes = expected_nodes;
++
++            // Voter changes with retain=false remove old voters that are absent
++            // from the new voter set.
++            if kind < 4 && !retain {
++                let new_voters = union(&expected_cfg);
++                want_nodes.retain(|x| !old_voters.contains(x) || new_voters.contains(x));
++            }
++
++            let got = m
++                .change(change.clone(), retain)
++                .unwrap_or_else(|e| panic!("seed {seed} step {step} kind {kind}: change failed: {e:?}"));
++
++            assert_eq!(
++                expected_cfg,
++                got.get_joint_config().clone(),
++                "seed {seed} step {step} kind {kind} retain {retain}"
++            );
++            assert!(
++                to_joint(&current).is_coherent_with(&to_joint(&expected_cfg)),
++                "seed {seed} step {step}: current and intermediate are not coherent"
++            );
++            assert!(
++                to_joint(&expected_cfg).is_coherent_with(&goal_vec(&goal)),
++                "seed {seed} step {step}: intermediate and goal are not coherent"
++            );
++
++            if kind < 4 && expected_cfg.len() > 1 {
++                let converged = got
++                    .clone()
++                    .change(ChangeMembers::ReplaceAllVoters(goal.clone()), true)
++                    .expect("convergence change failed");
++                assert_eq!(
++                    vec![goal.clone()],
++                    converged.get_joint_config().clone(),
++                    "seed {seed} step {step}: did not converge in one step"
++                );
++            }
++
++            let got_nodes = got.nodes().map(|(id, _)| *id).collect::<BTreeSet<_>>();
++            assert_eq!(want_nodes, got_nodes, "seed {seed} step {step} kind {kind} retain {retain}: nodes");
++
++            current = got.get_joint_config().clone();
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/membership/mod.rs openraft/src/membership/mod.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/membership/mod.rs	2026-10-18 11:44:44.758368036 +0800
++++ openraft/src/membership/mod.rs	2026-10-18 13:18:59.783559210 +0800
+@@ -11,6 +11,8 @@
+ #[cfg(test)]
+ mod effective_membership_test;
+ #[cfg(test)]
++mod audit_membership_transition_test;
++#[cfg(test)]
+ mod membership_test;
+ 
+ pub use effective_membership::EffectiveMembership;
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/network/snapshot_transport.rs openraft/src/network/snapshot_transport.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/network/snapshot_transport.rs	2026-10-18 11:44:44.760368146 +0800
++++ openraft/src/network/snapshot_transport.rs	2026-10-18 12:40:27.902630126 +0800
+@@ -575,6 +575,136 @@
+         assert_eq!(net.received_offset, vec![0, 1, 2, 0, 1, 2]);
+     }
+ 
++    /// AUDIT-ONLY: `snapshot_max_chunk_size = 0` is accepted by the config
++    /// parser, but makes `send_snapshot` send zero-byte chunks forever: the
++    /// offset never advances and `done` can never become true for a non-empty
++    /// snapshot.
++    #[tokio::test]
++    async fn audit_chunk_size_zero_loops_forever() {
++        let mut net = Network {
++            received_offset: vec![],
++            // Never trigger the SnapshotMismatch branch.
++            match_cnt: 0,
++        };
++
++        let mut opt = RPCOption::new(Duration::from_millis(100));
++        opt.snapshot_chunk_size = Some(0);
++        let cancel = futures::future::pending();
++
++        let res = tokio::time::timeout(
++            Duration::from_millis(100),
++            Chunked::send_snapshot(
++                &mut net,
++                Vote::new(1, 0),
++                Snapshot::<UTConfig>::new(
++                    SnapshotMeta {
++                        last_log_id: None,
++                        last_membership: StoredMembership::default(),
++                        snapshot_id: "audit-0".to_string(),
++                    },
++                    Box::new(Cursor::new(vec![1, 2, 3])),
++                ),
++                cancel,
++                opt,
++            ),
++        )
++        .await;
++
++        eprintln!(
++            "audit_chunk_size_zero: {} zero-byte chunks in 100ms, offsets[..8]={:?}",
++            net.received_offset.len(),
++            &net.received_offset[..net.received_offset.len().min(8)]
++        );
++        assert!(res.is_err(), "expected send_snapshot to make no progress with chunk size 0");
++        assert!(
++            net.received_offset.len() > 1,
++            "expected repeated zero-byte chunks, got offsets: {:?}",
++            net.received_offset
++        );
++        assert!(
++            net.received_offset.iter().all(|x| *x == 0),
++            "offset should never advance: {:?}",
++            net.received_offset
++        );
++    }
++
++    /// AUDIT-ONLY: `install_snapshot_timeout = 0` is accepted by config and
++    /// every install-snapshot RPC is immediately timed out.
++    struct AuditSlowNetwork {
++        calls: u64,
++    }
++
++    impl<C> RaftNetwork<C> for AuditSlowNetwork
++    where C: RaftTypeConfig<NodeId = u64>
++    {
++        async fn append_entries(
++            &mut self,
++            _rpc: AppendEntriesRequest<C>,
++            _option: RPCOption,
++        ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
++            unimplemented!()
++        }
++
++        async fn vote(
++            &mut self,
++            _rpc: VoteRequest<C::NodeId>,
++            _option: RPCOption,
++        ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
++            unimplemented!()
++        }
++
++        async fn full_snapshot(
++            &mut self,
++            _vote: Vote<C::NodeId>,
++            _snapshot: Snapshot<C>,
++            _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
++            _option: RPCOption,
++        ) -> Result<SnapshotResponse<C::NodeId>, StreamingError<C, Fatal<C::NodeId>>> {
++            unimplemented!()
++        }
++
++        async fn install_snapshot(
++            &mut self,
++            rpc: InstallSnapshotRequest<C>,
++            _option: RPCOption,
++        ) -> Result<
++            InstallSnapshotResponse<C::NodeId>,
++            RPCError<C::NodeId, C::Node, RaftError<C::NodeId, InstallSnapshotError>>,
++        > {
++            self.calls += 1;
++            sleep(Duration::from_millis(10)).await;
++            Ok(InstallSnapshotResponse { vote: rpc.vote })
++        }
++    }
++
++    #[tokio::test]
++    async fn audit_install_snapshot_timeout_zero() {
++        let mut net = AuditSlowNetwork { calls: 0 };
++        let mut opt = RPCOption::new(Duration::ZERO);
++        opt.snapshot_chunk_size = Some(16);
++        let cancel = futures::future::pending();
++
++        let res = Chunked::send_snapshot(
++            &mut net,
++            Vote::new(1, 0),
++            Snapshot::<UTConfig>::new(
++                SnapshotMeta {
++                    last_log_id: None,
++                    last_membership: StoredMembership::default(),
++                    snapshot_id: "audit-timeout".to_string(),
++                },
++                Box::new(Cursor::new(vec![1, 2, 3])),
++            ),
++            cancel,
++            opt,
++        )
++        .await;
++
++        eprintln!("zero install-snapshot timeout result is_err={}, calls={}", res.is_err(), net.calls);
++        assert!(res.is_err(), "expected the zero install_snapshot_timeout to fail the RPC");
++        assert!(net.calls <= 1, "the RPC should not be retried by send_snapshot: {}", net.calls);
++    }
++
+     struct RetryNetwork {
+         received_offset: Vec<u64>,
+         fail_offset: u64,
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/progress/audit_vec_progress_test.rs openraft/src/progress/audit_vec_progress_test.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/progress/audit_vec_progress_test.rs	1970-01-01 08:00:00.000000000 +0800
++++ openraft/src/progress/audit_vec_progress_test.rs	2026-10-18 12:00:07.398397201 +0800
+@@ -0,0 +1,106 @@
++//! Audit-only randomized model test for `VecProgress`.
++//!
++//! Not part of the captured implementation. It compares the incremental quorum
++//! scan against a brute-force recomputation of the greatest value granted by a
++//! quorum, for uniform and joint quorum sets.
++
++use std::collections::BTreeMap;
++
++use crate::progress::Progress;
++use crate::progress::VecProgress;
++use crate::quorum::Joint;
++use crate::quorum::QuorumSet;
++
++struct Lcg(u64);
++
++impl Lcg {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        self.0 >> 33
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++fn model_granted<QS: QuorumSet<u64>>(qs: &QS, values: &BTreeMap<u64, u64>, default_v: u64) -> u64 {
++    let mut candidates = values.values().cloned().collect::<Vec<_>>();
++    candidates.push(default_v);
++    candidates.sort_unstable();
++    candidates.dedup();
++
++    for v in candidates.into_iter().rev() {
++        let ids = values.iter().filter(|(_, x)| **x >= v).map(|(id, _)| *id).collect::<Vec<_>>();
++        if qs.is_quorum(ids.iter()) {
++            return v;
++        }
++    }
++    default_v
++}
++
++fn run<QS>(n: u64, qs: QS, seed: u64, steps: usize)
++where
++    QS: QuorumSet<u64> + Clone + std::fmt::Debug + 'static,
++{
++    let ids = (0..n).collect::<Vec<_>>();
++    let mut rng = Lcg(seed);
++    let mut p = VecProgress::<u64, u64, u64, QS>::new(qs.clone(), [], 0);
++    let mut values = ids.iter().map(|i| (*i, 0u64)).collect::<BTreeMap<_, _>>();
++
++    for step in 0..steps {
++        let id = rng.below(n);
++        let cur = values[&id];
++        let new_v = cur + rng.below(4);
++        let got = *p.update(&id, new_v).map_err(|e| *e).unwrap();
++        values.insert(id, new_v);
++
++        let want = model_granted(&qs, &values, 0);
++        assert_eq!(want, got, "step {step}: id {id} -> {new_v}, quorum: {qs:?}, values: {values:?}");
++
++        // All voter values greater than granted must stay sorted descending.
++        let granted = got;
++        let above = p
++            .iter()
++            .take(n as usize)
++            .map(|(_, v)| *v)
++            .filter(|v| *v > granted)
++            .collect::<Vec<_>>();
++        let mut sorted = above.clone();
++        sorted.sort_unstable_by(|a, b| b.cmp(a));
++        assert_eq!(sorted, above, "step {step}: values above granted are not sorted: {values:?}");
++    }
++}
++
++#[test]
++fn audit_vec_progress_uniform_majority() {
++    for n in 1..=9 {
++        for seed in 0..20 {
++            run(n, (0..n).collect::<Vec<u64>>(), seed, 300);
++        }
++    }
++}
++
++#[test]
++fn audit_vec_progress_joint_majority() {
++    // Joint quorum: majority of {0,1,2} AND majority of {1,2,3,4}.
++    let qs = Joint::from(vec![vec![0u64, 1, 2], vec![1u64, 2, 3, 4]]);
++    for seed in 0..50 {
++        let ids = [0u64, 1, 2, 3, 4];
++        let n = ids.len() as u64;
++        let mut rng = Lcg(seed);
++        let mut p = VecProgress::<u64, u64, u64, _>::new(qs.clone(), [], 0);
++        let mut values = ids.iter().map(|i| (*i, 0u64)).collect::<BTreeMap<_, _>>();
++
++        for step in 0..500 {
++            let id = rng.below(n);
++            let cur = values[&id];
++            let new_v = cur + rng.below(5);
++            let got = *p.update(&id, new_v).map_err(|e| *e).unwrap();
++            values.insert(id, new_v);
++
++            let want = model_granted(&qs, &values, 0);
++            assert_eq!(want, got, "step {step}: id {id} -> {new_v}, values: {values:?}");
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=_log' '--exclude=.runtime' /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/progress/mod.rs openraft/src/progress/mod.rs
+--- /home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/source/openraft/src/progress/mod.rs	2026-10-18 11:44:44.761368202 +0800
++++ openraft/src/progress/mod.rs	2026-10-18 11:59:59.277961916 +0800
+@@ -8,6 +8,8 @@
+ #[cfg(feature = "bench")]
+ #[cfg(test)]
+ mod bench;
++#[cfg(test)]
++mod audit_vec_progress_test;
+ pub(crate) mod entry;
+ pub(crate) mod inflight;
+ 

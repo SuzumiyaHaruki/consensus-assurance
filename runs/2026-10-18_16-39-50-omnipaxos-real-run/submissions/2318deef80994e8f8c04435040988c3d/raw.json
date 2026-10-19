@@ -1,0 +1,69 @@
+{
+  "rationale": "The successor execution (receipt 037218ff747d43cfa5af7925dccf6d2d) reproduced the probe with unambiguous admission: all three comparisons completed and hold (len 3 from 1 below compaction, len 2 from the boundary, duplicates true with no new decision). This update replaces the decided-subscription account with that admitted basis and resolves the open append_notify gap by source: pending completions are drained only on the actor tick, the Ok arm precedes the superseded arm and reads no log value, and nothing orders a drain between a ballot change and a decided advance, so an origin that observes both within one tick interval reports success for a replaced entry.",
+  "interpretations": [
+    {
+      "investigation_id": "93e6d663e93c42d7b68b91449efbcf31-question-0",
+      "experiment_id": "7862ce56b9d94e81b9351623e93f016b-experiment",
+      "source_ids": [
+        "core_read_suffix",
+        "core_entry_type",
+        "core_compacted_entry",
+        "rt_decided_sub",
+        "rt_push_sub",
+        "rt_push_all",
+        "rt_subscribe_api"
+      ],
+      "executions": {
+        "037218ff747d43cfa5af7925dccf6d2d": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The question is answered by a completed, admitted execution. Receipt 037218ff747d43cfa5af7925dccf6d2d ran decided_suffix_collapses_trimmed_prefix (exit 0, test passed) and all three comparisons are complete: from=1 returns len 3 (holds, evaluated event 1), from=4 returns len 2 (holds, evaluated event 2), and the cursor replay reports duplicates true (holds, evaluated event 3). Event 0 confirms the setup, with node 1 leader in Accept, both nodes decided 6 and compacted 4. The events show that read_decided_suffix(1) returns one Trimmed(4) element in place of the four trimmed indices plus Decided(5) and Decided(6), so the vector has 3 elements while decided-minus-from is 5; the runtime's only per-subscriber state is next_idx, incremented once per delivered element, so a catch-up starting below the compacted index ends at 4 instead of 6, and the next push reads from 4 and delivers entries 5 and 6 a second time (delivered_values 5,6,5,6, duplicate_values 5,6) with no new decision in between. subscribe_decided accepts any from, does not reject a compacted start, and does not advance the cursor to decided after a collapsed catch-up; the same boundary is crossed by a subscriber whose cursor lags behind compaction. The runtime therefore violates its documented single in-order decided stream, and an application applying Decided entries as it receives them applies entries 5 and 6 twice. The comparison predicates holding is consistent with this: they measure the operands that make the consumer arithmetic go wrong.",
+      "counterevidence": [
+        "A subscriber that starts at or above the compacted index is aligned: comparison 1 holds with len 2 for two indices at from=4, so the exposure is limited to a cursor below compaction.",
+        "Delivering a Trimmed element is itself correct and documented; the defect is the cursor advancing one step for an element that represents several log indices.",
+        "A caller that ignores the delivered Trimmed marker and re-reads the log itself would not be harmed by the duplicate indices, but the stream contract is what subscribe_decided advertises."
+      ],
+      "limitations": [
+        "omnipaxos_runtime is not a dev-dependency of the omnipaxos test target, so the actor cannot be compiled or run here; events 1-2 execute the core read and event 3 is a faithful replay of the actor's source arithmetic over those outputs, not an actor execution.",
+        "Only one compaction point, no snapshots, no batching and a single subscriber are exercised; snapshot-based compaction produces a Snapshotted element under the same collapse but was not executed.",
+        "The delivered sequence was produced from a single later push; multi-subscriber fan-out with a lagging peer was not exercised."
+      ]
+    },
+    {
+      "investigation_id": "3f84facd1a81451882518e32ee8be535-question-0",
+      "source_ids": [
+        "actor_drain",
+        "actor_pending",
+        "handle_contract",
+        "superseded_doc",
+        "test_ok_content",
+        "test_superseded_replace"
+      ],
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "The pending completion path can report a false success, under a schedule the actor does not exclude. A pending append_notify keeps only (assigned_idx, assignment_ballot). drain_notifiers evaluates, in order, Ok when assigned_idx <= decided, then Superseded when the assignment ballot is below the current promise ballot, then Timeout; the Ok arm reads no log entry and never checks that the value at assigned_idx is the caller's entry. The origin can hold an assignment made when it was leader or when a leader accepted its proposal, lose leadership to a higher ballot, and then have its own decided index advance past assigned_idx with a different value at that index: the runtime's own Superseded regression test constructs exactly that replacement (the old leader accepts locally with its outgoing cut, a new leader appends a fresh entry that decides at the same index, and the origin learns of the new ballot). Whether the pending resolves Ok or Superseded then depends only on whether a drain runs after the promise advanced but before decided reached assigned_idx. drain_notifiers runs only in the actor's tick branch; handling an incoming message never drains. Nothing orders a tick between the ballot change and the decided advance, so when the origin processes the higher-ballot Prepare and then the message that carries decided >= assigned_idx within one tick interval, the Ok arm wins and the caller is told its entry is decided at an index that holds a different entry. With a legal user-set tick_period that exceeds the leadership-turnover interval, that ordering is deterministic; with a short period it is a race. The gap on the reachable schedule is therefore answered on source grounds: no mechanism prevents it, and a legal configuration makes it the expected ordering.",
+      "answers": {
+        "3f84facd1a81451882518e32ee8be535-gap-0": {
+          "explanation": "Reachable. drain_notifiers is invoked only from the tick branch (actor.rs tick handling), while handle_incoming_tracked processes messages without draining; the actor polls the tick first each iteration but the tick fires at most once per configured period. The ballot change (Prepare/AcceptSync from the new leader) and the decided advance (AcceptDecide/Decide from that leader) are separate messages that can both be processed inside one period. If the period exceeds the turnover interval, the pending sees decided >= assigned_idx and a stale assignment ballot at the same drain, and the Ok arm precedes the Superseded arm. Since tick_period is user-set and only advised to match the ServerConfig tick budget, this ordering is legal and deterministic in that configuration.",
+          "resolved": true
+        }
+      },
+      "counterevidence": [
+        "The Superseded regression test observes Superseded for the same replacement scenario, which shows the other ordering is common in its configuration; that is evidence about that schedule, not a mechanism that guarantees it.",
+        "When the new leader adopts the caller's value at assigned_idx, Ok is accurate and returning it must not be suppressed; the defect is limited to the replaced-value case.",
+        "The Superseded doc already calls the error a heuristic and tells callers to inspect the index, which mitigates the Superseded path but not a false Ok."
+      ],
+      "limitations": [
+        "No execution of the runtime crate is possible from the omnipaxos harness (omnipaxos_runtime is not a dev-dependency), so the schedule is established by source reasoning plus the runtime's own saved test expectations, not by a measured actor run.",
+        "The false Ok needs the caller's entry to have been accepted without a majority and then replaced at the same index; if the entry is adopted by the new leader, Ok is correct.",
+        "The exact duration of an in-process leadership turnover relative to a given tick_period is unmeasured here."
+      ]
+    }
+  ]
+}

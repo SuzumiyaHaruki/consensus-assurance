@@ -1,0 +1,17 @@
+This pass added a model-based check of the raft log and left the main findings unchanged.
+
+**New work**
+
+- Wrote a randomised model check of `inMemory`, the unstable log the raft protocol reads from: 5 seeds × 400 rounds × 200 mixed operations (append, overwrite/truncate at an existing index, `savedLogTo`, `appliedLogTo`, snapshot restore), comparing `markerIndex`, retained entries, `savedTo`, `entriesToSave`, `getEntries` and snapshot state against a reference model after every step. It passes on the unmodified implementation — a negative result now recorded as evidence rather than a finding. While building it I confirmed why production never rewrites applied entries (`entryLog.append` rejects rewriting committed entries), so the harness restricts merges to `index >= markerIndex`, matching real usage.
+
+- Re-verified the state of the tree: default `internal/raft` suite green; with `-tags dragonboat_audit` the two Finding-2 tests fail as documented and the model check passes:
+  `PASS TestAuditInMemoryLogModel`, `FAIL TestAuditCandidateReadIndexIsDroppedOnce`, `PASS TestAuditCandidateProposalIsDroppedOnce`, `FAIL TestAuditPeerUpdateDroppedReadIndexes`.
+
+**Findings (unchanged, both executed)**
+
+1. `(*nodeUser).ReadIndex` in [nodehost.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/nodehost.go:2063) never marks the cluster step-ready, so the read is only dispatched on the next tick: ~one RTT extra latency and a deterministic `RequestTimeout` for one-RTT timeouts on a healthy cluster, while `NodeHost.ReadIndex` with the same timeout completes (8/8 failures vs. 5/5 passes with the one-line wakeup in `audit/diag`).
+2. `handleCandidateReadIndex` in [raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/raft.go:1998) records a dropped ReadIndex twice; the duplicate is visible through exported `Peer.GetUpdate` as two identical `SystemCtx` entries in `pb.Update.DroppedReadIndexes`.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) now also includes the model-check result, the updated reproduction inventory (`internal/raft/zz_audit_memlog_test.go`), and the extended command log. The implementation remains byte-identical to `../source`.
+
+Remaining useful work: mutual-TLS transport paths (blocked on the missing `tests/localhost.key`), an executable `tools.ImportSnapshot` repair scenario, and a mutant-style sweep of the root package for further sibling-method deviations like Finding 1.

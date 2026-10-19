@@ -1,0 +1,25 @@
+F10 is now confirmed: a state-machine panic during `apply()` leaves `client_write()` hanging while RaftCore remains alive. The audit has ten findings, all with executed reproductions.
+
+| Severity | Finding |
+|---|---|
+| High | Snapshot install persists the log purge before the state-machine install completes; a crash leaves an unrecoverable state and restart panics. |
+| Medium | Documented-valid `PartialSuccess(None)` panics the leader in debug builds. |
+| Medium | A panic in state-machine `apply()` leaves `client_write()` hanging while RaftCore stays alive. |
+| Medium | `snapshot_max_chunk_size = 0` makes `Chunked::send_snapshot()` send zero-byte chunks forever. |
+| Low/Medium | `purge_batch_size = 0` underflows at `calc_purge_upto()`'s `purge_end - 1`. |
+| Low/Medium | Blocking `add_learner()` returns `Ok` after a leadership change while the learner is still not caught up. |
+| Low/Medium | `heartbeat_interval = 0` is accepted and leaves the tick loop unthrottled. |
+| Low/Medium | `install_snapshot_timeout = 0` is accepted and every snapshot RPC times out immediately. |
+| Low/Medium | `QuitLeader` does not stop replication tasks; a deposed leader keeps sending a snapshot. |
+| Low/Medium | `Raft::shutdown()` returns while the state-machine worker is still running; the SM can change afterward. |
+
+F10’s reproducer is [t12_apply_panic_hang.rs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/tests/tests/audit/t12_apply_panic_hang.rs). With a test-only `set_panic_on_apply` memstore hook, the worker panics during apply; the client write times out after 2 seconds while `with_raft_state` still succeeds:
+
+```
+injected state machine worker panic in apply
+apply panic: client_write=true, core=Ok(Ok(()))
+```
+
+The worker’s panic is not converted into a fatal notification, and the client responder is held in `client_resp_channels`; the v0.9.25 changelog explicitly identifies this as an unaddressed failure mode.
+
+Verification: the six-test audit integration suite and the full `tests` package pass; 194 default-library tests, 205 `generic-snapshot-data` tests, and the release build also pass. Artifacts are in [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/report.md), [audit/repro](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/repro), [audit/logs](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/logs), and [audit/diagnostics](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-18_11-44-44-openraft-baseline/work/audit/diagnostics). The test-only memstore hooks are isolated in the diagnostic patch; no production openraft logic was changed.

@@ -1,0 +1,26 @@
+This pass is complete. Summary of what changed since the last handoff:
+
+**New execution evidence**
+
+- Full `internal/...` suite in the isolated namespace: the non-TLS transport tests (chunk assembly/ordering/staleness/slot limits, chunk writer, registry, circuit breaker, in-memory send limits) all pass. The mutual-TLS variants are blocked because the captured tree ships `tests/localhost.crt` but no `tests/localhost.key`; that is now recorded as blocked scope, not an implementation failure.
+- Consensus-critical root tests (`ReadIndex`, leadership transfer, add/delete node, snapshots, restart, linearizable read, add observer) pass 10/10 repetitions.
+- The default suite remains green; only the `dragonboat_audit`-tagged reproduction tests fail.
+
+**Finding 2 strengthened**
+
+The duplicate now reproduces across the exported boundary: `raft.Launch` → tick a 3-node peer into candidate state (bootstrap entries marked applied so the campaign is allowed) → deliver one `ReadIndex` → `Peer.GetUpdate` returns the same `SystemCtx` twice:
+
+```
+zz_audit_repro_test.go:76: one dropped ReadIndex produced 2 records in pb.Update:
+    [{Low:11 High:22} {Low:11 High:22}]
+```
+
+So it is observable from a root-package test through `internal/raft`'s exported `Peer`, not just from raft internals. Finding 1 is unchanged and re-verified 3/3 (plus earlier runs): `(*nodeUser).ReadIndex` omits the engine wakeup, adding ~one RTT and making a one-RTT timeout fail on a healthy cluster while `NodeHost.ReadIndex` completes.
+
+**Reviewed without new findings**
+
+Config defaults/validation, `rsm` offload/encoded/files, logdb sharding + compaction + compaction-task bookkeeping, the engine's snapshot worker pool, partitioners, and the snapshot persistence ordering in `snapshotter`/`node.doSave`/`removeLog` (rename → logdb record → flag removal; compaction after commit) all check out.
+
+The report at [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) is updated with the transport blocker, the 10x stress result, the Peer-level reproduction, and the abridged command log. Reproductions stay in [zz_audit_nodeuser_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/zz_audit_nodeuser_test.go) and [zz_audit_repro_test.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/zz_audit_repro_test.go); the implementation remains byte-identical to `../source`.
+
+Remaining useful work: the mutual-TLS transport path (blocked on the missing key), an end-to-end `tools.ImportSnapshot` repair scenario, and a mutant-style sweep of the root package for further sibling-method deviations like Finding 1.

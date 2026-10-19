@@ -1,0 +1,25 @@
+This pass closed the transport gap completely and finished the source review of the last unread core file.
+
+**Transport, including TLS**
+
+The transport tests iterate `mutualTLSValues := []bool{true, false}`, so the missing `tests/localhost.key` panicked on the first iteration and aborted the whole binary — every test after `TestMessageCanBeSent`, including all snapshot sending/streaming tests, never ran. In `audit/diag-transport/` I:
+
+- disabled the TLS setup to run every test on the non-TLS path — whole package passes (13 s);
+- generated a fresh CA plus a `localhost` server/client certificate (`audit/gencert.go`) into the copy's `tests/`, restored the TLS setup — whole package passes including all mutual-TLS variants (14 s);
+- re-ran the suite under `-race` — passes (32 s).
+
+Captured source untouched; only the copy's test fixtures/setup changed.
+
+**Final sweeps**
+
+- `-race` on `internal/raft`, `internal/rsm`, `internal/logdb`, `internal/server`: all pass.
+- Reviewed `internal/transport/tcp.go` framing (magic number, header CRC encode/decode, chunked payload I/O, poison chunks, rate-limited connection). One hardening observation recorded: the header size field is used directly to size the receive buffer, so a peer able to produce a valid header CRC could force a large allocation — not a consensus defect, not reproduced.
+- Checked the raft handler map against every (state, message type) pair, the "must be nil" list and the 26 message-type constants (0–25, matching `numMessageTypes`): no mismatches.
+- A callee-set comparison across sibling methods found no further missing-notification patterns beyond Finding 1.
+
+**Findings unchanged**
+
+- F1: `(*nodeUser).ReadIndex` in [nodehost.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/nodehost.go:2063) misses the engine wakeup — ~one RTT latency and deterministic `RequestTimeout` at a one-RTT timeout, while `NodeHost.ReadIndex` completes.
+- F2: `handleCandidateReadIndex` in [raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/raft.go:1998) records a dropped ReadIndex twice, visible in `Peer.GetUpdate`.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) records all of this; the audit test files are gofmt/vet-clean, the default suites are green, and the implementation is byte-identical to `../source`. Remaining work is source-only (rocksdb-backed packages cannot build offline).

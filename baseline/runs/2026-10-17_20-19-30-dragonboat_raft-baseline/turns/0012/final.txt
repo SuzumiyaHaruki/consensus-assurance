@@ -1,0 +1,29 @@
+This pass converted the Finding 2 impact claim from reasoning into an executed observation, and captured the final audit matrix.
+
+**New this pass**
+
+- **Finding 2 impact boundary, executed** (`TestAuditDroppedReadIndexIsIdempotent`): feeding the same `SystemCtx` through `pendingReadIndex.dropped` twice leaves exactly one notification on the client channel — the second call is a no-op because the batch was already deleted. So the duplicated record does not double-complete a request today; the defect is the wrong raft update.
+- **Finding 1 boundary, executed** (`TestAuditNodeUserReadIndexTwoTickTimeout`): a two-RTT timeout succeeds on the `INodeUser` path while one RTT fails, confirming the failure is precisely the one-tick dispatch delay.
+
+**Final audit-tagged matrix**
+
+```
+root package:  PASS DroppedReadIndexIsIdempotent, LargeProposal, LargeProposalTwoNodes,
+               LeaderTransfer, NodeUserReadIndexDispatchLatency, FollowerReadIndex,
+               NodeUserReadIndexTwoTickTimeout, ObserverReadAndPropose
+               FAIL NodeUserReadIndexOneTickTimeout                 (F1)
+internal/raft: PASS RaftSafetyFuzz, InMemoryLogModel, CandidateProposalIsDroppedOnce,
+               VoteSurvivesRestart
+               FAIL CandidateReadIndexIsDroppedOnce, PeerUpdateDroppedReadIndexes (F2)
+               FAIL UpdateHasUpdateWithDroppedReadIndexes           (F3)
+```
+
+All default suites remain green (including the transport suite with generated TLS certs in the diagnostic copy), and the implementation is byte-identical to `../source`.
+
+**Findings**
+
+- F1 — `(*nodeUser).ReadIndex` in [nodehost.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/nodehost.go:2063) never wakes the execution engine; ~one RTT latency and deterministic `RequestTimeout` for one-tick timeouts. Causality confirmed by a one-line fix in `audit/diag`.
+- F2 — `handleCandidateReadIndex` in [raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/raft.go:1998) records a dropped ReadIndex twice; visible via `Peer.GetUpdate`, currently idempotent downstream.
+- F3 — `pb.Update.HasUpdate` in [raftpb/raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/raftpb/raft.go:112) ignores `DroppedReadIndexes`, contradicting `Peer.HasUpdate` for the same state; no production caller.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) carries the full write-up, reproduction inventory and command log. Remaining work is source-only review of rocksdb-backed code that cannot build offline.

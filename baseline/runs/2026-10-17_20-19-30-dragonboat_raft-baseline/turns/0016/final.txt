@@ -1,0 +1,30 @@
+This pass completed the causal chain for all three findings: one diagnostic copy with the minimal fixes makes every reproduction pass and leaves the upstream suites green.
+
+**Fix verification** (`audit/diag-fixes/`, diffs are exactly the three intended hunks and nothing else)
+
+```go
+// F1 — nodehost.go
+req, err := nu.node.read(nu.nh.getTimeoutTick(timeout))
+nu.setStepReady(nu.node.clusterID)
+return req, err
+
+// F2 — internal/raft/raft.go: drop the duplicated ctx/append lines
+func (r *raft) handleCandidateReadIndex(m pb.Message) {
+	plog.Warningf("%s dropped read index, no leader", r.describe())
+	r.reportDroppedReadIndex(m)
+}
+
+// F3 — raftpb/raft.go
+... len(ud.DroppedEntries) > 0 ||
+	len(ud.DroppedReadIndexes) > 0
+```
+
+With those applied, the audit-tagged run is fully green — including the three previously failing tests (`NodeUserReadIndexOneTickTimeout`, the two F2 reproductions, and `UpdateHasUpdateWithDroppedReadIndexes`) and all negative-result tests (protocol fuzz, in-memory model, vote-restart, entry encoding, large payloads, follower/observer reads, leader transfer, dropped-read-index idempotence). The default `internal/raft`, `raftpb` and root-package suites also still pass, so the fixes introduce no regressions and each finding is caused by exactly the identified code.
+
+**Final state**
+
+- F1 — `(*nodeUser).ReadIndex` in [nodehost.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/nodehost.go:2063) never wakes the execution engine: ~one RTT added latency and deterministic `RequestTimeout` for one-RTT timeouts (two-RTT succeeds).
+- F2 — `handleCandidateReadIndex` in [raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/internal/raft/raft.go:1998) records a dropped ReadIndex twice; visible in `Peer.GetUpdate`, idempotent downstream.
+- F3 — `pb.Update.HasUpdate` in [raftpb/raft.go](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/raftpb/raft.go:112) ignores `DroppedReadIndexes`, contradicting `Peer.HasUpdate`.
+
+[report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-17_20-19-30-dragonboat_raft-baseline/work/report.md) now includes a **Fix verification** section with the patches, the green audit run and the no-regression result, alongside the findings, evidence, reviewed areas, inventory and command log. The audited work tree remains byte-identical to `../source`.

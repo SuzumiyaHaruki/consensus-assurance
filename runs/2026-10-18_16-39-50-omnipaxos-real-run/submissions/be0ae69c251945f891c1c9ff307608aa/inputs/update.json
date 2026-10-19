@@ -1,0 +1,146 @@
+{
+  "rationale": "Applies the already-witnessed decided-index regression to the reconfiguration signal, which is the authority-transition endpoint: stopsign_is_decided requires decided == accepted, so if a node that decided a StopSign has its decided index lowered by a reconnect AcceptSync while the StopSign stays accepted, is_reconfigured() flips from Some to None and back. A five-node run with a decided StopSign informed only on node 5, the new leader at decided 4, and the reconnected(2) path is requested to measure the flip.",
+  "sources": [
+    {
+      "id": "core_stopsign_decided",
+      "file": "omnipaxos/src/storage/state_cache.rs",
+      "start_line": 123,
+      "end_line": 126,
+      "kind": "code_observation"
+    },
+    {
+      "id": "core_is_reconfigured",
+      "file": "omnipaxos/src/sequence_paxos/mod.rs",
+      "start_line": 284,
+      "end_line": 290,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@stopsign_flip",
+      "question": "Can a StopSign that a node already observed as decided become undecided again after a reconnect AcceptSync from a leader with a lower decided index, so is_reconfigured() flips Some -> None -> Some?",
+      "source_ids": [
+        "core_stopsign_decided",
+        "core_is_reconfigured",
+        "core_sync_log",
+        "core_handle_acceptsync",
+        "core_send_accsync",
+        "core_majority_promises"
+      ],
+      "hypothesis": "Yes. stopsign_is_decided is decided_idx == accepted_idx, and is_reconfigured returns Some only while that holds. sync_log assigns the new leader's decided index unconditionally, so a node that had decided its accepted StopSign (decided == accepted) and then applies an AcceptSync carrying a lower decided index keeps the StopSign accepted but no longer decided. is_reconfigured therefore returns None until the new leader re-decides the StopSign, after which it returns Some again.",
+      "discriminator": "A five-node run where the StopSign is decided only on node 5, a new leader is elected with decided 4 while node 5 misses the Prepare, and node5.reconnected(2) triggers the Prepare/PrepareReq/Promise/AcceptSync exchange: is_reconfigured on node 5 before, immediately after the sync, and after re-decision.",
+      "disposition": "active"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@stopsign_flip",
+      "source_ids": [
+        "core_stopsign_decided",
+        "core_is_reconfigured",
+        "core_sync_log",
+        "core_handle_acceptsync",
+        "core_send_accsync",
+        "core_majority_promises"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Source establishes the mechanism but not yet the run. A node that accepts a StopSign stores it and increments its accepted index; once its decided index reaches that accepted index, stopsign_is_decided is true and is_reconfigured returns the StopSign. The reconnect path sends a Promise carrying that decided index, but the leader handles the late Promise in the Accept phase, where its AcceptSync is stamped with the leader's own decided index (which came from the prepare quorum and can be lower) and includes the StopSign it holds. sync_log then assigns the lower decided index while setting the StopSign, so decided < accepted and stopsign_is_decided becomes false; is_reconfigured returns None although the node previously reported the reconfiguration as decided. After the leader's accept quorum acknowledges, the StopSign is re-decided and is_reconfigured returns Some again. The consequence is an unstable authority-transition signal: a user polling is_reconfigured can observe a decided reconfiguration, then observe it as not decided. The probe measures whether the real instances realize this sequence.",
+      "counterevidence": [
+        "If the new leader's prepare quorum already includes a node that decided the StopSign, the leader's decided index covers it and no flip occurs.",
+        "If the delayed node's Promise participates in the prepare quorum, its decided index enters the maximum and no flip occurs.",
+        "The StopSign itself is preserved across the sync, so the reconfiguration is not lost and the value at the index does not change; the defect is the transient status flip.",
+        "The new leader re-decides the StopSign after its accept quorum acknowledges, so the None window is bounded by one accept round."
+      ],
+      "limitations": [
+        "No execution receipt yet.",
+        "The probe uses five nodes, majority quorum, memory storage, unit batch size and no snapshots; reconfiguration into a live new cluster is not exercised.",
+        "The user's reaction to the flip is not modeled; only the observable is_reconfigured value is measured."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@stopsign_flip",
+    "harness_path": "omnipaxos/tests/assurance_generated.rs",
+    "source_ids": [
+      "core_stopsign_decided",
+      "core_is_reconfigured",
+      "core_sync_log",
+      "core_handle_acceptsync",
+      "core_send_accsync",
+      "core_majority_promises"
+    ],
+    "scope": {
+      "description": "Five OmniPaxos instances, entries 1..4 decided everywhere, then a reconfigure whose StopSign is accepted by 1,2,3,5 and decided only on node 5. Node 1 is cut, node 2 is elected with promises from 3 and 4 (decided 4), node 5 misses the Prepare, and reconnected(2) drives the reconnect exchange; is_reconfigured and decided are sampled before, after the AcceptSync, and after re-decision.",
+      "assumptions": [
+        "The StopSign AcceptStopSign message to node 4 and the leader's Decide messages to 2, 3 and 4 are lost, so only node 5 learns the decision.",
+        "The Accepted replies from 3 and 4 are held so node 2 cannot re-decide before node 5 reconnects.",
+        "No ticks are called; leadership is obtained with try_become_leader."
+      ],
+      "excluded": [
+        "Snapshots, flexible quorums, batching, starting the new cluster, and multiple reconnects."
+      ],
+      "parameters": {
+        "nodes": 5,
+        "next_configuration_id": 2,
+        "leader": 2,
+        "reconnecting_node": 5
+      }
+    },
+    "prefix": "Build nodes 1..5, settle, node1.try_become_leader(), settle, append Value(1..=4) with settle after each. Call node1.reconfigure(ClusterConfig{configuration_id:2, nodes:[1,2,3,4,5]}, None); deliver the AcceptStopSign to 2,3,5 and purge the one for 4; deliver the Accepteds to node 1; deliver the Decide for index 5 only to node 5. Emit ready with node 5 decided, is_reconfigured, node 2 decided and accepted. Cut node 1, elect node 2, extract and discard the Prepare for node 5, settle the promises from 3 and 4 into Accept, deliver node 2's AcceptSyncs to 3 and 4, extract and hold their Accepted replies. Call node5.reconnected(2); deliver the PrepareReq, the Prepare, node 5's Promise and the resulting AcceptSync in order. Emit late_sync phase=after_sync with decided, reconfig, decided_leader2, lost_prepare_count. Deliver the held Accepted replies, settle among nodes 2..5, emit after_redecide with decided and reconfig.",
+    "comparisons": [
+      {
+        "event": "late_sync",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "before",
+        "assertion": {
+          "field": "reconfig",
+          "op": "eq",
+          "value": true
+        },
+        "applicability_conditions": [
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "after_sync"
+          }
+        ],
+        "description": "A StopSign that was decided should still read as decided after the sync; the predicate is expected to be violated if the decided index drops below the accepted StopSign index."
+      }
+    ],
+    "prerequisites": [
+      {
+        "alias": "before",
+        "event": "ready",
+        "conditions": [
+          {
+            "field": "phase",
+            "op": "eq",
+            "value": "before"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": 5
+          },
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 5
+          },
+          {
+            "field": "reconfig",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "test_names": [
+      "decided_stopsign_flips_through_reconnect_sync"
+    ]
+  }
+}
